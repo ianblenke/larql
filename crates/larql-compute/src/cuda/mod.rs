@@ -22,6 +22,7 @@ mod error;
 mod matmul;
 #[cfg(feature = "cuda-oxide")]
 mod oxide_kernels;
+pub mod q4k_batched;
 mod q4k_direct;
 mod quant_matvec;
 pub mod sampling;
