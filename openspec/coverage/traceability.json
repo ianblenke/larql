@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 50,
-    "requirements": 473,
-    "scenarios": 1460,
+    "requirements": 474,
+    "scenarios": 1461,
     "scenarios_backed": 1309,
-    "scenarios_unbacked": 151,
-    "test_refs": 3391,
+    "scenarios_unbacked": 152,
+    "test_refs": 3392,
     "test_refs_unresolved": 14
   },
   "capabilities": [
@@ -2433,6 +2433,19 @@
               "unbacked": true,
               "spec_file": "openspec/changes/cuda-decode-device-resident/specs/compute-cuda-kernels/spec.md",
               "line": 153
+            }
+          ]
+        },
+        {
+          "name": "Post-8.04-ms checkpoint follow-up consolidation document",
+          "scenarios": [
+            {
+              "name": "navigation aid lets a fresh contributor identify the next-step architectural path",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cuda-decode-perf-results-followup/specs/compute-cuda-kernels/spec.md",
+              "line": 28
             }
           ]
         },
