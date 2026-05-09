@@ -665,4 +665,115 @@ mod tests {
             println!();
         }
     }
+
+    /// `cuda-tensor-cores-q4k` viability probe: for each Gemma 3 4B
+    /// projection shape, time the existing dp4a-mmvq path against
+    /// cuBLAS hgemm with batch-size = 1 (f16 weight cache + f16
+    /// converted input). Tells us whether Tensor Cores can beat dp4a
+    /// for batch-1 INT4 matvec — analytically they shouldn't (TC
+    /// 16x16 tiles waste 15 rows for batch-1), but worth confirming
+    /// empirically before committing to a custom WMMA kernel.
+    ///
+    /// Run with:
+    /// ```text
+    /// LARQL_CUDA_AVAILABLE=1 cargo test -p larql-compute --features cuda \
+    ///   --lib q4k_decode_dp4a_vs_hgemm_b1 -- --ignored --nocapture --release
+    /// ```
+    #[test]
+    #[ignore = "manual microbench; warmups + repeated launches"]
+    fn q4k_decode_dp4a_vs_hgemm_b1() {
+        let Some(backend) = gpu_or_skip() else { return };
+        use crate::cuda::elem::{f16_to_f32_device, f32_to_f16_device};
+        use crate::cuda::matmul::matmul_transb_device_inout_f16;
+
+        let shapes = [
+            ("q     ", 2048, 2560),
+            ("kv    ", 1024, 2560),
+            ("wo    ", 2560, 2048),
+            ("gate  ", 10240, 2560),
+            ("up    ", 10240, 2560),
+            ("down  ", 2560, 10240),
+        ];
+
+        let n_iters: usize = 200;
+
+        for (label, rows, hidden) in shapes {
+            let w_q4k = quantize_q4_k(&synth(rows * hidden, 0x9000));
+            let q4k_dev = backend.arc_q4k_device_buf(&w_q4k).expect("htod q4k");
+
+            let x = synth(hidden, 0x9100);
+            let x_dev = backend.htod_f32(&x).expect("htod x");
+            let q8 = quantize_q8_1_device(&backend, &x_dev, hidden).expect("q8_1");
+
+            // dp4a path warmup + measure
+            let mut y_dp4a = backend.alloc_f32(rows).expect("alloc y");
+            for _ in 0..5 {
+                matvec_device_into_with_dev(
+                    &backend,
+                    &q4k_dev,
+                    &q8,
+                    &mut y_dp4a,
+                    rows,
+                    hidden,
+                )
+                .ok();
+            }
+            backend.driver().sync().expect("sync");
+
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                matvec_device_into_with_dev(
+                    &backend,
+                    &q4k_dev,
+                    &q8,
+                    &mut y_dp4a,
+                    rows,
+                    hidden,
+                )
+                .expect("launch");
+            }
+            backend.driver().sync().expect("sync");
+            let dp4a_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // hgemm batch-1 path: f16 weight cache + f32→f16 convert
+            // + cuBLAS hgemm (M=1, N=rows, K=hidden) + f16→f32.
+            // Warmup populates the f16 weight cache.
+            let _ = backend.with_q4k_f16_device_buf(&w_q4k, rows * hidden, |w_f16| {
+                let x_f16 = f32_to_f16_device(&backend, &x_dev)?;
+                let y_f16 =
+                    matmul_transb_device_inout_f16(backend.driver(), &x_f16, w_f16, 1, rows, hidden)?;
+                let _y_f32 = f16_to_f32_device(&backend, &y_f16)?;
+                Ok(())
+            });
+            backend.driver().sync().expect("sync");
+
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                let _ = backend
+                    .with_q4k_f16_device_buf(&w_q4k, rows * hidden, |w_f16| {
+                        let x_f16 = f32_to_f16_device(&backend, &x_dev)?;
+                        let y_f16 = matmul_transb_device_inout_f16(
+                            backend.driver(),
+                            &x_f16,
+                            w_f16,
+                            1,
+                            rows,
+                            hidden,
+                        )?;
+                        let _y_f32 = f16_to_f32_device(&backend, &y_f16)?;
+                        Ok(())
+                    })
+                    .expect("hgemm b1");
+            }
+            backend.driver().sync().expect("sync");
+            let hgemm_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            let ratio = hgemm_us / dp4a_us;
+            println!(
+                "[decode_tc] {label} rows={rows:>5} hidden={hidden:>5}  \
+                 dp4a={dp4a_us:>5.1}µs  hgemm_b1={hgemm_us:>5.1}µs  \
+                 ratio={ratio:>4.2}× (>1 means hgemm slower)"
+            );
+        }
+    }
 }
