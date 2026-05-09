@@ -825,4 +825,174 @@ extern "C" __global__ void axpb(const float* x, float* y, int n, float a, float 
             "graph replay drift {max_diff} > 1e-6 — capture mechanism is broken"
         );
     }
+
+    /// `cuda-attn-wmma-phase2` viability probe: confirms that cudarc's
+    /// NVRTC pipeline can compile a kernel that uses `mma.sync.aligned`
+    /// PTX intrinsics with f16 inputs + f32 accumulator (the
+    /// `m16n8k16` shape on sm_80+). If this fails to compile or
+    /// produces wrong output, the full Phase 2 WMMA attention kernel
+    /// is dead in the water and we'd take a different gap-closure
+    /// path.
+    ///
+    /// Computes a fixed 16×8 = (16×16) × (16×8) f16 matmul with f32
+    /// accumulator and verifies against an f32 reference.
+    #[test]
+    fn cuda_wmma_mma_sync_smoke_test() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+        if std::env::var("LARQL_CUDA_AVAILABLE").ok().as_deref() != Some("1") {
+            return;
+        }
+        let Ok(backend) = CudaBackend::new() else {
+            return;
+        };
+        let ctx = &backend.driver().ctx;
+        let stream = backend.driver().stream.clone();
+
+        // sm_80+ `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
+        // operates on:
+        //   A: 16×16 f16, row-major, distributed across 32 lanes as
+        //      4 fragments per lane (each holds 2 f16 values via half2).
+        //   B: 16× 8 f16, col-major, 2 fragments per lane.
+        //   C/D: 16× 8 f32, distributed as 4 fragments per lane.
+        //
+        // For this smoke test we keep the layout simple: 32 threads
+        // (one warp) cooperate to compute one 16×8 output tile.
+        // A is loaded from `a[16][16]` with each lane reading
+        // 4 elements at well-defined positions (PTX dictates the
+        // mapping; we follow the standard distribution).
+        //
+        // To avoid the layout maze, the kernel uses `wmma::` API
+        // through the NVRTC `<mma.h>` header — cleaner than raw PTX
+        // and what production WMMA code looks like.
+        let src = r#"
+#include <mma.h>
+using namespace nvcuda;
+
+extern "C" __global__ void mma_smoke(
+    const __half* __restrict__ a,   // 16×16, row-major
+    const __half* __restrict__ b,   // 16×8 logical (loaded as 16×16 with right half zero)
+    float* __restrict__ d            // 16×8 → stored as 16×16 with right half zero
+) {
+    wmma::fragment<wmma::matrix_a,    16, 16, 16, __half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b,    16, 16, 16, __half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+    wmma::load_matrix_sync(a_frag, a, 16);
+    wmma::load_matrix_sync(b_frag, b, 16);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    wmma::store_matrix_sync(d, c_frag, 16, wmma::mem_row_major);
+}
+"#;
+
+        // sm_80+ ships m16n16k16 wmma; sm_70 had it for f16 already.
+        // Compile against compute_80 to get the modern API.
+        // NVRTC needs an explicit include path for `<mma.h>` — it
+        // doesn't auto-discover the toolkit headers.
+        let mut include_paths = Vec::new();
+        for candidate in [
+            "/usr/local/cuda-12.5/targets/x86_64-linux/include",
+            "/usr/local/cuda-12.1/targets/x86_64-linux/include",
+            "/usr/local/cuda/targets/x86_64-linux/include",
+            "/usr/local/cuda/include",
+            "/opt/cuda/include",
+        ] {
+            if std::path::Path::new(candidate).is_dir() {
+                include_paths.push(candidate.to_string());
+                break;
+            }
+        }
+        let opts = CompileOptions {
+            arch: Some("compute_80"),
+            include_paths,
+            ..Default::default()
+        };
+        let ptx = match compile_ptx_with_opts(src, opts) {
+            Ok(p) => p,
+            Err(e) => {
+                // If NVRTC can't compile the WMMA kernel, the full
+                // Phase 2 kernel is also blocked and we'd need to
+                // pivot. Surface the error clearly and bail.
+                panic!("NVRTC WMMA compile failed: {e:?}");
+            }
+        };
+        let module = ctx.load_module(ptx).expect("load wmma module");
+        let func = module
+            .load_function("mma_smoke")
+            .expect("load mma_smoke function");
+
+        // 16×16 input matrices, generated as simple sequences so the
+        // expected output is easy to verify.
+        let a_host: Vec<half::f16> = (0..256)
+            .map(|i| half::f16::from_f32((i % 8) as f32))
+            .collect();
+        // B has only the left 16×8 used; right half = 0.
+        let b_host: Vec<half::f16> = (0..256)
+            .map(|i| {
+                let col = i % 16;
+                if col < 8 {
+                    half::f16::from_f32(((i / 16) + col) as f32)
+                } else {
+                    half::f16::from_f32(0.0)
+                }
+            })
+            .collect();
+
+        let a_dev = stream.clone_htod(&a_host).expect("htod a");
+        let b_dev = stream.clone_htod(&b_host).expect("htod b");
+        let mut d_dev = unsafe { stream.alloc::<f32>(256).expect("alloc d") };
+        stream.synchronize().expect("pre-launch sync");
+
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&a_dev)
+                .arg(&b_dev)
+                .arg(&mut d_dev)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .expect("launch mma_smoke");
+        }
+        stream.synchronize().expect("post-launch sync");
+        let d_dev_host = stream.clone_dtoh(&d_dev).expect("dtoh d");
+
+        // The B fragment is loaded as `col_major` from the row-major
+        // memory layout, which means B_loaded = B_memory^T. So the
+        // mma_sync output is A @ B^T (the canonical attention pattern
+        // Q @ K^T when A=Q row-major, B=K row-major).
+        // Reference: D[i, j] = Σ_k a[i*16+k] × b[j*16+k].
+        let a_f32: Vec<f32> = a_host.iter().map(|v| v.to_f32()).collect();
+        let b_f32: Vec<f32> = b_host.iter().map(|v| v.to_f32()).collect();
+        let mut d_ref = vec![0.0f32; 256];
+        for i in 0..16 {
+            for j in 0..16 {
+                let mut acc = 0.0f32;
+                for k in 0..16 {
+                    acc += a_f32[i * 16 + k] * b_f32[j * 16 + k];
+                }
+                d_ref[i * 16 + j] = acc;
+            }
+        }
+
+        let mut max_diff = 0.0f32;
+        for i in 0..16 {
+            for j in 0..16 {
+                let got = d_dev_host[i * 16 + j];
+                let exp = d_ref[i * 16 + j];
+                let diff = (got - exp).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-2,
+            "WMMA smoke test max-diff {max_diff} > 1e-2 — kernel is wrong"
+        );
+    }
 }
