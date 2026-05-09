@@ -108,6 +108,104 @@ extern "C" __global__ void add_in_place_f32(
 }
 "#;
 
+/// `cuda-fused-norm-quantize` (Path E): `out_bytes = quantize_q8_1
+/// (rms_norm(x, weight))` in one kernel. Fuses the captured-decode
+/// pipeline's pre-attn and pre-ffn norm + quantize pairs:
+/// `rms_norm_device_into(... → h_attn) + quantize_q8_1_device_into
+/// (h_attn → h_attn_q8_1)` becomes a single launch. Saves 2 of 4
+/// pre-projection launches per layer (68 per token in the 34-layer
+/// graph) AND the intermediate `h_attn` / `h_ffn` write+read
+/// (10 KB / layer × 2 ops × 34 layers ≈ 680 KB / token).
+///
+/// Single block (1024 threads). Shared memory holds the normalised
+/// values (n floats), reused by the per-block Q8_1 quantize phase.
+const RMS_NORM_QUANTIZE_Q8_1_SRC: &str = r#"
+__device__ unsigned short rnq_f32_to_f16_bits(float v) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    return h;
+}
+
+extern "C" __global__ void rms_norm_quantize_q8_1_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    int n,
+    int has_weight,
+    float eps,
+    float norm_offset,
+    unsigned char* __restrict__ out
+) {
+    int tid  = threadIdx.x;
+    int bdim = blockDim.x;
+    extern __shared__ float smem[];
+
+    // Phase 1: sum-of-squares reduction (smem holds per-thread ss).
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += bdim) {
+        float v = x[i];
+        ss += v * v;
+    }
+    smem[tid] = ss;
+    __syncthreads();
+    for (int s = bdim / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(smem[0] / (float)n + eps);
+    __syncthreads();
+
+    // Phase 2: write normalised values to smem (re-using as a
+    // [n × float] buffer; smem must be sized ≥ max(bdim, n)).
+    if (has_weight) {
+        for (int i = tid; i < n; i += bdim) {
+            smem[i] = x[i] * inv_rms * (weight[i] + norm_offset);
+        }
+    } else {
+        for (int i = tid; i < n; i += bdim) {
+            smem[i] = x[i] * inv_rms;
+        }
+    }
+    __syncthreads();
+
+    // Phase 3: per-warp Q8_1 quantize, one warp per 32-elem block,
+    // strided across `n_blocks` if there are more blocks than warps.
+    int n_blocks = n / 32;
+    int warp = tid / 32;
+    int lane = tid % 32;
+    int warps_per_block = bdim / 32;
+
+    for (int b = warp; b < n_blocks; b += warps_per_block) {
+        float v = smem[b * 32 + lane];
+        // amax across the warp.
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            float r = __shfl_xor_sync(0xffffffff, amax, o);
+            amax = fmaxf(amax, r);
+        }
+        float scale = amax / 127.0f;
+        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+        int q = __float2int_rn(v * inv_scale);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        // sum across the warp.
+        float sum_x = v;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            sum_x += __shfl_xor_sync(0xffffffff, sum_x, o);
+        }
+        unsigned char* block_ptr = out + (size_t)b * 36;
+        if (lane == 0) {
+            unsigned short s_h = rnq_f32_to_f16_bits(scale);
+            unsigned short m_h = rnq_f32_to_f16_bits(scale * sum_x);
+            unsigned int packed = (unsigned int)s_h | ((unsigned int)m_h << 16);
+            *((unsigned int*)block_ptr) = packed;
+        }
+        block_ptr[4 + lane] = (unsigned char)((signed char)q);
+    }
+}
+"#;
+
 /// `cuda-fused-norm-add`: `dst[i] += rms_norm(src, weight)[i] * scale`
 /// in one kernel. TensorRT-LLM-style residual fusion: combines the
 /// post-attn (and post-ffn) `rms_norm + add_in_place` pair into a
@@ -275,6 +373,8 @@ static QUANTIZE_Q8_1_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> 
 static F32_TO_F16_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = OnceLock::new();
 static F16_TO_F32_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = OnceLock::new();
 static RMS_NORM_ADD_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = OnceLock::new();
+static RMS_NORM_QUANTIZE_Q8_1_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
+    OnceLock::new();
 
 fn load_kernel(
     drv: &Driver,
@@ -866,6 +966,87 @@ pub(crate) fn rms_norm_add_device(
             .arg(&scale)
             .launch(cfg)
             .map_err(|e| CudaInitError::DriverMissing(format!("launch rms_norm_add: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// `cuda-fused-norm-quantize` (Path E): single-kernel fusion of
+/// `rms_norm_device_into + quantize_q8_1_device_into`. Used for
+/// the captured-decode pipeline's pre-attn (`h → h_attn_q8_1`)
+/// and pre-ffn (`h → h_ffn_q8_1`) projection inputs. Saves 2 of
+/// 4 pre-projection launches per layer + the intermediate
+/// `h_attn` / `h_ffn` write+read.
+pub(crate) fn rms_norm_quantize_q8_1_into(
+    backend: &CudaBackend,
+    x_dev: &CudaSlice<f32>,
+    weight_dev: Option<&CudaSlice<f32>>,
+    out_bytes: &mut CudaSlice<u8>,
+    n: usize,
+    eps: f32,
+    norm_offset: f32,
+) -> Result<(), CudaInitError> {
+    if x_dev.len() != n {
+        return Err(CudaInitError::DriverMissing(format!(
+            "rms_norm_quantize_q8_1_into: x_dev.len={} != n={n}",
+            x_dev.len()
+        )));
+    }
+    if !n.is_multiple_of(32) {
+        return Err(CudaInitError::DriverMissing(format!(
+            "rms_norm_quantize_q8_1_into: n={n} must be a multiple of 32"
+        )));
+    }
+    let n_blocks = n / 32;
+    if out_bytes.len() != n_blocks * 36 {
+        return Err(CudaInitError::DriverMissing(format!(
+            "rms_norm_quantize_q8_1_into: out_bytes.len={} != {}",
+            out_bytes.len(),
+            n_blocks * 36
+        )));
+    }
+    if let Some(w) = weight_dev {
+        if w.len() != n {
+            return Err(CudaInitError::DriverMissing(format!(
+                "rms_norm_quantize_q8_1_into: weight len {} != n {n}",
+                w.len()
+            )));
+        }
+    }
+
+    let drv = backend.driver();
+    let func = load_kernel(
+        drv,
+        &RMS_NORM_QUANTIZE_Q8_1_FUNC,
+        RMS_NORM_QUANTIZE_Q8_1_SRC,
+        "rms_norm_quantize_q8_1_f32",
+    )?;
+    let block_dim: u32 = 1024;
+    // smem hosts both the per-thread sum-of-squares (bdim floats)
+    // and the post-norm values (n floats), reused in sequence —
+    // size = max(bdim, n) × 4 bytes.
+    let smem_floats = std::cmp::max(block_dim as usize, n);
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: (smem_floats * std::mem::size_of::<f32>()) as u32,
+    };
+    let n_i = n as i32;
+    let has_weight_i: i32 = if weight_dev.is_some() { 1 } else { 0 };
+    let weight_arg: &CudaSlice<f32> = weight_dev.unwrap_or(x_dev);
+    unsafe {
+        drv.stream
+            .launch_builder(func)
+            .arg(x_dev)
+            .arg(weight_arg)
+            .arg(&n_i)
+            .arg(&has_weight_i)
+            .arg(&eps)
+            .arg(&norm_offset)
+            .arg(out_bytes)
+            .launch(cfg)
+            .map_err(|e| {
+                CudaInitError::DriverMissing(format!("launch rms_norm_quantize: {e:?}"))
+            })?;
     }
     Ok(())
 }

@@ -1600,23 +1600,19 @@ impl CudaBackend {
             };
             let layer_rotary_dim = layer.rotary_dim;
 
-            // 1. h_attn = rms_norm(h, input_norm)
-            elem::rms_norm_device_into(
+            // 1+2 (cuda-fused-norm-quantize / Path E): one kernel
+            // computes `h_attn_q8_1 = quantize_q8_1(rms_norm(h,
+            // input_norm))`. Replaces the legacy 2-launch pair
+            // `rms_norm_device_into → quantize_q8_1_device_into`
+            // and drops the `scratch.h_attn` intermediate write.
+            elem::rms_norm_quantize_q8_1_into(
                 self,
                 &scratch.h,
                 Some(&arcs.input_norm),
-                &mut scratch.h_attn,
+                &mut scratch.h_attn_q8_1.bytes,
                 hidden,
                 layer.eps,
                 layer.norm_offset,
-            )?;
-
-            // 2. h_attn_q8_1 = quantize(h_attn)
-            elem::quantize_q8_1_device_into(
-                self,
-                &scratch.h_attn,
-                &mut scratch.h_attn_q8_1.bytes,
-                hidden,
             )?;
 
             // 3. q/k/v projections (Q4_K / Q6_K mmvq via Q8_1 input)
@@ -1713,23 +1709,18 @@ impl CudaBackend {
                 elem::add_in_place_device(self, &mut scratch.h, &scratch.attn_delta)?;
             }
 
-            // 7. h_ffn = rms_norm(h, ffn_norm)
-            elem::rms_norm_device_into(
+            // 7+8 (cuda-fused-norm-quantize / Path E): one kernel
+            // computes `h_ffn_q8_1 = quantize_q8_1(rms_norm(h,
+            // ffn_norm))`. Drops the `scratch.h_ffn` intermediate
+            // write and one launch.
+            elem::rms_norm_quantize_q8_1_into(
                 self,
                 &scratch.h,
                 Some(&arcs.ffn_norm),
-                &mut scratch.h_ffn,
+                &mut scratch.h_ffn_q8_1.bytes,
                 hidden,
                 layer.eps,
                 layer.norm_offset,
-            )?;
-
-            // 8. h_ffn_q8_1 = quantize(h_ffn); gate/up projections.
-            elem::quantize_q8_1_device_into(
-                self,
-                &scratch.h_ffn,
-                &mut scratch.h_ffn_q8_1.bytes,
-                hidden,
             )?;
             self.proj_q8_1_into(
                 arcs.gate_format,
