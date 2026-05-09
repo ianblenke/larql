@@ -825,4 +825,311 @@ extern "C" __global__ void axpb(const float* x, float* y, int n, float a, float 
             "graph replay drift {max_diff} > 1e-6 — capture mechanism is broken"
         );
     }
+
+    /// `cuda-marlin-imma-probe`: head-to-head microbench between the
+    /// existing `__dp4a` INT4 mmvq path and an INT8-IMMA Tensor-Core
+    /// matmul over INT8 inputs. Decides whether the multi-day Marlin-
+    /// style INT4-IMMA kernel work has a viable upper bound on
+    /// Gemma 3 4B's projection shapes — if INT8 IMMA loses to dp4a
+    /// (analogous to how WMMA lost on GQA), Marlin is dead and we
+    /// pivot to other paths.
+    ///
+    /// The IMMA path is a STRIPPED-DOWN proxy for Marlin: takes
+    /// already-INT8 weights (no Q4_K dequant in shared mem yet) and
+    /// runs INT8 IMMA. If the proxy beats dp4a, the full Marlin
+    /// kernel (with Q4_K → INT8 staging) inherits the win. If it
+    /// loses, Marlin can't recover.
+    ///
+    /// Run with:
+    /// ```text
+    /// LARQL_CUDA_AVAILABLE=1 cargo test --release -p larql-compute \
+    ///   --features cuda --lib cuda_mmvq_dp4a_vs_imma_bench -- \
+    ///   --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual microbench"]
+    fn cuda_mmvq_dp4a_vs_imma_bench() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+        if std::env::var("LARQL_CUDA_AVAILABLE").ok().as_deref() != Some("1") {
+            return;
+        }
+        let Ok(backend) = CudaBackend::new() else { return; };
+        let ctx = &backend.driver().ctx;
+        let stream = backend.driver().stream.clone();
+
+        // Both kernels compute `y = W * x` where W is INT8 [rows × hidden]
+        // and x is INT8 [hidden]. Output is INT32 [rows].
+        //
+        // dp4a path: 1 warp per row, lanes split the hidden dimension,
+        // each lane does (hidden/32)/4 dp4a calls. Same pattern as the
+        // existing q4k_mmvq's INT8 SIMD inner loop, just without the
+        // Q4_K dequant.
+        //
+        // IMMA path: 1 block per (rows / 16) tile. Each block has 4
+        // warps; each warp loads its row-tile + a K-tile via
+        // `mma.sync.aligned.m16n8k32.s32.s8.s8.s32`. For batch=1
+        // matvec, only 1 of 8 N columns is real (input vector is
+        // 1 column wide). 1/8 column utilisation is the upper bound
+        // on what IMMA can achieve here vs dp4a's 100% utilisation.
+        let src = r#"
+__device__ int dp4a_s32(int a, int b, int c) {
+    int r;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+
+extern "C" __global__ void mmvq_int8_dp4a(
+    const signed char* __restrict__ w,    // [rows × hidden] row-major
+    const signed char* __restrict__ x,    // [hidden]
+    int* __restrict__ y,                   // [rows]
+    int rows, int hidden
+) {
+    // Grid: (rows / 4, 1, 1). Block: (32, 4, 1). 1 warp per row, 4 rows per block.
+    int tid_x = threadIdx.x;
+    int tid_y = threadIdx.y;
+    int row = blockIdx.x * blockDim.y + tid_y;
+    if (row >= rows) return;
+
+    const int* w_row = (const int*)(w + (size_t)row * hidden);
+    const int* x_int = (const int*)x;
+
+    int n_int = hidden / 4;  // hidden / 4 INT32 chunks
+    int acc = 0;
+    for (int i = tid_x; i < n_int; i += 32) {
+        acc = dp4a_s32(w_row[i], x_int[i], acc);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o);
+    }
+    if (tid_x == 0) y[row] = acc;
+}
+
+// `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` (sm_80+) IMMA.
+// A: 16×32 INT8 row-major. B: 32×8 INT8 col-major (we replicate the
+// 1-col input across all 8 cols → only col 0 is real). D: 16×8 INT32.
+//
+// Per warp: distributes the fragment over 32 lanes per the PTX ISA.
+// We use `wmma::fragment` for portability instead of raw mma.sync.
+#include <mma.h>
+using namespace nvcuda;
+
+extern "C" __global__ void mmvq_int8_imma(
+    const signed char* __restrict__ w,    // [rows × hidden] row-major
+    const signed char* __restrict__ x,    // [hidden]
+    int* __restrict__ y,                   // [rows]
+    int rows, int hidden
+) {
+    // Grid: (rows / 16, 1, 1). Block: (32, 1, 1). 1 warp per 16-row tile.
+    int row_tile = blockIdx.x;
+    int row_base = row_tile * 16;
+    if (row_base >= rows) return;
+
+    wmma::fragment<wmma::matrix_a,    16, 16, 16, signed char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b,    16, 16, 16, signed char, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag;
+    wmma::fill_fragment(c_frag, 0);
+
+    // sm_80+ supports 16x16x16 INT8 WMMA. We process the hidden
+    // dimension in tiles of 16 for direct compatibility with the
+    // standard WMMA shape (a higher-throughput m16n16k32 variant
+    // exists via raw mma.sync but adds layout complexity).
+    int n_k_tiles = hidden / 16;
+    for (int k_tile = 0; k_tile < n_k_tiles; ++k_tile) {
+        int k_off = k_tile * 16;
+        wmma::load_matrix_sync(a_frag, w + (size_t)row_base * hidden + k_off, hidden);
+        // Replicate x across 16 cols: loaded col_major as 16×16
+        // where each col holds the same 16 INT8 values.
+        // Easiest: write x's 16-byte slice into shared memory 16
+        // times, then load_matrix_sync. For this probe we just
+        // use the input pointer directly with a stride of 0 —
+        // wmma::load_matrix_sync requires a real ldm, so we stage
+        // via shared memory.
+        __shared__ signed char b_smem[16 * 16];
+        int tid = threadIdx.x;
+        if (tid < 16) {
+            signed char xv = x[k_off + tid];
+            #pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                b_smem[c * 16 + tid] = xv;
+            }
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(b_frag, b_smem, 16);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store col-0 of c_frag (the only real output column) into y.
+    // Since fragment storage layout is opaque, use a small shared
+    // staging buffer.
+    __shared__ int c_smem[16 * 16];
+    wmma::store_matrix_sync(c_smem, c_frag, 16, wmma::mem_row_major);
+    int tid = threadIdx.x;
+    if (tid < 16 && row_base + tid < rows) {
+        y[row_base + tid] = c_smem[tid * 16 + 0];
+    }
+}
+"#;
+
+        let mut include_paths = Vec::new();
+        for c in [
+            "/usr/local/cuda-12.5/targets/x86_64-linux/include",
+            "/usr/local/cuda-12.1/targets/x86_64-linux/include",
+            "/usr/local/cuda/targets/x86_64-linux/include",
+            "/usr/local/cuda/include",
+            "/opt/cuda/include",
+        ] {
+            if std::path::Path::new(c).is_dir() {
+                include_paths.push(c.to_string());
+                break;
+            }
+        }
+        let opts = CompileOptions {
+            arch: Some("compute_80"),
+            include_paths,
+            ..Default::default()
+        };
+        let ptx = match compile_ptx_with_opts(src, opts) {
+            Ok(p) => p,
+            Err(e) => panic!("nvrtc compile mmvq imma probe: {e:?}"),
+        };
+        let module = ctx.load_module(ptx).expect("load module");
+        let f_dp4a = module.load_function("mmvq_int8_dp4a").expect("dp4a fn");
+        let f_imma = module.load_function("mmvq_int8_imma").expect("imma fn");
+
+        // Gemma 3 4B Q4_K projection shapes (rows, hidden).
+        // Use INT8 surrogates here; Marlin's full kernel does
+        // Q4_K → INT8 staging in shared memory.
+        let shapes = [
+            ("q     ", 2048usize, 2560usize),
+            ("kv    ", 1024, 2560),
+            ("wo    ", 2560, 2048),
+            ("gate  ", 10240, 2560),
+            ("up    ", 10240, 2560),
+            ("down  ", 2560, 10240),
+        ];
+        let n_iters = 200;
+
+        for (label, rows, hidden) in shapes {
+            // Synthetic INT8 input.
+            let w_host: Vec<i8> = (0..rows * hidden)
+                .map(|i| ((i % 7) as i32 - 3) as i8)
+                .collect();
+            let x_host: Vec<i8> = (0..hidden).map(|i| ((i % 5) as i32 - 2) as i8).collect();
+            // SAFETY: `i8` and `signed char` have identical repr.
+            let w_dev = stream
+                .clone_htod(unsafe {
+                    std::slice::from_raw_parts(w_host.as_ptr() as *const u8, w_host.len())
+                })
+                .expect("htod w");
+            let x_dev = stream
+                .clone_htod(unsafe {
+                    std::slice::from_raw_parts(x_host.as_ptr() as *const u8, x_host.len())
+                })
+                .expect("htod x");
+            let mut y_dp4a = unsafe { stream.alloc::<i32>(rows).expect("alloc y_dp4a") };
+            let mut y_imma = unsafe { stream.alloc::<i32>(rows).expect("alloc y_imma") };
+
+            let rows_i = rows as i32;
+            let hidden_i = hidden as i32;
+
+            // Warmup
+            for _ in 0..5 {
+                unsafe {
+                    stream
+                        .launch_builder(&f_dp4a)
+                        .arg(&w_dev)
+                        .arg(&x_dev)
+                        .arg(&mut y_dp4a)
+                        .arg(&rows_i)
+                        .arg(&hidden_i)
+                        .launch(LaunchConfig {
+                            grid_dim: ((rows as u32 + 3) / 4, 1, 1),
+                            block_dim: (32, 4, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("dp4a launch");
+                    stream
+                        .launch_builder(&f_imma)
+                        .arg(&w_dev)
+                        .arg(&x_dev)
+                        .arg(&mut y_imma)
+                        .arg(&rows_i)
+                        .arg(&hidden_i)
+                        .launch(LaunchConfig {
+                            grid_dim: ((rows as u32 + 15) / 16, 1, 1),
+                            block_dim: (32, 1, 1),
+                            shared_mem_bytes: (16 * 16 + 16 * 16 * 4) as u32,
+                        })
+                        .expect("imma launch");
+                }
+            }
+            stream.synchronize().expect("warmup sync");
+
+            // dp4a timing
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    stream
+                        .launch_builder(&f_dp4a)
+                        .arg(&w_dev)
+                        .arg(&x_dev)
+                        .arg(&mut y_dp4a)
+                        .arg(&rows_i)
+                        .arg(&hidden_i)
+                        .launch(LaunchConfig {
+                            grid_dim: ((rows as u32 + 3) / 4, 1, 1),
+                            block_dim: (32, 4, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("dp4a launch");
+                }
+            }
+            stream.synchronize().expect("dp4a sync");
+            let dp4a_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // IMMA timing
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    stream
+                        .launch_builder(&f_imma)
+                        .arg(&w_dev)
+                        .arg(&x_dev)
+                        .arg(&mut y_imma)
+                        .arg(&rows_i)
+                        .arg(&hidden_i)
+                        .launch(LaunchConfig {
+                            grid_dim: ((rows as u32 + 15) / 16, 1, 1),
+                            block_dim: (32, 1, 1),
+                            shared_mem_bytes: (16 * 16 + 16 * 16 * 4) as u32,
+                        })
+                        .expect("imma launch");
+                }
+            }
+            stream.synchronize().expect("imma sync");
+            let imma_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // Parity check.
+            let y_dp4a_h = stream.clone_dtoh(&y_dp4a).expect("dtoh dp4a");
+            let y_imma_h = stream.clone_dtoh(&y_imma).expect("dtoh imma");
+            let mut max_diff = 0i32;
+            for i in 0..rows {
+                let d = (y_dp4a_h[i] - y_imma_h[i]).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+            }
+
+            let speedup = dp4a_us / imma_us;
+            println!(
+                "[mmvq_imma] {label} rows={rows:>5} hidden={hidden:>5}  \
+                 dp4a={dp4a_us:>6.2}µs  imma={imma_us:>6.2}µs  \
+                 speedup={speedup:>5.2}× (>1 means imma faster)  \
+                 parity_max_diff={max_diff}"
+            );
+        }
+    }
 }
