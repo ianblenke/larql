@@ -220,6 +220,13 @@ struct LayerArcs {
     wk_format: QuantFormat,
     wv: Arc<CudaSlice<u8>>,
     wv_format: QuantFormat,
+    /// `cuda-q4k-qkv-fuse-v2` (Path D): the concatenated `[W_q | W_k
+    /// | W_v]` Q4_K weight stream. `Some` only when all three are
+    /// Q4_K (the only format with a packed-bytes mmvq variant that
+    /// works on a row-major byte-concat of three matrices).
+    /// `None` for mixed-format layers (Q6_K mixed in, etc.) — the
+    /// captured pipeline falls back to 3 separate mmvq calls.
+    qkv_concat: Option<Arc<CudaSlice<u8>>>,
     wo: Arc<CudaSlice<u8>>,
     wo_format: QuantFormat,
     gate: Arc<CudaSlice<u8>>,
@@ -1431,6 +1438,24 @@ impl CudaBackend {
             let gate = self.arc_qweight(layer.gate).ok()?;
             let up = self.arc_qweight(layer.up).ok()?;
             let down = self.arc_qweight(layer.down).ok()?;
+            // `cuda-q4k-qkv-fuse-v2` (Path D): if all three Q/K/V
+            // weights are Q4_K, pre-fetch the concatenated
+            // `[W_q | W_k | W_v]` device buffer for a single fused
+            // mmvq launch. Q6_K and other formats fall back to 3
+            // separate calls.
+            let qkv_concat = if layer.wq.format == QuantFormat::Q4_K
+                && layer.wk.format == QuantFormat::Q4_K
+                && layer.wv.format == QuantFormat::Q4_K
+            {
+                self.arc_q4k_qkv_concat_device_buf(
+                    layer.wq.data,
+                    layer.wk.data,
+                    layer.wv.data,
+                )
+                .ok()
+            } else {
+                None
+            };
             layer_arcs.push(LayerArcs {
                 input_norm,
                 post_attn_norm,
@@ -1453,6 +1478,7 @@ impl CudaBackend {
                 up_format: layer.up.format,
                 down,
                 down_format: layer.down.format,
+                qkv_concat,
             });
         }
 
@@ -1620,30 +1646,49 @@ impl CudaBackend {
             )?;
 
             // 3. q/k/v projections (Q4_K / Q6_K mmvq via Q8_1 input)
-            self.proj_q8_1_into(
-                arcs.wq_format,
-                &arcs.wq,
-                &scratch.h_attn_q8_1,
-                &mut scratch.q,
-                layer_q_dim,
-                hidden,
-            )?;
-            self.proj_q8_1_into(
-                arcs.wk_format,
-                &arcs.wk,
-                &scratch.h_attn_q8_1,
-                &mut scratch.k,
-                layer_kv_dim,
-                hidden,
-            )?;
-            self.proj_q8_1_into(
-                arcs.wv_format,
-                &arcs.wv,
-                &scratch.h_attn_q8_1,
-                &mut scratch.v,
-                layer_kv_dim,
-                hidden,
-            )?;
+            // `cuda-q4k-qkv-fuse-v2` (Path D): if the layer has a
+            // concatenated [W_q | W_k | W_v] buffer (all three are
+            // Q4_K), do ONE fused mmvq into `scratch.qkv` instead
+            // of 3 separate launches; the attn wrapper takes
+            // CudaView slices of `scratch.qkv` for q/k_new/v_new.
+            let total_qkv = layer_q_dim + 2 * layer_kv_dim;
+            let used_qkv_fuse = if let Some(qkv_concat) = arcs.qkv_concat.as_ref() {
+                q4k_mmvq::matvec_device_into_with_dev(
+                    self,
+                    qkv_concat,
+                    &scratch.h_attn_q8_1,
+                    &mut scratch.qkv,
+                    total_qkv,
+                    hidden,
+                )?;
+                true
+            } else {
+                self.proj_q8_1_into(
+                    arcs.wq_format,
+                    &arcs.wq,
+                    &scratch.h_attn_q8_1,
+                    &mut scratch.q,
+                    layer_q_dim,
+                    hidden,
+                )?;
+                self.proj_q8_1_into(
+                    arcs.wk_format,
+                    &arcs.wk,
+                    &scratch.h_attn_q8_1,
+                    &mut scratch.k,
+                    layer_kv_dim,
+                    hidden,
+                )?;
+                self.proj_q8_1_into(
+                    arcs.wv_format,
+                    &arcs.wv,
+                    &scratch.h_attn_q8_1,
+                    &mut scratch.v,
+                    layer_kv_dim,
+                    hidden,
+                )?;
+                false
+            };
 
             // 4. Fused attention (device KV, device pos)
             let max_seq = cache.max_seq;
@@ -1652,11 +1697,27 @@ impl CudaBackend {
                     "decode_graph: kv slot missing for layer".into(),
                 )
             })?;
+            // Path D fused path: q/k_new/v_new come from
+            // `scratch.qkv` slice views. Legacy 3-mmvq path: from
+            // `scratch.q/k/v.as_view()`.
+            let (q_view, k_view, v_view) = if used_qkv_fuse {
+                (
+                    scratch.qkv.slice(0..layer_q_dim),
+                    scratch.qkv.slice(layer_q_dim..layer_q_dim + layer_kv_dim),
+                    scratch.qkv.slice(layer_q_dim + layer_kv_dim..total_qkv),
+                )
+            } else {
+                (
+                    scratch.q.slice(0..layer_q_dim),
+                    scratch.k.slice(0..layer_kv_dim),
+                    scratch.v.slice(0..layer_kv_dim),
+                )
+            };
             attn::fused_decode_attention_device_kv_into(
                 self,
-                &scratch.q,
-                &scratch.k,
-                &scratch.v,
+                &q_view,
+                &k_view,
+                &v_view,
                 &mut kv_slot.k,
                 &mut kv_slot.v,
                 &arcs.q_norm,

@@ -52,6 +52,14 @@ pub(crate) struct DecodeScratch {
     pub q: CudaSlice<f32>,
     pub k: CudaSlice<f32>,
     pub v: CudaSlice<f32>,
+    /// `cuda-q4k-qkv-fuse-v2` (Path D): contiguous concatenated
+    /// `[q_dim + 2 * kv_dim]` output for the fused Q/K/V mmvq.
+    /// The captured-decode pipeline writes the fused mmvq output
+    /// here, then passes slice views (`qkv[0..q_dim]`,
+    /// `qkv[q_dim..q_dim+kv_dim]`, `qkv[q_dim+kv_dim..]`) to the
+    /// attention `_into` wrapper. The legacy non-fused path keeps
+    /// using `q`, `k`, `v` separately.
+    pub qkv: CudaSlice<f32>,
     pub attn_out: CudaSlice<f32>,
     pub attn_out_q8_1: Q8_1Buf,
     pub attn_delta: CudaSlice<f32>,
@@ -95,6 +103,7 @@ impl DecodeScratch {
             q: drv.device_alloc_uninit(shape.q_dim)?,
             k: drv.device_alloc_uninit(shape.kv_dim)?,
             v: drv.device_alloc_uninit(shape.kv_dim)?,
+            qkv: drv.device_alloc_uninit(shape.q_dim + 2 * shape.kv_dim)?,
             attn_out: drv.device_alloc_uninit(shape.q_dim)?,
             attn_out_q8_1: alloc_q8_1(shape.q_dim)?,
             attn_delta: drv.device_alloc_uninit(shape.hidden)?,

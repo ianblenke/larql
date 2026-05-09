@@ -52,6 +52,13 @@ pub struct CudaBackend {
     /// Cores in cuBLAS hgemm.
     q4k_f16_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<half::f16>>>>,
     q6k_f16_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<half::f16>>>>,
+    /// `cuda-q4k-qkv-fuse-v2` (Path D): per-layer concatenated
+    /// `[W_q | W_k | W_v]` Q4_K weight bytes. Layer-load
+    /// concatenates the three packed-bytes streams once; the
+    /// captured-decode pipeline issues one mmvq for all three
+    /// projections instead of three separate calls. Keyed by
+    /// hash of the (W_q, W_k, W_v) host pointers + lengths.
+    q4k_qkv_concat_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     /// Per-pointer cache of small f32 weights (norms etc.) so the
     /// per-layer norm-weight htod's collapse to a one-time upload per
     /// host buffer. Keyed by host pointer + length + content hash so
@@ -88,6 +95,7 @@ impl CudaBackend {
             q4k_f32_device_cache: Mutex::new(HashMap::new()),
             q4k_f16_device_cache: Mutex::new(HashMap::new()),
             q6k_f16_device_cache: Mutex::new(HashMap::new()),
+            q4k_qkv_concat_device_cache: Mutex::new(HashMap::new()),
             f32_norm_device_cache: Mutex::new(HashMap::new()),
             decode_scratch: Mutex::new(None),
             decode_graph: Mutex::new(None),
@@ -108,6 +116,52 @@ impl CudaBackend {
     ) -> Result<R, CudaInitError> {
         let arc = self.arc_q4k_device_buf(host)?;
         f(&arc)
+    }
+
+    /// `cuda-q4k-qkv-fuse-v2` (Path D): one-shot concat of W_q, W_k,
+    /// W_v Q4_K packed bytes into a single `[(rows_q + rows_k +
+    /// rows_v), n_super_blocks]` weight buffer, htod'd once per
+    /// (layer, host pointer triple). The mmvq kernel iterates rows
+    /// linearly and doesn't care which "logical" weight a row
+    /// belongs to, so a simple bytes concat is a valid Q4_K stream.
+    ///
+    /// Saves 2 of 3 graph node launches per layer (Q + K + V → Q+K+V
+    /// fused; 68 nodes per token in the 34-layer Gemma 3 4B graph)
+    /// and 2 redundant reads of `h_attn_q8_1` (the shared input).
+    pub(crate) fn arc_q4k_qkv_concat_device_buf(
+        &self,
+        wq: &[u8],
+        wk: &[u8],
+        wv: &[u8],
+    ) -> Result<Arc<CudaSlice<u8>>, CudaInitError> {
+        // Key: (wq.ptr, wq.len, wk.ptr, wk.len, wv.ptr, wv.len) packed
+        // into a DeviceBytesKey. Stable across runs as long as the
+        // model layer pointers don't move.
+        let mut key_bytes = Vec::with_capacity(48);
+        for h in [wq, wk, wv] {
+            key_bytes.extend_from_slice(&(h.as_ptr() as usize).to_le_bytes());
+            key_bytes.extend_from_slice(&h.len().to_le_bytes());
+        }
+        let key = DeviceBytesKey::from_slice(&key_bytes);
+        {
+            let cache = self.q4k_qkv_concat_device_cache.lock().map_err(|_| {
+                CudaInitError::DriverMissing("q4k qkv concat cache poisoned".into())
+            })?;
+            if let Some(arc) = cache.get(&key) {
+                return Ok(Arc::clone(arc));
+            }
+        }
+        // Concat: W_q rows, then W_k rows, then W_v rows.
+        let mut concat = Vec::with_capacity(wq.len() + wk.len() + wv.len());
+        concat.extend_from_slice(wq);
+        concat.extend_from_slice(wk);
+        concat.extend_from_slice(wv);
+        let arc = Arc::new(self.drv.device_u8_buf_from(&concat)?);
+        let mut cache = self.q4k_qkv_concat_device_cache.lock().map_err(|_| {
+            CudaInitError::DriverMissing("q4k qkv concat cache poisoned".into())
+        })?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        Ok(Arc::clone(entry))
     }
 
     /// `cuda-decode-cuda-graph`: Arc-cloned device buffer for the

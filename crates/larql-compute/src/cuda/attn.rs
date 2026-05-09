@@ -1173,12 +1173,18 @@ pub fn fused_decode_attention_device_kv(
 /// The caller MUST `htod_into_slice(&[pos_i], pos_dev, 0)` before
 /// each replay and ensure `q_norm_dev` / `k_norm_dev` already hold
 /// the per-layer norm weights (or zeros if `use_qk_norm == 0`).
+/// `cuda-q4k-qkv-fuse-v2` (Path D) update: q/k_new/v_new are now
+/// `CudaView<'_, f32>` instead of `CudaSlice<f32>`, so the
+/// captured-decode pipeline can pass slices of a single fused QKV
+/// projection output (`scratch.qkv`) without a redundant copy.
+/// Existing callers using a fresh CudaSlice can convert via
+/// `slice.as_view()`.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_decode_attention_device_kv_into(
     backend: &CudaBackend,
-    q_dev: &CudaSlice<f32>,
-    k_new_dev: &CudaSlice<f32>,
-    v_new_dev: &CudaSlice<f32>,
+    q_dev: &cudarc::driver::CudaView<'_, f32>,
+    k_new_dev: &cudarc::driver::CudaView<'_, f32>,
+    v_new_dev: &cudarc::driver::CudaView<'_, f32>,
     k_cache_dev: &mut CudaSlice<half::f16>,
     v_cache_dev: &mut CudaSlice<half::f16>,
     q_norm_dev: &CudaSlice<f32>,
