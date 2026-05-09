@@ -36,6 +36,27 @@ The probe walks a candidate list (`/usr/local/cuda-12.5/...`,
 kernel will reuse this via a small helper in `cuda::nvrtc_paths`
 or equivalent.
 
+## Update: Phase 2B-as-sketched is dead — see `cuda-attn-wmma-kernel-v2`
+
+The follow-up change `cuda-attn-wmma-kernel-v2` ran a head-to-head
+microbench between SIMT and the Phase 2B-sketched WMMA score-matmul
+on Gemma 3 4B's GQA shape. **WMMA loses 20–32% at every n_ctx
+tested** with bit-exact parity. GQA gives only 12.5% fragment row
+utilization × 25% warp utilization × 50% block-count utilization;
+SIMT wins by structural parallelism even though Tensor Core
+per-op throughput is higher.
+
+The Phase 2B sketch below is preserved for reference but should NOT
+be implemented as written. Future Phase 2 work has to use one of:
+
+1. Multi-warp MMA per block (3-4 warps each issuing MMAs in parallel,
+   not just warp 0)
+2. Drop the kvh-grouped layout (replicate K per q_head in shared, or
+   accept "wrong K" rows and mask)
+3. Raw `mma.sync.aligned` PTX intrinsics for finer warp control
+
+Estimated cost: 5–10 days with no guaranteed net win on Ada (sm_89).
+
 ## Why Phase 2B is NOT in this change
 
 Phase 2B is the production WMMA attention kernel:

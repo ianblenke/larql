@@ -826,6 +826,287 @@ extern "C" __global__ void axpb(const float* x, float* y, int n, float a, float 
         );
     }
 
+    /// `cuda-attn-wmma-kernel-v2` head-to-head microbench: times the
+    /// score-matmul `scores = Q @ K^T` for representative Gemma 3 4B
+    /// decode shapes via two implementations:
+    ///   1. Legacy SIMT: scalar dot product, one warp per q_head row.
+    ///   2. WMMA: 16×16×16 f16/f32 fragments, GQA-padded.
+    /// Compares per-call wall-clock + reports speedup. Tells us
+    /// whether Phase 2B's full WMMA attention kernel is worth the
+    /// multi-day rewrite — analytically the GQA layout caps WMMA
+    /// throughput at ~25%; this microbench measures the actual gap.
+    ///
+    /// Run with:
+    /// ```text
+    /// LARQL_CUDA_AVAILABLE=1 cargo test --release -p larql-compute \
+    ///   --features cuda --lib cuda_attn_score_simt_vs_wmma_bench -- \
+    ///   --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual microbench"]
+    fn cuda_attn_score_simt_vs_wmma_bench() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+
+        if std::env::var("LARQL_CUDA_AVAILABLE").ok().as_deref() != Some("1") {
+            return;
+        }
+        let Ok(backend) = CudaBackend::new() else { return; };
+        let ctx = &backend.driver().ctx;
+        let stream = backend.driver().stream.clone();
+
+        // Both kernels compute a [num_q, n_ctx] score matrix from
+        // Q[num_q × head_dim] (f16, in shared mem) and K[n_ctx ×
+        // num_kv × head_dim] (f16, in HBM, reading a single kvh
+        // slice per q_head per row). Single block per kernel call
+        // for fair comparison; the real kernel can scale grid_dim
+        // to compensate.
+        let src = r#"
+#include <mma.h>
+using namespace nvcuda;
+
+extern "C" __global__ void score_simt(
+    const __half* __restrict__ q,         // [num_q, head_dim]
+    const __half* __restrict__ k,         // [n_ctx, num_kv, head_dim]
+    float*       __restrict__ scores,     // [num_q, n_ctx]
+    int num_q, int num_kv, int head_dim, int n_ctx
+) {
+    // Grid: (num_q, 1, 1). Block: (32, 1, 1). One warp per q row.
+    int qh = blockIdx.x;
+    if (qh >= num_q) return;
+    int lane = threadIdx.x;
+    int group = max(1, num_q / max(1, num_kv));
+    int kvh = min(num_kv - 1, qh / group);
+    const __half* q_row = q + (size_t)qh * head_dim;
+    for (int j = 0; j < n_ctx; ++j) {
+        const __half* k_row = k + ((size_t)j * num_kv + kvh) * head_dim;
+        float acc = 0.0f;
+        for (int d = lane; d < head_dim; d += 32) {
+            float qv, kv;
+            asm("cvt.f32.f16 %0, %1;" : "=f"(qv) : "h"(*((unsigned short*)(q_row + d))));
+            asm("cvt.f32.f16 %0, %1;" : "=f"(kv) : "h"(*((unsigned short*)(k_row + d))));
+            acc += qv * kv;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+        if (lane == 0) scores[qh * n_ctx + j] = acc;
+    }
+}
+
+// One block per kvh group. 4 warps cooperate. Q rows for the group
+// are padded to 16 in shared memory; K-tiles of 16 positions
+// processed via WMMA. Score-output: [num_q, n_ctx] (only the real
+// rows for this kvh group are written).
+extern "C" __global__ void score_wmma(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    float*       __restrict__ scores,
+    int num_q, int num_kv, int head_dim, int n_ctx
+) {
+    int kvh = blockIdx.x;
+    if (kvh >= num_kv) return;
+    int group = max(1, num_q / max(1, num_kv));
+    int qh_base = kvh * group;
+    int n_real_q = min(group, num_q - qh_base);
+
+    int tid = threadIdx.x;     // 0..127
+    int warp = tid / 32;        // 0..3
+    int lane = tid % 32;
+
+    // Shared: Q_pad[16 × head_dim], K_tile[16 × head_dim], scores_tile[16 × 16]
+    extern __shared__ unsigned char smem_raw[];
+    __half* q_smem  = (__half*)smem_raw;
+    __half* k_smem  = q_smem + 16 * head_dim;
+    float*  s_smem  = (float*)(k_smem + 16 * head_dim);
+
+    // Load Q rows into q_smem (cooperative across all 128 threads).
+    // Rows [0, n_real_q) get q[(qh_base+r), :]; rows [n_real_q, 16) zero.
+    for (int idx = tid; idx < 16 * head_dim; idx += 128) {
+        int r = idx / head_dim;
+        int d = idx % head_dim;
+        if (r < n_real_q) {
+            q_smem[idx] = q[(qh_base + r) * head_dim + d];
+        } else {
+            q_smem[idx] = __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    // Iterate K-tiles of 16 positions.
+    int n_tiles = (n_ctx + 15) / 16;
+    for (int t = 0; t < n_tiles; ++t) {
+        int j_base = t * 16;
+        // Load K-tile into k_smem. Rows beyond n_ctx zero.
+        for (int idx = tid; idx < 16 * head_dim; idx += 128) {
+            int r = idx / head_dim;
+            int d = idx % head_dim;
+            int j = j_base + r;
+            if (j < n_ctx) {
+                k_smem[idx] = k[((size_t)j * num_kv + kvh) * head_dim + d];
+            } else {
+                k_smem[idx] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // WMMA: warp 0 only does the matmul for simplicity (one
+        // 16×16 score-tile per kvh group). Other warps idle here.
+        if (warp == 0) {
+            wmma::fragment<wmma::matrix_a,    16, 16, 16, __half, wmma::row_major> q_frag;
+            wmma::fragment<wmma::matrix_b,    16, 16, 16, __half, wmma::col_major> k_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+            wmma::fill_fragment(s_frag, 0.0f);
+            for (int d_tile = 0; d_tile < head_dim; d_tile += 16) {
+                wmma::load_matrix_sync(q_frag, q_smem + d_tile, head_dim);
+                wmma::load_matrix_sync(k_frag, k_smem + d_tile, head_dim);
+                wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+            }
+            wmma::store_matrix_sync(s_smem, s_frag, 16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Cooperative write: real rows × real cols.
+        for (int idx = tid; idx < 16 * 16; idx += 128) {
+            int r = idx / 16;
+            int j = j_base + (idx % 16);
+            if (r < n_real_q && j < n_ctx) {
+                scores[(qh_base + r) * n_ctx + j] = s_smem[r * 16 + (idx % 16)];
+            }
+        }
+        __syncthreads();
+    }
+}
+"#;
+
+        let mut include_paths = Vec::new();
+        for c in [
+            "/usr/local/cuda-12.5/targets/x86_64-linux/include",
+            "/usr/local/cuda-12.1/targets/x86_64-linux/include",
+            "/usr/local/cuda/targets/x86_64-linux/include",
+            "/usr/local/cuda/include",
+            "/opt/cuda/include",
+        ] {
+            if std::path::Path::new(c).is_dir() {
+                include_paths.push(c.to_string());
+                break;
+            }
+        }
+        let opts = CompileOptions {
+            arch: Some("compute_80"),
+            include_paths,
+            ..Default::default()
+        };
+        let ptx = compile_ptx_with_opts(src, opts).expect("nvrtc compile");
+        let module = ctx.load_module(ptx).expect("load module");
+        let f_simt = module.load_function("score_simt").expect("simt fn");
+        let f_wmma = module.load_function("score_wmma").expect("wmma fn");
+
+        // Gemma 3 4B decode shapes. We sweep n_ctx since it's the
+        // dimension the score matmul scales with.
+        let head_dim = 256usize;
+        let num_q = 8;
+        let num_kv = 4;
+        for n_ctx in [16, 32, 64, 256, 1024usize] {
+            // Random input.
+            let q_host: Vec<half::f16> = (0..num_q * head_dim)
+                .map(|i| half::f16::from_f32(((i % 16) as f32 - 7.5) / 8.0))
+                .collect();
+            let k_host: Vec<half::f16> = (0..n_ctx * num_kv * head_dim)
+                .map(|i| half::f16::from_f32(((i % 32) as f32 - 15.5) / 16.0))
+                .collect();
+            let q_dev = stream.clone_htod(&q_host).expect("htod q");
+            let k_dev = stream.clone_htod(&k_host).expect("htod k");
+            let mut s_simt =
+                unsafe { stream.alloc::<f32>(num_q * n_ctx).expect("alloc s_simt") };
+            let mut s_wmma =
+                unsafe { stream.alloc::<f32>(num_q * n_ctx).expect("alloc s_wmma") };
+
+            let n_q_i = num_q as i32;
+            let n_kv_i = num_kv as i32;
+            let hd_i = head_dim as i32;
+            let n_ctx_i = n_ctx as i32;
+            // Warmup
+            for _ in 0..5 {
+                unsafe {
+                    stream.launch_builder(&f_simt)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_simt)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_q as u32, 1, 1),
+                            block_dim: (32, 1, 1),
+                            shared_mem_bytes: 0,
+                        }).expect("simt launch");
+                    stream.launch_builder(&f_wmma)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_wmma)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_kv as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: ((16 * head_dim * 2) // q_smem
+                                + (16 * head_dim * 2)             // k_smem
+                                + (16 * 16 * 4))                  // s_smem
+                                as u32,
+                        }).expect("wmma launch");
+                }
+            }
+            stream.synchronize().expect("warmup sync");
+
+            // SIMT timing
+            let n_iters = 500;
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    stream.launch_builder(&f_simt)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_simt)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_q as u32, 1, 1),
+                            block_dim: (32, 1, 1),
+                            shared_mem_bytes: 0,
+                        }).expect("simt launch");
+                }
+            }
+            stream.synchronize().expect("simt sync");
+            let simt_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // WMMA timing
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    stream.launch_builder(&f_wmma)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_wmma)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_kv as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: ((16 * head_dim * 2)
+                                + (16 * head_dim * 2)
+                                + (16 * 16 * 4)) as u32,
+                        }).expect("wmma launch");
+                }
+            }
+            stream.synchronize().expect("wmma sync");
+            let wmma_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // Parity check (just first n_ctx scores, both kernels
+            // should agree to within f16 quant noise).
+            let s_simt_h = stream.clone_dtoh(&s_simt).expect("dtoh simt");
+            let s_wmma_h = stream.clone_dtoh(&s_wmma).expect("dtoh wmma");
+            let mut max_diff = 0.0f32;
+            for i in 0..num_q * n_ctx {
+                let d = (s_simt_h[i] - s_wmma_h[i]).abs();
+                if d > max_diff { max_diff = d; }
+            }
+
+            let speedup = simt_us / wmma_us;
+            println!(
+                "[score_bench] n_ctx={n_ctx:>4}  simt={simt_us:>6.2}µs  \
+                 wmma={wmma_us:>6.2}µs  speedup={speedup:>5.2}×  \
+                 parity_max_diff={max_diff:.2e}"
+            );
+        }
+    }
+
     /// `cuda-attn-wmma-phase2` viability probe: confirms that cudarc's
     /// NVRTC pipeline can compile a kernel that uses `mma.sync.aligned`
     /// PTX intrinsics with f16 inputs + f32 accumulator (the
