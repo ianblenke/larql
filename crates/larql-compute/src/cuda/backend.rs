@@ -966,6 +966,103 @@ extern "C" __global__ void score_wmma(
         __syncthreads();
 
         // Cooperative write: real rows × real cols.
+        // (this is the score_wmma single-warp variant)
+        for (int idx = tid; idx < 16 * 16; idx += 128) {
+            int r = idx / 16;
+            int j = j_base + (idx % 16);
+            if (r < n_real_q && j < n_ctx) {
+                scores[(qh_base + r) * n_ctx + j] = s_smem[r * 16 + (idx % 16)];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// `cuda-attn-wmma-multi-warp`: 4 warps in parallel on the d-tile
+// reduction. Each warp accumulates an independent 16×16 partial
+// over a stride-4 slice of the head_dim/16 d-tiles; partials sum
+// in shared memory at the end. Mitigation #1 of the negative
+// result documented in `cuda-attn-wmma-kernel-v2`.
+extern "C" __global__ void score_wmma_mw(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    float*       __restrict__ scores,
+    int num_q, int num_kv, int head_dim, int n_ctx
+) {
+    int kvh = blockIdx.x;
+    if (kvh >= num_kv) return;
+    int group = max(1, num_q / max(1, num_kv));
+    int qh_base = kvh * group;
+    int n_real_q = min(group, num_q - qh_base);
+
+    int tid = threadIdx.x;
+    int warp = tid / 32;
+    int lane = tid % 32;
+
+    // Layout: q_smem [16 × head_dim] | k_smem [16 × head_dim] |
+    //         partials [4 warps × 16 × 16 floats] |
+    //         s_smem [16 × 16 floats]
+    extern __shared__ unsigned char smem_raw[];
+    __half* q_smem   = (__half*)smem_raw;
+    __half* k_smem   = q_smem + 16 * head_dim;
+    float*  partials = (float*)(k_smem + 16 * head_dim);
+    float*  s_smem   = partials + 4 * 16 * 16;
+
+    // Cooperative Q load.
+    for (int idx = tid; idx < 16 * head_dim; idx += 128) {
+        int r = idx / head_dim;
+        int d = idx % head_dim;
+        if (r < n_real_q) {
+            q_smem[idx] = q[(qh_base + r) * head_dim + d];
+        } else {
+            q_smem[idx] = __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    int n_tiles = (n_ctx + 15) / 16;
+    int n_d_tiles = head_dim / 16;
+    for (int t = 0; t < n_tiles; ++t) {
+        int j_base = t * 16;
+        // Cooperative K-tile load.
+        for (int idx = tid; idx < 16 * head_dim; idx += 128) {
+            int r = idx / head_dim;
+            int d = idx % head_dim;
+            int j = j_base + r;
+            if (j < n_ctx) {
+                k_smem[idx] = k[((size_t)j * num_kv + kvh) * head_dim + d];
+            } else {
+                k_smem[idx] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // Each warp accumulates over a stride-4 slice of d-tiles.
+        // For head_dim=256 → 16 d-tiles → 4 per warp.
+        wmma::fragment<wmma::matrix_a,    16, 16, 16, __half, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_b,    16, 16, 16, __half, wmma::col_major> k_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+        wmma::fill_fragment(s_frag, 0.0f);
+        for (int d_tile = warp; d_tile < n_d_tiles; d_tile += 4) {
+            int d_off = d_tile * 16;
+            wmma::load_matrix_sync(q_frag, q_smem + d_off, head_dim);
+            wmma::load_matrix_sync(k_frag, k_smem + d_off, head_dim);
+            wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+        }
+        // Each warp stores its partial to its own slot.
+        wmma::store_matrix_sync(partials + warp * 256, s_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        // Cooperative reduction across 4 partials.
+        for (int idx = tid; idx < 256; idx += 128) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 4; ++w) sum += partials[w * 256 + idx];
+            s_smem[idx] = sum;
+        }
+        __syncthreads();
+
+        // Cooperative write of real (q_row, j) entries.
         for (int idx = tid; idx < 16 * 16; idx += 128) {
             int r = idx / 16;
             int j = j_base + (idx % 16);
@@ -1000,6 +1097,9 @@ extern "C" __global__ void score_wmma(
         let module = ctx.load_module(ptx).expect("load module");
         let f_simt = module.load_function("score_simt").expect("simt fn");
         let f_wmma = module.load_function("score_wmma").expect("wmma fn");
+        let f_wmma_mw = module
+            .load_function("score_wmma_mw")
+            .expect("wmma_mw fn");
 
         // Gemma 3 4B decode shapes. We sweep n_ctx since it's the
         // dimension the score matmul scales with.
@@ -1020,6 +1120,12 @@ extern "C" __global__ void score_wmma(
                 unsafe { stream.alloc::<f32>(num_q * n_ctx).expect("alloc s_simt") };
             let mut s_wmma =
                 unsafe { stream.alloc::<f32>(num_q * n_ctx).expect("alloc s_wmma") };
+            let mut s_wmma_mw =
+                unsafe { stream.alloc::<f32>(num_q * n_ctx).expect("alloc s_wmma_mw") };
+            let wmma_mw_smem = ((16 * head_dim * 2)        // q_smem
+                + (16 * head_dim * 2)                       // k_smem
+                + (4 * 16 * 16 * 4)                         // partials
+                + (16 * 16 * 4)) as u32;                    // s_smem
 
             let n_q_i = num_q as i32;
             let n_kv_i = num_kv as i32;
@@ -1047,6 +1153,19 @@ extern "C" __global__ void score_wmma(
                                 + (16 * 16 * 4))                  // s_smem
                                 as u32,
                         }).expect("wmma launch");
+                }
+            }
+            // Warmup wmma_mw too.
+            for _ in 0..5 {
+                unsafe {
+                    stream.launch_builder(&f_wmma_mw)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_wmma_mw)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_kv as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: wmma_mw_smem,
+                        }).expect("wmma_mw warmup");
                 }
             }
             stream.synchronize().expect("warmup sync");
@@ -1088,22 +1207,47 @@ extern "C" __global__ void score_wmma(
             stream.synchronize().expect("wmma sync");
             let wmma_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
 
-            // Parity check (just first n_ctx scores, both kernels
-            // should agree to within f16 quant noise).
+            // WMMA-multi-warp timing
+            let t = std::time::Instant::now();
+            for _ in 0..n_iters {
+                unsafe {
+                    stream.launch_builder(&f_wmma_mw)
+                        .arg(&q_dev).arg(&k_dev).arg(&mut s_wmma_mw)
+                        .arg(&n_q_i).arg(&n_kv_i).arg(&hd_i).arg(&n_ctx_i)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_kv as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: wmma_mw_smem,
+                        }).expect("wmma_mw launch");
+                }
+            }
+            stream.synchronize().expect("wmma_mw sync");
+            let wmma_mw_us = t.elapsed().as_secs_f64() * 1e6 / n_iters as f64;
+
+            // Parity check (just first n_ctx scores; both WMMA
+            // variants should agree with SIMT within f16 quant noise).
             let s_simt_h = stream.clone_dtoh(&s_simt).expect("dtoh simt");
             let s_wmma_h = stream.clone_dtoh(&s_wmma).expect("dtoh wmma");
+            let s_wmma_mw_h = stream.clone_dtoh(&s_wmma_mw).expect("dtoh wmma_mw");
             let mut max_diff = 0.0f32;
+            let mut max_diff_mw = 0.0f32;
             for i in 0..num_q * n_ctx {
                 let d = (s_simt_h[i] - s_wmma_h[i]).abs();
+                let d_mw = (s_simt_h[i] - s_wmma_mw_h[i]).abs();
                 if d > max_diff { max_diff = d; }
+                if d_mw > max_diff_mw { max_diff_mw = d_mw; }
             }
 
             let speedup = simt_us / wmma_us;
+            let speedup_mw = simt_us / wmma_mw_us;
             println!(
                 "[score_bench] n_ctx={n_ctx:>4}  simt={simt_us:>6.2}µs  \
-                 wmma={wmma_us:>6.2}µs  speedup={speedup:>5.2}×  \
-                 parity_max_diff={max_diff:.2e}"
+                 wmma={wmma_us:>6.2}µs ({speedup:.2}×)  \
+                 wmma_mw={wmma_mw_us:>6.2}µs ({speedup_mw:.2}×)  \
+                 parity={max_diff:.2e}/{max_diff_mw:.2e}"
             );
+            // Suppress unused-binding warnings.
+            let _ = (speedup, speedup_mw, max_diff, max_diff_mw);
         }
     }
 
