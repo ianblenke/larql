@@ -24,6 +24,7 @@ mod matmul;
 mod oxide_kernels;
 mod q4k_direct;
 mod quant_matvec;
+pub mod sampling;
 
 pub use backend::CudaBackend;
 pub use error::CudaInitError;
