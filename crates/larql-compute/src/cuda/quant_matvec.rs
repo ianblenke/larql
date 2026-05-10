@@ -158,4 +158,40 @@ impl QuantMatVec for CudaBackend {
         }
         Some(out)
     }
+
+    /// `cuda-spec-lmh-softmax`: GPU-side batched softmax with scale +
+    /// softcap. Wraps the existing `scaled_softmax` kernel
+    /// (cuda/attn.rs) plus host↔device transfer. Replaces the per-row
+    /// CPU softmax in `compute_full_vocab_probs_batched`, which at
+    /// vocab=262144 × 4 rows was the dominant cost in the spec verify
+    /// lm_head step (~10-15 ms/iter on Gemma 3 4B).
+    fn softmax_inplace_batched(
+        &self,
+        x: &mut [f32],
+        n_rows: usize,
+        n_cols: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> Option<()> {
+        if x.len() != n_rows * n_cols || n_rows == 0 || n_cols == 0 {
+            return None;
+        }
+        let drv = self.driver();
+        let mut x_dev = self.htod_f32(x).ok()?;
+        super::attn::softmax_inplace(
+            drv,
+            &mut x_dev,
+            n_rows,
+            n_cols,
+            scale,
+            super::attn::AttentionOpts {
+                causal: false,
+                softcap,
+            },
+        )
+        .ok()?;
+        let result = self.dtoh_f32(&x_dev).ok()?;
+        x.copy_from_slice(&result);
+        Some(())
+    }
 }

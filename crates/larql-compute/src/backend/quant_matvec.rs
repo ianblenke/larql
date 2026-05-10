@@ -254,4 +254,26 @@ pub trait QuantMatVec {
     fn has_q4(&self) -> bool {
         false
     }
+
+    /// Batched in-place row-wise softmax with optional pre-scale and
+    /// softcap. Applies, for each row `r ∈ [0, n_rows)`:
+    /// 1. `x[r, j] *= scale` for all `j ∈ [0, n_cols)`.
+    /// 2. if `softcap > 0`: `x[r, j] = softcap * tanh(x[r, j] / softcap)`.
+    /// 3. `x[r, j] = exp(x[r, j] - max(x[r, :])) / sum(exp(x[r, :] - max))`.
+    ///
+    /// Used by speculative decode's `compute_full_vocab_probs_batched`
+    /// to skip the CPU-side scalar softmax (which dominates the spec
+    /// verify path at vocab=262144 × 4 rows). CUDA backend overrides
+    /// with the on-device `scaled_softmax` kernel; default returns
+    /// `None` so callers can fall back to a CPU loop.
+    fn softmax_inplace_batched(
+        &self,
+        _x: &mut [f32],
+        _n_rows: usize,
+        _n_cols: usize,
+        _scale: f32,
+        _softcap: f32,
+    ) -> Option<()> {
+        None
+    }
 }

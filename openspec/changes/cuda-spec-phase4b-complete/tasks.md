@@ -233,6 +233,60 @@ Next bottlenecks (in order of remaining cost):
 - 18 ms forward kernel compute itself — the GEMM is what it is; no
   win without different precision or sparsity.
 
+### D.0.3 GPU softmax for spec verify lm_head (2026-05-10)
+
+Surprise finding: the "21 ms lm_head GEMM" was actually ~5 ms GEMM
+plus **~16 ms CPU scalar softmax** at vocab=262144 × m=4 rows. The
+per-element `f32::exp` + `f32::tanh` calls in the host softmax loop
+were the dominant cost, not the cuBLAS hgemm.
+
+Fix: added `softmax_inplace_batched` to the `QuantMatVec` backend
+trait and overrode it on `CudaBackend` to dispatch to the existing
+`scaled_softmax` CUDA kernel (was already used by attention). The
+kernel fuses scale + softcap + per-row max + exp + sum + normalize
+in three passes with shared-memory reductions.
+
+Measured impact (RTX 4090, Gemma 3 4B Q4_K_M, depth=4, α=0.83,
+translation-echo prompt, 3-run median):
+
+| Path | lmh_total | iter total | ms/tok |
+|---|---|---|---|
+| Pre-#37 (CPU softmax)                | 21.0 ms | 46.3 | 29.38 |
+| #37 GPU softmax                      | 4.7 ms  | 28.3 | **21.78** |
+| **Improvement**                      | -77%    | -39% | **-26%** |
+
+This is the biggest single win in the spec perf chain so far —
+~4.5× speedup on the lm_head step. Cumulative from baseline:
+
+| | ms/tok | Improvement |
+|---|---|---|
+| Baseline (sequential lm_head, CPU softmax)  | 31.13 | — |
+| #35 (batched lm_head)                       | 29.66 | -4.7% |
+| #36 (CUDA Graphs A+B+C)                     | 29.38 | -5.6% |
+| **#37 (GPU softmax)**                       | **21.78** | **-30%** |
+| Plain decode floor                          | 7.34  | (4.6× of plain) |
+
+Surprisingly large win because:
+- `f32::exp` is a slow libm call (~30-50 ns per element).
+- vocab=262144 × m=4 rows = 1M exp calls per iter → ~30-50 ms naive.
+- Even with -O3 vectorisation, scalar `f32::exp` doesn't auto-vectorise
+  well — the bench was seeing ~16 ms for the loop.
+- The GPU `scaled_softmax` kernel does the same work in ~0.5-1 ms
+  including htod/dtoh.
+
+This makes the lm_head step competitive with plain decode's
+`lm_head_topk` (~1.3 ms per token). The next bottlenecks:
+- 18 ms forward kernel compute — needs precision/sparsity changes.
+- 6.5 ms bonus decode — defer into next iter's spec batch.
+
+Spec at 21.78 ms/tok vs plain at 7.34 ms/tok means spec is still
+**~3× slower than plain decode** end-to-end. The D.3 perf flip gate
+(≤1.6× plain decode = ≤11.7 ms/tok) is no longer hopeless but still
+out of reach. Two more changes could plausibly close most of the gap:
+- Deferred bonus (~14% iter savings) → ~18.7 ms/tok (2.5× plain).
+- Mixed-precision lm_head via `cublasGemmEx` → another ~1-2 ms saved.
+- Combined: ~17 ms/tok (~2.3× plain).
+
 ## Validation (this PR)
 
 - [x] V.1 `openspec validate cuda-spec-phase4b-complete --strict` passes
