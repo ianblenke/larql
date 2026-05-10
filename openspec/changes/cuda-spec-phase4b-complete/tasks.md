@@ -287,6 +287,62 @@ out of reach. Two more changes could plausibly close most of the gap:
 - Mixed-precision lm_head via `cublasGemmEx` → another ~1-2 ms saved.
 - Combined: ~17 ms/tok (~2.3× plain).
 
+### D.0.4 Depth-2 is the sweet spot (2026-05-10)
+
+With the GPU softmax landed in #37, depth-2 is now the wall-clock
+optimum. Earlier depth sweeps (D.0 / phase 4d) preferred depth=4
+because the CPU softmax cost was amortised across more drafts; with
+softmax now 4×-faster, the depth=4 forward overhead dominates.
+
+Depth sweep on RTX 4090, Gemma 3 4B Q4_K_M, translation-echo prompt,
+`--tokens 64`:
+
+| Depth | α      | ms/tok | Vs plain (7.53) | Per-iter fwd |
+|-------|--------|--------|----------------|---------------|
+| 2     | 0.855  | **18.38** | 2.44×       | 12.5 ms       |
+| 3     | 0.839  | 21.41  | 2.84×          | ~15 ms        |
+| 4     | 0.829  | 21.87  | 2.91×          | 18.0 ms       |
+
+The `bench_cmd.rs` already defaults to depth=2 when
+`LARQL_SPEC_DEPTH` isn't set, so this is the actual user experience.
+
+Per-iter cost breakdown at depth=2 (α=0.855):
+- Forward (2 tokens batched): 12.5 ms (52%)
+- lm_head + softmax: 4.2 ms (17%)
+- verify_tree: 0.7 ms (3%)
+- Bonus decode: 6.4 ms (26%)
+- **Iter total: 24 ms / ~2.7 emits = 8.9 ms per emit**
+
+To hit the D.3 perf-flip gate (≤1.6× plain = ≤11.7 ms/tok wall-clock),
+the iter cost would need to drop to ~13 ms (~6 ms less per iter).
+The largest remaining levers are:
+- Forward kernel compute (12.5 ms) — already at theoretical for the
+  GEMM shapes; no easy win.
+- Bonus decode (6.4 ms) — same speed as plain decode; would need to
+  defer K/V write into next iter's spec batch (architectural change,
+  loses picked_id amortisation in naive form).
+- Branching tree (depth=2 branches=2 = 7 nodes) — could yield more
+  emits per iter, but requires PLD to propose multiple chains and a
+  branching keep-cache helper. Substantial refactor.
+
+### Cumulative perf story (2026-05-09…10)
+
+| | ms/tok | Δ from prev | Total Δ |
+|---|---|---|---|
+| Session start (depth=2, CPU softmax)        | 31.13 |    —   |    —    |
+| #35 batched lm_head                         | 29.66 | -4.7%  | -4.7%   |
+| #36 CUDA Graphs A+B+C                       | 29.38 | -0.9%  | -5.6%   |
+| **#37 GPU softmax**                         | **21.78** | -26%   | **-30%** |
+| (depth=2 default vs older depth=4 baseline) | 18.38 | -16%   | **-41%** |
+| Plain decode floor                          | 7.53  |        | 2.44× spec |
+
+The single biggest contributor was #37 (GPU softmax) — a 26% wall-
+clock improvement from moving the per-row scalar `f32::exp` loop to
+the existing `scaled_softmax` CUDA kernel. The CUDA Graphs work in
+#36 contributed ~1% wall-clock; most of its theoretical benefit was
+eaten by modern CUDA 12+ driver having already amortised launch
+overhead to ~1 µs per kernel.
+
 ## Validation (this PR)
 
 - [x] V.1 `openspec validate cuda-spec-phase4b-complete --strict` passes
