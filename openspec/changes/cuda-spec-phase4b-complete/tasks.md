@@ -333,8 +333,9 @@ The largest remaining levers are:
 | #35 batched lm_head                         | 29.66 | -4.7%  | -4.7%   |
 | #36 CUDA Graphs A+B+C                       | 29.38 | -0.9%  | -5.6%   |
 | **#37 GPU softmax**                         | **21.78** | -26%   | **-30%** |
-| (depth=2 default vs older depth=4 baseline) | 18.38 | -16%   | **-41%** |
-| Plain decode floor                          | 7.53  |        | 2.44× spec |
+| #37 + fused GEMM+softmax                    | 18.15 | -17%   | **-42%** |
+| (depth=2 default vs older depth=4 baseline) | 18.15 |   —   | **-42%** |
+| Plain decode floor                          | 7.53  |        | 2.41× spec |
 
 The single biggest contributor was #37 (GPU softmax) — a 26% wall-
 clock improvement from moving the per-row scalar `f32::exp` loop to
@@ -342,6 +343,40 @@ the existing `scaled_softmax` CUDA kernel. The CUDA Graphs work in
 #36 contributed ~1% wall-clock; most of its theoretical benefit was
 eaten by modern CUDA 12+ driver having already amortised launch
 overhead to ~1 µs per kernel.
+
+### Out-of-scope levers for future work
+
+After this session's wins, remaining gap (18.15 → 11.7 ms/tok for the
+D.3 perf-flip gate) requires architectural changes:
+
+- **Branching trees (depth=2 branches=2 → 7-node tree)**: more emits
+  per spec iter via parallel chain verification. Blocked on:
+  - PLD must produce multiple n-gram matches as branches (small change).
+  - Spec scratch + graph capture path currently linear-chain-only;
+    needs branching-tree variant (~200 LoC).
+  - **Tree-aware attention mask**: position k attends only to its
+    ancestors in the tree, not siblings. Current `fused_prefill_attn`
+    is purely causal (each position attends to all earlier positions),
+    which is wrong for non-root branch positions. Requires a new
+    `fused_prefill_attn_tree_mask` kernel (~150 LoC of CUDA).
+  - Total estimated effort: 400-600 LoC, multi-day.
+
+- **Deferred bonus into next iter's spec batch**: skips the per-iter
+  bonus decode_token (5.6 ms) by including the previous-iter's bonus
+  as the first position of the next iter's spec batch. Spec forward
+  grows from M=depth to M=depth+1, adding ~3-4 ms; net savings ~2 ms.
+  Requires:
+  - Carry `pending_bonus_id` between iters (thread-local).
+  - Special-case position-0 of spec forward (no verify since bonus is
+    already accepted by previous iter).
+  - Handle the first iter (no pending bonus) and the last iter (EOS
+    flush) corner cases.
+  - Estimated effort: 200-300 LoC, moderate refactor risk.
+
+- **Mixed-precision lm_head via cublasGemmEx**: skip 2-4 f32↔f16
+  conversion kernels by letting cuBLAS do the conversion internally.
+  Modest gain (~1-2 ms saved) at moderate refactor cost. Lower
+  priority than the two above.
 
 ## Validation (this PR)
 
