@@ -92,6 +92,13 @@ forward, then `LARQL_QWEN35_DUMP_L0=1` to dump ours:
 - **`(1+w)` RMSNorm offset** (C.5a) — GGUF already pre-applies.
 - **Embedding scale / softcapping** — verified absent in HF and
   llama.cpp.
+- **CYCLE GQA in DeltaNet** (C.5h) — llama.cpp's fused kernel uses
+  `ik1 = iv1 % nek1` (cycle), but applying that to our recurrence
+  empirically regressed step-0 (101,839 → 125,425) and step-1
+  (7,617 → 32,881) GT ranks. The model weights were trained with
+  HF's `repeat_interleave` (block) layout; reconciliation with
+  llama.cpp's `%` mapping lives in the GGUF tensor layout, not in
+  the per-head recurrence loop. Block remains correct.
 
 ## Verified consistent with HF Qwen3-Next + llama.cpp
 
