@@ -477,6 +477,136 @@ mod tests {
         assert_eq!(w.final_norm.len(), cfg.hidden_size);
     }
 
+    /// Regression test for PR #69 — Gemma-style `(1 + weight)` RMSNorm
+    /// offset must be applied to standard norms (attn_norm,
+    /// post_attention_norm, q_norm, k_norm, final_norm) but NOT to
+    /// ssm_norm (RMSNormGated uses raw weight).
+    ///
+    /// We seed the synthetic `ModelWeights` with norm-weight values of
+    /// `0.0` everywhere (the zero-init delta that Qwen3-Next uses)
+    /// and verify the bridge produces `1.0` for the standard norms
+    /// (because `(1 + 0.0) = 1.0`) and `0.0` for `ssm_norm`.
+    #[test]
+    fn bridge_applies_gemma_one_plus_w_offset_to_standard_norms() {
+        let cfg = qwen35_tiny_config();
+        let arch = Qwen35Arch::from_config(cfg.clone());
+        let mut tensors = std::collections::HashMap::new();
+        let mut vectors = std::collections::HashMap::new();
+        populate_tensors(&mut tensors, &mut vectors, &arch);
+
+        // Overwrite every norm-weight vector with zeros to make the
+        // offset behaviour observable: standard norms should become
+        // 1.0 after the bridge; ssm_norm should remain 0.0.
+        for layer in 0..cfg.num_layers {
+            let prefix = format!("layers.{layer}.");
+            vectors.insert(
+                format!("{prefix}input_layernorm.weight"),
+                vec![0.0; cfg.hidden_size],
+            );
+            vectors.insert(
+                format!("{prefix}post_attention_norm.weight"),
+                vec![0.0; cfg.hidden_size],
+            );
+            if !arch.is_linear_attention_layer(layer) {
+                vectors.insert(
+                    format!("{prefix}attn_q_norm.weight"),
+                    vec![0.0; cfg.head_dim],
+                );
+                vectors.insert(
+                    format!("{prefix}attn_k_norm.weight"),
+                    vec![0.0; cfg.head_dim],
+                );
+            } else {
+                vectors.insert(
+                    format!("{prefix}ssm_norm.weight"),
+                    vec![0.0; cfg.ssm_state_size.unwrap()],
+                );
+            }
+        }
+        vectors.insert("norm.weight".into(), vec![0.0; cfg.hidden_size]);
+
+        let mw = ModelWeights {
+            tensors,
+            vectors,
+            raw_bytes: std::collections::HashMap::new(),
+            packed_mmaps: std::collections::HashMap::new(),
+            skipped_tensors: Vec::new(),
+            packed_byte_ranges: std::collections::HashMap::new(),
+            embed: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
+            lm_head: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
+            arch: Box::new(Qwen35Arch::from_config(cfg.clone())),
+            num_layers: cfg.num_layers,
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            vocab_size: cfg.vocab_size.unwrap(),
+            head_dim: cfg.head_dim,
+            num_q_heads: cfg.num_q_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            rope_base: cfg.rope_base,
+        };
+
+        let w = load_qwen35_weights(&mw, &arch).expect("bridge");
+
+        // Final norm: 0.0 stored → (1 + 0.0) = 1.0 after bridge.
+        for &v in w.final_norm.iter() {
+            assert!(
+                (v - 1.0).abs() < 1e-9,
+                "final_norm should be 1.0 after (1+w) offset; got {v}"
+            );
+        }
+
+        // Per-layer norms.
+        for (idx, layer) in w.layers.iter().enumerate() {
+            // attn_post_norm always uses (1+w).
+            for &v in layer.attn_post_norm.iter() {
+                assert!(
+                    (v - 1.0).abs() < 1e-9,
+                    "layer {idx} attn_post_norm should be 1.0; got {v}"
+                );
+            }
+
+            match &layer.block {
+                Qwen35LayerWeights::Linear(dn) => {
+                    // attn_norm uses (1+w).
+                    for &v in dn.attn_norm.iter() {
+                        assert!(
+                            (v - 1.0).abs() < 1e-9,
+                            "layer {idx} (linear) attn_norm should be 1.0; got {v}"
+                        );
+                    }
+                    // ssm_norm does NOT use (1+w) — stays raw.
+                    for &v in dn.ssm_norm.iter() {
+                        assert!(
+                            v.abs() < 1e-9,
+                            "layer {idx} (linear) ssm_norm should stay raw 0.0; got {v}"
+                        );
+                    }
+                }
+                Qwen35LayerWeights::Attention(at) => {
+                    // attn_norm, attn_q_norm, attn_k_norm all use (1+w).
+                    for &v in at.attn_norm.iter() {
+                        assert!(
+                            (v - 1.0).abs() < 1e-9,
+                            "layer {idx} (attn) attn_norm should be 1.0; got {v}"
+                        );
+                    }
+                    for &v in at.attn_q_norm.iter() {
+                        assert!(
+                            (v - 1.0).abs() < 1e-9,
+                            "layer {idx} (attn) attn_q_norm should be 1.0; got {v}"
+                        );
+                    }
+                    for &v in at.attn_k_norm.iter() {
+                        assert!(
+                            (v - 1.0).abs() < 1e-9,
+                            "layer {idx} (attn) attn_k_norm should be 1.0; got {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bridge_missing_tensor_errors_with_key_name() {
         let cfg = qwen35_tiny_config();
