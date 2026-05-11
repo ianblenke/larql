@@ -214,9 +214,15 @@ pub fn deltanet_block_step(
 
     // 6. Delta-rule recurrence.
     let o = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state);
-    // o shape: [head_v_dim, n_v_heads]. Flatten to [value_dim] in the
-    // canonical row-major order so the post-mixer RMSNorm + Z-gate
-    // see the layout `concat_heads(head_v_dim chunks)`.
+    // o shape: [head_v_dim, n_v_heads]. Flatten via row-major
+    // iteration. Empirically (C.4p + C.4u attempts): switching to
+    // `o.t().to_owned().into_iter().collect()` (head-major flat per
+    // HF Qwen3-Next's `out.reshape(B, S, -1)`) is INCONSISTENT —
+    // some token positions improve dramatically, others regress
+    // dramatically. The naïve row-major produces more uniform (if
+    // still imperfect) per-step quality, so this stays as-is until
+    // a per-layer parity oracle can determine the actual right
+    // direction.
     let o_flat: Array1<f32> = o.into_iter().collect();
     debug_assert_eq!(o_flat.len(), value_dim);
 
