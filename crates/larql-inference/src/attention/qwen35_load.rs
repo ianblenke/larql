@@ -1328,4 +1328,214 @@ mod tests {
             "decoded continuation is empty; generated ids: {generated:?}"
         );
     }
+
+    // ── C.4k: diagnostic — lm_head row norms + embed row norms ──
+    //
+    // Bisects the C.4j bug. If `lm_head.row(185983)` has a much larger
+    // L2 norm than typical rows, the attractor is a loader/quant
+    // artifact (most likely a per-row outlier in the Q6_K
+    // dequantization of `output.weight`). If row norms are uniform,
+    // the bug is downstream in the forward path.
+    //
+    // Same env-gating as the other real-GGUF tests.
+    #[test]
+    fn real_gguf_qwen35_lm_head_row_norms_diagnostic() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping lm_head row norm diagnostic");
+                return;
+            }
+        };
+        let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
+        let lm_head = &weights.lm_head;
+        let embed = &weights.embed;
+        let vocab = lm_head.shape()[0];
+        let hidden = lm_head.shape()[1];
+        eprintln!(
+            "lm_head shape: {:?}, embed shape: {:?}",
+            lm_head.shape(),
+            embed.shape()
+        );
+
+        let row_norm = |arr: &ndarray::ArcArray2<f32>, row: usize| -> f32 {
+            arr.row(row).iter().map(|&v| v * v).sum::<f32>().sqrt()
+        };
+        let row_mean_abs = |arr: &ndarray::ArcArray2<f32>, row: usize| -> f32 {
+            arr.row(row).iter().map(|&v| v.abs()).sum::<f32>() / hidden as f32
+        };
+
+        // Sample some tokens: the C.4j attractor, the second-place
+        // attractor, BOS, EOS, IM_START, IM_END, and uniformly spaced
+        // indices to characterize the typical row norm.
+        let probes: Vec<(u32, &str)> = vec![
+            (185983, "C.4j argmax attractor"),
+            (240193, "C.4j second-place"),
+            (123894, "C.4j third-place"),
+            (212496, "C.4i first decode"),
+            (248044, "BOS"),
+            (248045, "<|im_start|>"),
+            (248046, "<|im_end|> / EOS"),
+            (248055, "PAD"),
+            (0, "token 0"),
+            (1, "token 1"),
+            (1000, "token 1000"),
+            (10000, "token 10000"),
+            (100000, "token 100000"),
+            (200000, "token 200000"),
+            (248319, "last in-vocab"),
+        ];
+
+        eprintln!(
+            "\n{:<10} {:<30} {:>12} {:>12} {:>12} {:>12}",
+            "tok_id", "note", "lm_head_norm", "lm_head_mean", "embed_norm", "embed_mean"
+        );
+        for (tok, note) in &probes {
+            let t = *tok as usize;
+            if t >= vocab {
+                continue;
+            }
+            eprintln!(
+                "{:<10} {:<30} {:>12.3} {:>12.6} {:>12.3} {:>12.6}",
+                tok,
+                note,
+                row_norm(lm_head, t),
+                row_mean_abs(lm_head, t),
+                row_norm(embed, t),
+                row_mean_abs(embed, t),
+            );
+        }
+
+        // Population stats: sample every 1024th row of lm_head and
+        // embed, compute mean, std, max norm.
+        let stride = 1024;
+        let lm_norms: Vec<f32> = (0..vocab)
+            .step_by(stride)
+            .map(|r| row_norm(lm_head, r))
+            .collect();
+        let em_norms: Vec<f32> = (0..vocab)
+            .step_by(stride)
+            .map(|r| row_norm(embed, r))
+            .collect();
+        let stats = |xs: &[f32]| -> (f32, f32, f32, f32) {
+            let n = xs.len() as f32;
+            let mean = xs.iter().sum::<f32>() / n;
+            let var = xs.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+            let max = xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let min = xs.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            (mean, var.sqrt(), min, max)
+        };
+        let (lm_mean, lm_std, lm_min, lm_max) = stats(&lm_norms);
+        let (em_mean, em_std, em_min, em_max) = stats(&em_norms);
+        eprintln!("\npopulation (every {stride}th row, n={}):", lm_norms.len());
+        eprintln!(
+            "  lm_head_norm  mean={lm_mean:.3} std={lm_std:.3} min={lm_min:.3} max={lm_max:.3}"
+        );
+        eprintln!(
+            "  embed_norm    mean={em_mean:.3} std={em_std:.3} min={em_min:.3} max={em_max:.3}"
+        );
+
+        // If the C.4j attractor's lm_head row is > 3 sigma above mean,
+        // we've found the smoking gun.
+        let attr_norm = row_norm(lm_head, 185983);
+        let attr_z = (attr_norm - lm_mean) / lm_std.max(1e-6);
+        eprintln!("\n185983 lm_head_norm z-score vs population: {attr_z:.2}");
+        if attr_z.abs() > 3.0 {
+            eprintln!(
+                "🔥 185983 IS A ROW-NORM OUTLIER. Hypothesis: \
+                 Q6_K dequant produces a bad row, OR this token's \
+                 row was naturally trained as an outlier 'sink'."
+            );
+        } else {
+            eprintln!(
+                "✓ 185983 row norm is within {attr_z:.1}σ of population mean. \
+                 The attractor is NOT a row-magnitude artifact in lm_head — \
+                 the bug is downstream in the forward path."
+            );
+        }
+
+        // What does the lm_head naturally output if the residual
+        // collapsed to a uniform / norm-weight-only direction?
+        let final_norm = weights
+            .vectors
+            .get("norm.weight")
+            .expect("final_norm tensor must exist");
+        let final_norm_arr = ndarray::Array1::from(final_norm.clone());
+        eprintln!(
+            "\nfinal_norm shape={}, mean={:.4}, min={:.4}, max={:.4}",
+            final_norm.len(),
+            final_norm.iter().sum::<f32>() / final_norm.len() as f32,
+            final_norm.iter().copied().fold(f32::INFINITY, f32::min),
+            final_norm.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        );
+
+        let argmax_top3 = |logits: &ndarray::Array1<f32>| -> Vec<(usize, f32)> {
+            let mut idx: Vec<(usize, f32)> =
+                logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            idx[..3].to_vec()
+        };
+
+        // Probe 1: lm_head @ ones_vector — what the model would output
+        // if the residual stream collapsed to a uniform vector.
+        let ones = ndarray::Array1::<f32>::ones(hidden);
+        let logits_ones = lm_head.dot(&ones);
+        eprintln!("lm_head @ ones top-3: {:?}", argmax_top3(&logits_ones));
+
+        // Probe 2: lm_head @ final_norm_weight — the "no-info"
+        // baseline. After RMSNorm of a degenerate residual, the output
+        // is roughly (residual / |residual|) * final_norm_weight, so
+        // a totally degenerate residual produces logits ≈
+        // lm_head @ final_norm_weight (modulo sign).
+        let logits_fn = lm_head.dot(&final_norm_arr);
+        eprintln!(
+            "lm_head @ final_norm_weight top-3: {:?}",
+            argmax_top3(&logits_fn)
+        );
+
+        // Probe 3: lm_head @ embed_row(token=1) — what would the
+        // model output if NO layers ran (residual = embedding only)?
+        // If argmax matches 185983 → forward IS computing something
+        // but it's converging to the same answer the embedding-only
+        // path produces. If argmax differs from 185983 → forward
+        // breaks the embedding's natural signal somewhere.
+        let embed_row = embed.row(1).to_owned();
+        let logits_embed_only = lm_head.dot(&embed_row);
+        eprintln!(
+            "lm_head @ embed(token=1) top-3: {:?}",
+            argmax_top3(&logits_embed_only)
+        );
+
+        // Probe 4: argmax of (lm_head @ final_norm_weight) — does it
+        // happen to be 185983? If yes, that means our forward path
+        // is collapsing the residual to ~zero/uniform, and the model
+        // is then outputting the "no-info" token, which IS 185983.
+        let baseline_argmax = logits_fn
+            .iter()
+            .enumerate()
+            .fold((0_usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0;
+        eprintln!("\nbaseline argmax (lm_head @ final_norm_weight) = {baseline_argmax}");
+        if baseline_argmax == 185983 {
+            eprintln!(
+                "🔥 SMOKING GUN: 185983 is the model's 'no-information' baseline output. \
+                 This means our forward path is collapsing the residual stream — \
+                 the rest of the model (attention/DeltaNet/FFN) is being added to ~0 \
+                 or otherwise normalized away to the bias-only output."
+            );
+        } else {
+            eprintln!(
+                "Baseline argmax differs from 185983 ({baseline_argmax} ≠ 185983). \
+                 The attractor is NOT just the model's no-information default — \
+                 something IS being computed by the forward, but it's converging \
+                 to 185983 for our inputs."
+            );
+        }
+    }
 }

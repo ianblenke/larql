@@ -164,15 +164,35 @@ pub fn deltanet_block_step(
     let v_raw = qkv_conv.slice(ndarray::s![2 * key_dim..]).to_owned();
 
     // Reshape Q/K to [head_v_dim, n_k_heads], V to [head_v_dim, n_v_heads].
+    //
+    // CONVENTION: the projection output is laid out head-major in flat
+    // form — `q_raw[h * head_v_dim + d]` is head h, dim d (this matches
+    // the PyTorch `.view(n_heads, head_dim)` interpretation used by
+    // HF transformers). To get the `[head_v_dim, n_k_heads]` shape that
+    // `l2_normalize_per_head` and `delta_net_step` expect (with d as
+    // the outer axis), we reshape FIRST to `(n_k_heads, head_v_dim)`
+    // — which is the natural row-major view of a head-major flat —
+    // THEN transpose to `(head_v_dim, n_k_heads)`.
+    //
+    // The earlier `.into_shape_with_order((head_v_dim, n_k_heads))`
+    // direct reshape was a bug: it interpreted head-major flat as
+    // dim-major, scrambling head indices. This was latent until real
+    // Qwen 3.6 weights were loaded (synthetic constant tensors mask it).
     let q = q_raw
-        .into_shape_with_order((dims.head_v_dim, dims.n_k_heads))
-        .expect("q reshape");
+        .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
+        .expect("q reshape")
+        .reversed_axes()
+        .to_owned();
     let k = k_raw
-        .into_shape_with_order((dims.head_v_dim, dims.n_k_heads))
-        .expect("k reshape");
+        .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
+        .expect("k reshape")
+        .reversed_axes()
+        .to_owned();
     let v = v_raw
-        .into_shape_with_order((dims.head_v_dim, dims.n_v_heads))
-        .expect("v reshape");
+        .into_shape_with_order((dims.n_v_heads, dims.head_v_dim))
+        .expect("v reshape")
+        .reversed_axes()
+        .to_owned();
 
     // 5. L2-norm Q and K per head. V passes through.
     let q = l2_normalize_per_head(&q);
