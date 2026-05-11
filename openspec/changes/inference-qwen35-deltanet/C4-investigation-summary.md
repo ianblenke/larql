@@ -1,21 +1,20 @@
 # Phase C.4 investigation summary
 
-Status as of 2026-05-11 after ~20 sub-phases on the
+Status as of 2026-05-11 after ~25 sub-phases on the
 `inference-qwen35-deltanet` openspec change.
 
 ## Where we are
 
 - **Plumbing complete.** GGUF → Qwen35Weights bridge, tokenizer
   round-trip, prefill + decode all work end-to-end on real
-  Qwen3.6 27B Q4_K_S in ~3 s/token CPU. 111 unit tests + 7
+  Qwen3.6 27B Q4_K_S in ~3 s/token CPU. 111 unit tests + 8
   real-GGUF env-gated tests pass.
-- **3 confirmed layout bug fixes landed** (PRs #60, #63, #64).
-- **1 remaining correctness bug.** Per C.4r token-diff vs
-  llama-cli ground truth: ground-truth tokens (`|-`, ` [`,
-  `Start`, ` thinking`, `]`) all land at rank 100,000+ out of
-  248,320 vocab in our logit distribution. Our argmax tokens
-  get logits ~10, ground truth gets ~0. **Output is in the
-  wrong basis direction.**
+- **5 confirmed bug fixes landed** (PRs #60, #63, #64-reverted,
+  #69).
+- **1 remaining correctness bug** (smaller magnitude than before).
+  Per C.4r token-diff vs llama-cli ground truth: step-0 ground-
+  truth token now at **rank 16,054 out of 248,320 (top 6%)** —
+  up from rank 118,718 before fixes.
 
 ## Confirmed fixes (in `main`)
 
@@ -25,8 +24,28 @@ Status as of 2026-05-11 after ~20 sub-phases on the
 2. **PR #63** — `split_q_gate` assumed split-half layout; actual
    Qwen 3.6 layout is interleaved-per-head per llama.cpp
    `qwen35.cpp:220-244`.
-3. **PR #64** — DeltaNet GQA used block pattern (`h / repeat`);
-   ggml_repeat is cycle (`h % h_k`).
+3. **PR #64 (reverted in #69)** — DeltaNet GQA used block pattern
+   (`h / repeat`); switched to cycle (`h % h_k`); reverted in #69
+   because HF transformers' training-time convention is block.
+4. **PR #69 — THE BIG ONE** — Gemma-style `(1+w)` RMSNorm offset.
+   Qwen3-Next uses `output = x * (1 + weight)` for all standard
+   RMSNorms (`attn_norm`, `post_attention_norm`, `q_norm`,
+   `k_norm`, `final_norm`); GGUF stores only the trained delta
+   `w` (zero-init at training). My code's `x * w` collapsed every
+   norm toward zero, suppressing the entire model's computation.
+   Applied at bridge load via `add_one_to_vec()`. NOT applied to
+   `ssm_norm` which uses RMSNormGated (ones-init weight, raw `w`).
+5. **PR #69 (combined)** — Reverted PR #64 to block GQA matching
+   HF's `repeat_interleave` convention.
+
+## Token-rank progression for first ground-truth token (`|-`)
+
+| State | Step-0 GT rank | Step-0 GT logit |
+|---|---:|---:|
+| Pre-C.4 fixes | n/a | n/a |
+| After PR #60+63 | n/a | n/a |
+| After PR #64 (cycle GQA) | 118,718 | 0.097 |
+| **After PR #69 (1+w + block GQA)** | **16,054** | **4.289** |
 
 ## Hypotheses ruled out (via diagnostics)
 
