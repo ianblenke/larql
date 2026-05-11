@@ -1,20 +1,26 @@
-# Phase C.4 investigation summary
+# Phase C.4–C.5 investigation summary
 
-Status as of 2026-05-11 after ~25 sub-phases on the
+Status as of 2026-05-11 after ~30 sub-phases on the
 `inference-qwen35-deltanet` openspec change.
 
 ## Where we are
 
 - **Plumbing complete.** GGUF → Qwen35Weights bridge, tokenizer
   round-trip, prefill + decode all work end-to-end on real
-  Qwen3.6 27B Q4_K_S in ~3 s/token CPU. 111 unit tests + 8
+  Qwen3.6 27B Q4_K_S in ~3 s/token CPU. 113 unit tests + 9
   real-GGUF env-gated tests pass.
-- **5 confirmed bug fixes landed** (PRs #60, #63, #64-reverted,
-  #69).
-- **1 remaining correctness bug** (smaller magnitude than before).
-  Per C.4r token-diff vs llama-cli ground truth: step-0 ground-
-  truth token now at **rank 16,054 out of 248,320 (top 6%)** —
-  up from rank 118,718 before fixes.
+- **Parity oracle operational.** `llama-eval-callback` is built;
+  per-layer tensor comparison vs llama.cpp now drives bug
+  bisection. Layer-0 `x_norm`, `qkv_conv`, and `final_out` all
+  verified BIT-EXACT or near-bit-exact (f32 precision) at sampled
+  positions.
+- **4 confirmed bug fixes landed** (PRs #60, #63, #74-reverts-#69,
+  #76).
+- **1 known remaining issue**: layer-0 `linear_attn_out` is ~3×
+  larger than llama.cpp's. Source unidentified — the `ssm_out`
+  matmul input is bit-exact but output diverges. Layer 1's
+  `attn_norm` also ~3× larger, indicating consistent bounded
+  amplification (not compounding per layer).
 
 ## Confirmed fixes (in `main`)
 
@@ -24,46 +30,66 @@ Status as of 2026-05-11 after ~25 sub-phases on the
 2. **PR #63** — `split_q_gate` assumed split-half layout; actual
    Qwen 3.6 layout is interleaved-per-head per llama.cpp
    `qwen35.cpp:220-244`.
-3. **PR #64 (reverted in #69)** — DeltaNet GQA used block pattern
-   (`h / repeat`); switched to cycle (`h % h_k`); reverted in #69
-   because HF transformers' training-time convention is block.
-4. **PR #69 — THE BIG ONE** — Gemma-style `(1+w)` RMSNorm offset.
-   Qwen3-Next uses `output = x * (1 + weight)` for all standard
-   RMSNorms (`attn_norm`, `post_attention_norm`, `q_norm`,
-   `k_norm`, `final_norm`); GGUF stores only the trained delta
-   `w` (zero-init at training). My code's `x * w` collapsed every
-   norm toward zero, suppressing the entire model's computation.
-   Applied at bridge load via `add_one_to_vec()`. NOT applied to
-   `ssm_norm` which uses RMSNormGated (ones-init weight, raw `w`).
-5. **PR #69 (combined)** — Reverted PR #64 to block GQA matching
-   HF's `repeat_interleave` convention.
+3. **PR #69 (reverted in PR #74)** — Tried Gemma-style `(1+w)`
+   RMSNorm offset at bridge load. **WRONG** — empirical inspection
+   via `llama-eval-callback` showed GGUF stores `(1+w)` baked in
+   (stored weights ≈ 1.0). PR #74 reverts the double-application.
+4. **PR #76 (C.5c) — HEAD-MAJOR FLATTEN** of DeltaNet recurrence
+   output. The naïve `o.into_iter()` flatten produced DIM-MAJOR
+   flat layout, scrambling `rms_norm_heads` slices across multiple
+   heads and producing 46× over-amplification. Transpose first
+   so layout becomes head-major (matching HF Qwen3-Next's
+   `out.reshape(B, S, -1)` of an `[..., n_v_heads, head_v_dim]`
+   tensor). **Step-1 GT rank: 216,947 → 7,617 (top 3%).**
 
-## Token-rank progression for first ground-truth token (`|-`)
+## Token-rank progression
 
-| State | Step-0 GT rank | Step-0 GT logit |
+For ground-truth token at step 1 (` [` = 498):
+
+| State | step-1 GT rank | step-1 GT logit |
 |---|---:|---:|
 | Pre-C.4 fixes | n/a | n/a |
-| After PR #60+63 | n/a | n/a |
-| After PR #64 (cycle GQA) | 118,718 | 0.097 |
-| **After PR #69 (1+w + block GQA)** | **16,054** | **4.289** |
+| After PR #64 (cycle GQA, wrong) | 119,184 | 0.075 |
+| After PR #69 ((1+w) + block GQA) | 185,292 | -1.978 |
+| After PR #74 (revert 1+w, keep block) | 216,947 | -2.045 |
+| **After PR #76 (head-major flatten)** | **7,617** | **+3.505** |
 
-## Hypotheses ruled out (via diagnostics)
+## Parity oracle: verified bit-exact (or near) at layer 0
+
+Using `llama-eval-callback` to dump tensors during a real Qwen3.6-27B
+forward, then `LARQL_QWEN35_DUMP_L0=1` to dump ours:
+
+| Tensor | Match status |
+|---|---|
+| `embed` (input embedding lookup) | implied bit-exact |
+| `attn_norm` (x_norm output) | **BIT-EXACT** at first-3 + last-3 |
+| `attn_qkv` matmul (qkv_mixed) | ~1-4% per-element Q5_K dequant noise |
+| `conv1d + silu` (qkv_conv) | **near-bit-exact at f32 precision** |
+| `recurrence` (o) | matches expected (small magnitude) |
+| `ssm_norm + silu(z)` (final_out, pre-ssm_out) | **BIT-EXACT** at first-3 + last-3 |
+| `ssm_out` matmul (linear_attn_out) | **3× too large** (16.7 vs ~5.7) ← bug |
+
+## Hypotheses ruled out
 
 - **lm_head row outlier** (C.4k) — row norms within population σ.
 - **ssm_a sign error** (C.4s) — all 48 values negative as
   expected.
-- **L00 first-block-output magnitude** (C.4l observation) —
-  likely init-state characteristic, not a bug.
+- **GGUF `ssm_a` storage** (C.4v) — pre-computed `-exp(A_log)`
+  matches llama.cpp's direct multiplication.
+- **HF chunkwise recurrence formula** (C.4w) — paper's recurrent
+  form is correct at chunk_size=1.
+- **`(1+w)` RMSNorm offset** (C.5a) — GGUF already pre-applies.
+- **Embedding scale / softcapping** — verified absent in HF and
+  llama.cpp.
 
-## Verified consistent with llama.cpp reference
+## Verified consistent with HF Qwen3-Next + llama.cpp
 
-After reading `llama.cpp/src/models/qwen35.cpp` and related
-ggml ops:
+After reading both references:
 
-- RMSNorm semantics (no offset, no weight bias add)
+- RMSNorm semantics (epsilon, mean, weight broadcast)
 - Softplus / sigmoid pointwise math
 - Attention scale = `1/sqrt(head_dim)`
-- DeltaNet decay: `g = exp(ssm_a * softplus(alpha + dt))`
+- DeltaNet decay: `g_exp = exp(ssm_a * softplus(alpha + dt))`
 - Conv1D time direction (weight[0] = oldest token)
 - Conv state shift-and-insert pattern
 - Residual add pattern (attn block to original x, FFN to residual)
@@ -73,105 +99,63 @@ ggml ops:
 - RoPE pairing convention (split-half for NEOX/IMROPE)
 - MRoPE-text-only reduces to partial-RoPE at first `rotary_dim` dims
 - `ggml_l2_norm` per-head normalization
-- ssm_norm + silu(z) gating order
 - Q+gate split convention (PR #63)
-- DeltaNet GQA cycle pattern (PR #64)
+- DeltaNet GQA block pattern (PR #76 / `repeat_interleave`)
+- DeltaNet recurrence output flatten: HEAD-MAJOR (PR #76)
 - Embedding lookup: row by token id, no scale
-- All weights from the GGUF have consumers in our forward
 
-## Still-possible bug locations
+## Remaining bug investigation paths
 
-Ranked by likelihood, the remaining bug is most likely in:
+The 3× `linear_attn_out` discrepancy with bit-exact `final_out`
+input means the `ssm_out` matmul produces 3× larger output than
+llama.cpp's. Candidate explanations to investigate:
 
-1. **DeltaNet output flatten layout** (C.4p attempt). A
-   `o.t().to_owned()` fix to produce head-major flat was
-   empirically WORSE (regressed to single attractor), but the
-   theoretical analysis says it should be right. Could be (a)
-   the fix is wrong, or (b) the fix is right and unmasks
-   another bug. Cannot disambiguate without a per-layer
-   parity oracle.
+1. **Q5_K dequant precision differences for `ssm_out.weight`** —
+   middle-element noise that doesn't show in abbreviated first/last
+   prints but compounds through the matmul.
+2. **Matmul precision** — llama.cpp may use f16 intermediate; we
+   use full f32 BLAS.
+3. **A missing per-head scale factor** between recurrence output
+   and final projection.
+4. **A possible 3× normalization factor** we're missing.
 
-2. **`attn_qkv` post-conv split layout** — within Q/K/V slabs,
-   per-head interleaving may differ from simple
-   `flat[h * head_dim + d]` head-major.
+The 3× ratio is consistent across `linear_attn_out` (l2 16.7 vs
+~5.7) and `attn_norm-1` (l2 44.8 vs ~14.3), suggesting a single
+multiplicative cause not compounding through layers.
 
-3. **`attn_post_norm` placement details** — design.md says it
-   applies to the residual; double-check against llama.cpp's
-   exact tensor flow.
+## Diagnostics infrastructure
 
-4. **`final_norm` weight offset** — Gemma-style adds 1.0;
-   verify Qwen 3.6 doesn't.
+Env-gated, all checked in:
 
-5. **Embedding scale / final-logit softcapping** — defaults
-   should be 1.0 / None; verify.
+- `LARQL_QWEN35_GGUF=/path/to/gguf` enables 9 real-GGUF tests
+- `LARQL_QWEN35_TRACE=1` per-layer residual stream l2 trace
+- `LARQL_QWEN35_DUMP_L0=1` layer-0 tensor first/last-3 dumps
+  (x_norm, qkv_mixed, qkv_conv, o(recurrence), final_out,
+  linear_attn_out)
+- `LARQL_QWEN35_DUMP_FINAL=1` x_final dump pre-lm_head
 
-## Diagnostics infrastructure that's landed
+llama.cpp side:
+- `llama-eval-callback` binary built and ready (in
+  `~/3rd-party/llama.cpp/build/bin/`); dumps all tensors during
+  a forward pass.
 
-All env-gated on `LARQL_QWEN35_GGUF=/path/to/gguf` so unit-test
-CI passes without the GGUF:
+## Next session's concrete agenda
 
-- `real_gguf_qwen35_bridge_smoke` (C.4f) — load + bridge shape
-  verification.
-- `real_gguf_qwen35_forward_one_token_smoke` (C.4g) — single
-  forward, finite logits check.
-- `real_gguf_qwen35_multi_token_argmax_decode` (C.4h) —
-  multi-token cosine cross-step.
-- `real_gguf_qwen35_tokenizer_roundtrip` (C.4i) — text→tokens→
-  forward→tokens→text.
-- `real_gguf_qwen35_chat_prompt_forward` (C.4j) — chat-template
-  prompt.
-- `real_gguf_qwen35_lm_head_row_norms_diagnostic` (C.4k) —
-  lm_head + embed row norm statistics.
-- `real_gguf_qwen35_chat_prompt_temperature_sampling` (C.4m) —
-  temperature sampling.
-- `real_gguf_qwen35_token_diff_vs_llama_cpp` (C.4r) — rank of
-  ground-truth tokens in our logits.
-- `real_gguf_qwen35_ssm_a_sign_diagnostic` (C.4s) — ssm_a values.
+The parity oracle has reduced the bug from "somewhere in 64
+layers" to "in the `ssm_out` matmul or its immediate inputs."
+Pick one:
 
-Tracer: `LARQL_QWEN35_TRACE=1` env var prints per-layer
-residual stream l2/max norms.
+1. **Dump more positions of `final_out`** (e.g. positions 1024,
+   2048, 3072, 5000) to verify bit-exact across the full 6144
+   vector. If middle differs, the 3× is from Q5_K input noise
+   amplified by matmul.
 
-## Next session's concrete agenda — Phase C.5 parity oracle
+2. **Dump `ssm_out.weight` row norms** for a few rows; compare
+   to magnitudes implied by llama.cpp's `linear_attn_out` values.
 
-The remaining bug requires per-layer hidden-state diff vs
-llama.cpp. Suggested approach:
+3. **Try a HIGHER-precision GGUF** (Q8_0 if available) — if the
+   3× discrepancy disappears, the bug is Q5_K dequant precision
+   (not a logic bug).
 
-1. **Capture llama.cpp per-layer hidden states.** Options:
-   a. Use llama.cpp's tensor callback hook (build with
-      `GGML_PERF=1` or similar) to dump named tensors per layer
-      to disk.
-   b. Patch llama.cpp temporarily to `ggml_print` specific
-      tensors (`attn_norm`, `attn_residual`, `attn_post_norm`,
-      `ffn_residual`, `post_ffn`, final `cur`) for layer 0
-      only, for a one-token prompt. ~50 LoC patch.
-   c. Use `llama-perplexity` or write a small standalone
-      ggml program that runs the forward and dumps tensors.
-
-2. **Run our forward in the same harness.** Capture the
-   equivalent tensors at each step.
-
-3. **Diff layer 0 first.** Compare:
-   - `attn_norm(x)` — pre-norm input
-   - `block_out` from `qwen35_attention_block_step` or
-     `deltanet_block_step`
-   - `residual = x + block_out`
-   - `attn_post_norm(residual)`
-   - `ffn_out`
-   - `final = residual + ffn_out`
-
-4. **Bisect.** First diverging op IS the bug. With layer 0
-   isolated, the search space drops from "anywhere in 64
-   layers × multiple ops" to "this specific op in this
-   specific block kind".
-
-5. **Generalize.** Once layer 0 matches, run multi-layer to
-   verify the residual stream stays aligned. If layer 0
-   matches but later layers diverge, the bug is a cumulative
-   numerical drift — harder but bounded.
-
-## Time budget for Phase C.5
-
-Estimate: 4-8 hours of focused work to build the parity
-harness, plus 2-4 hours to bisect the remaining bug given the
-harness exists. Could go faster if the bug is in one of the
-ranked-1 hypotheses and a direct fix attempt works.
+4. **Switch token-diff test to ground-truth feeding** for clean
+   per-step parity comparison.
