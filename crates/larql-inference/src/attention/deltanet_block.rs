@@ -136,10 +136,42 @@ pub fn deltanet_block_step(
 
     // 1. Pre-mixer RMSNorm.
     let x_norm = rms_norm_1d(x, &weights.attn_norm, dims.eps);
+    // Diagnostic dump for layer 0 tensor comparison vs
+    // llama-eval-callback. Verified C.5a: x_norm matches llama.cpp
+    // bit-exactly at positions 0, 1, 2, N-3, N-2, N-1 for
+    // chat-prompt's first token (248045 = `<|im_start|>`).
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let n = x_norm.len();
+        eprintln!(
+            "x_norm:    first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            x_norm[0],
+            x_norm[1],
+            x_norm[2],
+            x_norm[n - 3],
+            x_norm[n - 2],
+            x_norm[n - 1],
+            x_norm.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
 
     // 2. Projections (matvec).
     let qkv_mixed = weights.attn_qkv.dot(&x_norm); // [conv_dim]
     let z = weights.attn_gate.dot(&x_norm); // [value_dim]
+                                            // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
+                                            // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let n = qkv_mixed.len();
+        eprintln!(
+            "qkv_mixed: first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            qkv_mixed[0],
+            qkv_mixed[1],
+            qkv_mixed[2],
+            qkv_mixed[n - 3],
+            qkv_mixed[n - 2],
+            qkv_mixed[n - 1],
+            qkv_mixed.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
     let beta_raw = weights.ssm_beta.dot(&x_norm); // [n_v_heads]
     let alpha_raw = weights.ssm_alpha.dot(&x_norm); // [n_v_heads]
 
