@@ -58,6 +58,7 @@ pub fn delta_net_step(
     debug_assert_eq!(beta.len(), h_v);
     debug_assert!(h_k > 0 && h_v.is_multiple_of(h_k), "H_k must divide H_v");
 
+    let repeat_factor = h_v / h_k;
     let scale_q = 1.0 / (s_k as f32).sqrt();
 
     let mut output = Array2::<f32>::zeros((s_v, h_v));
@@ -67,17 +68,22 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head h reads Q/K head index `h % h_k`
-        // (cycle pattern), matching `ggml_repeat`'s semantics in
-        // llama.cpp's `src/models/qwen35.cpp:419-420` where Q/K are
-        // repeated from H_k to H_v before delta_net.
+        // GQA broadcast: V head h reads Q/K head index `h / repeat_factor`
+        // (block / repeat-interleave pattern), matching HF transformers'
+        // training-time convention in `modeling_qwen3_next.py`:
         //
-        // Note: this is NOT `h / repeat_factor` (block-interleave),
-        // which is what `torch.repeat_interleave` and HF transformers'
-        // standard GQA helper do. Qwen 3.6 was trained with the cycle
-        // convention via ggml/PyTorch broadcasting that follows it,
-        // so block-interleave would scramble per-head computation.
-        let kh = h % h_k;
+        //     query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        //     key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        //
+        // PyTorch's `repeat_interleave` produces a block pattern where
+        // each source head is duplicated `repeat_factor` times in a row
+        // before moving to the next, so output[h] = source[h / ratio].
+        //
+        // Earlier (PR #64) we switched to `h % h_k` (cycle) based on
+        // ggml_repeat's semantics in llama.cpp's qwen35.cpp. However,
+        // the trained weights expect the HF / training-time convention
+        // (block), and using cycle scrambles per-head computation.
+        let kh = h / repeat_factor;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
 
