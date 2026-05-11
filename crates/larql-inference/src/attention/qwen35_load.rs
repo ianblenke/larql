@@ -1934,4 +1934,65 @@ mod tests {
             }
         }
     }
+
+    // ── C.4s: inspect ssm_a sign convention ──
+    //
+    // Per llama.cpp `qwen35.cpp:326` comment, the model expects
+    // `gate = -A_log.exp() * softplus(alpha + dt)`. If the GGUF
+    // stores ssm_a as already-negative (`-A_log.exp()`), my code
+    // is correct. If stored as positive `A_log` or `A_log.exp()`,
+    // my forward causes state EXPLOSION since
+    // `g = exp(positive * positive softplus) > 1`.
+    //
+    // Just dumps the actual values from layer 0's ssm_a to settle
+    // the question.
+    #[test]
+    fn real_gguf_qwen35_ssm_a_sign_diagnostic() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping ssm_a sign diagnostic");
+                return;
+            }
+        };
+        let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
+        // ssm_a for layer 0 is at key `layers.0.ssm_a` (1-D, n_v_heads = 48).
+        let ssm_a = weights
+            .vectors
+            .get("layers.0.ssm_a")
+            .expect("layers.0.ssm_a must exist");
+        eprintln!(
+            "layers.0.ssm_a (n_v_heads = {}) values: {:?}",
+            ssm_a.len(),
+            ssm_a
+        );
+        let min = ssm_a.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = ssm_a.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mean = ssm_a.iter().sum::<f32>() / ssm_a.len() as f32;
+        eprintln!("min={min:.4} max={max:.4} mean={mean:.4}");
+        let n_neg = ssm_a.iter().filter(|&&v| v < 0.0).count();
+        let n_pos = ssm_a.iter().filter(|&&v| v > 0.0).count();
+        eprintln!(
+            "negative: {n_neg}/{}, positive: {n_pos}/{}",
+            ssm_a.len(),
+            ssm_a.len()
+        );
+        if n_neg == ssm_a.len() {
+            eprintln!(
+                "✓ all ssm_a values are negative → matches my forward's assumption \
+                 (log_g = ssm_a * softplus(...) ≤ 0 → decay factor in (0, 1])"
+            );
+        } else if n_pos == ssm_a.len() {
+            eprintln!(
+                "🔥 all ssm_a values are POSITIVE → my forward causes state explosion. \
+                 Need to negate ssm_a OR the model stores `A_log` (positive) and \
+                 llama.cpp computes `-A_log.exp()` from it (need to add the negation)."
+            );
+        } else {
+            eprintln!(
+                "Mixed signs ({} neg, {} pos) — unusual; investigate further",
+                n_neg, n_pos
+            );
+        }
+    }
 }
