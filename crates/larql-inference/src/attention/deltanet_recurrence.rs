@@ -68,24 +68,28 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head h reads Q/K head index `h / repeat_factor`
-        // (block / repeat-interleave pattern), matching HF transformers'
-        // training-time convention in `modeling_qwen3_next.py`:
+        // GQA broadcast: V head h reads Q/K head `h / repeat_factor`
+        // (block pattern matching HF's `repeat_interleave(dim=head_axis)`).
         //
-        //     query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-        //     key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-        //
-        // PyTorch's `repeat_interleave` produces a block pattern where
-        // each source head is duplicated `repeat_factor` times in a row
-        // before moving to the next, so output[h] = source[h / ratio].
-        //
-        // Earlier (PR #64) we switched to `h % h_k` (cycle) based on
-        // ggml_repeat's semantics in llama.cpp's qwen35.cpp. However,
-        // the trained weights expect the HF / training-time convention
-        // (block), and using cycle scrambles per-head computation.
+        // C.4o originally switched to `h % h_k` (cycle) based on ggml_repeat
+        // semantics; reverted in C.4u back to block per HF training-time
+        // convention.
         let kh = h / repeat_factor;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
+
+        // Math per Yang et al. 2024 "Gated DeltaNet" paper (Eq. 6):
+        //
+        //   S_t = G_t S_{t-1} + β_t (v_t - S_{t-1}^T k_t) k_t^T
+        //   o_t = S_t^T q_t / sqrt(d_k)
+        //
+        // In code: decay state, compute sk = state_decayed @ k, then
+        // delta d = (v - sk) * β, rank-1 update state += k ⊗ d, then
+        // output = q @ state_new. Verified empirically: C.4w attempt
+        // to use HF's chunkwise pseudocode (`output = exp(g)*(q@S_old)
+        // + v_new` instead of `q @ S_new`) regressed step-0 rank from
+        // 16,054 to 66,136 AND broke the β=0 invariant. The paper's
+        // recurrent formula is the correct one for chunk_size=1.
 
         // 1. Decay state per head: S ← S * g.
         for r in 0..s_v {
@@ -95,7 +99,6 @@ pub fn delta_net_step(
         }
 
         // 2. sk[c] = sum_r state[r, c, h] * k[r, kh]  (S_v × S_k matvec).
-        //    Reuse the buffer to avoid allocating per head.
         for entry in sk.iter_mut() {
             *entry = 0.0;
         }
@@ -114,7 +117,7 @@ pub fn delta_net_step(
             d[c] = (v[[c, h]] - sk[c]) * b_h;
         }
 
-        // 4. S ← S + k ⊗ d^T  (rank-1 update; state[r,c,h] += k[r,kh] * d[c]).
+        // 4. S ← S + k ⊗ d^T  (rank-1 update).
         for r in 0..s_k {
             let k_val = k[[r, kh]];
             if k_val == 0.0 {
