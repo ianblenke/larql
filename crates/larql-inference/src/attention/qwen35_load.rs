@@ -1187,6 +1187,60 @@ mod tests {
     // meaningful (that requires parity vs llama.cpp). What it DOES
     // assert is the same plumbing gates as C.4i: tokens in range,
     // finite logits, non-empty decode.
+    //
+    // ── GROUND TRUTH (Phase C.4q, captured 2026-05-11) ──
+    //
+    // llama-cli with `--jinja --single-turn -p "Hi" --temp 0`
+    // (greedy sampling, applies the GGUF's chat template) on the
+    // same Qwen3.6 27B Q4_K_S GGUF produces:
+    //
+    //   |- [Start thinking]
+    //   Here's a thinking process:
+    //
+    //   1.  **Analyze User Input**
+    //      - User …
+    //
+    // i.e. real English with Qwen 3.6's `[Start thinking]` reasoning-
+    // mode prefix. Our current chat-prompt forward (after PRs #60,
+    // #63, #64) produces "和讯volu勇往直前ardeezoemann supposedBUFF"
+    // — varied multi-script tokens but nothing resembling the
+    // expected English output. That means there's at least one
+    // remaining correctness bug after the three layout fixes
+    // (DeltaNet reshape, Q+gate interleave, DeltaNet GQA cycle).
+    //
+    // Candidate areas to investigate next (none verified, all are
+    // hypotheses ranked by likelihood):
+    //
+    // 1. **DeltaNet output flatten layout**: `delta_net_step` returns
+    //    Array2 [s_v, h_v] with `o[d, h]` indexing. The naïve
+    //    `o.into_iter()` flatten walks row-major → produces
+    //    DIM-MAJOR flat (`flat[d * h_v + h]`). ggml's convention is
+    //    HEAD-MAJOR (axis 0 inner = head_v_dim, so flat per head is
+    //    contiguous). An attempted fix in a C.4p branch
+    //    (`o.t().to_owned().into_iter().collect()`) produced
+    //    head-major flat but EMPIRICALLY regressed output to a
+    //    single Chinese attractor ("勤勤恳恳"×8). That's either
+    //    (a) the right fix unmasking a downstream bug, or (b) the
+    //    wrong direction. Needs token-level llama.cpp parity to
+    //    disambiguate.
+    //
+    // 2. **`attn_qkv` post-conv split layout**: the Q/K/V slabs may
+    //    have a different per-head interleaving than the simple
+    //    head-major slice we use.
+    //
+    // 3. **`attn_post_norm` placement**: maybe it should be
+    //    `ffn_in = post_norm(ffn_in)` rather than `ffn_in =
+    //    post_norm(residual)`. design.md §6 says post-norm applies
+    //    to the residual; double-check against llama.cpp.
+    //
+    // 4. **`final_norm` epsilon / weight offset**: Gemma-style models
+    //    add 1.0 to weight; check whether Qwen 3.6 does too.
+    //
+    // 5. **Embedding scale / final-logit softcapping**: defaults for
+    //    Qwen 3.6 should be 1.0 / None, but worth verifying.
+    //
+    // The Phase C.5 parity oracle is the right tool to bisect these
+    // hypotheses one at a time against llama.cpp's per-layer dumps.
     #[test]
     fn real_gguf_qwen35_chat_prompt_forward() {
         let path = match std::env::var("LARQL_QWEN35_GGUF") {
