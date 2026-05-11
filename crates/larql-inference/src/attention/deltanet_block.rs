@@ -145,6 +145,20 @@ pub fn deltanet_block_step(
 
     // Per-head non-linearities.
     let beta: Array1<f32> = beta_raw.iter().map(|&v| sigmoid(v)).collect();
+    // Decay-rate computation: `log_g = ssm_a * softplus(alpha + dt)`.
+    //
+    // The GGUF stores ssm_a as the PRE-COMPUTED `-exp(A_log)`, not
+    // the raw `A_log` trained parameter. (Verified: real-GGUF values
+    // are negative in [-0.34, -0.004]; if stored as raw A_log,
+    // `-exp(A_log)` would be much larger in magnitude.)
+    //
+    // This matches llama.cpp's `qwen35.cpp:326`:
+    //     ggml_mul(alpha_softplus, model.layers[il].ssm_a)
+    // which multiplies the stored value directly.
+    //
+    // Attempted in C.4v: switching to `-exp(ssm_a) * softplus(...)`
+    // empirically regressed step-0 rank from 16,054 to 99,056 —
+    // confirming the GGUF storage convention.
     let log_g: Array1<f32> = (0..dims.n_v_heads)
         .map(|h| weights.ssm_a[h] * softplus(alpha_raw[h] + weights.ssm_dt[h]))
         .collect();
