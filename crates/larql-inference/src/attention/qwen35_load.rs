@@ -82,7 +82,15 @@ pub fn load_qwen35_weights(
         } else {
             Qwen35LayerWeights::Attention(load_attention_layer(weights, arch, layer)?)
         };
-        let attn_post_norm = get_vec(weights, &arch.post_attention_layernorm_key(layer))?;
+        // Qwen 3.6 uses Gemma-style RMSNorm: output = x * (1 + weight)
+        // where `weight` is zero-initialised at training and the GGUF
+        // stores only the trained delta. Pre-add 1.0 here so the
+        // forward path can use the standard `x * inv_rms * w` form.
+        // Applies to: input_layernorm (attn_norm), post_attention_norm
+        // (attn_post_norm), q_norm, k_norm, final_norm. NOT ssm_norm
+        // (that's RMSNormGated with ones-init weight, no offset).
+        let attn_post_norm =
+            add_one_to_vec(get_vec(weights, &arch.post_attention_layernorm_key(layer))?);
         let ffn_gate = get_tensor(weights, &arch.ffn_gate_key(layer))?;
         let ffn_up = get_tensor(weights, &arch.ffn_up_key(layer))?;
         let ffn_down = get_tensor(weights, &arch.ffn_down_key(layer))?;
@@ -95,7 +103,7 @@ pub fn load_qwen35_weights(
         });
     }
 
-    let final_norm = get_vec(weights, arch.final_norm_key())?;
+    let final_norm = add_one_to_vec(get_vec(weights, arch.final_norm_key())?);
 
     Ok(Qwen35Weights {
         embed: weights.embed.clone(),
@@ -106,12 +114,22 @@ pub fn load_qwen35_weights(
     })
 }
 
+/// Pre-add 1.0 to a Qwen 3.6 RMSNorm weight vector (Gemma-style
+/// `output = x * (1 + w)` semantics; the GGUF stores only the trained
+/// delta `w`). Allocates a fresh `Arc<[f32]>`.
+fn add_one_to_vec(v: Arc<[f32]>) -> Arc<[f32]> {
+    let adjusted: Vec<f32> = v.iter().map(|&x| 1.0 + x).collect();
+    Arc::from(adjusted.as_slice())
+}
+
 fn load_deltanet_layer(
     weights: &ModelWeights,
     arch: &dyn ModelArchitecture,
     layer: usize,
 ) -> Result<DeltaNetLayerWeights, Qwen35LoadError> {
-    let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
+    // Gemma-style RMSNorm: pre-add 1.0 to attn_norm. NOT to ssm_norm
+    // (RMSNormGated uses raw weight).
+    let attn_norm = add_one_to_vec(get_vec(weights, &arch.input_layernorm_key(layer))?);
     let attn_qkv_key = require_key(arch.attn_qkv_key(layer), layer, "attn_qkv_key", "linear")?;
     let attn_qkv = get_tensor(weights, &attn_qkv_key)?;
     let attn_gate_key = require_key(arch.attn_gate_key(layer), layer, "attn_gate_key", "linear")?;
@@ -163,7 +181,9 @@ fn load_attention_layer(
     arch: &dyn ModelArchitecture,
     layer: usize,
 ) -> Result<Qwen35AttentionLayerWeights, Qwen35LoadError> {
-    let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
+    // Gemma-style RMSNorm: pre-add 1.0 to attn_norm, attn_q_norm,
+    // attn_k_norm (all use the (1+w) convention per HF Qwen3-Next).
+    let attn_norm = add_one_to_vec(get_vec(weights, &arch.input_layernorm_key(layer))?);
     let attn_q = get_tensor(weights, &arch.attn_q_key(layer))?;
     let attn_k = get_tensor(weights, &arch.attn_k_key(layer))?;
     let attn_v = get_tensor(weights, &arch.attn_v_key(layer))?;
@@ -174,14 +194,14 @@ fn load_attention_layer(
         "attn_q_per_head_norm_key",
         "full-attn",
     )?;
-    let attn_q_norm = get_vec(weights, &q_norm_key)?;
+    let attn_q_norm = add_one_to_vec(get_vec(weights, &q_norm_key)?);
     let k_norm_key = require_key(
         arch.attn_k_per_head_norm_key(layer),
         layer,
         "attn_k_per_head_norm_key",
         "full-attn",
     )?;
-    let attn_k_norm = get_vec(weights, &k_norm_key)?;
+    let attn_k_norm = add_one_to_vec(get_vec(weights, &k_norm_key)?);
 
     Ok(Qwen35AttentionLayerWeights {
         attn_norm,
