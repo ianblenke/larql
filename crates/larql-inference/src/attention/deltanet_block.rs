@@ -201,6 +201,19 @@ pub fn deltanet_block_step(
     for v in qkv_conv.iter_mut() {
         *v = silu(*v);
     }
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let n = qkv_conv.len();
+        eprintln!(
+            "qkv_conv:  first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            qkv_conv[0],
+            qkv_conv[1],
+            qkv_conv[2],
+            qkv_conv[n - 3],
+            qkv_conv[n - 2],
+            qkv_conv[n - 1],
+            qkv_conv.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
 
     // 4. Split QKV into Q, K, V slabs.
     let key_dim = dims.key_dim();
@@ -246,16 +259,28 @@ pub fn deltanet_block_step(
 
     // 6. Delta-rule recurrence.
     let o = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state);
-    // o shape: [head_v_dim, n_v_heads]. Flatten via row-major
-    // iteration. Empirically (C.4p + C.4u attempts): switching to
-    // `o.t().to_owned().into_iter().collect()` (head-major flat per
-    // HF Qwen3-Next's `out.reshape(B, S, -1)`) is INCONSISTENT —
-    // some token positions improve dramatically, others regress
-    // dramatically. The naïve row-major produces more uniform (if
-    // still imperfect) per-step quality, so this stays as-is until
-    // a per-layer parity oracle can determine the actual right
-    // direction.
-    let o_flat: Array1<f32> = o.into_iter().collect();
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        eprintln!(
+            "o(recurrence) shape={:?}: first-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            o.shape(),
+            o[[0, 0]],
+            o[[1, 0]],
+            o[[2, 0]],
+            o.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
+    // o has shape [head_v_dim, n_v_heads] with `o[d, h]` = head h, dim d.
+    // The downstream `rms_norm_heads` and element-wise `silu(z)` expect
+    // **head-major** flat layout (`flat[h * head_v_dim + d]`), matching
+    // HF Qwen3-Next's `out.reshape(B, S, -1)` of an underlying
+    // `[..., n_v_heads, head_v_dim]` tensor.
+    //
+    // Phase C.5c verified: naïve `o.into_iter()` flatten produces
+    // DIM-MAJOR flat which scrambles `rms_norm_heads` slices across
+    // heads, producing a 46× amplification (l2: 0.6 → 27.4) where
+    // llama.cpp produces 5× less. Transpose first so the flatten
+    // yields head-major.
+    let o_flat: Array1<f32> = o.t().to_owned().into_iter().collect();
     debug_assert_eq!(o_flat.len(), value_dim);
 
     // 7. Per-head RMSNorm by ssm_norm (weight is [head_v_dim], shared
@@ -276,9 +301,28 @@ pub fn deltanet_block_step(
     for c in 0..value_dim {
         o_flat[c] *= silu(z[c]);
     }
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let n = o_flat.len();
+        eprintln!(
+            "final_out (pre-ssm_out): first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            o_flat[0], o_flat[1], o_flat[2],
+            o_flat[n - 3], o_flat[n - 2], o_flat[n - 1],
+            o_flat.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
 
     // 9. Output projection (matvec).
-    weights.ssm_out.dot(&o_flat)
+    let block_out = weights.ssm_out.dot(&o_flat);
+    if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let n = block_out.len();
+        eprintln!(
+            "linear_attn_out:         first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            block_out[0], block_out[1], block_out[2],
+            block_out[n - 3], block_out[n - 2], block_out[n - 1],
+            block_out.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
+    block_out
 }
 
 #[inline]

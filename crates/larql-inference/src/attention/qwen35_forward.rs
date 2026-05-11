@@ -155,6 +155,19 @@ pub fn qwen35_forward_step(
 
     // 3. Final norm + lm_head.
     let x_final = rms_norm_1d_pub(&x, &weights.final_norm, eps);
+    if std::env::var("LARQL_QWEN35_DUMP_FINAL").is_ok() {
+        let n = x_final.len();
+        eprintln!(
+            "x_final: first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            x_final[0],
+            x_final[1],
+            x_final[2],
+            x_final[n - 3],
+            x_final[n - 2],
+            x_final[n - 1],
+            x_final.iter().map(|v| v * v).sum::<f32>().sqrt(),
+        );
+    }
     let logits = weights.lm_head.dot(&x_final);
 
     if trace {
