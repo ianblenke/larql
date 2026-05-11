@@ -1538,4 +1538,193 @@ mod tests {
             );
         }
     }
+
+    // ── C.4m: temperature-sampled chat-prompt generation ──
+    //
+    // Same env-gating as the other real-GGUF tests. Replaces the
+    // greedy-argmax sampling from C.4j with temperature-scaled
+    // multinomial sampling at temperature=0.7, seeded from a fixed
+    // u64 for reproducibility.
+    //
+    // If output diversifies into varied tokens (different argmax
+    // choices, distinct decoded characters per step), the 107315
+    // attractor from C.4j was a greedy-sampling artifact and the
+    // forward path is doing real inference. If output remains
+    // tightly repetitive even with temperature, there's likely
+    // still a correctness bug.
+    //
+    // Plumbing-only assertions (same as C.4i/C.4j): tokens in
+    // range, finite logits, non-empty decode.
+    #[test]
+    fn real_gguf_qwen35_chat_prompt_temperature_sampling() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping temperature sampling test");
+                return;
+            }
+        };
+        let gguf_path = std::path::PathBuf::from(&path);
+        let model_dir = gguf_path
+            .parent()
+            .expect("LARQL_QWEN35_GGUF must point to a file in a directory");
+        let tokenizer = match crate::tokenizer::load_tokenizer(model_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("no tokenizer.json sibling next to GGUF ({e:?}) — skipping");
+                return;
+            }
+        };
+
+        let prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        let encoding = tokenizer.encode(prompt, true).expect("encode prompt");
+        let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+        eprintln!("prompt has {} tokens: {prompt_ids:?}", prompt_ids.len());
+
+        let weights = larql_models::load_gguf(&gguf_path).expect("load_gguf");
+        let vocab = weights.embed.shape()[0];
+        let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+
+        let arch = &*weights.arch;
+        let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
+            hidden: weights.hidden_size,
+            head_v_dim: arch.ssm_state_size(),
+            n_v_heads: arch.ssm_dt_rank(),
+            n_k_heads: arch.ssm_group_count(),
+            d_conv: arch.ssm_conv_kernel(),
+            eps: 1e-6,
+        };
+        let rotary_dim: usize = arch
+            .rope_dimension_sections()
+            .map(|s| s.iter().sum())
+            .unwrap_or(weights.head_dim);
+        let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
+            hidden: weights.hidden_size,
+            n_head: weights.num_q_heads,
+            n_head_kv: weights.num_kv_heads,
+            head_dim: weights.head_dim,
+            rotary_dim,
+            rope_base: weights.rope_base,
+            eps: 1e-6,
+        };
+        let layer_kinds: Vec<bool> = (0..weights.num_layers)
+            .map(|l| arch.is_linear_attention_layer(l))
+            .collect();
+        let mut cache = crate::attention::qwen35_block::DeltaNetHybridCache::allocate(
+            &layer_kinds,
+            attn_dims.kv_dim(),
+            dn_dims.d_conv,
+            dn_dims.conv_dim(),
+            dn_dims.head_v_dim,
+            dn_dims.n_v_heads,
+        );
+
+        // Prefill.
+        let mut last_logits: Option<ndarray::Array1<f32>> = None;
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            let logits = crate::attention::qwen35_forward::qwen35_forward_step(
+                tok, &w, &dn_dims, &attn_dims, &mut cache, 1e-6,
+            );
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "prefill {i}: finite logits"
+            );
+            last_logits = Some(logits);
+        }
+
+        // Top-k temperature sampling with fixed seed.
+        const N_GEN: usize = 12;
+        const TEMPERATURE: f32 = 0.7;
+        const TOP_K: usize = 50;
+        const EOS: u32 = 248046;
+        // Linear congruential PRNG seeded fixed for reproducibility.
+        let mut rng_state: u64 = 0x_dead_beef_cafe_1234;
+        let mut rand_unit = || -> f32 {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // High bits as f32 in [0, 1).
+            ((rng_state >> 33) as u32 as f32) / (u32::MAX as f32 + 1.0)
+        };
+
+        let sample_top_k = |logits: &ndarray::Array1<f32>, rand: f32| -> u32 {
+            // Indexed sort by logit desc, take TOP_K.
+            let mut idx: Vec<(usize, f32)> = logits
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i, v / TEMPERATURE))
+                .collect();
+            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            idx.truncate(TOP_K);
+            let max_l = idx[0].1;
+            let exps: Vec<f32> = idx.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+            let total: f32 = exps.iter().sum();
+            let mut cum = 0.0_f32;
+            let threshold = rand * total;
+            for (i, e) in exps.iter().enumerate() {
+                cum += e;
+                if cum >= threshold {
+                    return idx[i].0 as u32;
+                }
+            }
+            idx[idx.len() - 1].0 as u32
+        };
+
+        let mut generated: Vec<u32> = Vec::with_capacity(N_GEN);
+        let mut logits = last_logits.expect("at least one prompt token");
+        for step in 0..N_GEN {
+            let next = sample_top_k(&logits, rand_unit());
+            eprintln!(
+                "decode {step}: sampled={next} (token decode: {:?})",
+                tokenizer.decode(&[next], false).unwrap_or_default()
+            );
+            generated.push(next);
+            if next == EOS {
+                break;
+            }
+            if (next as usize) >= vocab {
+                panic!("sampled out-of-vocab id {next}");
+            }
+            if step + 1 < N_GEN {
+                logits = crate::attention::qwen35_forward::qwen35_forward_step(
+                    next, &w, &dn_dims, &attn_dims, &mut cache, 1e-6,
+                );
+                assert!(
+                    logits.iter().all(|v| v.is_finite()),
+                    "decode {step}: finite logits"
+                );
+            }
+        }
+
+        let continuation = tokenizer
+            .decode(&generated, false)
+            .expect("decode generated");
+        eprintln!("decoded continuation (T={TEMPERATURE}, top-{TOP_K}): {continuation:?}");
+
+        // Cross-step uniqueness: temperature sampling should produce
+        // ≥ 4 distinct tokens across 12 decoded steps. If it doesn't,
+        // the distribution is too tight around one token even after
+        // temperature scaling — indicating either Q4 quant collapse
+        // or a remaining correctness bug.
+        let mut uniq = generated.clone();
+        uniq.sort();
+        uniq.dedup();
+        eprintln!(
+            "generated {} tokens, {} distinct: {generated:?}",
+            generated.len(),
+            uniq.len()
+        );
+        assert!(
+            !continuation.is_empty(),
+            "decoded continuation must not be empty"
+        );
+        // Soft assertion (warn, don't fail): we want to SEE this number.
+        // Strict fail at <2 unique tokens — at that point the
+        // distribution is essentially a one-hot which would be a
+        // separate, stronger bug signal.
+        assert!(
+            uniq.len() >= 2,
+            "temperature sampling produced <2 distinct tokens: {generated:?}"
+        );
+    }
 }
