@@ -83,22 +83,17 @@ pub fn delta_net_step(
         //   S_t = G_t S_{t-1} + β_t (v_t - S_{t-1}^T k_t) k_t^T
         //   o_t = S_t^T q_t / sqrt(d_k)
         //
-        // In code: decay state, compute sk = state_decayed @ k, then
-        // delta d = (v - sk) * β, rank-1 update state += k ⊗ d, then
-        // output = q @ state_new. Verified empirically: C.4w attempt
-        // to use HF's chunkwise pseudocode (`output = exp(g)*(q@S_old)
-        // + v_new` instead of `q @ S_new`) regressed step-0 rank from
-        // 16,054 to 66,136 AND broke the β=0 invariant. The paper's
-        // recurrent formula is the correct one for chunk_size=1.
+        // **CRITICAL ORDER**: the delta term `(v_t - S_{t-1}^T k_t)`
+        // uses S_{t-1} BEFORE decay, NOT the decayed state. This is
+        // load-bearing: for token 0 (S=0) the order doesn't matter,
+        // but for non-empty state the difference compounds wildly.
+        //
+        // Earlier (pre-C.5f) my code computed `sk` AFTER decay,
+        // giving `sk = g * (S^T k)` instead of `S^T k`. Token 0
+        // matched llama.cpp bit-exact but token 1+ diverged 20×.
 
-        // 1. Decay state per head: S ← S * g.
-        for r in 0..s_v {
-            for c in 0..s_v {
-                state[[r, c, h]] *= g_h;
-            }
-        }
-
-        // 2. sk[c] = sum_r state[r, c, h] * k[r, kh]  (S_v × S_k matvec).
+        // 1. sk[c] = sum_r state_old[r, c, h] * k[r, kh] = (S_old^T k)[c]
+        //    USING UN-DECAYED state.
         for entry in sk.iter_mut() {
             *entry = 0.0;
         }
@@ -112,23 +107,21 @@ pub fn delta_net_step(
             }
         }
 
-        // 3. d = (v - sk) * b.
+        // 2. d = (v - sk) * b (no decay factor on sk).
         for c in 0..s_v {
             d[c] = (v[[c, h]] - sk[c]) * b_h;
         }
 
-        // 4. S ← S + k ⊗ d^T  (rank-1 update).
-        for r in 0..s_k {
-            let k_val = k[[r, kh]];
-            if k_val == 0.0 {
-                continue;
-            }
+        // 3. NOW decay state and add rank-1 update in one pass:
+        //    state[r, c, h] = g_h * state_old[r, c, h] + k[r] * d[c]
+        for r in 0..s_v {
+            let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
             for c in 0..s_v {
-                state[[r, c, h]] += k_val * d[c];
+                state[[r, c, h]] = g_h * state[[r, c, h]] + k_val * d[c];
             }
         }
 
-        // 5. o[c, h] = sum_r state[r, c, h] * q[r, kh] * scale_q.
+        // 4. o[c, h] = sum_r state[r, c, h] * q[r, kh] * scale_q.
         for c in 0..s_v {
             let mut acc = 0.0_f32;
             for r in 0..s_k {
