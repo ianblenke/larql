@@ -58,7 +58,6 @@ pub fn delta_net_step(
     debug_assert_eq!(beta.len(), h_v);
     debug_assert!(h_k > 0 && h_v.is_multiple_of(h_k), "H_k must divide H_v");
 
-    let repeat_factor = h_v / h_k;
     let scale_q = 1.0 / (s_k as f32).sqrt();
 
     let mut output = Array2::<f32>::zeros((s_v, h_v));
@@ -68,7 +67,17 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        let kh = h / repeat_factor;
+        // GQA broadcast: V head h reads Q/K head index `h % h_k`
+        // (cycle pattern), matching `ggml_repeat`'s semantics in
+        // llama.cpp's `src/models/qwen35.cpp:419-420` where Q/K are
+        // repeated from H_k to H_v before delta_net.
+        //
+        // Note: this is NOT `h / repeat_factor` (block-interleave),
+        // which is what `torch.repeat_interleave` and HF transformers'
+        // standard GQA helper do. Qwen 3.6 was trained with the cycle
+        // convention via ggml/PyTorch broadcasting that follows it,
+        // so block-interleave would scramble per-head computation.
+        let kh = h % h_k;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
 
