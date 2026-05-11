@@ -68,12 +68,18 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head h reads Q/K head `h / repeat_factor`
-        // (block pattern matching HF's `repeat_interleave(dim=head_axis)`).
+        // GQA broadcast: V head `h` reads Q/K head `h / repeat_factor`
+        // (BLOCK pattern matching HF's `repeat_interleave(dim=head_axis)`).
         //
-        // C.4o originally switched to `h % h_k` (cycle) based on ggml_repeat
-        // semantics; reverted in C.4u back to block per HF training-time
-        // convention.
+        // C.5h tried CYCLE (`h % h_k`) per llama.cpp's
+        // `ggml_compute_forward_gated_delta_net_one_chunk` (line 10543:
+        // `ik1 = iv1 % nek1`), but empirically regressed both step-0
+        // (101,839 → 125,425) and step-1 (7,617 → 32,881) GT ranks
+        // versus llama.cpp's ground-truth output. The model weights
+        // were trained with HF's `repeat_interleave` block layout, so
+        // block remains correct here even though llama.cpp's runtime
+        // kernel reads heads via `%`. The reconciliation lives in
+        // llama.cpp's GGUF tensor layout, not in this kernel.
         let kh = h / repeat_factor;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
