@@ -82,15 +82,16 @@ pub fn load_qwen35_weights(
         } else {
             Qwen35LayerWeights::Attention(load_attention_layer(weights, arch, layer)?)
         };
-        // Qwen 3.6 uses Gemma-style RMSNorm: output = x * (1 + weight)
-        // where `weight` is zero-initialised at training and the GGUF
-        // stores only the trained delta. Pre-add 1.0 here so the
-        // forward path can use the standard `x * inv_rms * w` form.
-        // Applies to: input_layernorm (attn_norm), post_attention_norm
-        // (attn_post_norm), q_norm, k_norm, final_norm. NOT ssm_norm
-        // (that's RMSNormGated with ones-init weight, no offset).
-        let attn_post_norm =
-            add_one_to_vec(get_vec(weights, &arch.post_attention_layernorm_key(layer))?);
+        // RMSNorm convention for Qwen 3.6: this GGUF stores `(1 + w)`
+        // pre-applied (verified empirically via C.4y/C.5a diagnostic:
+        // stored layers.0.input_layernorm.weight has mean=0.98, range
+        // [0.88, 1.20] — i.e. ≈ 1.0, not the ≈0.05 you'd expect for a
+        // raw zero-init delta).
+        //
+        // So the forward's `x * inv_rms * w` form just works.
+        // No `add_one_to_vec` needed here despite Qwen3-Next using
+        // `Qwen3NextRMSNorm(x) = x * inv_rms * (1 + w)` semantically.
+        let attn_post_norm = get_vec(weights, &arch.post_attention_layernorm_key(layer))?;
         let ffn_gate = get_tensor(weights, &arch.ffn_gate_key(layer))?;
         let ffn_up = get_tensor(weights, &arch.ffn_up_key(layer))?;
         let ffn_down = get_tensor(weights, &arch.ffn_down_key(layer))?;
@@ -103,7 +104,7 @@ pub fn load_qwen35_weights(
         });
     }
 
-    let final_norm = add_one_to_vec(get_vec(weights, arch.final_norm_key())?);
+    let final_norm = get_vec(weights, arch.final_norm_key())?;
 
     Ok(Qwen35Weights {
         embed: weights.embed.clone(),
@@ -114,22 +115,18 @@ pub fn load_qwen35_weights(
     })
 }
 
-/// Pre-add 1.0 to a Qwen 3.6 RMSNorm weight vector (Gemma-style
-/// `output = x * (1 + w)` semantics; the GGUF stores only the trained
-/// delta `w`). Allocates a fresh `Arc<[f32]>`.
-fn add_one_to_vec(v: Arc<[f32]>) -> Arc<[f32]> {
-    let adjusted: Vec<f32> = v.iter().map(|&x| 1.0 + x).collect();
-    Arc::from(adjusted.as_slice())
-}
+// `add_one_to_vec` removed in C.5a: empirical inspection of the
+// actual Qwen 3.6 27B Q4_K_S GGUF showed stored norm weights are
+// already ≈ 1.0 (i.e. `(1 + w)` is pre-applied in the conversion
+// path), so adding 1.0 again double-applies the offset.
 
 fn load_deltanet_layer(
     weights: &ModelWeights,
     arch: &dyn ModelArchitecture,
     layer: usize,
 ) -> Result<DeltaNetLayerWeights, Qwen35LoadError> {
-    // Gemma-style RMSNorm: pre-add 1.0 to attn_norm. NOT to ssm_norm
-    // (RMSNormGated uses raw weight).
-    let attn_norm = add_one_to_vec(get_vec(weights, &arch.input_layernorm_key(layer))?);
+    // GGUF stores `(1+w)` pre-applied for attn_norm — use raw.
+    let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
     let attn_qkv_key = require_key(arch.attn_qkv_key(layer), layer, "attn_qkv_key", "linear")?;
     let attn_qkv = get_tensor(weights, &attn_qkv_key)?;
     let attn_gate_key = require_key(arch.attn_gate_key(layer), layer, "attn_gate_key", "linear")?;
@@ -181,9 +178,8 @@ fn load_attention_layer(
     arch: &dyn ModelArchitecture,
     layer: usize,
 ) -> Result<Qwen35AttentionLayerWeights, Qwen35LoadError> {
-    // Gemma-style RMSNorm: pre-add 1.0 to attn_norm, attn_q_norm,
-    // attn_k_norm (all use the (1+w) convention per HF Qwen3-Next).
-    let attn_norm = add_one_to_vec(get_vec(weights, &arch.input_layernorm_key(layer))?);
+    // GGUF stores `(1+w)` pre-applied for all norms — use raw values.
+    let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
     let attn_q = get_tensor(weights, &arch.attn_q_key(layer))?;
     let attn_k = get_tensor(weights, &arch.attn_k_key(layer))?;
     let attn_v = get_tensor(weights, &arch.attn_v_key(layer))?;
@@ -194,14 +190,14 @@ fn load_attention_layer(
         "attn_q_per_head_norm_key",
         "full-attn",
     )?;
-    let attn_q_norm = add_one_to_vec(get_vec(weights, &q_norm_key)?);
+    let attn_q_norm = get_vec(weights, &q_norm_key)?;
     let k_norm_key = require_key(
         arch.attn_k_per_head_norm_key(layer),
         layer,
         "attn_k_per_head_norm_key",
         "full-attn",
     )?;
-    let attn_k_norm = add_one_to_vec(get_vec(weights, &k_norm_key)?);
+    let attn_k_norm = get_vec(weights, &k_norm_key)?;
 
     Ok(Qwen35AttentionLayerWeights {
         attn_norm,
@@ -477,26 +473,25 @@ mod tests {
         assert_eq!(w.final_norm.len(), cfg.hidden_size);
     }
 
-    /// Regression test for PR #69 — Gemma-style `(1 + weight)` RMSNorm
-    /// offset must be applied to standard norms (attn_norm,
-    /// post_attention_norm, q_norm, k_norm, final_norm) but NOT to
-    /// ssm_norm (RMSNormGated uses raw weight).
+    /// Regression test for C.5a — verifies the bridge does NOT
+    /// double-apply the `(1+w)` Gemma offset to norms. Empirical
+    /// inspection (C.4y) confirmed the GGUF stores norms with
+    /// `(1+w)` already baked in, so the bridge should pass the
+    /// stored values through verbatim.
     ///
-    /// We seed the synthetic `ModelWeights` with norm-weight values of
-    /// `0.0` everywhere (the zero-init delta that Qwen3-Next uses)
-    /// and verify the bridge produces `1.0` for the standard norms
-    /// (because `(1 + 0.0) = 1.0`) and `0.0` for `ssm_norm`.
+    /// Seeds zero-init delta weights (`0.0`) and verifies the bridge
+    /// passes them through as `0.0`. Catches future re-application
+    /// of `add_one_to_vec` or similar offset logic.
     #[test]
-    fn bridge_applies_gemma_one_plus_w_offset_to_standard_norms() {
+    fn bridge_passes_norm_weights_through_verbatim() {
         let cfg = qwen35_tiny_config();
         let arch = Qwen35Arch::from_config(cfg.clone());
         let mut tensors = std::collections::HashMap::new();
         let mut vectors = std::collections::HashMap::new();
         populate_tensors(&mut tensors, &mut vectors, &arch);
 
-        // Overwrite every norm-weight vector with zeros to make the
-        // offset behaviour observable: standard norms should become
-        // 1.0 after the bridge; ssm_norm should remain 0.0.
+        // Overwrite every norm-weight vector with zeros so the bridge
+        // pass-through is observable.
         for layer in 0..cfg.num_layers {
             let prefix = format!("layers.{layer}.");
             vectors.insert(
@@ -547,59 +542,49 @@ mod tests {
 
         let w = load_qwen35_weights(&mw, &arch).expect("bridge");
 
-        // Final norm: 0.0 stored → (1 + 0.0) = 1.0 after bridge.
+        // All norms should pass through verbatim — stored 0.0 → 0.0.
         for &v in w.final_norm.iter() {
-            assert!(
-                (v - 1.0).abs() < 1e-9,
-                "final_norm should be 1.0 after (1+w) offset; got {v}"
-            );
+            assert!(v.abs() < 1e-9, "final_norm should pass through; got {v}");
         }
-
-        // Per-layer norms.
         for (idx, layer) in w.layers.iter().enumerate() {
-            // attn_post_norm always uses (1+w).
             for &v in layer.attn_post_norm.iter() {
                 assert!(
-                    (v - 1.0).abs() < 1e-9,
-                    "layer {idx} attn_post_norm should be 1.0; got {v}"
+                    v.abs() < 1e-9,
+                    "layer {idx} attn_post_norm should pass through; got {v}"
                 );
             }
-
             match &layer.block {
                 Qwen35LayerWeights::Linear(dn) => {
-                    // attn_norm uses (1+w).
                     for &v in dn.attn_norm.iter() {
                         assert!(
-                            (v - 1.0).abs() < 1e-9,
-                            "layer {idx} (linear) attn_norm should be 1.0; got {v}"
+                            v.abs() < 1e-9,
+                            "layer {idx} (linear) attn_norm should pass through; got {v}"
                         );
                     }
-                    // ssm_norm does NOT use (1+w) — stays raw.
                     for &v in dn.ssm_norm.iter() {
                         assert!(
                             v.abs() < 1e-9,
-                            "layer {idx} (linear) ssm_norm should stay raw 0.0; got {v}"
+                            "layer {idx} (linear) ssm_norm should pass through; got {v}"
                         );
                     }
                 }
                 Qwen35LayerWeights::Attention(at) => {
-                    // attn_norm, attn_q_norm, attn_k_norm all use (1+w).
                     for &v in at.attn_norm.iter() {
                         assert!(
-                            (v - 1.0).abs() < 1e-9,
-                            "layer {idx} (attn) attn_norm should be 1.0; got {v}"
+                            v.abs() < 1e-9,
+                            "layer {idx} (attn) attn_norm should pass through; got {v}"
                         );
                     }
                     for &v in at.attn_q_norm.iter() {
                         assert!(
-                            (v - 1.0).abs() < 1e-9,
-                            "layer {idx} (attn) attn_q_norm should be 1.0; got {v}"
+                            v.abs() < 1e-9,
+                            "layer {idx} (attn) attn_q_norm should pass through; got {v}"
                         );
                     }
                     for &v in at.attn_k_norm.iter() {
                         assert!(
-                            (v - 1.0).abs() < 1e-9,
-                            "layer {idx} (attn) attn_k_norm should be 1.0; got {v}"
+                            v.abs() < 1e-9,
+                            "layer {idx} (attn) attn_k_norm should pass through; got {v}"
                         );
                     }
                 }
@@ -2142,6 +2127,61 @@ mod tests {
             eprintln!(
                 "Mixed signs ({} neg, {} pos) — unusual; investigate further",
                 n_neg, n_pos
+            );
+        }
+    }
+
+    /// Diagnostic: dump the raw stored values of `input_layernorm.weight`
+    /// for layer 0, and the magnitude of the FINAL value our bridge
+    /// produces (after potential `(1+w)` offset).
+    ///
+    /// llama.cpp's eval-callback shows `attn_norm-0 = MUL(norm-0,
+    /// blk.0.attn_norm.weight)` and the result is values ~1.0-2.0
+    /// magnitude (similar to norm-0). That implies stored weight is
+    /// ≈ 1.0 (not 0.05 as the agent suggested would be the case
+    /// for raw zero-init delta storage).
+    ///
+    /// If our stored attn_norm.weight is ≈ 1.0 → my C.4u
+    /// `add_one_to_vec` was WRONG (double-applies offset).
+    /// If our stored attn_norm.weight is ≈ 0.05 → C.4u was correct.
+    #[test]
+    fn real_gguf_qwen35_attn_norm_weight_diagnostic() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping attn_norm weight diagnostic");
+                return;
+            }
+        };
+        let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
+        let attn_norm = weights
+            .vectors
+            .get("layers.0.input_layernorm.weight")
+            .expect("layers.0.input_layernorm.weight must exist");
+        eprintln!(
+            "layers.0.input_layernorm.weight (n={}) first-10 values: {:?}",
+            attn_norm.len(),
+            &attn_norm[..10]
+        );
+        let min = attn_norm.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = attn_norm.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mean = attn_norm.iter().sum::<f32>() / attn_norm.len() as f32;
+        let mean_abs = attn_norm.iter().map(|&v| v.abs()).sum::<f32>() / attn_norm.len() as f32;
+        eprintln!("min={min:.4} max={max:.4} mean={mean:.4} mean_abs={mean_abs:.4}");
+        if mean_abs > 0.5 {
+            eprintln!(
+                "✓ stored weight is ≈ 1.0 magnitude → GGUF already has (1+w) baked in. \
+                 My C.4u `add_one_to_vec` is DOUBLE-APPLYING the offset and should be reverted."
+            );
+        } else if mean_abs < 0.1 {
+            eprintln!(
+                "✓ stored weight is ≈ delta magnitude (< 0.1) → GGUF stores raw `w`. \
+                 C.4u's `add_one_to_vec` is correct."
+            );
+        } else {
+            eprintln!(
+                "Intermediate magnitude — neither cleanly raw-delta nor pre-applied. \
+                 Investigate further."
             );
         }
     }
