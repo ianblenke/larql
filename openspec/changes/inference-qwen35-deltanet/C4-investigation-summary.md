@@ -1,6 +1,6 @@
 # Phase C.4–C.5 investigation summary
 
-Status as of 2026-05-11 after ~30 sub-phases on the
+Status as of 2026-05-11 after ~33 sub-phases on the
 `inference-qwen35-deltanet` openspec change.
 
 ## Where we are
@@ -11,16 +11,27 @@ Status as of 2026-05-11 after ~30 sub-phases on the
   real-GGUF env-gated tests pass.
 - **Parity oracle operational.** `llama-eval-callback` is built;
   per-layer tensor comparison vs llama.cpp now drives bug
-  bisection. Layer-0 `x_norm`, `qkv_conv`, and `final_out` all
-  verified BIT-EXACT or near-bit-exact (f32 precision) at sampled
-  positions.
-- **4 confirmed bug fixes landed** (PRs #60, #63, #74-reverts-#69,
-  #76).
-- **1 known remaining issue**: layer-0 `linear_attn_out` is ~3×
-  larger than llama.cpp's. Source unidentified — the `ssm_out`
-  matmul input is bit-exact but output diverges. Layer 1's
-  `attn_norm` also ~3× larger, indicating consistent bounded
-  amplification (not compounding per layer).
+  bisection. Layer-0 `x_norm`, `qkv_conv`, and `final_out`
+  (TOKEN 0 ONLY) all verified BIT-EXACT or near-bit-exact at
+  sampled positions.
+- **6 confirmed bug fixes landed** (PRs #60, #63, #74, #76, #79,
+  plus diagnostic infra).
+- **1 known remaining issue**: token 0 matches bit-exact, but
+  **token 1+ `final_out` diverges ~20× from llama.cpp**. The bug
+  is in inter-token state-handling. The most likely structural
+  cause is per-token recurrent algorithm semantically diverging
+  from llama.cpp's prefill-chunked algorithm, even though the
+  Gated DeltaNet paper claims they're mathematically equivalent.
+
+## Token-rank progression for step-0 GT (`|-` = 49143)
+
+| State | step-0 GT rank | step-0 GT logit |
+|---|---:|---:|
+| Pre-C.4 fixes | 118,718 | 0.097 |
+| After PR #69 (wrong double 1+w) | 16,054 | 4.289 |
+| After PR #74 (revert 1+w, correct math) | 183,447 | -1.344 |
+| After PR #76 (head-major flatten) | 149,333 | -0.913 |
+| **After PR #79 (sk-before-decay)** | **101,839** | **-0.083** |
 
 ## Confirmed fixes (in `main`)
 
