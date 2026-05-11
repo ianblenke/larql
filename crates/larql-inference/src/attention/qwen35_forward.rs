@@ -96,6 +96,21 @@ pub fn qwen35_forward_step(
 
     let mut x: Array1<f32> = weights.embed.row(token_id as usize).to_owned();
 
+    // Optional per-layer trace, enabled via `LARQL_QWEN35_TRACE=1`.
+    // Prints residual stream stats to stderr at each layer so a
+    // single forward run can be bisected for "where does the
+    // stream blow up / collapse." Cheap when disabled (the env
+    // lookup is a thread-local cache hit) so leaving it in the
+    // production forward is fine.
+    let trace = std::env::var("LARQL_QWEN35_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "    embed:                  l2={:.3} max_abs={:.3}",
+            l2(&x),
+            max_abs(&x),
+        );
+    }
+
     // 2. Hybrid layer stack.
     for layer in 0..n_layers {
         let layer_w = &weights.layers[layer];
@@ -119,16 +134,56 @@ pub fn qwen35_forward_step(
         // `ffn_in + ffn_out`; the FFN residual bypasses the
         // post-norm per design.md §6).
         x = &residual + &ffn_out;
+
+        if trace {
+            let kind = matches!(
+                layer_w.block,
+                crate::attention::qwen35_block::Qwen35LayerWeights::Linear(_)
+            );
+            eprintln!(
+                "  L{layer:02} {} block_l2={:.3} block_max={:.3}  ffn_l2={:.3} ffn_max={:.3}  x_l2={:.3} x_max={:.3}",
+                if kind { "lin" } else { "atn" },
+                l2(&block_out),
+                max_abs(&block_out),
+                l2(&ffn_out),
+                max_abs(&ffn_out),
+                l2(&x),
+                max_abs(&x),
+            );
+        }
     }
 
     // 3. Final norm + lm_head.
     let x_final = rms_norm_1d_pub(&x, &weights.final_norm, eps);
     let logits = weights.lm_head.dot(&x_final);
 
+    if trace {
+        eprintln!(
+            "    final_norm(x):          l2={:.3} max_abs={:.3}",
+            l2(&x_final),
+            max_abs(&x_final),
+        );
+        eprintln!(
+            "    logits:                 l2={:.3} max_abs={:.3}",
+            l2(&logits),
+            max_abs(&logits),
+        );
+    }
+
     // 4. Advance position for the next token's RoPE.
     hybrid_cache.next_position += 1;
 
     logits
+}
+
+#[inline]
+fn l2(a: &Array1<f32>) -> f32 {
+    a.iter().map(|&v| v * v).sum::<f32>().sqrt()
+}
+
+#[inline]
+fn max_abs(a: &Array1<f32>) -> f32 {
+    a.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()))
 }
 
 /// SwiGLU FFN: `down @ (silu(gate @ x) * (up @ x))`.
