@@ -1781,4 +1781,157 @@ mod tests {
             "temperature sampling produced <2 distinct tokens: {generated:?}"
         );
     }
+
+    // ── C.4r: token-level diff vs llama.cpp ground truth ──
+    //
+    // Greedily decodes 5 tokens from our forward, then for each
+    // decoded position prints WHERE the llama.cpp ground-truth
+    // first token lands in our logit distribution. Quantifies
+    // "how broken is our forward" without needing a full parity
+    // oracle.
+    //
+    // Ground truth from `llama-cli --jinja --single-turn -p "Hi"
+    // --temp 0`: `|- [Start thinking]\nHere's a thinking…`. The
+    // first generated character is `|`, so the first token is
+    // tokenizer("|")[0]. Encode the prefix `|- [Start` and look up
+    // where each of those tokens lands in our forward's logits at
+    // each decode position.
+    //
+    // If our argmax matches → forward is correct at that position.
+    // If our argmax differs but expected token is in top-10 →
+    // forward is roughly right but slightly off (small numerical
+    // bug). If expected token has small or negative logit →
+    // forward is structurally broken.
+    #[test]
+    fn real_gguf_qwen35_token_diff_vs_llama_cpp() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping token-diff test");
+                return;
+            }
+        };
+        let gguf_path = std::path::PathBuf::from(&path);
+        let model_dir = gguf_path
+            .parent()
+            .expect("LARQL_QWEN35_GGUF must point to a file in a directory");
+        let tokenizer = match crate::tokenizer::load_tokenizer(model_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("no tokenizer.json sibling next to GGUF ({e:?}) — skipping");
+                return;
+            }
+        };
+
+        // Same chat prompt as C.4j.
+        let prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        let prompt_ids: Vec<u32> = tokenizer
+            .encode(prompt, true)
+            .expect("encode prompt")
+            .get_ids()
+            .to_vec();
+        eprintln!("prompt has {} tokens: {prompt_ids:?}", prompt_ids.len());
+
+        // Ground truth from llama-cli for the same prompt (greedy,
+        // temp=0). Captured 2026-05-11.
+        let ground_truth_text = "|- [Start thinking]\nHere's a thinking";
+        let gt_ids: Vec<u32> = tokenizer
+            .encode(ground_truth_text, false)
+            .expect("encode ground truth")
+            .get_ids()
+            .to_vec();
+        eprintln!("ground truth {:?} → tokens {gt_ids:?}", ground_truth_text);
+
+        let weights = larql_models::load_gguf(&gguf_path).expect("load_gguf");
+        let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+
+        let arch = &*weights.arch;
+        let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
+            hidden: weights.hidden_size,
+            head_v_dim: arch.ssm_state_size(),
+            n_v_heads: arch.ssm_dt_rank(),
+            n_k_heads: arch.ssm_group_count(),
+            d_conv: arch.ssm_conv_kernel(),
+            eps: 1e-6,
+        };
+        let rotary_dim: usize = arch
+            .rope_dimension_sections()
+            .map(|s| s.iter().sum())
+            .unwrap_or(weights.head_dim);
+        let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
+            hidden: weights.hidden_size,
+            n_head: weights.num_q_heads,
+            n_head_kv: weights.num_kv_heads,
+            head_dim: weights.head_dim,
+            rotary_dim,
+            rope_base: weights.rope_base,
+            eps: 1e-6,
+        };
+        let layer_kinds: Vec<bool> = (0..weights.num_layers)
+            .map(|l| arch.is_linear_attention_layer(l))
+            .collect();
+        let mut cache = crate::attention::qwen35_block::DeltaNetHybridCache::allocate(
+            &layer_kinds,
+            attn_dims.kv_dim(),
+            dn_dims.d_conv,
+            dn_dims.conv_dim(),
+            dn_dims.head_v_dim,
+            dn_dims.n_v_heads,
+        );
+
+        // Prefill (no greedy decoding during prefill).
+        let mut last_logits: Option<ndarray::Array1<f32>> = None;
+        for &tok in &prompt_ids {
+            last_logits = Some(crate::attention::qwen35_forward::qwen35_forward_step(
+                tok, &w, &dn_dims, &attn_dims, &mut cache, 1e-6,
+            ));
+        }
+
+        // For each ground-truth position, compute argmax + where the
+        // expected token lands in our logit distribution.
+        let n_compare = gt_ids.len().min(5);
+        let mut logits = last_logits.expect("at least one prompt token");
+        eprintln!(
+            "\n{:>4} {:>10} {:>10} {:>10} {:>10}",
+            "step", "gt_id", "gt_logit", "gt_rank", "our_argmax"
+        );
+        for step in 0..n_compare {
+            let expected = gt_ids[step];
+            let expected_logit = logits[expected as usize];
+            // Rank of expected: how many tokens have a strictly higher logit.
+            let rank = logits.iter().filter(|&&v| v > expected_logit).count();
+            let (argmax_id, argmax_v) = logits.iter().enumerate().fold(
+                (0_usize, f32::NEG_INFINITY),
+                |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) },
+            );
+            eprintln!(
+                "{:>4} {:>10} {:>10.3} {:>10} {:>10}  (gt='{}', our='{}')",
+                step,
+                expected,
+                expected_logit,
+                rank,
+                argmax_id,
+                tokenizer
+                    .decode(&[expected], false)
+                    .unwrap_or_default()
+                    .replace('\n', "\\n"),
+                tokenizer
+                    .decode(&[argmax_id as u32], false)
+                    .unwrap_or_default()
+                    .replace('\n', "\\n"),
+            );
+            // Feed argmax forward (NOT the ground-truth token — measures
+            // our model's autoregressive trajectory).
+            if step + 1 < n_compare {
+                logits = crate::attention::qwen35_forward::qwen35_forward_step(
+                    argmax_id as u32,
+                    &w,
+                    &dn_dims,
+                    &attn_dims,
+                    &mut cache,
+                    1e-6,
+                );
+            }
+        }
+    }
 }
