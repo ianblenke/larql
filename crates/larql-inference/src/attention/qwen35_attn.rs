@@ -30,16 +30,29 @@ use super::deltanet_state::sigmoid;
 /// per-head sigmoid'd gate.
 ///
 /// Input shape: `[seq_len, 2 * n_head * head_dim]`.
-/// Output:
-/// - `q`: `[seq_len, n_head * head_dim]` — the Q tensor; caller
-///   applies per-head RMSNorm + RoPE + attention.
-/// - `gate_sigmoid`: `[seq_len, n_head * head_dim]` — the gate
-///   tensor with sigmoid already applied element-wise. Caller
-///   multiplies the attention output (per-head) by this BEFORE the
-///   final `attn_output` projection.
 ///
-/// The split convention (Q first, gate second) matches llama.cpp's
-/// `qwen35.cpp::build_layer_attn` view of the fused tensor.
+/// **Layout convention** (matches llama.cpp's `qwen35.cpp::build_layer_attn`,
+/// lines 220-244 in upstream): the fused tensor is laid out as
+/// **interleaved-per-head** along the inner axis:
+///
+/// ```text
+/// [H0_Q_d0..d_{H-1}, H0_gate_d0..d_{H-1}, H1_Q..., H1_gate..., ...]
+/// ```
+///
+/// Stride per head = `2 * head_dim`; Q starts at offset 0, gate at
+/// offset `head_dim` within each head's slab. This is the **NOT** the
+/// "first half Q, second half gate" split-half layout that a naive
+/// reading of "split, sigmoid the second half" suggests.
+///
+/// Output (head-major contiguous, matching `rms_norm_heads`'s
+/// expected layout):
+/// - `q`: `[seq_len, n_head * head_dim]` — the Q tensor; caller
+///   applies per-head RMSNorm + RoPE + attention. Column `h * head_dim
+///   + d` is head h, dim d.
+/// - `gate_sigmoid`: `[seq_len, n_head * head_dim]` — the gate tensor
+///   with sigmoid already applied element-wise. Caller multiplies the
+///   attention output (per-head) by this BEFORE the final `attn_output`
+///   projection.
 pub fn split_q_gate(
     fused: &Array2<f32>,
     n_head: usize,
@@ -47,22 +60,26 @@ pub fn split_q_gate(
 ) -> (Array2<f32>, Array2<f32>) {
     let seq_len = fused.shape()[0];
     let total = fused.shape()[1];
-    let half = n_head * head_dim;
+    let q_dim = n_head * head_dim;
     debug_assert_eq!(
         total,
-        2 * half,
+        2 * q_dim,
         "fused Q+gate tensor must have {} cols (2 * n_head * head_dim), got {}",
-        2 * half,
+        2 * q_dim,
         total
     );
 
-    let mut q = Array2::<f32>::zeros((seq_len, half));
-    let mut gate = Array2::<f32>::zeros((seq_len, half));
+    let mut q = Array2::<f32>::zeros((seq_len, q_dim));
+    let mut gate = Array2::<f32>::zeros((seq_len, q_dim));
 
     for s in 0..seq_len {
-        for c in 0..half {
-            q[[s, c]] = fused[[s, c]];
-            gate[[s, c]] = sigmoid(fused[[s, half + c]]);
+        for h in 0..n_head {
+            let in_off = h * 2 * head_dim;
+            let out_off = h * head_dim;
+            for d in 0..head_dim {
+                q[[s, out_off + d]] = fused[[s, in_off + d]];
+                gate[[s, out_off + d]] = sigmoid(fused[[s, in_off + head_dim + d]]);
+            }
         }
     }
 
@@ -106,18 +123,24 @@ mod tests {
     use ndarray::array;
 
     #[test]
-    fn split_q_gate_separates_halves() {
-        // n_head = 2, head_dim = 2 → half = 4, total = 8.
-        // Row 0: Q = [1, 2, 3, 4], gate_pre = [-1, 0, 1, 2].
-        // Expected gate_post = sigmoid([-1, 0, 1, 2]).
-        let fused = array![[1.0_f32, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0]];
+    fn split_q_gate_interleaved_per_head() {
+        // n_head = 2, head_dim = 2.
+        // Layout per llama.cpp qwen35.cpp: interleaved per head.
+        //   [H0_Q_d0, H0_Q_d1, H0_gate_d0, H0_gate_d1,
+        //    H1_Q_d0, H1_Q_d1, H1_gate_d0, H1_gate_d1]
+        // So fused row = [1, 2, -1, 0, 3, 4, 1, 2]
+        //   → Q  = [1, 2, 3, 4] (head-major)
+        //   → gate_pre = [-1, 0, 1, 2] → sigmoid each
+        let fused = array![[1.0_f32, 2.0, -1.0, 0.0, 3.0, 4.0, 1.0, 2.0]];
         let (q, gate) = split_q_gate(&fused, 2, 2);
         assert_eq!(q.shape(), &[1, 4]);
         assert_eq!(gate.shape(), &[1, 4]);
-        // Q is the first half verbatim.
+        // Q output is head-major contiguous: H0 then H1.
         assert_eq!(q[[0, 0]], 1.0);
+        assert_eq!(q[[0, 1]], 2.0);
+        assert_eq!(q[[0, 2]], 3.0);
         assert_eq!(q[[0, 3]], 4.0);
-        // Gate is the second half passed through sigmoid.
+        // Gate output is also head-major contiguous, sigmoid applied.
         assert!((gate[[0, 0]] - sigmoid(-1.0)).abs() < 1e-6);
         assert!((gate[[0, 1]] - 0.5).abs() < 1e-6); // sigmoid(0)
         assert!((gate[[0, 2]] - sigmoid(1.0)).abs() < 1e-6);
@@ -126,13 +149,16 @@ mod tests {
 
     #[test]
     fn split_q_gate_multi_row() {
+        // n_head=1, head_dim=2 → fused total = 2 * 1 * 2 = 4 cols.
+        // Per-head layout (head 0): [Q_d0, Q_d1, gate_d0, gate_d1].
+        //   row 0: Q=[1, 0],  gate_pre=[2, 0]
+        //   row 1: Q=[3, 0],  gate_pre=[4, 0]
         let fused = array![[1.0_f32, 0.0, 2.0, 0.0], [3.0, 0.0, 4.0, 0.0],];
-        // n_head=1, head_dim=2 → half=2.
         let (q, gate) = split_q_gate(&fused, 1, 2);
         assert_eq!(q.shape(), &[2, 2]);
         assert_eq!(q.row(0).to_vec(), vec![1.0, 0.0]);
         assert_eq!(q.row(1).to_vec(), vec![3.0, 0.0]);
-        // Gate pre-sigmoid = [2.0, 0.0] then [4.0, 0.0].
+        // Gate pre-sigmoid: row 0 = [2.0, 0.0], row 1 = [4.0, 0.0].
         assert!((gate[[0, 0]] - sigmoid(2.0)).abs() < 1e-6);
         assert!((gate[[0, 1]] - 0.5).abs() < 1e-6);
         assert!((gate[[1, 0]] - sigmoid(4.0)).abs() < 1e-6);
@@ -165,7 +191,9 @@ mod tests {
         // End-to-end shape check: split a fused tensor, multiply
         // a dummy attn output by the gate, verify shapes stayed
         // consistent.
-        let fused = array![[1.0_f32, 2.0, 0.0, 0.0]]; // n_head=1, head_dim=2
+        //
+        // n_head=1, head_dim=2 → fused = [Q_d0, Q_d1, gate_d0, gate_d1].
+        let fused = array![[1.0_f32, 2.0, 0.0, 0.0]];
         let (_q, gate) = split_q_gate(&fused, 1, 2);
         let mut attn = array![[7.0_f32, 11.0]];
         apply_q_gate(&mut attn, &gate);
