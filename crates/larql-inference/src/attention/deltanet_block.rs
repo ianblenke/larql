@@ -304,10 +304,12 @@ pub fn deltanet_block_step(
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = o_flat.len();
         eprintln!(
-            "final_out (pre-ssm_out): first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            "final_out (pre-ssm_out): first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}  sum={:.4}  mid={:.4} {:.4} {:.4}",
             o_flat[0], o_flat[1], o_flat[2],
             o_flat[n - 3], o_flat[n - 2], o_flat[n - 1],
             o_flat.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            o_flat.iter().sum::<f32>(),
+            o_flat[1024], o_flat[2048], o_flat[3072],
         );
     }
 
