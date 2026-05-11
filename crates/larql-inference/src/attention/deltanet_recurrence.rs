@@ -68,19 +68,23 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head `h` reads Q/K head `h / repeat_factor`
-        // (BLOCK pattern matching HF's `repeat_interleave(dim=head_axis)`).
+        // GQA broadcast: V head `h` reads Q/K head `h % h_k` (CYCLE pattern).
         //
-        // C.5h tried CYCLE (`h % h_k`) per llama.cpp's
-        // `ggml_compute_forward_gated_delta_net_one_chunk` (line 10543:
-        // `ik1 = iv1 % nek1`), but empirically regressed both step-0
-        // (101,839 → 125,425) and step-1 (7,617 → 32,881) GT ranks
-        // versus llama.cpp's ground-truth output. The model weights
-        // were trained with HF's `repeat_interleave` block layout, so
-        // block remains correct here even though llama.cpp's runtime
-        // kernel reads heads via `%`. The reconciliation lives in
-        // llama.cpp's GGUF tensor layout, not in this kernel.
-        let kh = h / repeat_factor;
+        // Authority: llama.cpp `ggml/src/ggml-cpu/ops.cpp`
+        // `ggml_compute_forward_gated_delta_net_one_chunk`, line 10542-10543:
+        //   const int64_t iq1 = iv1 % neq1;
+        //   const int64_t ik1 = iv1 % nek1;
+        //
+        // Verified by C.5i elementwise diff of `final_out` against
+        // llama-eval-callback binary dumps: with CYCLE, pearson=1.000,
+        // max|diff|=0.006 on token 0 layer 0 (vs BLOCK pearson=0.77,
+        // max|diff|=3.17 from heads being assigned to wrong K groups).
+        //
+        // The C.5h reversion was wrong: it relied on token-rank as the
+        // metric, but rank is contaminated by downstream bugs and didn't
+        // catch this. Elementwise parity is the correct oracle.
+        let kh = h % h_k;
+        let _ = repeat_factor;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
 

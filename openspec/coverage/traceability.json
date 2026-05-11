@@ -21817,157 +21817,157 @@
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 491,
+      "line": 626,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 406,
+      "line": 541,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 527,
+      "line": 662,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 455,
+      "line": 590,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 517,
+      "line": 652,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 507,
+      "line": 642,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 491,
+      "line": 626,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 406,
+      "line": 541,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 527,
+      "line": 662,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 455,
+      "line": 590,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 517,
+      "line": 652,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 507,
+      "line": 642,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_decay_halves_state",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 214,
+      "line": 218,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_delta_rule_corrects_seeded_state",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 301,
+      "line": 305,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_initial_state_rank1_update",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 153,
+      "line": 157,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_k_broadcast_3x_to_v_heads",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 266,
+      "line": 270,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_q_scale_is_inverse_sqrt_s_k",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 335,
+      "line": 339,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_two_calls_compound",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 234,
+      "line": 238,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::delta_net_step_zero_beta_leaves_state_unchanged",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 192,
+      "line": 196,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_decay_halves_state",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 214,
+      "line": 218,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_delta_rule_corrects_seeded_state",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 301,
+      "line": 305,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_initial_state_rank1_update",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 153,
+      "line": 157,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_k_broadcast_3x_to_v_heads",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 266,
+      "line": 270,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_q_scale_is_inverse_sqrt_s_k",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 335,
+      "line": 339,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_two_calls_compound",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 234,
+      "line": 238,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_recurrence::tests::delta_net_step_zero_beta_leaves_state_unchanged",
       "file": "crates/larql-inference/src/attention/deltanet_recurrence.rs",
-      "line": 192,
+      "line": 196,
       "crate": "larql_inference"
     },
     {

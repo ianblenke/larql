@@ -171,6 +171,61 @@ pub fn deltanet_block_step(
             qkv_mixed[n - 1],
             qkv_mixed.iter().map(|v| v * v).sum::<f32>().sqrt(),
         );
+        // Z gate (pre-silu): raw first/last-3 + per-head l2 + silu magnitudes.
+        eprintln!(
+            "z(gate) raw: first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}  mid={:.4} {:.4} {:.4}",
+            z[0], z[1], z[2],
+            z[z.len() - 3], z[z.len() - 2], z[z.len() - 1],
+            z.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            z[1024], z[2048], z[3072],
+        );
+        // Also dump attn_gate weight stats to see if weight itself is the bug.
+        let attn_gate = &weights.attn_gate;
+        let aw = attn_gate.as_slice().unwrap_or(&[]);
+        if !aw.is_empty() {
+            let max_abs = aw.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let mean_abs = aw.iter().map(|v| v.abs()).sum::<f32>() / aw.len() as f32;
+            let l2 = aw.iter().map(|v| v * v).sum::<f32>().sqrt();
+            eprintln!(
+                "attn_gate.weight: shape={:?}  max|w|={:.4}  mean|w|={:.4}  frobenius={:.3}  first-3=[{:.4},{:.4},{:.4}]",
+                attn_gate.shape(), max_abs, mean_abs, l2,
+                aw[0], aw[1], aw[2],
+            );
+        }
+
+        let mut z_l2: Vec<(usize, f32, f32)> = (0..dims.n_v_heads)
+            .map(|h| {
+                let off = h * dims.head_v_dim;
+                let l2 = (0..dims.head_v_dim)
+                    .map(|d| {
+                        let v = z[off + d];
+                        v * v
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                let silu_l2 = (0..dims.head_v_dim)
+                    .map(|d| {
+                        let v = z[off + d];
+                        let s = v * sigmoid(v);
+                        s * s
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                (h, l2, silu_l2)
+            })
+            .collect();
+        z_l2.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        eprintln!(
+            "z(gate):   top-5 silu-heads: {} (z={:.3}, silu={:.3}) {} ({:.3}, {:.3}) {} ({:.3}, {:.3}) {} ({:.3}, {:.3}) {} ({:.3}, {:.3})  bot-3: {} ({:.3}, {:.3}) {} ({:.3}, {:.3}) {} ({:.3}, {:.3})",
+            z_l2[0].0, z_l2[0].1, z_l2[0].2,
+            z_l2[1].0, z_l2[1].1, z_l2[1].2,
+            z_l2[2].0, z_l2[2].1, z_l2[2].2,
+            z_l2[3].0, z_l2[3].1, z_l2[3].2,
+            z_l2[4].0, z_l2[4].1, z_l2[4].2,
+            z_l2[z_l2.len() - 1].0, z_l2[z_l2.len() - 1].1, z_l2[z_l2.len() - 1].2,
+            z_l2[z_l2.len() - 2].0, z_l2[z_l2.len() - 2].1, z_l2[z_l2.len() - 2].2,
+            z_l2[z_l2.len() - 3].0, z_l2[z_l2.len() - 3].1, z_l2[z_l2.len() - 3].2,
+        );
     }
     let beta_raw = weights.ssm_beta.dot(&x_norm); // [n_v_heads]
     let alpha_raw = weights.ssm_alpha.dot(&x_norm); // [n_v_heads]
@@ -260,13 +315,32 @@ pub fn deltanet_block_step(
     // 6. Delta-rule recurrence.
     let o = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state);
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
+        let mut per_head: Vec<(usize, f32)> = (0..dims.n_v_heads)
+            .map(|h| {
+                let l2 = (0..dims.head_v_dim)
+                    .map(|d| {
+                        let v = o[[d, h]];
+                        v * v
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                (h, l2)
+            })
+            .collect();
+        per_head.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         eprintln!(
-            "o(recurrence) shape={:?}: first-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}",
+            "o(recurrence) shape={:?}: first-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}  top-3 heads: {} ({:.3}), {} ({:.3}), {} ({:.3})  bot-3 heads: {} ({:.3}), {} ({:.3}), {} ({:.3})",
             o.shape(),
             o[[0, 0]],
             o[[1, 0]],
             o[[2, 0]],
             o.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            per_head[0].0, per_head[0].1,
+            per_head[1].0, per_head[1].1,
+            per_head[2].0, per_head[2].1,
+            per_head[per_head.len() - 1].0, per_head[per_head.len() - 1].1,
+            per_head[per_head.len() - 2].0, per_head[per_head.len() - 2].1,
+            per_head[per_head.len() - 3].0, per_head[per_head.len() - 3].1,
         );
     }
     // o has shape [head_v_dim, n_v_heads] with `o[d, h]` = head h, dim d.
@@ -303,13 +377,74 @@ pub fn deltanet_block_step(
     }
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = o_flat.len();
+        // Optional: dump full final_out (and other vectors) to binary file
+        // for elementwise diff vs llama-eval-callback's LLAMA_DUMP_BIN_DIR.
+        if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_BIN_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            // Single-token, we just write [N] f32. Use the same convention as
+            // llama-eval-callback so the diff tool reads both identically.
+            let write = |name: &str, data: &[f32], ne0: i64| {
+                let path = std::path::Path::new(&dir).join(name);
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    use std::io::Write;
+                    let ne: [i64; 4] = [ne0, 1, 1, 1];
+                    for n in ne {
+                        f.write_all(&n.to_le_bytes()).ok();
+                    }
+                    for v in data {
+                        f.write_all(&v.to_le_bytes()).ok();
+                    }
+                }
+            };
+            write(
+                "our_final_out.bin",
+                &o_flat.as_slice().unwrap_or(&[]),
+                o_flat.len() as i64,
+            );
+            write("our_z.bin", &z.as_slice().unwrap_or(&[]), z.len() as i64);
+            write(
+                "our_x_norm.bin",
+                &x_norm.as_slice().unwrap_or(&[]),
+                x_norm.len() as i64,
+            );
+            write(
+                "our_qkv_conv.bin",
+                &qkv_conv.as_slice().unwrap_or(&[]),
+                qkv_conv.len() as i64,
+            );
+            // Mark done so we don't re-dump on subsequent tokens.
+            std::env::remove_var("LARQL_QWEN35_DUMP_BIN_DIR");
+        }
+        let mut per_head: Vec<(usize, f32)> = (0..dims.n_v_heads)
+            .map(|h| {
+                let off = h * dims.head_v_dim;
+                let l2 = (0..dims.head_v_dim)
+                    .map(|d| {
+                        let v = o_flat[off + d];
+                        v * v
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                (h, l2)
+            })
+            .collect();
+        per_head.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         eprintln!(
-            "final_out (pre-ssm_out): first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}  sum={:.4}  mid={:.4} {:.4} {:.4}",
+            "final_out (pre-ssm_out): first-3 = [{:.4}, {:.4}, {:.4}]  last-3 = [{:.4}, {:.4}, {:.4}]  l2={:.3}  sum={:.4}  mid={:.4} {:.4} {:.4}  top-5 heads: {} ({:.3}) {} ({:.3}) {} ({:.3}) {} ({:.3}) {} ({:.3})  median head: {} ({:.3})  bot-3: {} ({:.3}) {} ({:.3}) {} ({:.3})",
             o_flat[0], o_flat[1], o_flat[2],
             o_flat[n - 3], o_flat[n - 2], o_flat[n - 1],
             o_flat.iter().map(|v| v * v).sum::<f32>().sqrt(),
             o_flat.iter().sum::<f32>(),
             o_flat[1024], o_flat[2048], o_flat[3072],
+            per_head[0].0, per_head[0].1,
+            per_head[1].0, per_head[1].1,
+            per_head[2].0, per_head[2].1,
+            per_head[3].0, per_head[3].1,
+            per_head[4].0, per_head[4].1,
+            per_head[per_head.len() / 2].0, per_head[per_head.len() / 2].1,
+            per_head[per_head.len() - 1].0, per_head[per_head.len() - 1].1,
+            per_head[per_head.len() - 2].0, per_head[per_head.len() - 2].1,
+            per_head[per_head.len() - 3].0, per_head[per_head.len() - 3].1,
         );
     }
 

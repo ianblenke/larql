@@ -1,7 +1,33 @@
 # Phase C.4–C.5 investigation summary
 
-Status as of 2026-05-11 after ~33 sub-phases on the
+Status as of 2026-05-11 after ~34 sub-phases on the
 `inference-qwen35-deltanet` openspec change.
+
+## C.5i breakthrough — CYCLE GQA is correct (elementwise parity)
+
+Earlier sub-phases (C.4o → C.4u → C.5h) flipped CYCLE
+(`kh = h % h_k`) vs BLOCK (`kh = h / repeat_factor`) GQA mapping
+based on **token-rank** as the validator. C.5i instead extended
+llama.cpp's `common/debug.cpp` to dump full f32 tensors to
+`LLAMA_DUMP_BIN_DIR`, then compared token-0 layer-0 `final_out`
+against ours **elementwise**:
+
+| GQA mode | pearson r | max\|diff\| | l2 ours | l2 theirs | median per-head ratio |
+|---|---|---|---|---|---|
+| BLOCK | 0.7697 | 3.17 | 7.01 | 6.67 | 0.996 |
+| **CYCLE** | **0.9999** | **0.006** | **6.67** | **6.67** | **0.998** |
+
+CYCLE matches llama.cpp's `final_output-0` token-0 essentially
+bit-exact (modulo Q5_K quant noise). Heads 12, 28, 10 (BLOCK
+amplified 100×+) and heads 32, 36, 37 (BLOCK suppressed 100×) all
+collapse to within 1% of llama.cpp under CYCLE. The C.5h reversion
+was wrong: token-rank is masked by downstream bugs and missed this.
+
+**Token-rank with CYCLE is the same as C.5h's measurement (~125k
+step-0).** The remaining bug is downstream of layer 0 — almost
+certainly in the recurrence algorithm order for non-empty state
+(decay-first vs sk-before-decay, per llama.cpp's actual kernel) and
+its compound effect across 64 layers.
 
 ## Where we are
 
