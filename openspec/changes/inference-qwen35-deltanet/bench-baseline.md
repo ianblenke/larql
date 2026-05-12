@@ -168,6 +168,42 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.A.6 follow-up: reduction-order + fmad in nvrtc
+
+Tightening the GPU kernel's numerical behaviour against the host
+reference while debugging the multi-position fused-path drift:
+
+- **L2 norm + rms_norm_heads reductions** now use a sequential
+  per-element accumulator in thread 0 (matches the host's per-d
+  loop in `l2_normalize_per_head_eps` / `residual::rms_norm_heads`).
+  The previous parallel tree reduction across 256 threads produced
+  bit-different sums from the CPU (max_abs drift 5e-7 → 2.4e-7 on
+  rms_norm; 4.5e-8 → 1.5e-8 on L2 norm at production shape).
+  All other threads still parallelise the elementwise normalize
+  pass, so the slowdown is negligible.
+- **nvrtc fmad disabled** (`CompileOptions { fmad: Some(false), .. }`)
+  for both the `cuda::deltanet` and `cuda::qwen35_block` modules.
+  Removes fused-multiply-add as a source of GPU/CPU divergence in
+  the recurrence + reshape + silu_mul kernels.
+- New unit test `l2_and_rms_norm_drift_at_qwen35_shape` quantifies
+  the residual drift at production shape (head_dim=128,
+  n_v_heads=48, n_k_heads=16).
+- New `src_offset > 0` coverage in
+  `reshape_kernels_match_cpu_at_qwen35_shape` validating the K / V
+  slab reshape with offsets the production fused path actually uses
+  (offset = key_dim and 2*key_dim into a packed qkv_conv buffer).
+
+Result on the parity check (`real_gguf_qwen35_token_diff_vs_llama_cpp`
+with `LARQL_QWEN35_E6A_FUSED=1`): **still diverges from llama.cpp
+GT at the first decode step** despite the new bit-tighter
+reductions and disabled fmad. The argmax numerics are identical
+before and after these changes, so the drift root cause is
+neither parallel reduction order nor fmad. Most likely it's the
+recurrence kernel's state-update pattern compounding through the
+9 prompt × 48 layer × position cycle in a way the single-call
+unit test doesn't catch — under continued investigation (still
+E.6.A.6). The default path (fused off) remains parity-clean.
+
 ## 2026-05-12 update — Phase E.6.A foundations (fused post-projection chain, opt-in)
 
 Lays down the Phase E.6.A infrastructure for a fused device-resident

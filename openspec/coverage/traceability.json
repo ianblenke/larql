@@ -21269,49 +21269,49 @@
     {
       "fqn": "larql_compute::cuda::deltanet::causal_conv1d_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 628,
+      "line": 645,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::deltanet_step_matches_cpu_tiny_decay_first",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 668,
+      "line": 685,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::l2_normalize_per_head_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 726,
+      "line": 743,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::rms_norm_heads_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 757,
+      "line": 774,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::causal_conv1d_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 628,
+      "line": 645,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::deltanet_step_matches_cpu_tiny_decay_first",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 668,
+      "line": 685,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::l2_normalize_per_head_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 726,
+      "line": 743,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::rms_norm_heads_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 757,
+      "line": 774,
       "crate": "larql_compute"
     },
     {
@@ -21371,37 +21371,49 @@
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 753,
+      "line": 899,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 660,
+      "line": 806,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::l2_and_rms_norm_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 721,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 594,
+      "line": 602,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 753,
+      "line": 899,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 660,
+      "line": 806,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::l2_and_rms_norm_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 721,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 594,
+      "line": 602,
       "crate": "larql_compute"
     },
     {

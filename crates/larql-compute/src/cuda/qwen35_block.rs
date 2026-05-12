@@ -34,7 +34,7 @@
 use std::sync::OnceLock;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use super::backend::CudaBackend;
 use super::driver::Driver;
@@ -120,7 +120,15 @@ fn functions(
     if let Some((_, silu, head_to_dim, dim_to_head, silu_mul)) = QWEN35_MODULE.get() {
         return Ok((silu, head_to_dim, dim_to_head, silu_mul));
     }
-    let ptx = compile_ptx(QWEN35_BLOCK_SRC)
+    // Match `deltanet.rs`: disable fmad so the kernel's fp32
+    // operations have the same rounding pattern as the host
+    // reference. See the comment over `compile_ptx_with_opts` in
+    // `deltanet.rs` for the why.
+    let opts = CompileOptions {
+        fmad: Some(false),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(QWEN35_BLOCK_SRC, opts)
         .map_err(|e| CudaInitError::DriverMissing(format!("nvrtc compile qwen35_block: {e:?}")))?;
     let module = drv
         .ctx
@@ -650,6 +658,144 @@ mod tests {
         for (i, (a, b)) in head_host.iter().zip(src.iter()).enumerate() {
             assert_eq!(a, b, "round-trip @ {i}");
         }
+
+        // Test src_offset > 0: the K/V slabs in the fused path call
+        // reshape_head_to_dim with a non-zero offset into the
+        // concatenated qkv_conv buffer. Bug here wouldn't show up in
+        // the offset=0 test above.
+        let key_dim = head_dim * 16;
+        let value_dim = head_dim * 48;
+        let conv_dim = 2 * key_dim + value_dim;
+        let qkv_src: Vec<f32> = (0..conv_dim).map(|i| 0.001 + i as f32 * 0.0005).collect();
+        let qkv_dev = drv.device_buf_from(&qkv_src).expect("htod qkv");
+        let mut k_dim_dev = drv.device_alloc_uninit(key_dim).expect("alloc k");
+        launch_reshape(
+            drv,
+            head_to_dim_f,
+            &qkv_dev,
+            &mut k_dim_dev,
+            head_dim,
+            16,
+            key_dim,
+        )
+        .expect("k slab reshape");
+        drv.sync().expect("sync");
+        let k_host = drv.to_host(&k_dim_dev).expect("dtoh k");
+        for h in 0..16 {
+            for d in 0..head_dim {
+                let want = qkv_src[key_dim + h * head_dim + d];
+                let got = k_host[d * 16 + h];
+                assert_eq!(got, want, "k slab @ (h={h}, d={d}): got {got} want {want}");
+            }
+        }
+        let mut v_dim_dev = drv.device_alloc_uninit(value_dim).expect("alloc v");
+        launch_reshape(
+            drv,
+            head_to_dim_f,
+            &qkv_dev,
+            &mut v_dim_dev,
+            head_dim,
+            48,
+            2 * key_dim,
+        )
+        .expect("v slab reshape");
+        drv.sync().expect("sync");
+        let v_host = drv.to_host(&v_dim_dev).expect("dtoh v");
+        for h in 0..48 {
+            for d in 0..head_dim {
+                let want = qkv_src[2 * key_dim + h * head_dim + d];
+                let got = v_host[d * 48 + h];
+                assert_eq!(got, want, "v slab @ (h={h}, d={d}): got {got} want {want}");
+            }
+        }
+    }
+
+    /// L2 norm + rms_norm_heads parity at Qwen3.6 production shapes.
+    /// Both kernels do a parallel-reduction sum (tree pattern across
+    /// 256 threads) while the CPU reference adds elements in sequence.
+    /// The difference is normally ~1e-7 in the sum-of-squares, which
+    /// scales by `rsqrt(sum + eps)` and then propagates downstream.
+    /// Quantifies the drift so we know how much of the multi-position
+    /// fused-path divergence is attributable to reduction order.
+    #[test]
+    fn l2_and_rms_norm_drift_at_qwen35_shape() {
+        let Some(backend) = gpu_or_skip() else { return };
+        let drv = backend.driver();
+
+        // L2 normalise per K-head: head_dim=128, n_heads=16
+        let head_dim = 128_usize;
+        let n_k_heads = 16_usize;
+        let eps = 1e-6_f32;
+        let x: Vec<f32> = (0..head_dim * n_k_heads)
+            .map(|i| {
+                let r = ((i as i64 * 1103515245 + 12345) & 0x7fffffff) as f32;
+                (r / 2.147483647e9) * 0.5 - 0.25
+            })
+            .collect();
+        let mut expected_l2 = vec![0.0_f32; x.len()];
+        for h in 0..n_k_heads {
+            let mut ss = 0.0_f32;
+            for d in 0..head_dim {
+                let v = x[d * n_k_heads + h];
+                ss += v * v;
+            }
+            let inv = 1.0_f32 / (ss + eps).sqrt();
+            for d in 0..head_dim {
+                expected_l2[d * n_k_heads + h] = x[d * n_k_heads + h] * inv;
+            }
+        }
+        let gpu_l2 =
+            super::super::deltanet::l2_normalize_per_head(&backend, &x, head_dim, n_k_heads, eps)
+                .expect("l2 gpu");
+        let mut max_l2 = 0.0_f32;
+        let mut sum_l2 = 0.0_f32;
+        for i in 0..gpu_l2.len() {
+            let d = (gpu_l2[i] - expected_l2[i]).abs();
+            max_l2 = max_l2.max(d);
+            sum_l2 += d;
+        }
+        eprintln!(
+            "l2_norm drift @ qwen35: max_abs={max_l2:.4e} mean_abs={:.4e}",
+            sum_l2 / gpu_l2.len() as f32
+        );
+
+        // rms_norm_heads: num_heads=48, head_dim=128 (head-major flat)
+        let num_heads = 48_usize;
+        let x2: Vec<f32> = (0..num_heads * head_dim)
+            .map(|i| {
+                let r = ((i as i64 * 1664525 + 1013904223) & 0x7fffffff) as f32;
+                (r / 2.147483647e9) * 0.4 - 0.2
+            })
+            .collect();
+        let w: Vec<f32> = (0..head_dim).map(|d| 1.0 + d as f32 * 0.003).collect();
+        let mut expected_rms = vec![0.0_f32; x2.len()];
+        for h in 0..num_heads {
+            let off = h * head_dim;
+            let mut ss = 0.0_f32;
+            for d in 0..head_dim {
+                let v = x2[off + d];
+                ss += v * v;
+            }
+            let inv = 1.0_f32 / (ss / head_dim as f32 + eps).sqrt();
+            for d in 0..head_dim {
+                expected_rms[off + d] = x2[off + d] * inv * w[d];
+            }
+        }
+        let gpu_rms =
+            super::super::deltanet::rms_norm_heads(&backend, &x2, &w, num_heads, head_dim, eps)
+                .expect("rms gpu");
+        let mut max_rms = 0.0_f32;
+        let mut sum_rms = 0.0_f32;
+        for i in 0..gpu_rms.len() {
+            let d = (gpu_rms[i] - expected_rms[i]).abs();
+            max_rms = max_rms.max(d);
+            sum_rms += d;
+        }
+        eprintln!(
+            "rms_norm drift @ qwen35: max_abs={max_rms:.4e} mean_abs={:.4e}",
+            sum_rms / gpu_rms.len() as f32
+        );
+        let _ = drv;
     }
 
     /// Recurrence kernel parity at Qwen3.6's production shapes
