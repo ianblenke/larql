@@ -30,6 +30,7 @@ mod q4k_direct;
 mod q4k_mmvq;
 mod q6k_mmvq;
 mod quant_matvec;
+mod qwen35_block;
 pub mod sampling;
 mod scratch;
 

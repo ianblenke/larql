@@ -190,6 +190,24 @@ static DELTANET_MODULE: OnceLock<(
     CudaFunction,
 )> = OnceLock::new();
 
+/// Public accessor for the (conv1d, deltanet, l2_norm, rms_norm)
+/// kernel function references compiled from `DELTANET_SRC`. Used by
+/// `qwen35_block::deltanet_postproj_step_cached` to chain the kernels
+/// onto its own stream without redundant module loads.
+pub(crate) fn module_functions(
+    drv: &Driver,
+) -> Result<
+    (
+        &'static CudaFunction,
+        &'static CudaFunction,
+        &'static CudaFunction,
+        &'static CudaFunction,
+    ),
+    CudaInitError,
+> {
+    functions(drv)
+}
+
 fn functions(
     drv: &Driver,
 ) -> Result<

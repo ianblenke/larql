@@ -844,6 +844,44 @@ impl ComputeBackend for CudaBackend {
         super::deltanet::rms_norm_heads(self, x, weight, num_heads, head_dim, eps).ok()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_postproj_step(
+        &self,
+        qkv_mixed: &[f32],
+        ssm_conv1d_weight: &[f32],
+        log_g: &[f32],
+        beta: &[f32],
+        z: &[f32],
+        ssm_norm_weight: &[f32],
+        conv_state: &mut [f32],
+        recurrent_state: &mut [f32],
+        head_v_dim: usize,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        d_conv: usize,
+        eps: f32,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::qwen35_block::deltanet_postproj_step_cached(
+            self,
+            qkv_mixed,
+            ssm_conv1d_weight,
+            log_g,
+            beta,
+            z,
+            ssm_norm_weight,
+            conv_state,
+            recurrent_state,
+            head_v_dim,
+            n_v_heads,
+            n_k_heads,
+            d_conv,
+            eps,
+            sequence_pos,
+        )
+        .ok()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

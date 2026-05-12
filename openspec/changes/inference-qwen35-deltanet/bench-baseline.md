@@ -168,6 +168,84 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.A foundations (fused post-projection chain, opt-in)
+
+Lays down the Phase E.6.A infrastructure for a fused device-resident
+DeltaNet post-projection chain — conv1d → silu → split + reshape →
+L2 Q/K → recurrence → reshape → rms_norm_heads → silu(z)*o — all on
+the device with one sync at the block boundary, then a single dtoh
+of the block output. The matvecs (attn_qkv / attn_gate / ssm_out)
+remain on the existing host-returning `quant_matvec` path; absorbing
+them into the device chain is the E.6.B scope.
+
+What landed:
+
+- New CUDA PTX module `cuda::qwen35_block` with the four small
+  scaffolding kernels needed to keep the chain on device:
+  `silu_inplace_f32`, `reshape_head_to_dim_f32`,
+  `reshape_dim_to_head_f32`, `silu_mul_inplace_f32`. The
+  five-kernel pipeline reuses the existing
+  `cuda::deltanet::module_functions` (causal_conv1d,
+  deltanet_step, l2_norm_dim_major, rms_norm_heads_head_major) on
+  the same stream without inter-kernel sync.
+- New optional `ComputeBackend::qwen35_deltanet_postproj_step`
+  trait method (default `None`); CUDA backend's implementation
+  routes to `qwen35_block::deltanet_postproj_step_cached`.
+- New unit tests at Qwen3.6 production shapes that previously had
+  no coverage: `reshape_kernels_match_cpu_at_qwen35_shape` (head⇄dim
+  layout transpose) and `deltanet_step_matches_cpu_at_qwen35_shape`
+  (s=128, h_k=16, h_v=48 — max_abs vs CPU = 7.45e-9, mean=1.02e-9).
+- Loader fix in `qwen35_load::load_one_deltanet_layer`:
+  `ssm_conv1d_raw.t().to_owned()` preserved transposed strides,
+  silently disabling the `as_slice()`-gated GPU conv1d hook
+  (which therefore never actually ran). Replaced with
+  `as_standard_layout().to_owned()` so the row-major copy makes
+  `as_slice()` `Some` — the conv1d kernel now actually executes
+  on GPU when `LARQL_QWEN35_GPU=1`. Verified parity-clean by the
+  token-diff harness.
+
+Status:
+
+- **Default OFF** behind `LARQL_QWEN35_E6A_FUSED=1`. Parity is
+  bit-equivalent to CPU on a single call (per-element drift
+  ~1e-7), and pos=0 layer-by-layer diff vs CPU is clean. But
+  enabling fused mode for every position causes the multi-token
+  parity check (`real_gguf_qwen35_token_diff_vs_llama_cpp`) to
+  diverge from llama.cpp's GT — argmax flips on step 0 even
+  though every individual kernel matches CPU to <1e-8 in
+  isolation. The drift compounds non-trivially through 9 prompt +
+  5 decode positions and the per-layer recurrent state, in a way
+  the single-call unit tests don't catch. Root cause still under
+  investigation (most likely fp32 reduction-order sensitivity in
+  the L2 and rms_norm reductions, amplified by the recurrence's
+  state-update cycle across positions).
+- The conv1d-on-GPU enablement (load-side fix) is parity-validated
+  with the fused path disabled.
+- Throughput is unchanged in either mode (still 0.33 t/s decode):
+  the post-projection hooks aren't the bottleneck on their own.
+  The dominant cost remains the projection matvecs themselves;
+  Phase E.6.B (device-resident matvec absorption into the same
+  chain, eliminating ~7 host bounces per layer) is the actual
+  throughput lever.
+
+```bash
+# Run the parity check at default (E.6.A disabled):
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_token_diff_vs_llama_cpp -- --nocapture
+# → [<think>, \n\n, </think>, \n\n, Hello] with GT rank 0 every step.
+
+# Same test with the fused path on (currently fails parity at step 0):
+LARQL_QWEN35_E6A_FUSED=1 <as above>
+```
+
+| Config | Decode (t/s) | Parity | VmRSS |
+|---|---:|:--:|---:|
+| Phase E.4.3 (per-step, conv1d falls back to CPU) | 0.33 | clean | 21.16 GiB |
+| **Phase E.6.A foundations (conv1d-on-GPU, fused off)** | **0.33** | **clean** | **21.16 GiB** |
+| Phase E.6.A foundations (fused on, opt-in) | 0.33 | broken — under investigation | 21.16 GiB |
+
 ## 2026-05-12 update — Phase E.4.3 GPU per-head L2/RMSNorm
 
 Added CUDA reductions for the remaining per-head DeltaNet norms:

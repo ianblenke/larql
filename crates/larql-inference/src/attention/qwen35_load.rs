@@ -187,8 +187,18 @@ fn load_deltanet_layer(
     // and cols = conv_dim (per-tap-channel layout), so transpose
     // once at load time. Trivial cost: 48 layers × 4 × 10240 f32
     // ≈ 7.8 MB total for Qwen 3.6 27B, done once.
+    //
+    // `t().to_owned()` keeps the transposed strides (non-standard
+    // layout), which silently disables every `as_slice()`-based GPU
+    // dispatch downstream. `as_standard_layout().to_owned()` forces
+    // a row-major copy so the resulting ArcArray's `as_slice()` is
+    // `Some` — required by the Phase E.4 / E.6 CUDA hooks.
     let ssm_conv1d_raw = get_tensor(weights, &ssm_conv1d_key)?;
-    let ssm_conv1d = ssm_conv1d_raw.t().to_owned().into_shared();
+    let ssm_conv1d = ssm_conv1d_raw
+        .t()
+        .as_standard_layout()
+        .to_owned()
+        .into_shared();
     let ssm_dt_key = require_key(arch.ssm_dt_key(layer), layer, "ssm_dt_key", "linear")?;
     let ssm_dt = get_vec(weights, &ssm_dt_key)?;
     let ssm_a_key = require_key(arch.ssm_a_key(layer), layer, "ssm_a_key", "linear")?;

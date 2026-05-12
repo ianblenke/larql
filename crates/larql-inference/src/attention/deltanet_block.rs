@@ -314,9 +314,72 @@ pub fn deltanet_block_step(
         );
     }
 
-    // 4. Split QKV into Q, K, V slabs.
     let key_dim = dims.key_dim();
     let value_dim = dims.value_dim();
+
+    // Phase E.6.A fast-path: if a CUDA backend exposes the fused
+    // post-projection step, do conv1d → silu → split → reshape →
+    // L2 Q/K → recurrence → reshape → rms_norm_heads → silu(z)*o
+    // entirely on device with one sync at the end. The matvecs
+    // (attn_qkv/attn_gate/ssm_out) still go through the existing
+    // host-bouncing path — E.6.B absorbs them.
+    //
+    // Returns the same `o_flat` value the per-step path computes
+    // just before `ssm_out`; we resume the unfused tail (output
+    // projection) from there.
+    // Phase E.6.A — fused device-resident DeltaNet post-projection
+    // chain. Opt-in via `LARQL_QWEN35_E6A_FUSED=1`. Off by default
+    // because the recurrence kernel matches CPU on a single call but
+    // accumulated state drift across positions causes the multi-token
+    // parity check to deviate from llama.cpp (single-call output
+    // matches CPU to 1e-7; across 9 prompt + 5 decode tokens the
+    // residual stream diverges enough to flip argmax — root cause
+    // still under investigation, likely fp32 reduction-order
+    // sensitivity compounding through the per-layer recurrent state).
+    // The fused implementation is otherwise complete and ready for
+    // E.6.B (absorbing the projection matvecs into the same device
+    // chain), which is the actual throughput lever — the post-proj
+    // hooks aren't the bottleneck on their own.
+    let post_proj = if std::env::var("LARQL_QWEN35_E6A_FUSED").is_ok() {
+        backend.and_then(|b| {
+            let qkv_mixed_slice = qkv_mixed.as_slice()?;
+            let log_g_slice = log_g.as_slice()?;
+            let beta_slice = beta.as_slice()?;
+            let z_slice = z.as_slice()?;
+            let conv_w = weights.ssm_conv1d.as_slice()?;
+            let conv_state_slice = state.conv_state.as_slice_mut()?;
+            let rec_state_slice = state.recurrent_state.as_slice_mut()?;
+            b.qwen35_deltanet_postproj_step(
+                qkv_mixed_slice,
+                conv_w,
+                log_g_slice,
+                beta_slice,
+                z_slice,
+                &weights.ssm_norm,
+                conv_state_slice,
+                rec_state_slice,
+                dims.head_v_dim,
+                dims.n_v_heads,
+                dims.n_k_heads,
+                dims.d_conv,
+                crate::residual::DEFAULT_EPS as f32,
+                sequence_pos,
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(o_flat_vec) = post_proj {
+        let o_flat = Array1::from(o_flat_vec);
+        let block_out = if let Some(q) = weights.ssm_out_quant.as_ref() {
+            matvec_with_backend(q, &o_flat, backend)
+        } else {
+            weights.ssm_out.dot(&o_flat)
+        };
+        return block_out;
+    }
+
+    // 4. Split QKV into Q, K, V slabs.
     let q_raw = qkv_conv.slice(ndarray::s![..key_dim]).to_owned();
     let k_raw = qkv_conv.slice(ndarray::s![key_dim..2 * key_dim]).to_owned();
     let v_raw = qkv_conv.slice(ndarray::s![2 * key_dim..]).to_owned();

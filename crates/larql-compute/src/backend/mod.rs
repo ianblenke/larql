@@ -127,6 +127,37 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Optional fused Qwen3.6 DeltaNet post-projection chain (Phase
+    /// E.6.A). Composes conv1d → silu → split + reshape → L2 Q/K →
+    /// recurrence → reshape → rms_norm_heads → silu(z) * o on the
+    /// device with a single sync at the end. Caller has already
+    /// computed the projection outputs (`qkv_mixed`, `z`, `log_g`,
+    /// `beta`) and supplies them as host slices.
+    ///
+    /// Returns the post-rms-norm, post-silu-z output `[value_dim]` in
+    /// head-major layout, ready for the `ssm_out` projection. `None`
+    /// means the backend declined to handle this call (CPU fallback).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_postproj_step(
+        &self,
+        _qkv_mixed: &[f32],
+        _ssm_conv1d_weight: &[f32],
+        _log_g: &[f32],
+        _beta: &[f32],
+        _z: &[f32],
+        _ssm_norm_weight: &[f32],
+        _conv_state: &mut [f32],
+        _recurrent_state: &mut [f32],
+        _head_v_dim: usize,
+        _n_v_heads: usize,
+        _n_k_heads: usize,
+        _d_conv: usize,
+        _eps: f32,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 }
