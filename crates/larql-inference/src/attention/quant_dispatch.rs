@@ -11,7 +11,7 @@
 //! Phase E.1 of `qwen35-gpu-forward`. The fallback path is the
 //! existing rayon CPU dispatch already living on `QuantTensor::matvec`.
 
-use larql_compute::backend::QuantMatVec;
+use larql_compute::ComputeBackend;
 use larql_compute::QuantFormat;
 use larql_models::quant::ggml::{TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K};
 use larql_models::quant::lazy::QuantTensor;
@@ -37,7 +37,7 @@ pub fn ggml_type_to_quant_format(t: u32) -> Option<QuantFormat> {
 pub fn matvec_with_backend(
     qt: &QuantTensor,
     x: &Array1<f32>,
-    backend: Option<&(dyn QuantMatVec + Send + Sync)>,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array1<f32> {
     let shape = qt.shape();
     let rows = shape[0];

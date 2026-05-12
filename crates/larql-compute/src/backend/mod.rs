@@ -55,6 +55,78 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         false
     }
 
+    /// Optional Qwen3.6 Gated DeltaNet causal Conv1D step.
+    ///
+    /// Implementations mutate `state` in place and return the
+    /// convolution output. Shape convention is row-major:
+    /// `weight[d_conv, conv_dim]`, `state[d_conv - 1, conv_dim]`,
+    /// `new[conv_dim]`.
+    fn qwen35_causal_conv1d_step(
+        &self,
+        _weight: &[f32],
+        _state: &mut [f32],
+        _new: &[f32],
+        _d_conv: usize,
+        _conv_dim: usize,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Optional Qwen3.6 Gated DeltaNet recurrence step.
+    ///
+    /// Shape convention is row-major for the ndarray layouts used by
+    /// `larql-inference`: `q[s, h_k]`, `k[s, h_k]`, `v[s, h_v]`, and
+    /// `state[s, s, h_v]` with `h_v` as the fastest-moving axis.
+    /// Implementations mutate `state` in place and return
+    /// `out[s, h_v]`.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_step(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _log_g: &[f32],
+        _beta: &[f32],
+        _state: &mut [f32],
+        _s: usize,
+        _h_k: usize,
+        _h_v: usize,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Optional Qwen3.6 per-head L2 normalisation.
+    ///
+    /// Shape convention is row-major for a logical
+    /// `[head_dim, n_heads]` array, i.e. `x[d * n_heads + h]`.
+    /// Implementations return the same layout.
+    fn qwen35_l2_normalize_per_head(
+        &self,
+        _x: &[f32],
+        _head_dim: usize,
+        _n_heads: usize,
+        _eps: f32,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Optional Qwen3.6 per-head RMSNorm.
+    ///
+    /// Shape convention is head-major flat layout,
+    /// `x[h * head_dim + d]`; `weight[d]` is shared across heads.
+    fn qwen35_rms_norm_heads(
+        &self,
+        _x: &[f32],
+        _weight: &[f32],
+        _num_heads: usize,
+        _head_dim: usize,
+        _eps: f32,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 }

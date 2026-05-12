@@ -17,6 +17,7 @@ pub mod attn_tree;
 mod backend;
 mod cache;
 mod decode;
+mod deltanet;
 mod dequant;
 mod driver;
 mod elem;

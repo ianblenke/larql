@@ -330,6 +330,30 @@ mod tests {
     use ndarray::Array2;
     use std::collections::HashMap;
 
+    fn attach_cuda_backend_if_requested(w: &mut Qwen35Weights) {
+        if std::env::var("LARQL_QWEN35_GPU").is_err() {
+            return;
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            match larql_compute::cuda::CudaBackend::new() {
+                Ok(b) => {
+                    eprintln!("attached CudaBackend");
+                    w.backend = Some(std::sync::Arc::new(b));
+                }
+                Err(e) => {
+                    eprintln!("LARQL_QWEN35_GPU set but CudaBackend::new() failed: {e:?}");
+                }
+            }
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("LARQL_QWEN35_GPU set but larql-inference was built without --features cuda");
+        }
+    }
+
     /// Build a tiny synthetic Qwen3.6 config — 4 layers,
     /// `full_attention_interval=2` so layers 1 and 3 are full-attention
     /// and 0, 2 are linear.
@@ -2254,21 +2278,10 @@ mod tests {
         let mut w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
         eprintln!("loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-        // Phase E.1: attach GPU backend when LARQL_QWEN35_GPU=1 is
+        // Phase E.1+: attach GPU backend when LARQL_QWEN35_GPU=1 is
         // set. CudaBackend::new() consumes ~no VRAM at construction;
         // the kernels lazy-compile on first dispatch.
-        #[cfg(feature = "cuda")]
-        if std::env::var("LARQL_QWEN35_GPU").is_ok() {
-            match larql_compute::cuda::CudaBackend::new() {
-                Ok(b) => {
-                    eprintln!("attached CudaBackend");
-                    w.backend = Some(std::sync::Arc::new(b));
-                }
-                Err(e) => {
-                    eprintln!("LARQL_QWEN35_GPU set but CudaBackend::new() failed: {e:?}");
-                }
-            }
-        }
+        attach_cuda_backend_if_requested(&mut w);
 
         let arch = &*weights.arch;
         let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
@@ -2458,7 +2471,8 @@ mod tests {
         } else {
             larql_models::load_gguf(&gguf_path).expect("load_gguf")
         };
-        let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+        let mut w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+        attach_cuda_backend_if_requested(&mut w);
 
         let arch = &*weights.arch;
         let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
