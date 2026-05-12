@@ -225,10 +225,35 @@ fn load_attention_layer(
 ) -> Result<Qwen35AttentionLayerWeights, Qwen35LoadError> {
     // GGUF stores `(1+w)` pre-applied for all norms — use raw values.
     let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
-    let attn_q = get_tensor(weights, &arch.attn_q_key(layer))?;
-    let attn_k = get_tensor(weights, &arch.attn_k_key(layer))?;
-    let attn_v = get_tensor(weights, &arch.attn_v_key(layer))?;
-    let attn_output = get_tensor(weights, &arch.attn_o_key(layer))?;
+    let empty = || ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new()).unwrap();
+    let attn_q_key = arch.attn_q_key(layer);
+    let attn_q_quant = weights.quant_tensors.get(&attn_q_key).cloned();
+    let attn_q = if attn_q_quant.is_some() {
+        empty()
+    } else {
+        get_tensor(weights, &attn_q_key)?
+    };
+    let attn_k_key = arch.attn_k_key(layer);
+    let attn_k_quant = weights.quant_tensors.get(&attn_k_key).cloned();
+    let attn_k = if attn_k_quant.is_some() {
+        empty()
+    } else {
+        get_tensor(weights, &attn_k_key)?
+    };
+    let attn_v_key = arch.attn_v_key(layer);
+    let attn_v_quant = weights.quant_tensors.get(&attn_v_key).cloned();
+    let attn_v = if attn_v_quant.is_some() {
+        empty()
+    } else {
+        get_tensor(weights, &attn_v_key)?
+    };
+    let attn_output_key = arch.attn_o_key(layer);
+    let attn_output_quant = weights.quant_tensors.get(&attn_output_key).cloned();
+    let attn_output = if attn_output_quant.is_some() {
+        empty()
+    } else {
+        get_tensor(weights, &attn_output_key)?
+    };
     let q_norm_key = require_key(
         arch.attn_q_per_head_norm_key(layer),
         layer,
@@ -252,6 +277,10 @@ fn load_attention_layer(
         attn_q_norm,
         attn_k_norm,
         attn_output,
+        attn_q_quant,
+        attn_k_quant,
+        attn_v_quant,
+        attn_output_quant,
     })
 }
 
@@ -2189,6 +2218,13 @@ mod tests {
                 if let Some(k) = arch_ref.ssm_out_key(l) {
                     lazy_keys.insert(k);
                 }
+                // Full-attn projections (only populated for the
+                // attention layers in the hybrid pattern; absent
+                // keys are silently ignored by lazy_tensors).
+                lazy_keys.insert(arch_ref.attn_q_key(l));
+                lazy_keys.insert(arch_ref.attn_k_key(l));
+                lazy_keys.insert(arch_ref.attn_v_key(l));
+                lazy_keys.insert(arch_ref.attn_o_key(l));
             }
             if lazy_lm_head {
                 lazy_keys.insert("lm_head.weight".to_string());
@@ -2369,6 +2405,13 @@ mod tests {
                 if let Some(k) = arch_ref.ssm_out_key(l) {
                     lazy_keys.insert(k);
                 }
+                // Full-attn projections (only populated for the
+                // attention layers in the hybrid pattern; absent
+                // keys are silently ignored by lazy_tensors).
+                lazy_keys.insert(arch_ref.attn_q_key(l));
+                lazy_keys.insert(arch_ref.attn_k_key(l));
+                lazy_keys.insert(arch_ref.attn_v_key(l));
+                lazy_keys.insert(arch_ref.attn_o_key(l));
             }
             if lazy_lm_head {
                 lazy_keys.insert("lm_head.weight".to_string());

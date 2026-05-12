@@ -44,6 +44,40 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-12 update — Phase 2c lazy-quant full-attn q/k/v/o
+
+Extends the lazy set to the four full-attention projections per
+attn layer (16 attn layers × q/k/v/o = 64 additional matvecs/token).
+
+| Config | Decode (t/s) | VmRSS |
+|---|---:|---:|
+| Phase 2b (lazy FFN + DeltaNet projs) | 0.20 | 29.62 GiB |
+| **Phase 2c (+ full-attn q/k/v/o)** | **0.23** | **24.07 GiB** |
+| Δ vs Phase 2b | **+15 %** | **−5.55 GiB** |
+| Δ vs baseline | −53 % | **−81.18 GiB (−77.1 %)** |
+
+Speed actually **improved slightly** (0.20 → 0.23 t/s): the
+full-attn dense matvecs on x86 CPU run at f32 BLAS but as
+single-vector sgemv (no batching across rows), whereas the
+rayon-parallel Q4_K kernel splits each matvec's rows across cores.
+On a 16-core box the parallelism wins even for these moderately-sized
+matrices.
+
+llama.cpp parity on RAM (~16 GiB) is now **~8 GiB away**. The
+remaining big chunks are:
+- `embed` `{vocab=248320, hidden=5120}` ≈ 5 GiB (Q4_K → ~1 GiB)
+- Per-head SSM tensors (ssm_beta, ssm_alpha, ssm_conv1d, ssm_norm)
+- Various per-layer norm vectors
+
+Embed needs a different code path (row-lookup not matvec) — a
+future `QuantTensor::row_to_f32(token_id)` would dequant one row
+on demand. Per-head SSM tensors are small enough that the win is
+marginal (<2 GiB total).
+
+**Parity preserved**: `real_gguf_qwen35_token_diff_vs_llama_cpp`
+still emits the same `[<think>, \n\n, </think>, \n\n, Hello]`
+sequence with GT rank 0 every step.
+
 ## 2026-05-12 update — Phase 2b lazy-quant attn_qkv / attn_gate / ssm_out
 
 Phase 2b extends the lazy-tensor set to the three big DeltaNet
