@@ -302,21 +302,33 @@ pub fn quantize_q6_k(data: &[f32]) -> Vec<u8> {
             }
         }
 
-        // Pack lower 4 bits: 128 bytes (2 nibbles per byte)
+        // Pack into llama.cpp Q6_K layout (matches `dequantize_row_q6_K`).
+        // Two halves of 128 output positions each. Within each half, for
+        // l in 0..32:
+        //   ql[l +  0]: low4(y[l +  0]), high4(y[l + 64])
+        //   ql[l + 32]: low4(y[l + 32]), high4(y[l + 96])
+        //   qh[l]:      hi2(y[l +  0])@bits0..1, hi2(y[l + 32])@bits2..3,
+        //               hi2(y[l + 64])@bits4..5, hi2(y[l + 96])@bits6..7
         let mut ql = [0u8; 128];
-        for i in 0..128 {
-            ql[i] = (q6_vals[i * 2] & 0x0F) | ((q6_vals[i * 2 + 1] & 0x0F) << 4);
+        let mut qh = [0u8; 64];
+        for half in 0..2 {
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            let y_off = half * 128;
+            for l in 0..32 {
+                let v0 = q6_vals[y_off + l] as u32;
+                let v1 = q6_vals[y_off + l + 32] as u32;
+                let v2 = q6_vals[y_off + l + 64] as u32;
+                let v3 = q6_vals[y_off + l + 96] as u32;
+                ql[ql_off + l] = ((v0 & 0x0F) | ((v2 & 0x0F) << 4)) as u8;
+                ql[ql_off + l + 32] = ((v1 & 0x0F) | ((v3 & 0x0F) << 4)) as u8;
+                qh[qh_off + l] = ((v0 >> 4) & 0x03) as u8
+                    | (((v1 >> 4) & 0x03) << 2) as u8
+                    | (((v2 >> 4) & 0x03) << 4) as u8
+                    | (((v3 >> 4) & 0x03) << 6) as u8;
+            }
         }
         out.extend_from_slice(&ql);
-
-        // Pack upper 2 bits: 64 bytes (4 × 2 bits per byte)
-        let mut qh = [0u8; 64];
-        for (i, &q6_val) in q6_vals.iter().enumerate() {
-            let hi2 = (q6_val >> 4) & 0x03;
-            let byte_idx = i / 4;
-            let bit_offset = (i % 4) * 2;
-            qh[byte_idx] |= hi2 << bit_offset;
-        }
         out.extend_from_slice(&qh);
 
         // 16 × int8 scales

@@ -1526,6 +1526,159 @@ mod tests {
     // dequantization of `output.weight`). If row norms are uniform,
     // the bug is downstream in the forward path.
     //
+    /// C.5j diagnostic — feed llama.cpp's `result_norm.bin` (token 8's
+    /// x_final) into OUR `lm_head` and see if argmax matches theirs.
+    /// Isolates the lm_head loading bug from any upstream parity issue.
+    /// Expects `/tmp/llama_bin/result_norm.bin` and `result_output.bin`
+    /// produced by `llama-eval-callback` with `LLAMA_DUMP_BIN_DIR`.
+    #[test]
+    fn real_gguf_qwen35_lm_head_vs_their_xfinal_diagnostic() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping");
+                return;
+            }
+        };
+        let xfinal_path = "/tmp/llama_bin/result_norm.bin";
+        let logits_path = "/tmp/llama_bin/result_output.bin";
+        if !std::path::Path::new(xfinal_path).exists() {
+            eprintln!("No {xfinal_path} — run llama-eval-callback first");
+            return;
+        }
+        let load_bin = |p: &str| -> Vec<f32> {
+            use std::io::Read;
+            let mut f = std::fs::File::open(p).expect("open");
+            let mut header = [0u8; 32];
+            f.read_exact(&mut header).expect("header");
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).expect("read");
+            buf.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let their_x = load_bin(xfinal_path);
+        let their_logits = load_bin(logits_path);
+        let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
+        let lm_head = &weights.lm_head;
+        let x = ndarray::Array1::from_vec(their_x);
+        let our_logits_from_their_x: ndarray::Array1<f32> = lm_head.dot(&x);
+
+        let our_argmax = our_logits_from_their_x
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let their_argmax = their_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        eprintln!(
+            "argmax: (our_lm_head @ their_x) = {}  their_argmax = {}",
+            our_argmax, their_argmax
+        );
+        eprintln!("their logit at our argmax = {}", their_logits[our_argmax]);
+        eprintln!(
+            "our (our_lm_head @ their_x) logit at their argmax = {}",
+            our_logits_from_their_x[their_argmax]
+        );
+        // Pearson
+        let n = their_logits.len();
+        let mean_o = our_logits_from_their_x.iter().sum::<f32>() / n as f32;
+        let mean_t = their_logits.iter().sum::<f32>() / n as f32;
+        let mut num = 0.0f64;
+        let mut do2 = 0.0f64;
+        let mut dt2 = 0.0f64;
+        for i in 0..n {
+            let do_ = (our_logits_from_their_x[i] - mean_o) as f64;
+            let dt = (their_logits[i] - mean_t) as f64;
+            num += do_ * dt;
+            do2 += do_ * do_;
+            dt2 += dt * dt;
+        }
+        let pearson = num / (do2.sqrt() * dt2.sqrt());
+        eprintln!(
+            "pearson(our_lm_head @ their_x_final, their_logits) = {:.6}",
+            pearson
+        );
+        // Check: is lm_head == embed (tied)?
+        let embed = &weights.embed;
+        eprintln!(
+            "lm_head shape: {:?}  embed shape: {:?}",
+            lm_head.shape(),
+            embed.shape()
+        );
+        let row_diff = |row: usize| -> f32 {
+            let lh = lm_head.row(row);
+            let em = embed.row(row);
+            lh.iter()
+                .zip(em.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+        };
+        for row in [0usize, 100, 1000, 145263, 248045, 248068] {
+            if row < lm_head.shape()[0] && row < embed.shape()[0] {
+                let lh = lm_head.row(row);
+                let em = embed.row(row);
+                let lh_l2: f32 = lh.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let em_l2: f32 = em.iter().map(|v| v * v).sum::<f32>().sqrt();
+                eprintln!(
+                    "  row {row:>6}: lm_head_l2={lh_l2:.4} embed_l2={em_l2:.4} sum|lh-em|={:.4} first-3: lm=[{:.4},{:.4},{:.4}] em=[{:.4},{:.4},{:.4}]",
+                    row_diff(row), lh[0], lh[1], lh[2], em[0], em[1], em[2]
+                );
+            }
+        }
+        // Also try using `embed` as lm_head — does that give a better argmax?
+        let logits_from_embed: ndarray::Array1<f32> = embed.dot(&x);
+        let from_embed_argmax = logits_from_embed
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        eprintln!(
+            "argmax (embed @ their_x_final) = {}  (theirs = {}; would be tied-embed case)",
+            from_embed_argmax, their_argmax
+        );
+        // Pearson with embed
+        let mean_e = logits_from_embed.iter().sum::<f32>() / n as f32;
+        let mut nume = 0.0f64;
+        let mut de2 = 0.0f64;
+        for i in 0..n {
+            let de = (logits_from_embed[i] - mean_e) as f64;
+            let dt = (their_logits[i] - mean_t) as f64;
+            nume += de * dt;
+            de2 += de * de;
+        }
+        eprintln!(
+            "pearson(embed @ their_x_final, their_logits) = {:.6}",
+            nume / (de2.sqrt() * dt2.sqrt())
+        );
+        // Dump row 248068 (llama.cpp's argmax) of our lm_head to a binary file
+        // so a Python script can elementwise diff it against gguf-py's dequant.
+        if let Ok(p) = std::env::var("LARQL_QWEN35_DUMP_LM_HEAD_ROW") {
+            let row_idx = p.parse::<usize>().unwrap_or(248068);
+            let row = lm_head.row(row_idx);
+            let out = "/tmp/larql_lm_head_row.bin";
+            use std::io::Write;
+            let mut f = std::fs::File::create(out).expect("create");
+            let ne: [i64; 4] = [row.len() as i64, 1, 1, 1];
+            for n in ne {
+                f.write_all(&n.to_le_bytes()).ok();
+            }
+            for v in row.iter() {
+                f.write_all(&v.to_le_bytes()).ok();
+            }
+            eprintln!(
+                "Wrote our lm_head row {row_idx} ({} f32) to {out}",
+                row.len()
+            );
+        }
+    }
+
     // Same env-gating as the other real-GGUF tests.
     #[test]
     fn real_gguf_qwen35_lm_head_row_norms_diagnostic() {

@@ -102,32 +102,84 @@ pub fn delta_net_step(
         // giving `sk = g * (S^T k)` instead of `S^T k`. Token 0
         // matched llama.cpp bit-exact but token 1+ diverged 20×.
 
-        // 1. sk[c] = sum_r state_old[r, c, h] * k[r, kh] = (S_old^T k)[c]
-        //    USING UN-DECAYED state.
-        for entry in sk.iter_mut() {
-            *entry = 0.0;
-        }
-        for r in 0..s_k {
-            let k_val = k[[r, kh]];
-            if k_val == 0.0 {
-                continue;
+        // Algorithm order: DECAY-FIRST matching llama.cpp's
+        // `ggml_compute_forward_gated_delta_net_one_chunk`:
+        //     S_decayed = g * S_old
+        //     sk        = S_decayed^T k          (uses DECAYED state)
+        //     d         = (v - sk) * b
+        //     S_new     = S_decayed + k ⊗ d
+        //
+        // Verified C.5j via elementwise parity oracle: for token 8 (last
+        // prompt token, state accumulated from 8 prior steps), decay-first
+        // gives pearson 0.995-0.998 at every LIN layer's block_out vs
+        // llama.cpp; paper-order (Yang et al. 2024 Eq. 6, sk-before-decay,
+        // landed in C.5f) gave 0.83-0.97. Residual-stream pearson at L62:
+        // decay-first 0.9985 vs paper 0.982. The PAPER order is correct
+        // mathematically but llama.cpp's kernel does decay-first, and the
+        // model was trained / quantised with this kernel's behaviour.
+        //
+        // Set `LARQL_QWEN35_PAPER_ORDER=1` to revert to paper order for
+        // bisection. Default = decay-first.
+        let decay_first = !std::env::var("LARQL_QWEN35_PAPER_ORDER").is_ok();
+        if decay_first {
+            // 1. Decay state in place.
+            for r in 0..s_v {
+                for c in 0..s_v {
+                    state[[r, c, h]] *= g_h;
+                }
             }
-            for c in 0..s_v {
-                sk[c] += state[[r, c, h]] * k_val;
+            // 2. sk = decayed_state^T k.
+            for entry in sk.iter_mut() {
+                *entry = 0.0;
             }
-        }
-
-        // 2. d = (v - sk) * b (no decay factor on sk).
-        for c in 0..s_v {
-            d[c] = (v[[c, h]] - sk[c]) * b_h;
-        }
-
-        // 3. NOW decay state and add rank-1 update in one pass:
-        //    state[r, c, h] = g_h * state_old[r, c, h] + k[r] * d[c]
-        for r in 0..s_v {
-            let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
+            for r in 0..s_k {
+                let k_val = k[[r, kh]];
+                if k_val == 0.0 {
+                    continue;
+                }
+                for c in 0..s_v {
+                    sk[c] += state[[r, c, h]] * k_val;
+                }
+            }
+            // 3. d = (v - sk) * b.
             for c in 0..s_v {
-                state[[r, c, h]] = g_h * state[[r, c, h]] + k_val * d[c];
+                d[c] = (v[[c, h]] - sk[c]) * b_h;
+            }
+            // 4. state += k ⊗ d.
+            for r in 0..s_v {
+                let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
+                if k_val == 0.0 {
+                    continue;
+                }
+                for c in 0..s_v {
+                    state[[r, c, h]] += k_val * d[c];
+                }
+            }
+        } else {
+            // PAPER ORDER (default).
+            // 1. sk[c] = sum_r state_old[r, c, h] * k[r, kh] = (S_old^T k)[c].
+            for entry in sk.iter_mut() {
+                *entry = 0.0;
+            }
+            for r in 0..s_k {
+                let k_val = k[[r, kh]];
+                if k_val == 0.0 {
+                    continue;
+                }
+                for c in 0..s_v {
+                    sk[c] += state[[r, c, h]] * k_val;
+                }
+            }
+            // 2. d = (v - sk) * b (no decay factor on sk).
+            for c in 0..s_v {
+                d[c] = (v[[c, h]] - sk[c]) * b_h;
+            }
+            // 3. state = g * state + k ⊗ d (decay + outer product in one pass).
+            for r in 0..s_v {
+                let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
+                for c in 0..s_v {
+                    state[[r, c, h]] = g_h * state[[r, c, h]] + k_val * d[c];
+                }
             }
         }
 

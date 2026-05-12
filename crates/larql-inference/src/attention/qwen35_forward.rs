@@ -88,6 +88,20 @@ pub fn qwen35_forward_step(
     let n_layers = weights.layers.len();
     debug_assert_eq!(n_layers, hybrid_cache.num_layers());
 
+    // Per-session token counter for the LARQL_QWEN35_DUMP_LAYER_BOUNDARY
+    // diagnostic. Reset by setting `LARQL_QWEN35_DUMP_TOKEN_RESET=1`
+    // before the first forward call.
+    if std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY").is_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TOK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        if std::env::var("LARQL_QWEN35_DUMP_TOKEN_RESET").is_ok() {
+            TOK_COUNTER.store(0, Ordering::Relaxed);
+            std::env::remove_var("LARQL_QWEN35_DUMP_TOKEN_RESET");
+        }
+        let tok = TOK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::set_var("LARQL_QWEN35_DUMP_TOKEN_TAG", format!("tok{tok}"));
+    }
+
     // 1. Embed lookup.
     let vocab = weights.embed.shape()[0];
     let hidden = weights.embed.shape()[1];
@@ -135,6 +149,67 @@ pub fn qwen35_forward_step(
         // post-norm per design.md §6).
         x = &residual + &ffn_out;
 
+        // Optional per-layer binary tensor dump for elementwise parity
+        // diff vs llama-eval-callback (`LLAMA_DUMP_BIN_DIR` on llama.cpp
+        // side). Triggered by `LARQL_QWEN35_DUMP_LAYER_BOUNDARY=<dir>` —
+        // dumps `block_out_lN.bin`, `attn_residual_lN.bin`,
+        // `ffn_in_lN.bin`, `ffn_out_lN.bin`, `x_after_lN.bin` for every
+        // layer. Each call is per-token; the caller is responsible for
+        // dispatching the right token (or pre-pending the token-id).
+        if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY") {
+            let _ = std::fs::create_dir_all(&dir);
+            let write = |name: &str, data: &[f32]| {
+                use std::io::Write;
+                let path = std::path::Path::new(&dir).join(name);
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+                    for n in ne {
+                        f.write_all(&n.to_le_bytes()).ok();
+                    }
+                    for v in data {
+                        f.write_all(&v.to_le_bytes()).ok();
+                    }
+                }
+            };
+            // Use token-prefixed dir so successive prompt tokens don't
+            // overwrite each other. The harness sets an outer env that
+            // names the token index, e.g. `dir/tok0/`, `dir/tok1/`, ...
+            let token_subdir =
+                std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
+            let layer_dir = format!("{}/{}", dir, token_subdir);
+            let _ = std::fs::create_dir_all(&layer_dir);
+            let path_for = |name: &str| format!("{}/{}", layer_dir, name);
+            let write_at = |name: &str, data: &[f32]| {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::File::create(path_for(name)) {
+                    let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+                    for n in ne {
+                        f.write_all(&n.to_le_bytes()).ok();
+                    }
+                    for v in data {
+                        f.write_all(&v.to_le_bytes()).ok();
+                    }
+                }
+            };
+            let _ = write; // suppress unused; we now use write_at
+            write_at(
+                &format!("block_out_l{layer:02}.bin"),
+                block_out.as_slice().unwrap_or(&[]),
+            );
+            write_at(
+                &format!("residual_l{layer:02}.bin"),
+                residual.as_slice().unwrap_or(&[]),
+            );
+            write_at(
+                &format!("ffn_out_l{layer:02}.bin"),
+                ffn_out.as_slice().unwrap_or(&[]),
+            );
+            write_at(
+                &format!("x_after_l{layer:02}.bin"),
+                x.as_slice().unwrap_or(&[]),
+            );
+        }
+
         if trace {
             let kind = matches!(
                 layer_w.block,
@@ -155,6 +230,31 @@ pub fn qwen35_forward_step(
 
     // 3. Final norm + lm_head.
     let x_final = rms_norm_1d_pub(&x, &weights.final_norm, eps);
+    // Optional final-norm + logits dump for elementwise parity diff
+    // vs llama.cpp's `result_norm.bin` / `result_output.bin`. Triggered
+    // by `LARQL_QWEN35_DUMP_FINAL_BIN_DIR=<dir>` (single-shot, dumps
+    // each call but the harness will only call once for the last
+    // prompt token). Caller is responsible for invoking at the right
+    // step.
+    if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        let tag =
+            std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
+        let write = |name: &str, data: &[f32]| {
+            use std::io::Write;
+            let path = std::path::Path::new(&dir).join(format!("{tag}_{name}"));
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+                for n in ne {
+                    f.write_all(&n.to_le_bytes()).ok();
+                }
+                for v in data {
+                    f.write_all(&v.to_le_bytes()).ok();
+                }
+            }
+        };
+        write("x_final.bin", x_final.as_slice().unwrap_or(&[]));
+    }
     if std::env::var("LARQL_QWEN35_DUMP_FINAL").is_ok() {
         let n = x_final.len();
         eprintln!(
@@ -169,6 +269,22 @@ pub fn qwen35_forward_step(
         );
     }
     let logits = weights.lm_head.dot(&x_final);
+    if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR") {
+        let tag =
+            std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
+        let path = std::path::Path::new(&dir).join(format!("{tag}_logits.bin"));
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let data = logits.as_slice().unwrap_or(&[]);
+            let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+            for n in ne {
+                f.write_all(&n.to_le_bytes()).ok();
+            }
+            for v in data {
+                f.write_all(&v.to_le_bytes()).ok();
+            }
+        }
+    }
 
     if trace {
         eprintln!(
