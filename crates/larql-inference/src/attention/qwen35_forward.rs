@@ -452,6 +452,9 @@ mod tests {
                 .into_shared(),
             ssm_norm: Arc::from(vec![1.0_f32; dn_dims.head_v_dim].as_slice()),
             ssm_out: Array2::from_elem((dn_dims.hidden, value_dim), 0.5_f32).into_shared(),
+            attn_qkv_quant: None,
+            attn_gate_quant: None,
+            ssm_out_quant: None,
         }
     }
 

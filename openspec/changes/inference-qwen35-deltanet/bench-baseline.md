@@ -44,6 +44,42 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-12 update — Phase 2b lazy-quant attn_qkv / attn_gate / ssm_out
+
+Phase 2b extends the lazy-tensor set to the three big DeltaNet
+projections per linear layer: `attn_qkv` `{conv_dim=10240, hidden=5120}`,
+`attn_gate` `{value_dim=6144, hidden=5120}`, `ssm_out`
+`{hidden=5120, value_dim=6144}`. 48 linear-attention layers × 3
+tensors = 144 additional matvecs/token through the lazy path.
+
+| Config | Decode (t/s) | VmRSS |
+|---|---:|---:|
+| Phase 3 (lazy FFN + AVX2 + rayon) | 0.20 | 46.65 GiB |
+| **Phase 2b (+ attn_qkv / attn_gate / ssm_out)** | **0.20** | **29.62 GiB** |
+| Δ vs Phase 3 | same | **−17.03 GiB** |
+| Δ vs baseline | −59 % | **−75.63 GiB (−71.9 %)** |
+
+Each linear-attention layer's three big projections sum to
+~470 MB f32 → ~75 MB Q4_K (lossy 6.3×); 48 layers × 395 MB saved
+= ~19 GiB. The observed 17 GiB drop matches that estimate.
+
+Speed unchanged at 0.20 t/s — the extra 144 matvecs/token are
+amortised by the same rayon row-parallelism that drove Phase 3.
+
+Remaining ~30 GiB is mostly:
+- `embed` `{vocab=248320, hidden=5120}` ≈ 5 GiB
+- Full-attn projections (16 layers × q/k/v/o) ≈ 4-8 GiB
+- Smaller per-layer SSM tensors and DeltaNet `ssm_norm` /
+  per-head bias vectors
+- Plus the dequantized layer attn_*_norm / ssm_norm vectors
+
+**Parity preserved**: `real_gguf_qwen35_token_diff_vs_llama_cpp`
+still emits the same `[<think>, \n\n, </think>, \n\n, Hello]`
+sequence with logits `[28.18, 24.78, 25.47, 30.39, 21.66]` and
+GT rank 0 every step.
+
+llama.cpp parity on RAM (~16 GiB) is now ~13 GiB away.
+
 ## 2026-05-11 update — Phase 3 AVX2 + rayon for Q4_K matvec
 
 Phase 3 adds (a) an AVX2 inner-loop kernel for `q4k_row_dot` on
