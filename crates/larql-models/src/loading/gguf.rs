@@ -599,7 +599,22 @@ pub fn load_gguf_lazy_tensors(
         let cols = info.dims[0] as usize;
         let rows = info.dims[1] as usize;
         let qt = crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?;
-        weights.quant_tensors.insert(key.clone(), qt);
+        // Special-case the embed tensor: it has its own dedicated
+        // field on `ModelWeights` (a 5 GiB f32 for Qwen3.6 248k vocab)
+        // and is consumed via row lookup rather than matvec. Steer it
+        // into `embed_quant` and empty out `embed`. Caller dispatches
+        // via `QuantTensor::row_to_f32`.
+        let embed_key_normalised = super::safetensors::normalize_key(
+            &normalize_gguf_key(weights.arch.embed_key()),
+            prefixes,
+        );
+        if key == embed_key_normalised {
+            weights.embed_quant = Some(qt);
+            weights.embed = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
+                .expect("empty array is always valid");
+        } else {
+            weights.quant_tensors.insert(key.clone(), qt);
+        }
         // Drop dense entries that correspond to this lazified tensor.
         weights.tensors.remove(&key);
         weights.tensors.remove(&key_raw);
@@ -693,6 +708,7 @@ pub(crate) fn load_gguf_filtered_with_validation(
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
+        embed_quant: None,
         lm_head,
         lm_head_quant: None,
         quant_tensors: std::collections::HashMap::new(),

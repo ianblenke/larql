@@ -64,6 +64,12 @@ pub struct ModelWeights {
     /// Byte ranges into `packed_mmaps`: maps tensor key → (file_name, offset, length).
     pub packed_byte_ranges: HashMap<String, (String, usize, usize)>,
     pub embed: WeightArray,
+    /// Optional lazy-quantised embed (Q4_K most commonly). When
+    /// populated, callers that only need per-token row lookup may
+    /// use `QuantTensor::row_to_f32(token_id)` and skip the ~5 GiB
+    /// f32 materialisation the dense `embed` field would otherwise
+    /// require for a 248k-vocab model.
+    pub embed_quant: Option<QuantTensor>,
     /// Output projection matrix. Same as embed if tie_word_embeddings=true,
     /// separate lm_head.weight otherwise.
     pub lm_head: WeightArray,

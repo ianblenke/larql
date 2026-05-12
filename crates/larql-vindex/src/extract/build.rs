@@ -905,6 +905,7 @@ mod tests {
             packed_mmaps: HashMap::new(),
             packed_byte_ranges: HashMap::new(),
             embed,
+            embed_quant: None,
             lm_head,
             lm_head_quant: None,
             quant_tensors: std::collections::HashMap::new(),

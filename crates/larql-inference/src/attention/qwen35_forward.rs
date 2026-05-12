@@ -66,8 +66,14 @@ pub struct Qwen35FullLayerWeights {
 #[derive(Clone)]
 pub struct Qwen35Weights {
     /// Token embedding matrix `[vocab, hidden]`. The lookup uses
-    /// `embed.row(token_id)`.
+    /// `embed.row(token_id)`. May be a 0×0 placeholder when
+    /// `embed_quant` is populated and the caller does row-lookup
+    /// via `QuantTensor::row_to_f32`.
     pub embed: ArcArray2<f32>,
+    /// Lazy-quantised embed (Q4_K typical). When `Some`, the
+    /// forward uses `embed_quant.row_to_f32(token_id)` instead of
+    /// the dense `embed` field. Saves ~4 GiB on Qwen3.6-27B.
+    pub embed_quant: Option<larql_models::quant::lazy::QuantTensor>,
     /// Per-layer full weights, indexed 0..n_layer.
     pub layers: Vec<Qwen35FullLayerWeights>,
     /// Final RMSNorm weight `[hidden]`.
@@ -116,13 +122,21 @@ pub fn qwen35_forward_step(
         std::env::set_var("LARQL_QWEN35_DUMP_TOKEN_TAG", format!("tok{tok}"));
     }
 
-    // 1. Embed lookup.
-    let vocab = weights.embed.shape()[0];
-    let hidden = weights.embed.shape()[1];
-    debug_assert!((token_id as usize) < vocab);
-    debug_assert_eq!(hidden, dn_dims.hidden);
-
-    let mut x: Array1<f32> = weights.embed.row(token_id as usize).to_owned();
+    // 1. Embed lookup. Lazy-quant path takes precedence when set;
+    //    falls back to dense `embed.row(token_id)` otherwise.
+    let mut x: Array1<f32> = if let Some(qt) = weights.embed_quant.as_ref() {
+        let [vocab, hidden] = qt.shape();
+        debug_assert!((token_id as usize) < vocab);
+        debug_assert_eq!(hidden, dn_dims.hidden);
+        qt.row_to_f32(token_id as usize)
+            .expect("embed_quant row_to_f32")
+    } else {
+        let vocab = weights.embed.shape()[0];
+        let hidden = weights.embed.shape()[1];
+        debug_assert!((token_id as usize) < vocab);
+        debug_assert_eq!(hidden, dn_dims.hidden);
+        weights.embed.row(token_id as usize).to_owned()
+    };
 
     // Optional per-layer trace, enabled via `LARQL_QWEN35_TRACE=1`.
     // Prints residual stream stats to stderr at each layer so a
@@ -555,6 +569,7 @@ mod tests {
 
         let weights = Qwen35Weights {
             embed: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            embed_quant: None,
             layers: vec![
                 Qwen35FullLayerWeights {
                     block: Qwen35LayerWeights::Linear(dn_weights),
@@ -615,6 +630,7 @@ mod tests {
 
         let weights = Qwen35Weights {
             embed: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            embed_quant: None,
             layers: vec![Qwen35FullLayerWeights {
                 block: Qwen35LayerWeights::Attention(attn_weights),
                 attn_post_norm: post,
@@ -668,6 +684,7 @@ mod tests {
 
         let weights = Qwen35Weights {
             embed: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            embed_quant: None,
             layers: vec![Qwen35FullLayerWeights {
                 block: Qwen35LayerWeights::Linear(dn_weights),
                 attn_post_norm: post,

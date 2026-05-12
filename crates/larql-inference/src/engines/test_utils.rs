@@ -153,6 +153,7 @@ pub fn make_test_weights_with(dims: SyntheticDims) -> ModelWeights {
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
         embed,
+        embed_quant: None,
         lm_head,
         lm_head_quant: None,
         quant_tensors: HashMap::new(),

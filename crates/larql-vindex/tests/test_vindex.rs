@@ -1935,6 +1935,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
+        embed_quant: None,
         lm_head,
         lm_head_quant: None,
         quant_tensors: std::collections::HashMap::new(),

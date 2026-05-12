@@ -44,6 +44,34 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-12 update — Phase 2d lazy-quant embed (105 → 20 GiB, −80.9 %)
+
+Adds `QuantTensor::row_to_f32(token_id)` for the embed-lookup
+pattern (a row read, not a matvec), then wires it into
+`qwen35_forward_step` and the GGUF lazy loader. `embed_quant`
+becomes a peer of `lm_head_quant` on `ModelWeights` and
+`Qwen35Weights`.
+
+| Config | Decode (t/s) | VmRSS |
+|---|---:|---:|
+| Phase 2c (lazy FFN/attn) | 0.23 | 24.07 GiB |
+| **Phase 2d (+ embed lazy)** | **0.23** | **19.99 GiB** |
+| Δ vs Phase 2c | same | **−4.08 GiB** |
+| Δ vs baseline | −53 % | **−85.26 GiB (−81.0 %)** |
+
+Speed unchanged — embed lookup is a single-row dequant per token,
+amortised against the 256 matvecs/token already on the lazy path.
+
+**llama.cpp's ~16 GiB target is now ~4 GiB away.** Remaining
+chunks are smaller per-head SSM tensors (ssm_alpha / ssm_beta /
+ssm_conv1d / ssm_norm) and the per-layer norm vectors. Closing
+the last 4 GiB would require lazifying those too, but each one is
+tiny (1-50 MB), so the engineering effort per GiB has crossed an
+inflection point — Phase 3b (cache-tile batched Q4_K matvec) is
+now a higher-priority lever.
+
+**Parity preserved**: argmax bit-exact, GT rank 0 every step.
+
 ## 2026-05-12 update — Phase 2c lazy-quant full-attn q/k/v/o
 
 Extends the lazy set to the four full-attention projections per
