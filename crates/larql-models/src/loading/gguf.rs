@@ -550,6 +550,63 @@ pub fn load_gguf_lazy_lm_head(path: &Path) -> Result<ModelWeights, ModelError> {
     Ok(weights)
 }
 
+/// Load a GGUF file into ModelWeights and **additionally** populate
+/// `quant_tensors` for every tensor key in `lazy_keys`. Each lazy
+/// tensor is removed from the dense `tensors` map so the caller pays
+/// for the quantised form only. This is the multi-tensor cousin of
+/// [`load_gguf_lazy_lm_head`] — same drop-the-dense semantics, but
+/// any number of named tensors can be kept quantised.
+///
+/// `lazy_keys` is matched against the *normalised* tensor key (after
+/// arch-prefix stripping). Unknown keys are silently ignored so the
+/// caller can hand in a fixed FFN-name set without worrying about
+/// whether a given architecture exposes every entry (e.g. MoE may
+/// have packed experts rather than per-layer `ffn_*`).
+pub fn load_gguf_lazy_tensors(
+    path: &Path,
+    lazy_keys: &std::collections::HashSet<String>,
+) -> Result<ModelWeights, ModelError> {
+    let mut weights = load_gguf_filtered(path, &|_| false)?;
+    if lazy_keys.is_empty() {
+        return Ok(weights);
+    }
+    let gguf = GgufFile::open(path)?;
+    let prefixes = weights.arch.key_prefixes_to_strip();
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    for info in &gguf.tensor_infos {
+        if info.n_dims != 2 {
+            continue;
+        }
+        let key_raw = normalize_gguf_key(&info.name);
+        let key = super::safetensors::normalize_key(&key_raw, prefixes);
+        if !lazy_keys.contains(&key) {
+            continue;
+        }
+        let abs_offset_usize = (gguf.data_offset + info.offset) as usize;
+        let n_elements: usize = info.dims.iter().product::<u64>() as usize;
+        let data_size = tensor_data_size(info.tensor_type, n_elements)?;
+        if abs_offset_usize + data_size > mmap.len() {
+            return Err(ModelError::Parse(format!(
+                "load_gguf_lazy_tensors: {} data out of bounds (offset {} + size {} > file {})",
+                info.name,
+                abs_offset_usize,
+                data_size,
+                mmap.len(),
+            )));
+        }
+        let bytes = mmap[abs_offset_usize..abs_offset_usize + data_size].to_vec();
+        let cols = info.dims[0] as usize;
+        let rows = info.dims[1] as usize;
+        let qt = crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?;
+        weights.quant_tensors.insert(key.clone(), qt);
+        // Drop dense entries that correspond to this lazified tensor.
+        weights.tensors.remove(&key);
+        weights.tensors.remove(&key_raw);
+    }
+    Ok(weights)
+}
+
 /// Load and validate a GGUF file into ModelWeights (dequantized to f32).
 pub fn load_gguf_validated(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered_with_validation(path, &|_| false, true)
@@ -638,6 +695,7 @@ pub(crate) fn load_gguf_filtered_with_validation(
         embed,
         lm_head,
         lm_head_quant: None,
+        quant_tensors: std::collections::HashMap::new(),
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,

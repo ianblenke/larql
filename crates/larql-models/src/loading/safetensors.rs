@@ -329,6 +329,7 @@ fn load_model_dir_filtered_with_validation(
         embed,
         lm_head,
         lm_head_quant: None,
+        quant_tensors: HashMap::new(),
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,

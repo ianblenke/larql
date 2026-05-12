@@ -52,6 +52,13 @@ pub struct Qwen35FullLayerWeights {
     pub ffn_up: ArcArray2<f32>,
     /// SwiGLU down projection `[hidden, ffn_dim]`.
     pub ffn_down: ArcArray2<f32>,
+    /// Optional lazy-quantised gate / up / down. When `Some`, the
+    /// matvec dispatches through `QuantTensor::matvec` and the
+    /// corresponding dense `ffn_*` field is unused (typically a 0×0
+    /// placeholder). Populated by `load_qwen35_weights_lazy_ffn`.
+    pub ffn_gate_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub ffn_up_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub ffn_down_quant: Option<larql_models::quant::lazy::QuantTensor>,
 }
 
 /// Full Qwen 3.6 model weights — embed, every layer's weights, and
@@ -144,13 +151,29 @@ pub fn qwen35_forward_step(
         // 2c. Post-attention RMSNorm (only on `has_post_norms`
         // architectures — Qwen 3.6 is one of them).
         let ffn_in = rms_norm_1d_pub(&residual, &layer_w.attn_post_norm, eps);
-        // 2d. SwiGLU FFN.
-        let ffn_out = swiglu_ffn(
-            &ffn_in,
-            layer_w.ffn_gate.view(),
-            layer_w.ffn_up.view(),
-            layer_w.ffn_down.view(),
-        );
+        // 2d. SwiGLU FFN. Lazy-quant path takes precedence per
+        //     projection; falls back to dense ndarray dot otherwise.
+        let ffn_out = if layer_w.ffn_gate_quant.is_some()
+            || layer_w.ffn_up_quant.is_some()
+            || layer_w.ffn_down_quant.is_some()
+        {
+            swiglu_ffn_lazy(
+                &ffn_in,
+                layer_w.ffn_gate_quant.as_ref(),
+                layer_w.ffn_up_quant.as_ref(),
+                layer_w.ffn_down_quant.as_ref(),
+                &layer_w.ffn_gate,
+                &layer_w.ffn_up,
+                &layer_w.ffn_down,
+            )
+        } else {
+            swiglu_ffn(
+                &ffn_in,
+                layer_w.ffn_gate.view(),
+                layer_w.ffn_up.view(),
+                layer_w.ffn_down.view(),
+            )
+        };
         // 2e. Residual add 2 — `x = residual + ffn_out` (NOT
         // `ffn_in + ffn_out`; the FFN residual bypasses the
         // post-norm per design.md §6).
@@ -348,6 +371,40 @@ fn swiglu_ffn(
     down.dot(&inter) // [hidden]
 }
 
+/// SwiGLU FFN with per-projection lazy-quantised fallback. Each of
+/// the three projections takes the lazy form when `Some`, falling
+/// back to the dense `ArcArray2<f32>` when `None`. Allows the bench
+/// to compare configurations where only some projections are lazy
+/// (or to drop in AVX2-accelerated `QuantTensor::matvec` in a
+/// follow-up without touching the call sites).
+#[allow(clippy::too_many_arguments)]
+fn swiglu_ffn_lazy(
+    x: &Array1<f32>,
+    gate_q: Option<&larql_models::quant::lazy::QuantTensor>,
+    up_q: Option<&larql_models::quant::lazy::QuantTensor>,
+    down_q: Option<&larql_models::quant::lazy::QuantTensor>,
+    gate_dense: &ArcArray2<f32>,
+    up_dense: &ArcArray2<f32>,
+    down_dense: &ArcArray2<f32>,
+) -> Array1<f32> {
+    let g = match gate_q {
+        Some(q) => q.matvec(x).expect("ffn_gate_quant matvec"),
+        None => gate_dense.dot(x),
+    };
+    let u = match up_q {
+        Some(q) => q.matvec(x).expect("ffn_up_quant matvec"),
+        None => up_dense.dot(x),
+    };
+    let mut inter = Array1::<f32>::zeros(g.len());
+    for i in 0..g.len() {
+        inter[i] = (g[i] * sigmoid(g[i])) * u[i];
+    }
+    match down_q {
+        Some(q) => q.matvec(&inter).expect("ffn_down_quant matvec"),
+        None => down_dense.dot(&inter),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +555,9 @@ mod tests {
                     ffn_gate: gate0,
                     ffn_up: up0,
                     ffn_down: down0,
+                    ffn_gate_quant: None,
+                    ffn_up_quant: None,
+                    ffn_down_quant: None,
                 },
                 Qwen35FullLayerWeights {
                     block: Qwen35LayerWeights::Attention(attn_weights),
@@ -505,6 +565,9 @@ mod tests {
                     ffn_gate: gate1,
                     ffn_up: up1,
                     ffn_down: down1,
+                    ffn_gate_quant: None,
+                    ffn_up_quant: None,
+                    ffn_down_quant: None,
                 },
             ],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
@@ -551,6 +614,9 @@ mod tests {
                 ffn_gate: gate,
                 ffn_up: up,
                 ffn_down: down,
+                ffn_gate_quant: None,
+                ffn_up_quant: None,
+                ffn_down_quant: None,
             }],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
@@ -598,6 +664,9 @@ mod tests {
             layers: vec![Qwen35FullLayerWeights {
                 block: Qwen35LayerWeights::Linear(dn_weights),
                 attn_post_norm: post,
+                ffn_gate_quant: None,
+                ffn_up_quant: None,
+                ffn_down_quant: None,
                 ffn_gate: gate,
                 ffn_up: up,
                 ffn_down: down,

@@ -92,15 +92,41 @@ pub fn load_qwen35_weights(
         // No `add_one_to_vec` needed here despite Qwen3-Next using
         // `Qwen3NextRMSNorm(x) = x * inv_rms * (1 + w)` semantically.
         let attn_post_norm = get_vec(weights, &arch.post_attention_layernorm_key(layer))?;
-        let ffn_gate = get_tensor(weights, &arch.ffn_gate_key(layer))?;
-        let ffn_up = get_tensor(weights, &arch.ffn_up_key(layer))?;
-        let ffn_down = get_tensor(weights, &arch.ffn_down_key(layer))?;
+        let ffn_gate_key = arch.ffn_gate_key(layer);
+        let ffn_up_key = arch.ffn_up_key(layer);
+        let ffn_down_key = arch.ffn_down_key(layer);
+        // Lazy-quant takes precedence per projection. The dense
+        // field gets a 0×0 placeholder when the quant form is
+        // available so we don't pay RAM twice.
+        let ffn_gate_quant = weights.quant_tensors.get(&ffn_gate_key).cloned();
+        let ffn_up_quant = weights.quant_tensors.get(&ffn_up_key).cloned();
+        let ffn_down_quant = weights.quant_tensors.get(&ffn_down_key).cloned();
+        let empty_arr = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
+            .expect("empty array is always valid");
+        let ffn_gate = if ffn_gate_quant.is_some() {
+            empty_arr.clone()
+        } else {
+            get_tensor(weights, &ffn_gate_key)?
+        };
+        let ffn_up = if ffn_up_quant.is_some() {
+            empty_arr.clone()
+        } else {
+            get_tensor(weights, &ffn_up_key)?
+        };
+        let ffn_down = if ffn_down_quant.is_some() {
+            empty_arr.clone()
+        } else {
+            get_tensor(weights, &ffn_down_key)?
+        };
         layers.push(Qwen35FullLayerWeights {
             block,
             attn_post_norm,
             ffn_gate,
             ffn_up,
             ffn_down,
+            ffn_gate_quant,
+            ffn_up_quant,
+            ffn_down_quant,
         });
     }
 
@@ -431,6 +457,7 @@ mod tests {
             embed,
             lm_head,
             lm_head_quant: None,
+            quant_tensors: HashMap::new(),
             arch: Box::new(Qwen35Arch::from_config(cfg.clone())),
             num_layers: cfg.num_layers,
             hidden_size: cfg.hidden_size,
@@ -532,6 +559,7 @@ mod tests {
             embed: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
             lm_head: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
             lm_head_quant: None,
+            quant_tensors: HashMap::new(),
             arch: Box::new(Qwen35Arch::from_config(cfg.clone())),
             num_layers: cfg.num_layers,
             hidden_size: cfg.hidden_size,
@@ -640,6 +668,7 @@ mod tests {
             embed: make_2d(1, 1, 0.0),
             lm_head: make_2d(1, 1, 0.0),
             lm_head_quant: None,
+            quant_tensors: HashMap::new(),
             arch: Box::new(Qwen35Arch::from_config(cfg)),
             num_layers: 0,
             hidden_size: 0,
@@ -2119,9 +2148,27 @@ mod tests {
             .unwrap_or(16);
 
         let lazy_lm_head = std::env::var("LARQL_QWEN35_LAZY_LM_HEAD").is_ok();
-        eprintln!("loading GGUF (lazy_lm_head={lazy_lm_head})…");
+        let lazy_ffn = std::env::var("LARQL_QWEN35_LAZY_FFN").is_ok();
+        eprintln!("loading GGUF (lazy_lm_head={lazy_lm_head}, lazy_ffn={lazy_ffn})…");
         let load_t = std::time::Instant::now();
-        let weights = if lazy_lm_head {
+        let weights = if lazy_ffn {
+            let probe = larql_models::load_gguf(&gguf_path).expect("probe load");
+            let n_layers = probe.num_layers;
+            let arch_ref = &*probe.arch;
+            let mut lazy_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for l in 0..n_layers {
+                lazy_keys.insert(arch_ref.ffn_gate_key(l));
+                lazy_keys.insert(arch_ref.ffn_up_key(l));
+                lazy_keys.insert(arch_ref.ffn_down_key(l));
+            }
+            if lazy_lm_head {
+                lazy_keys.insert("lm_head.weight".to_string());
+                lazy_keys.insert("output.weight".to_string());
+            }
+            drop(probe);
+            larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
+                .expect("load_gguf_lazy_tensors")
+        } else if lazy_lm_head {
             larql_models::load_gguf_lazy_lm_head(&gguf_path).expect("load_gguf_lazy_lm_head")
         } else {
             larql_models::load_gguf(&gguf_path).expect("load_gguf")
@@ -2265,9 +2312,36 @@ mod tests {
             .expect("encode ground truth")
             .get_ids()
             .to_vec();
+
+        // Optional lazy-quant paths. Both are env-gated and verify
+        // that swapping in `QuantTensor::matvec` for FFN and/or
+        // lm_head keeps argmax parity with llama.cpp.
+        let lazy_lm_head = std::env::var("LARQL_QWEN35_LAZY_LM_HEAD").is_ok();
+        let lazy_ffn = std::env::var("LARQL_QWEN35_LAZY_FFN").is_ok();
         eprintln!("ground truth {:?} → tokens {gt_ids:?}", ground_truth_text);
 
-        let weights = larql_models::load_gguf(&gguf_path).expect("load_gguf");
+        let weights = if lazy_ffn {
+            let probe = larql_models::load_gguf(&gguf_path).expect("probe load");
+            let n_layers = probe.num_layers;
+            let arch_ref = &*probe.arch;
+            let mut lazy_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for l in 0..n_layers {
+                lazy_keys.insert(arch_ref.ffn_gate_key(l));
+                lazy_keys.insert(arch_ref.ffn_up_key(l));
+                lazy_keys.insert(arch_ref.ffn_down_key(l));
+            }
+            if lazy_lm_head {
+                lazy_keys.insert("lm_head.weight".to_string());
+                lazy_keys.insert("output.weight".to_string());
+            }
+            drop(probe);
+            larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
+                .expect("load_gguf_lazy_tensors")
+        } else if lazy_lm_head {
+            larql_models::load_gguf_lazy_lm_head(&gguf_path).expect("load_gguf_lazy_lm_head")
+        } else {
+            larql_models::load_gguf(&gguf_path).expect("load_gguf")
+        };
         let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
 
         let arch = &*weights.arch;
