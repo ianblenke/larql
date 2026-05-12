@@ -22435,7 +22435,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2310,
+      "line": 2429,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_bench",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2098,
       "crate": "larql_inference"
     },
     {
@@ -22483,13 +22489,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2247,
+      "line": 2366,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2094,
+      "line": 2213,
       "crate": "larql_inference"
     },
     {
@@ -22555,7 +22561,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2310,
+      "line": 2429,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_bench",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2098,
       "crate": "larql_inference"
     },
     {
@@ -22603,13 +22615,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2247,
+      "line": 2366,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2094,
+      "line": 2213,
       "crate": "larql_inference"
     },
     {
