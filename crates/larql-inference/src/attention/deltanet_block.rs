@@ -399,20 +399,31 @@ pub fn deltanet_block_step(
     // direct reshape was a bug: it interpreted head-major flat as
     // dim-major, scrambling head indices. This was latent until real
     // Qwen 3.6 weights were loaded (synthetic constant tensors mask it).
+    // `reversed_axes().to_owned()` preserves transposed strides (same
+    // gotcha as the loader's `t().to_owned()` fixed by E.6.A's
+    // ssm_conv1d patch). `as_standard_layout().to_owned()` forces a
+    // row-major copy so `as_slice()` returns `Some`, which lets the
+    // L2-norm and deltanet-recurrence GPU hooks actually fire when
+    // `LARQL_QWEN35_GPU=1`. Without this they silently fall back to
+    // CPU regardless of backend availability. Layout convention
+    // unchanged: `q[d, h]` is still head h, dim d.
     let q = q_raw
         .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
         .expect("q reshape")
         .reversed_axes()
+        .as_standard_layout()
         .to_owned();
     let k = k_raw
         .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
         .expect("k reshape")
         .reversed_axes()
+        .as_standard_layout()
         .to_owned();
     let v = v_raw
         .into_shape_with_order((dims.n_v_heads, dims.head_v_dim))
         .expect("v reshape")
         .reversed_axes()
+        .as_standard_layout()
         .to_owned();
 
     // 5. L2-norm Q and K per head. V passes through.

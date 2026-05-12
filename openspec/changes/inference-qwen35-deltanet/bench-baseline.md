@@ -168,6 +168,41 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.A.7: Q/K/V `as_standard_layout` enables full GPU per-step DeltaNet
+
+Same latent stride bug that E.6.A's `ssm_conv1d` loader fix surfaced:
+`q_raw.into_shape_with_order((n_k_heads, head_v_dim)).reversed_axes().to_owned()`
+preserves the transposed strides, so `as_slice()` returns `None`,
+silently disabling the `qwen35_l2_normalize_per_head` and
+`qwen35_deltanet_step` GPU hooks in `deltanet_block_step`. Same
+pattern for K and V. Adding `.as_standard_layout()` before
+`.to_owned()` forces a row-major copy with identical logical values
+(`q[d, h]` still represents head h, dim d) — and now the GPU hooks
+actually fire.
+
+After this fix, ALL the per-step DeltaNet kernels run on GPU under
+`LARQL_QWEN35_GPU=1` (conv1d + L2-norm Q + L2-norm K +
+recurrence + rms_norm_heads), with only `silu` and `silu(z)*o`
+elementwise loops still on host.
+
+Parity preserved: `real_gguf_qwen35_token_diff_vs_llama_cpp` still
+emits `[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0 every
+step.
+
+Bench result:
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.4.3 (only conv1d + rms_norm on GPU) | 0.32 | 0.33 | 21.16 GiB |
+| **Phase E.6.A.7 (+ L2-norm + recurrence on GPU)** | **0.35** | **0.35** | **21.16 GiB** |
+
+**+6 % decode.** Modest but the lever is real: each per-layer host
+bounce removed cuts the sync chain. Next we need the per-step path
+to also do silu, reshape, and silu(z)*o on device (i.e. the fused
+post-projection chain from E.6.A) — that's still blocked on
+E.6.A.6 parity (suspected fp32 expf drift in the GPU silu kernel
+compounding through the per-position recurrent state).
+
 ## 2026-05-12 update — Phase E.6.A.6 follow-up: reduction-order + fmad in nvrtc
 
 Tightening the GPU kernel's numerical behaviour against the host
