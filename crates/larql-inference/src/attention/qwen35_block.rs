@@ -141,32 +141,42 @@ pub fn qwen35_attention_block_step(
     dims: &Qwen35AttentionDims,
     kv_layer: &mut (Array2<f32>, Array2<f32>),
     position: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
-    debug_assert_eq!(weights.attn_q.shape(), [dims.fused_q_dim(), dims.hidden]);
-    debug_assert_eq!(weights.attn_k.shape(), [dims.kv_dim(), dims.hidden]);
-    debug_assert_eq!(weights.attn_v.shape(), [dims.kv_dim(), dims.hidden]);
+    if weights.attn_q_quant.is_none() {
+        debug_assert_eq!(weights.attn_q.shape(), [dims.fused_q_dim(), dims.hidden]);
+    }
+    if weights.attn_k_quant.is_none() {
+        debug_assert_eq!(weights.attn_k.shape(), [dims.kv_dim(), dims.hidden]);
+    }
+    if weights.attn_v_quant.is_none() {
+        debug_assert_eq!(weights.attn_v.shape(), [dims.kv_dim(), dims.hidden]);
+    }
     debug_assert_eq!(weights.attn_q_norm.len(), dims.head_dim);
     debug_assert_eq!(weights.attn_k_norm.len(), dims.head_dim);
-    debug_assert_eq!(weights.attn_output.shape(), [dims.hidden, dims.q_dim()]);
+    if weights.attn_output_quant.is_none() {
+        debug_assert_eq!(weights.attn_output.shape(), [dims.hidden, dims.q_dim()]);
+    }
 
     // 1. Pre-attention RMSNorm.
     let x_norm = super::deltanet_block::rms_norm_1d_pub(x, &weights.attn_norm, dims.eps);
 
     // 2. Projections.
+    use crate::attention::quant_dispatch::matvec_with_backend;
     let q_fused_1d = if let Some(q) = weights.attn_q_quant.as_ref() {
-        q.matvec(&x_norm).expect("attn_q_quant matvec")
+        matvec_with_backend(q, &x_norm, backend)
     } else {
         weights.attn_q.dot(&x_norm)
     }; // [fused_q_dim]
     let k_1d = if let Some(q) = weights.attn_k_quant.as_ref() {
-        q.matvec(&x_norm).expect("attn_k_quant matvec")
+        matvec_with_backend(q, &x_norm, backend)
     } else {
         weights.attn_k.dot(&x_norm)
     }; // [kv_dim]
     let v_1d = if let Some(q) = weights.attn_v_quant.as_ref() {
-        q.matvec(&x_norm).expect("attn_v_quant matvec")
+        matvec_with_backend(q, &x_norm, backend)
     } else {
         weights.attn_v.dot(&x_norm)
     }; // [kv_dim]
@@ -248,7 +258,7 @@ pub fn qwen35_attention_block_step(
     // 9. Output projection: y = attn_output @ attn_out[0].
     let attn_out_1d = attn_out.row(0).to_owned();
     if let Some(q) = weights.attn_output_quant.as_ref() {
-        q.matvec(&attn_out_1d).expect("attn_output_quant matvec")
+        matvec_with_backend(q, &attn_out_1d, backend)
     } else {
         weights.attn_output.dot(&attn_out_1d)
     }
@@ -444,6 +454,8 @@ pub fn hybrid_layer_step(
     dn_dims: &DeltaNetDims,
     attn_dims: &Qwen35AttentionDims,
     hybrid_cache: &mut DeltaNetHybridCache,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    sequence_pos: usize,
 ) -> Array1<f32> {
     debug_assert!(layer < hybrid_cache.num_layers());
     let is_linear = hybrid_cache.layer_kinds[layer];
@@ -452,13 +464,20 @@ pub fn hybrid_layer_step(
             let state = hybrid_cache.dn_state.layers[layer]
                 .as_mut()
                 .expect("linear-layer state should be allocated");
-            deltanet_block_step(x, w, dn_dims, state)
+            deltanet_block_step(x, w, dn_dims, state, backend, sequence_pos)
         }
         (Qwen35LayerWeights::Attention(w), false) => {
             let kv_layer = hybrid_cache.kv_layers[layer]
                 .as_mut()
                 .expect("full-attn KV slabs should be allocated");
-            qwen35_attention_block_step(x, w, attn_dims, kv_layer, hybrid_cache.next_position)
+            qwen35_attention_block_step(
+                x,
+                w,
+                attn_dims,
+                kv_layer,
+                hybrid_cache.next_position,
+                backend,
+            )
         }
         _ => panic!(
             "layer {} kind mismatch: weights and layer_kinds disagree",
@@ -695,7 +714,16 @@ mod tests {
         let layer_weights = Qwen35LayerWeights::Linear(dn_weights);
 
         let x = Array1::from_elem(dn_dims.hidden, 1.0_f32);
-        let y = hybrid_layer_step(0, &x, &layer_weights, &dn_dims, &attn_dims, &mut cache);
+        let y = hybrid_layer_step(
+            0,
+            &x,
+            &layer_weights,
+            &dn_dims,
+            &attn_dims,
+            &mut cache,
+            None,
+            0,
+        );
         assert_eq!(y.len(), dn_dims.hidden);
         // Linear-layer state should be non-zero after one step.
         let state = cache.dn_state.layers[0].as_ref().unwrap();
@@ -733,7 +761,16 @@ mod tests {
         let layer_weights = Qwen35LayerWeights::Attention(attn_weights);
 
         let x = Array1::from_elem(attn_dims.hidden, 1.0_f32);
-        let _ = hybrid_layer_step(0, &x, &layer_weights, &dn_dims, &attn_dims, &mut cache);
+        let _ = hybrid_layer_step(
+            0,
+            &x,
+            &layer_weights,
+            &dn_dims,
+            &attn_dims,
+            &mut cache,
+            None,
+            0,
+        );
     }
 
     /// Avoids the dead-code-warning silence on the reserved helper.

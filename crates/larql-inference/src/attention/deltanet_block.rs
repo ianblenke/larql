@@ -130,6 +130,8 @@ pub fn deltanet_block_step(
     weights: &DeltaNetLayerWeights,
     dims: &DeltaNetDims,
     state: &mut DeltaNetLayerState,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    sequence_pos: usize,
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
@@ -170,20 +172,16 @@ pub fn deltanet_block_step(
     }
 
     // 2. Projections (matvec).
-    // Matvecs go through `QuantTensor::matvec` when the lazy form is
+    // Matvecs go through `matvec_with_backend` when the lazy form is
     // populated; otherwise fall back to the dense f32 dot.
-    //
-    // Phase E.3 will plumb the GPU backend through `state` or a
-    // function argument so these matvecs can also route through
-    // `matvec_with_backend`. For E.1/E.2 (this commit) only lm_head
-    // and FFN matvecs are GPU-dispatched.
+    use crate::attention::quant_dispatch::matvec_with_backend;
     let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
-        q.matvec(&x_norm).expect("attn_qkv_quant matvec")
+        matvec_with_backend(q, &x_norm, backend)
     } else {
         weights.attn_qkv.dot(&x_norm)
     }; // [conv_dim]
     let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
-        q.matvec(&x_norm).expect("attn_gate_quant matvec")
+        matvec_with_backend(q, &x_norm, backend)
     } else {
         weights.attn_gate.dot(&x_norm)
     }; // [value_dim]
@@ -281,8 +279,24 @@ pub fn deltanet_block_step(
         .collect();
 
     // 3. Causal Conv1D-with-state, then SiLU element-wise.
-    let mut qkv_conv =
-        causal_conv1d_step(weights.ssm_conv1d.view(), &mut state.conv_state, &qkv_mixed);
+    let mut qkv_conv = backend
+        .and_then(|b| {
+            let weight = weights.ssm_conv1d.as_slice()?;
+            let conv_state = state.conv_state.as_slice_mut()?;
+            let new = qkv_mixed.as_slice()?;
+            b.qwen35_causal_conv1d_step(
+                weight,
+                conv_state,
+                new,
+                dims.d_conv,
+                dims.conv_dim(),
+                sequence_pos,
+            )
+        })
+        .map(Array1::from)
+        .unwrap_or_else(|| {
+            causal_conv1d_step(weights.ssm_conv1d.view(), &mut state.conv_state, &qkv_mixed)
+        });
     for v in qkv_conv.iter_mut() {
         *v = silu(*v);
     }
@@ -339,11 +353,53 @@ pub fn deltanet_block_step(
         .to_owned();
 
     // 5. L2-norm Q and K per head. V passes through.
-    let q = l2_normalize_per_head(&q);
-    let k = l2_normalize_per_head(&k);
+    let q = backend
+        .and_then(|b| {
+            let q_slice = q.as_slice()?;
+            b.qwen35_l2_normalize_per_head(q_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
+        })
+        .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
+        .unwrap_or_else(|| l2_normalize_per_head(&q));
+    let k = backend
+        .and_then(|b| {
+            let k_slice = k.as_slice()?;
+            b.qwen35_l2_normalize_per_head(k_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
+        })
+        .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
+        .unwrap_or_else(|| l2_normalize_per_head(&k));
 
     // 6. Delta-rule recurrence.
-    let o = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state);
+    let o = if std::env::var("LARQL_QWEN35_PAPER_ORDER").is_err() {
+        backend
+            .and_then(|b| {
+                let q_slice = q.as_slice()?;
+                let k_slice = k.as_slice()?;
+                let v_slice = v.as_slice()?;
+                let log_g_slice = log_g.as_slice()?;
+                let beta_slice = beta.as_slice()?;
+                let recurrent_state = state.recurrent_state.as_slice_mut()?;
+                b.qwen35_deltanet_step(
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                    log_g_slice,
+                    beta_slice,
+                    recurrent_state,
+                    dims.head_v_dim,
+                    dims.n_k_heads,
+                    dims.n_v_heads,
+                    sequence_pos,
+                )
+            })
+            .and_then(|out| {
+                ndarray::Array2::from_shape_vec((dims.head_v_dim, dims.n_v_heads), out).ok()
+            })
+            .unwrap_or_else(|| {
+                delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+            })
+    } else {
+        delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+    };
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let mut per_head: Vec<(usize, f32)> = (0..dims.n_v_heads)
             .map(|h| {
@@ -384,22 +440,36 @@ pub fn deltanet_block_step(
     // heads, producing a 46× amplification (l2: 0.6 → 27.4) where
     // llama.cpp produces 5× less. Transpose first so the flatten
     // yields head-major.
-    let o_flat: Array1<f32> = o.t().to_owned().into_iter().collect();
-    debug_assert_eq!(o_flat.len(), value_dim);
+    let o_flat_pre: Array1<f32> = o.t().to_owned().into_iter().collect();
+    debug_assert_eq!(o_flat_pre.len(), value_dim);
 
     // 7. Per-head RMSNorm by ssm_norm (weight is [head_v_dim], shared
     //    across heads). Reshape to [1, value_dim] for rms_norm_heads.
-    let o_2d = o_flat
-        .into_shape_with_order((1, value_dim))
-        .expect("o reshape");
-    let o_normed = crate::residual::rms_norm_heads(
-        &o_2d,
-        &weights.ssm_norm,
-        dims.n_v_heads,
-        dims.head_v_dim,
-        0.0,
-    );
-    let mut o_flat = o_normed.index_axis_move(Axis(0), 0);
+    let gpu_o_normed = backend.and_then(|b| {
+        let o_slice = o_flat_pre.as_slice()?;
+        b.qwen35_rms_norm_heads(
+            o_slice,
+            &weights.ssm_norm,
+            dims.n_v_heads,
+            dims.head_v_dim,
+            crate::residual::DEFAULT_EPS as f32,
+        )
+    });
+    let mut o_flat = if let Some(out) = gpu_o_normed {
+        Array1::from(out)
+    } else {
+        let o_2d = o_flat_pre
+            .into_shape_with_order((1, value_dim))
+            .expect("o reshape");
+        let o_normed = crate::residual::rms_norm_heads(
+            &o_2d,
+            &weights.ssm_norm,
+            dims.n_v_heads,
+            dims.head_v_dim,
+            0.0,
+        );
+        o_normed.index_axis_move(Axis(0), 0)
+    };
 
     // 8. Multiply by SiLU(Z) element-wise.
     for c in 0..value_dim {
@@ -480,7 +550,7 @@ pub fn deltanet_block_step(
 
     // 9. Output projection (matvec).
     let block_out = if let Some(q) = weights.ssm_out_quant.as_ref() {
-        q.matvec(&o_flat).expect("ssm_out_quant matvec")
+        matvec_with_backend(q, &o_flat, backend)
     } else {
         weights.ssm_out.dot(&o_flat)
     };
@@ -601,7 +671,7 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::from_elem(dims.hidden, 1.0_f32);
 
-        let y = deltanet_block_step(&x, &weights, &dims, &mut state);
+        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
         assert_eq!(y.len(), dims.hidden);
         assert!(y.iter().all(|v| v.is_finite()));
 
@@ -653,7 +723,7 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::zeros(dims.hidden);
 
-        let y = deltanet_block_step(&x, &weights, &dims, &mut state);
+        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
         for &v in y.iter() {
             assert!(v.abs() < 1e-5, "expected zero output, got {v}");
         }
@@ -721,9 +791,9 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::from_elem(dims.hidden, 1.0_f32);
 
-        let _y1 = deltanet_block_step(&x, &weights, &dims, &mut state);
+        let _y1 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
         let state_mass_after_1: f32 = state.recurrent_state.iter().map(|&v| v.abs()).sum();
-        let _y2 = deltanet_block_step(&x, &weights, &dims, &mut state);
+        let _y2 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 1);
         let state_mass_after_2: f32 = state.recurrent_state.iter().map(|&v| v.abs()).sum();
 
         // Without decay, the state should retain at least as much

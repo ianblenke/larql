@@ -66,6 +66,11 @@ pub struct CudaBackend {
     /// Gemma 3 270M's lm_head with hidden=640 — not a multiple of
     /// the 256-element Q4_K super-block).
     f16_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
+    /// Qwen3.6 DeltaNet recurrent and Conv1D state buffers keyed by
+    /// host ndarray storage pointer. The host state is uploaded on
+    /// first use and whenever sequence position resets to 0; after
+    /// that the device buffer is authoritative for the active sequence.
+    pub(crate) qwen35_f32_state_cache: Mutex<HashMap<DeviceStateKey, CudaSlice<f32>>>,
     /// `cuda-decode-cuda-graph`: pre-allocated per-decode scratch
     /// buffers. `None` until the first decode_token_device call sees
     /// a shape; reused on every subsequent same-shape call.
@@ -113,6 +118,7 @@ impl CudaBackend {
             q6k_f16_device_cache: Mutex::new(HashMap::new()),
             f32_norm_device_cache: Mutex::new(HashMap::new()),
             f16_f32_device_cache: Mutex::new(HashMap::new()),
+            qwen35_f32_state_cache: Mutex::new(HashMap::new()),
             decode_scratch: Mutex::new(None),
             decode_graph: Mutex::new(None),
             decode_warmup_count: Mutex::new(0),
@@ -614,6 +620,26 @@ impl CudaBackend {
             m.iter().copied().collect()
         }
     }
+
+    pub(crate) fn with_qwen35_state_device_buf<R>(
+        &self,
+        host: &mut [f32],
+        sequence_pos: usize,
+        f: impl FnOnce(&mut CudaSlice<f32>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceStateKey::from_slice(host);
+        let mut cache = self.qwen35_f32_state_cache.lock().map_err(|_| {
+            CudaInitError::DriverMissing("qwen35 state device cache poisoned".into())
+        })?;
+        if sequence_pos == 0 || !cache.contains_key(&key) {
+            let state_dev = self.drv.device_buf_from(host)?;
+            cache.insert(key, state_dev);
+        }
+        let state_dev = cache
+            .get_mut(&key)
+            .ok_or_else(|| CudaInitError::DriverMissing("qwen35 state cache miss".into()))?;
+        f(state_dev)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -639,6 +665,21 @@ impl DeviceBytesKey {
             len: bytes.len(),
             head: read_u64(bytes),
             tail: read_u64(&bytes[tail_start..]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DeviceStateKey {
+    ptr: usize,
+    len: usize,
+}
+
+impl DeviceStateKey {
+    fn from_slice(values: &[f32]) -> Self {
+        Self {
+            ptr: values.as_ptr() as usize,
+            len: values.len(),
         }
     }
 }
@@ -730,6 +771,77 @@ impl ComputeBackend for CudaBackend {
                 | Capability::DecodeToken
                 | Capability::PrefillQ4
         )
+    }
+
+    fn qwen35_causal_conv1d_step(
+        &self,
+        weight: &[f32],
+        state: &mut [f32],
+        new: &[f32],
+        d_conv: usize,
+        conv_dim: usize,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::deltanet::causal_conv1d_step_cached(
+            self,
+            weight,
+            state,
+            new,
+            d_conv,
+            conv_dim,
+            sequence_pos,
+        )
+        .ok()
+    }
+
+    fn qwen35_deltanet_step(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        log_g: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        s: usize,
+        h_k: usize,
+        h_v: usize,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::deltanet::deltanet_step_cached(
+            self,
+            q,
+            k,
+            v,
+            log_g,
+            beta,
+            state,
+            s,
+            h_k,
+            h_v,
+            sequence_pos,
+        )
+        .ok()
+    }
+
+    fn qwen35_l2_normalize_per_head(
+        &self,
+        x: &[f32],
+        head_dim: usize,
+        n_heads: usize,
+        eps: f32,
+    ) -> Option<Vec<f32>> {
+        super::deltanet::l2_normalize_per_head(self, x, head_dim, n_heads, eps).ok()
+    }
+
+    fn qwen35_rms_norm_heads(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        num_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Option<Vec<f32>> {
+        super::deltanet::rms_norm_heads(self, x, weight, num_heads, head_dim, eps).ok()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

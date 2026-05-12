@@ -95,7 +95,7 @@ pub struct Qwen35Weights {
     /// route through `backend.quant_matvec(...)` before falling
     /// back to the CPU rayon path. None keeps the all-CPU
     /// behaviour shipped in Phase 2a-2d.
-    pub backend: Option<std::sync::Arc<dyn larql_compute::backend::QuantMatVec + Send + Sync>>,
+    pub backend: Option<std::sync::Arc<dyn larql_compute::ComputeBackend>>,
 }
 
 /// One-token forward through the entire Qwen 3.6 model.
@@ -164,8 +164,17 @@ pub fn qwen35_forward_step(
         let layer_w = &weights.layers[layer];
         // 2a. Block forward (linear or full-attn). The block does
         // its own pre-norm internally (`attn_norm`).
-        let block_out =
-            hybrid_layer_step(layer, &x, &layer_w.block, dn_dims, attn_dims, hybrid_cache);
+        let backend = weights.backend.as_deref();
+        let block_out = hybrid_layer_step(
+            layer,
+            &x,
+            &layer_w.block,
+            dn_dims,
+            attn_dims,
+            hybrid_cache,
+            backend,
+            hybrid_cache.next_position,
+        );
         // 2b. Residual add 1 — `residual = x + block_out`.
         let residual: Array1<f32> = &x + &block_out;
         // 2c. Post-attention RMSNorm (only on `has_post_norms`
@@ -185,10 +194,7 @@ pub fn qwen35_forward_step(
                 &layer_w.ffn_gate,
                 &layer_w.ffn_up,
                 &layer_w.ffn_down,
-                weights
-                    .backend
-                    .as_deref()
-                    .map(|b| b as &(dyn larql_compute::backend::QuantMatVec + Send + Sync)),
+                weights.backend.as_deref(),
             )
         } else {
             swiglu_ffn(
@@ -330,10 +336,7 @@ pub fn qwen35_forward_step(
         crate::attention::quant_dispatch::matvec_with_backend(
             qt,
             &x_final,
-            weights
-                .backend
-                .as_deref()
-                .map(|b| b as &(dyn larql_compute::backend::QuantMatVec + Send + Sync)),
+            weights.backend.as_deref(),
         )
     } else {
         weights.lm_head.dot(&x_final)
@@ -419,7 +422,7 @@ fn swiglu_ffn_lazy(
     gate_dense: &ArcArray2<f32>,
     up_dense: &ArcArray2<f32>,
     down_dense: &ArcArray2<f32>,
-    backend: Option<&(dyn larql_compute::backend::QuantMatVec + Send + Sync)>,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
     use crate::attention::quant_dispatch::matvec_with_backend;
     let g = match gate_q {

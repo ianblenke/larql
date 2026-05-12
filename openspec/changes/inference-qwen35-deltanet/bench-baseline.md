@@ -77,13 +77,146 @@ diffed bit-exact in Phase C. Estimated ~600 LoC + the cudarc PTX
 plumbing.
 
 E.3 (DeltaNet `attn_qkv`/`attn_gate`/`ssm_out` + full-attn
-q/k/v/o through GPU) is queued — pure plumbing once E.4 is in
-place. E.6 (device-resident weights + KV cache + CUDA Graphs) is
-the longer-term arc.
+q/k/v/o through GPU) is now done; it is pure projection plumbing
+and remains marginal until E.4 moves the recurrence. E.6
+(device-resident weights + KV cache + CUDA Graphs) is the
+longer-term arc.
 
 **Parity preserved**: `real_gguf_qwen35_token_diff_vs_llama_cpp`
 under `LARQL_QWEN35_GPU=1` still emits the same
 `[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0 every step.
+
+## 2026-05-12 update — Phase E.3 GPU dispatch for DeltaNet + full-attn projections
+
+Extended the Phase E backend path to route the remaining
+lazy-quantised projection matvecs through `CudaBackend`: DeltaNet
+`attn_qkv`, `attn_gate`, `ssm_out`, and full-attn `attn_q`,
+`attn_k`, `attn_v`, `attn_o`. The token-diff parity harness now
+attaches the same backend when `LARQL_QWEN35_GPU=1`, so the
+documented GPU validation command exercises CUDA dispatch.
+
+Protocol:
+
+```bash
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_BENCH_PREFILL=16 LARQL_QWEN35_BENCH_DECODE=4 \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_bench -- --nocapture
+```
+
+Result:
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.1/E.2 (+ GPU lm_head & FFN) | — | 0.28 | 21 GiB (host) |
+| **Phase E.3 (+ DeltaNet/full-attn projections)** | **0.33** | **0.33** | **21.16 GiB** |
+
+E.3 buys another modest +18 % over E.1/E.2. The headline still
+confirms the same bottleneck: DeltaNet recurrence and Conv1D remain
+CPU-resident, so Phase E.4 is still the real unlock.
+
+## 2026-05-12 update — Phase E.4 first pass: CUDA Conv1D + DeltaNet recurrence kernels
+
+Added CUDA kernels for the Qwen3.6 DeltaNet Conv1D-with-state and
+decay-first recurrence. The recurrence kernel keeps the `state[s, s,
+h_v]` layout used by ndarray (`h_v` fastest), uses one CUDA block per
+V head, and matches the llama.cpp-compatible C.5j decay-first order.
+`CudaBackend` now caches the Conv1D and recurrent state buffers by
+host state pointer and re-uploads only when `next_position == 0`, so
+the device buffer is authoritative during an active sequence.
+
+Validation:
+
+```bash
+cargo test -p larql-compute --features cuda cuda::deltanet -- --nocapture
+
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_token_diff_vs_llama_cpp -- --nocapture
+```
+
+The token-diff parity check still emits
+`[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0 every step.
+
+Bench protocol was unchanged from E.3:
+
+```bash
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_BENCH_PREFILL=16 LARQL_QWEN35_BENCH_DECODE=4 \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_bench -- --nocapture
+```
+
+Result:
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.3 (+ DeltaNet/full-attn projections) | 0.33 | 0.33 | 21.16 GiB |
+| **Phase E.4.1/E.4.2 first pass (+ CUDA Conv1D/recur)** | **0.33** | **0.33** | **21.16 GiB** |
+
+The first pass preserves correctness but does **not** improve headline
+throughput. The bottleneck has shifted from arithmetic in the scalar
+recurrence to per-layer launch/synchronisation and CPU/GPU ping-pong:
+Conv1D output, recurrence output, post-recurrence RMSNorm, z-gating,
+and residual/FFN boundaries still cross back to the CPU every layer.
+The remaining E.4 work should focus on fusing the DeltaNet block
+around the recurrence output and moving per-head L2/RMSNorm/z-gate
+operations onto the same device path; otherwise E.6-style
+device-resident activations/CUDA graphs are required for the expected
+multi-tok/s jump.
+
+## 2026-05-12 update — Phase E.4.3 GPU per-head L2/RMSNorm
+
+Added CUDA reductions for the remaining per-head DeltaNet norms:
+Q/K L2 normalisation in the `[head_dim, n_k_heads]` dim-major layout
+and post-recurrence RMSNorm in the head-major `[n_v_heads, head_dim]`
+layout. Both are exposed as optional `ComputeBackend` hooks and keep
+the CPU implementation as fallback. The CUDA module now validates
+Conv1D, recurrence, L2, and RMSNorm against tiny CPU references.
+
+Validation:
+
+```bash
+cargo check -p larql-inference --features cuda
+cargo test -p larql-compute --features cuda cuda::deltanet -- --nocapture
+cargo test -p larql-inference --lib qwen35 -- --nocapture
+
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_token_diff_vs_llama_cpp -- --nocapture
+```
+
+The token-diff parity check still emits
+`[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0 every step.
+
+Bench protocol was unchanged from E.4.1/E.4.2:
+
+```bash
+LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
+LARQL_QWEN35_BENCH_PREFILL=16 LARQL_QWEN35_BENCH_DECODE=4 \
+LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
+cargo test -p larql-inference --release --features cuda --lib \
+  real_gguf_qwen35_bench -- --nocapture
+```
+
+Result:
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.4.1/E.4.2 first pass (+ CUDA Conv1D/recur) | 0.33 | 0.33 | 21.16 GiB |
+| **Phase E.4.3 (+ CUDA per-head L2/RMSNorm)** | **0.32** | **0.33** | **21.16 GiB** |
+
+Correctness is preserved, but the E.4.4 target (≥ 10 decode t/s) is
+still unmet. The new reductions remove more CPU arithmetic but add
+more tiny GPU launches and synchronising host returns. The next
+meaningful speed step is a fused/device-resident DeltaNet block path
+or the E.6 device-resident activation/weight pipeline; standalone
+host-returning hooks are correctness plumbing, not enough throughput
+plumbing.
 
 ## 2026-05-12 update — Phase 2d lazy-quant embed (105 → 20 GiB, −80.9 %)
 
