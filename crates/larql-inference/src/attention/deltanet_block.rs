@@ -172,6 +172,11 @@ pub fn deltanet_block_step(
     // 2. Projections (matvec).
     // Matvecs go through `QuantTensor::matvec` when the lazy form is
     // populated; otherwise fall back to the dense f32 dot.
+    //
+    // Phase E.3 will plumb the GPU backend through `state` or a
+    // function argument so these matvecs can also route through
+    // `matvec_with_backend`. For E.1/E.2 (this commit) only lm_head
+    // and FFN matvecs are GPU-dispatched.
     let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
         q.matvec(&x_norm).expect("attn_qkv_quant matvec")
     } else {

@@ -170,6 +170,13 @@ impl QuantTensor {
         self.data.len()
     }
 
+    /// Borrow the raw GGML bytes. Used by GPU dispatch — the matvec
+    /// kernels read the same bit layout the CPU `q4k_row_dot` /
+    /// `q6k_row_dot` use, so no conversion is required.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Dequantise a single row to `Array1<f32>`. Hot path for embed
     /// lookups where the caller wants one row by index without
     /// materialising the entire matrix.

@@ -44,6 +44,47 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-12 update — Phase E.1/E.2 GPU dispatch for lm_head + FFN
+
+Pivot off the CPU AVX2 axis: route lm_head Q6_K matvec and all 192
+FFN Q4_K matvecs/token through `larql_compute::cuda::CudaBackend`
+(the existing `q6k_direct` / `q4k_direct` GPU kernels). Opt-in
+behind `--features cuda` and `LARQL_QWEN35_GPU=1`. Weights upload
+to VRAM on first dispatch; cache reused thereafter.
+
+| Config | Decode (t/s) | Δ vs CPU lazy | VmRSS |
+|---|---:|---:|---:|
+| Phase 2d (CPU lazy + AVX2 + rayon) | 0.23 | — | 19.99 GiB |
+| **Phase E.1/E.2 (+ GPU lm_head & FFN)** | **0.28** | **+22 %** | 21 GiB (host) |
+| llama.cpp CUDA GPU | 50.60 | 220× theirs | 14.76 GiB VRAM |
+
+Modest +22 % gain — much less than expected. The matvec wins are
+real, but **the DeltaNet recurrence stays on CPU** and dominates
+steady-state decode time at 3.6 s/token. Per-token contributions:
+
+- **DeltaNet recurrence (CPU scalar)** — 48 layers × `delta_net_step`
+  with per-head state matrices: this is now the bottleneck.
+- **Per-matvec host↔device transfer** — ~480 transfers/token at
+  PCIe Gen4 ~25 GB/s ≈ 1.5 ms each, adds up.
+- **Non-matvec ops (norms, silu, residual adds)** still CPU.
+
+**The next big perf lever is Phase E.4** — a CUDA kernel for the
+DeltaNet recurrence + Conv1D-with-state. Per-head state matrices
+fit in shared memory (128×128 f32 = 64 KB per head, ok on Ampere
+SM-89). Mirrors llama.cpp's
+`ggml_compute_forward_gated_delta_net_one_chunk` which we already
+diffed bit-exact in Phase C. Estimated ~600 LoC + the cudarc PTX
+plumbing.
+
+E.3 (DeltaNet `attn_qkv`/`attn_gate`/`ssm_out` + full-attn
+q/k/v/o through GPU) is queued — pure plumbing once E.4 is in
+place. E.6 (device-resident weights + KV cache + CUDA Graphs) is
+the longer-term arc.
+
+**Parity preserved**: `real_gguf_qwen35_token_diff_vs_llama_cpp`
+under `LARQL_QWEN35_GPU=1` still emits the same
+`[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0 every step.
+
 ## 2026-05-12 update — Phase 2d lazy-quant embed (105 → 20 GiB, −80.9 %)
 
 Adds `QuantTensor::row_to_f32(token_id)` for the embed-lookup

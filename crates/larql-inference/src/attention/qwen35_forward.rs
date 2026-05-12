@@ -90,6 +90,12 @@ pub struct Qwen35Weights {
     pub lm_head_quant: Option<larql_models::quant::lazy::QuantTensor>,
     /// FFN intermediate dim (for shape assertions in tests).
     pub ffn_dim: usize,
+    /// Optional GPU (or other) quant-matvec backend. Phase E.1
+    /// of `qwen35-gpu-forward`: when set, lazy-quant tensors
+    /// route through `backend.quant_matvec(...)` before falling
+    /// back to the CPU rayon path. None keeps the all-CPU
+    /// behaviour shipped in Phase 2a-2d.
+    pub backend: Option<std::sync::Arc<dyn larql_compute::backend::QuantMatVec + Send + Sync>>,
 }
 
 /// One-token forward through the entire Qwen 3.6 model.
@@ -179,6 +185,10 @@ pub fn qwen35_forward_step(
                 &layer_w.ffn_gate,
                 &layer_w.ffn_up,
                 &layer_w.ffn_down,
+                weights
+                    .backend
+                    .as_deref()
+                    .map(|b| b as &(dyn larql_compute::backend::QuantMatVec + Send + Sync)),
             )
         } else {
             swiglu_ffn(
@@ -313,9 +323,18 @@ pub fn qwen35_forward_step(
         );
     }
     // Final logits matvec. Prefer the lazy-quantised path when
-    // populated; falls back to dense f32 dot otherwise.
+    // populated; falls back to dense f32 dot otherwise. When a
+    // GPU backend is attached, the lazy path routes through
+    // `matvec_with_backend` for cuBLAS-style GEMV.
     let logits = if let Some(qt) = weights.lm_head_quant.as_ref() {
-        qt.matvec(&x_final).expect("lm_head_quant matvec")
+        crate::attention::quant_dispatch::matvec_with_backend(
+            qt,
+            &x_final,
+            weights
+                .backend
+                .as_deref()
+                .map(|b| b as &(dyn larql_compute::backend::QuantMatVec + Send + Sync)),
+        )
     } else {
         weights.lm_head.dot(&x_final)
     };
@@ -400,13 +419,15 @@ fn swiglu_ffn_lazy(
     gate_dense: &ArcArray2<f32>,
     up_dense: &ArcArray2<f32>,
     down_dense: &ArcArray2<f32>,
+    backend: Option<&(dyn larql_compute::backend::QuantMatVec + Send + Sync)>,
 ) -> Array1<f32> {
+    use crate::attention::quant_dispatch::matvec_with_backend;
     let g = match gate_q {
-        Some(q) => q.matvec(x).expect("ffn_gate_quant matvec"),
+        Some(q) => matvec_with_backend(q, x, backend),
         None => gate_dense.dot(x),
     };
     let u = match up_q {
-        Some(q) => q.matvec(x).expect("ffn_up_quant matvec"),
+        Some(q) => matvec_with_backend(q, x, backend),
         None => up_dense.dot(x),
     };
     let mut inter = Array1::<f32>::zeros(g.len());
@@ -414,7 +435,7 @@ fn swiglu_ffn_lazy(
         inter[i] = (g[i] * sigmoid(g[i])) * u[i];
     }
     match down_q {
-        Some(q) => q.matvec(&inter).expect("ffn_down_quant matvec"),
+        Some(q) => matvec_with_backend(q, &inter, backend),
         None => down_dense.dot(&inter),
     }
 }
@@ -596,6 +617,7 @@ mod tests {
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
             lm_head_quant: None,
             ffn_dim,
+            backend: None,
         };
 
         let token = 2u32;
@@ -645,6 +667,7 @@ mod tests {
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
             lm_head_quant: None,
             ffn_dim,
+            backend: None,
         };
 
         let _ = qwen35_forward_step(0, &weights, &dn_dims, &attn_dims, &mut cache, 1e-6);
@@ -699,6 +722,7 @@ mod tests {
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
             lm_head_quant: None,
             ffn_dim,
+            backend: None,
         };
 
         let _ = qwen35_forward_step(2, &weights, &dn_dims, &attn_dims, &mut cache, 1e-6);

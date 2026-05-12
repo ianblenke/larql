@@ -140,6 +140,11 @@ pub fn load_qwen35_weights(
         lm_head: weights.lm_head.clone(),
         lm_head_quant: weights.lm_head_quant.clone(),
         ffn_dim: arch.config().intermediate_size,
+        // Backend is attached by the caller (typically the bench
+        // harness reading `LARQL_QWEN35_GPU=1`). The bridge stays
+        // backend-agnostic so synthetic-weight tests don't need
+        // CUDA available.
+        backend: None,
     })
 }
 
@@ -2246,8 +2251,24 @@ mod tests {
         } else {
             larql_models::load_gguf(&gguf_path).expect("load_gguf")
         };
-        let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+        let mut w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
         eprintln!("loaded in {:.2}s", load_t.elapsed().as_secs_f64());
+
+        // Phase E.1: attach GPU backend when LARQL_QWEN35_GPU=1 is
+        // set. CudaBackend::new() consumes ~no VRAM at construction;
+        // the kernels lazy-compile on first dispatch.
+        #[cfg(feature = "cuda")]
+        if std::env::var("LARQL_QWEN35_GPU").is_ok() {
+            match larql_compute::cuda::CudaBackend::new() {
+                Ok(b) => {
+                    eprintln!("attached CudaBackend");
+                    w.backend = Some(std::sync::Arc::new(b));
+                }
+                Err(e) => {
+                    eprintln!("LARQL_QWEN35_GPU set but CudaBackend::new() failed: {e:?}");
+                }
+            }
+        }
 
         let arch = &*weights.arch;
         let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
