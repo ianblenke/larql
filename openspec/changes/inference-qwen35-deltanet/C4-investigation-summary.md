@@ -1,7 +1,45 @@
 # Phase C.4–C.5 investigation summary
 
-Status as of 2026-05-11 after ~34 sub-phases on the
-`inference-qwen35-deltanet` openspec change.
+Status as of 2026-05-11 after ~35 sub-phases. **Phase C is DONE.**
+
+## C.5j/C.5k: full greedy parity vs llama.cpp ✅
+
+The first 5 greedy-decoded tokens from our Qwen3.6-27B Q4_K_S
+forward now match `llama-eval-callback` exactly — GT rank 0 at
+every step:
+
+| step | gt_id | gt_logit | gt_rank | our_argmax | gt_text |
+|------|-------|----------|---------|------------|---------|
+| 0 | 248068 | 28.177 | 0 | 248068 | `<think>` |
+| 1 | 271 | 24.776 | 0 | 271 | `\n\n` |
+| 2 | 248069 | 25.470 | 0 | 248069 | `</think>` |
+| 3 | 271 | 30.392 | 0 | 271 | `\n\n` |
+| 4 | 9419 | 21.656 | 0 | 9419 | `Hello` |
+
+The earlier "ground truth" (`|- [Start thinking]\nHere's a thinking`)
+was a non-chat-template completion captured under different
+sampling, not what a chat-tuned model produces for the
+`<|im_start|>assistant\n` continuation. Stored GT in the parity
+test has been corrected.
+
+## C.5j: the two final bugs
+
+Both surfaced by the elementwise binary tensor parity oracle
+(added in C.5i — `LLAMA_DUMP_BIN_DIR` on llama.cpp, mirrored on
+ours). Token-rank had been hiding them.
+
+1. **Q6_K dequant layout** — our code wrote dequantized values
+   sequentially per scale-subblock; llama.cpp uses an interleaved
+   layout (`y[l]`, `y[l+32]`, `y[l+64]`, `y[l+96]` per
+   `l in 0..32` of each half, with different scales). Hit
+   `output.weight` (lm_head, Q6_K). Sorted-logit pearson with
+   llama.cpp was 0.99 (correct value distribution) but elementwise
+   pearson was 0.06 (rows permuted within each Q6_K super-block).
+2. **DeltaNet recurrence order** — we used paper-order
+   (sk-before-decay per Yang et al. Eq. 6). llama.cpp's actual
+   kernel does **decay-first**. Switched. Token-8 LIN-layer
+   block_out pearson rose from 0.83-0.97 to 0.995-0.998 at every
+   layer; residual-stream L62 pearson 0.982 → 0.9985.
 
 ## C.5i breakthrough — CYCLE GQA is correct (elementwise parity)
 

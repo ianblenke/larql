@@ -2120,9 +2120,18 @@ mod tests {
             .to_vec();
         eprintln!("prompt has {} tokens: {prompt_ids:?}", prompt_ids.len());
 
-        // Ground truth from llama-cli for the same prompt (greedy,
-        // temp=0). Captured 2026-05-11.
-        let ground_truth_text = "|- [Start thinking]\nHere's a thinking";
+        // Ground truth for the chat-template prompt above, captured
+        // from llama-eval-callback against the same Qwen3.6-27B
+        // Q4_K_S GGUF on 2026-05-11 (post C.5j Q6_K + decay-first
+        // fixes). Each token is what llama.cpp's greedy decode emits
+        // for the same residual stream. Decoded text:
+        //   "<think>\n\n</think>\n\nHello"
+        // Note: an earlier capture had a non-chat-template completion
+        // (`|- [Start thinking]\nHere's a thinking`) — that was a raw
+        // text-completion mode, not what a chat-tuned model produces
+        // for the `<|im_start|>assistant\n` continuation. The current
+        // text reflects the chat-tuned greedy continuation.
+        let ground_truth_text = "<think>\n\n</think>\n\nHello";
         let gt_ids: Vec<u32> = tokenizer
             .encode(ground_truth_text, false)
             .expect("encode ground truth")
