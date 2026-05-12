@@ -844,6 +844,18 @@ impl ComputeBackend for CudaBackend {
         super::deltanet::rms_norm_heads(self, x, weight, num_heads, head_dim, eps).ok()
     }
 
+    fn qwen35_paired_q4k_matvec(
+        &self,
+        a_data: &[u8],
+        a_rows: usize,
+        b_data: &[u8],
+        b_rows: usize,
+        x: &[f32],
+        hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        super::q4k_direct::matvec_pair(self, a_data, a_rows, b_data, b_rows, x, hidden).ok()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qwen35_deltanet_postproj_step(
         &self,

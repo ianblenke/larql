@@ -176,6 +176,39 @@ pub(crate) fn matvec_device(
     Ok(y_dev)
 }
 
+/// Paired Q4_K matvec: two `(rows_i × hidden)` weight matrices sharing
+/// one `x` host slice. Uploads `x` once, runs both kernels on the
+/// same stream, syncs once, then dtohs both outputs. Amortises the
+/// per-call sync + htod overhead — Qwen3.6's DeltaNet block fires
+/// attn_qkv (10240 rows) and attn_gate (6144 rows) back-to-back on
+/// the same x_norm, so calling this in place of two `matvec()`s
+/// saves one htod + one sync per layer × 48 linear layers ≈ ~50 ms
+/// per token at the current 0.35 t/s decode budget.
+pub(crate) fn matvec_pair(
+    backend: &CudaBackend,
+    a_q4k: &[u8],
+    a_rows: usize,
+    b_q4k: &[u8],
+    b_rows: usize,
+    x: &[f32],
+    hidden: usize,
+) -> Result<(Vec<f32>, Vec<f32>), CudaInitError> {
+    if hidden == 0 || x.len() != hidden || !hidden.is_multiple_of(Q4K_BLOCK_ELEMS) {
+        return Err(CudaInitError::DriverMissing(format!(
+            "invalid pair matvec shape hidden={hidden} x_len={}",
+            x.len()
+        )));
+    }
+    let drv = backend.driver();
+    let x_dev = drv.device_buf_from(x)?;
+    let a_dev = matvec_device(backend, a_q4k, &x_dev, a_rows, hidden)?;
+    let b_dev = matvec_device(backend, b_q4k, &x_dev, b_rows, hidden)?;
+    drv.sync()?;
+    let a_host = drv.to_host(&a_dev)?;
+    let b_host = drv.to_host(&b_dev)?;
+    Ok((a_host, b_host))
+}
+
 pub(crate) fn matvec(
     backend: &CudaBackend,
     q4k_data: &[u8],

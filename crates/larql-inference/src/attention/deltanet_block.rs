@@ -174,19 +174,58 @@ pub fn deltanet_block_step(
     // 2. Projections (matvec).
     // Matvecs go through `matvec_with_backend` when the lazy form is
     // populated; otherwise fall back to the dense f32 dot.
-    use crate::attention::quant_dispatch::matvec_with_backend;
-    let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
-        matvec_with_backend(q, &x_norm, backend)
+    //
+    // Fast-path: when both attn_qkv and attn_gate are lazy Q4_K and a
+    // backend exposes `qwen35_paired_q4k_matvec`, run them on the
+    // same device-resident `x_norm` upload with a single sync —
+    // saves one htod + one sync per linear layer.
+    use crate::attention::quant_dispatch::{ggml_type_to_quant_format, matvec_with_backend};
+    use larql_compute::QuantFormat;
+    let paired = match (
+        backend,
+        weights.attn_qkv_quant.as_ref(),
+        weights.attn_gate_quant.as_ref(),
+    ) {
+        (Some(b), Some(qkv_q), Some(gate_q)) => {
+            let qkv_fmt = ggml_type_to_quant_format(qkv_q.tensor_type());
+            let gate_fmt = ggml_type_to_quant_format(gate_q.tensor_type());
+            if matches!(qkv_fmt, Some(QuantFormat::Q4_K))
+                && matches!(gate_fmt, Some(QuantFormat::Q4_K))
+            {
+                let x_slice = x_norm.as_slice().expect("Array1 contiguous");
+                let qkv_shape = qkv_q.shape();
+                let gate_shape = gate_q.shape();
+                b.qwen35_paired_q4k_matvec(
+                    qkv_q.raw_bytes(),
+                    qkv_shape[0],
+                    gate_q.raw_bytes(),
+                    gate_shape[0],
+                    x_slice,
+                    qkv_shape[1],
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let (qkv_mixed, z) = if let Some((qkv_out, gate_out)) = paired {
+        (Array1::from(qkv_out), Array1::from(gate_out))
     } else {
-        weights.attn_qkv.dot(&x_norm)
-    }; // [conv_dim]
-    let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
-        matvec_with_backend(q, &x_norm, backend)
-    } else {
-        weights.attn_gate.dot(&x_norm)
-    }; // [value_dim]
-       // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
-       // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
+        let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
+            matvec_with_backend(q, &x_norm, backend)
+        } else {
+            weights.attn_qkv.dot(&x_norm)
+        };
+        let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
+            matvec_with_backend(q, &x_norm, backend)
+        } else {
+            weights.attn_gate.dot(&x_norm)
+        };
+        (qkv_mixed, z)
+    };
+    // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
+    // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = qkv_mixed.len();
         eprintln!(

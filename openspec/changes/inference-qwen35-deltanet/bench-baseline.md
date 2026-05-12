@@ -168,6 +168,33 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.A.8: paired Q4_K matvec (attn_qkv+attn_gate, ffn_gate+ffn_up)
+
+New `ComputeBackend::qwen35_paired_q4k_matvec` trait method that
+takes two Q4_K weight matrices sharing one `x` host slice and runs
+both kernels on the same stream with one htod + one sync. Wired in:
+
+- `deltanet_block_step` pairs `attn_qkv` (10240 rows) + `attn_gate`
+  (6144 rows) on `x_norm` for the 48 linear DeltaNet layers.
+- `swiglu_ffn_lazy` pairs `ffn_gate` + `ffn_up` on the post-attn-norm
+  residual for all 64 FFN layers.
+
+Saves 1 htod + 1 sync per (layer, pair) × 112 pairs per token.
+
+Parity preserved. Bench result is **0.35 t/s decode** — same as
+E.6.A.7. The amortised sync overhead turned out to be much smaller
+than expected on this RTX 4090 + cudarc 0.19 setup (~100 µs per
+sync, not the ~1 ms I'd budgeted). Net-zero throughput change but
+the infrastructure is in place for future use (CUDA Graphs, the
+device-resident projection chain in E.6.B). Code path is cleaner:
+the dispatch lives in one helper instead of two consecutive
+matvec calls per location.
+
+| Config | Decode (t/s) | Notes |
+|---|---:|---|
+| Phase E.6.A.7 (Q/K/V as_standard_layout) | 0.35 | per-call host bounces |
+| **Phase E.6.A.8 (paired Q4_K matvec)** | **0.35** | 1 htod + 1 sync per pair |
+
 ## 2026-05-12 update — Phase E.6.A.7: Q/K/V `as_standard_layout` enables full GPU per-step DeltaNet
 
 Same latent stride bug that E.6.A's `ssm_conv1d` loader fix surfaced:

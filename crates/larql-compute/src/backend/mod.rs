@@ -127,6 +127,29 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Paired Q4_K matvec sharing one `x` input. Two weight matrices
+    /// (`a_rows × hidden` and `b_rows × hidden`) feed off the same
+    /// activation; backend uploads `x` once, runs both kernels on the
+    /// same stream, syncs once, returns `(a_out, b_out)`.
+    ///
+    /// Qwen3.6's DeltaNet block runs `attn_qkv` (10240 rows) and
+    /// `attn_gate` (6144 rows) back-to-back on `x_norm`. The full-attn
+    /// block similarly chains its Q/K/V projections. Pairing them
+    /// halves the per-call sync overhead. `None` falls back to two
+    /// independent `q4k_matvec` calls.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_paired_q4k_matvec(
+        &self,
+        _a_data: &[u8],
+        _a_rows: usize,
+        _b_data: &[u8],
+        _b_rows: usize,
+        _x: &[f32],
+        _hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
+
     /// Optional fused Qwen3.6 DeltaNet post-projection chain (Phase
     /// E.6.A). Composes conv1d → silu → split + reshape → L2 Q/K →
     /// recurrence → reshape → rms_norm_heads → silu(z) * o on the

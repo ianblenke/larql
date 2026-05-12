@@ -424,14 +424,47 @@ fn swiglu_ffn_lazy(
     down_dense: &ArcArray2<f32>,
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
-    use crate::attention::quant_dispatch::matvec_with_backend;
-    let g = match gate_q {
-        Some(q) => matvec_with_backend(q, x, backend),
-        None => gate_dense.dot(x),
+    use crate::attention::quant_dispatch::{ggml_type_to_quant_format, matvec_with_backend};
+    use larql_compute::QuantFormat;
+
+    // Fast-path: gate + up are both lazy Q4_K and a backend exposes
+    // `qwen35_paired_q4k_matvec`. Both projections feed off `x` (the
+    // post-attn-norm residual), so pairing them onto one htod + one
+    // sync saves a host bounce per FFN × 64 layers per token.
+    let paired = match (backend, gate_q, up_q) {
+        (Some(b), Some(gq), Some(uq)) => {
+            let gfmt = ggml_type_to_quant_format(gq.tensor_type());
+            let ufmt = ggml_type_to_quant_format(uq.tensor_type());
+            if matches!(gfmt, Some(QuantFormat::Q4_K)) && matches!(ufmt, Some(QuantFormat::Q4_K)) {
+                let x_slice = x.as_slice().expect("Array1 contiguous");
+                let g_shape = gq.shape();
+                let u_shape = uq.shape();
+                b.qwen35_paired_q4k_matvec(
+                    gq.raw_bytes(),
+                    g_shape[0],
+                    uq.raw_bytes(),
+                    u_shape[0],
+                    x_slice,
+                    g_shape[1],
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
     };
-    let u = match up_q {
-        Some(q) => matvec_with_backend(q, x, backend),
-        None => up_dense.dot(x),
+    let (g, u) = if let Some((gv, uv)) = paired {
+        (Array1::from(gv), Array1::from(uv))
+    } else {
+        let g = match gate_q {
+            Some(q) => matvec_with_backend(q, x, backend),
+            None => gate_dense.dot(x),
+        };
+        let u = match up_q {
+            Some(q) => matvec_with_backend(q, x, backend),
+            None => up_dense.dot(x),
+        };
+        (g, u)
     };
     let mut inter = Array1::<f32>::zeros(g.len());
     for i in 0..g.len() {
