@@ -424,6 +424,7 @@ fn make_test_weights() -> larql_inference::ModelWeights {
         embed,
         lm_head,
         lm_head_quant: None,
+        quant_tensors: std::collections::HashMap::new(),
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

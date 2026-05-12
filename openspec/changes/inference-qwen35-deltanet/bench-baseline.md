@@ -44,6 +44,38 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-11 update — Phase 2 lazy-quant FFN
+
+Same harness, smaller workload (prefill 8 / decode 2) because the
+all-lazy path is 8× slower per token. Opt-in:
+`LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1`.
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| larql CPU, fully dequant (baseline) | 0.48 | 0.49 | **105.25 GiB** |
+| larql CPU, lazy lm_head only | 0.31 | 0.31 | 101.30 GiB |
+| **larql CPU, lazy lm_head + FFN** | **0.06** | **0.06** | **46.65 GiB** |
+| Δ vs baseline | −88 % | −88 % | **−58.6 GiB** |
+
+192 FFN matvecs per token now route through scalar Q4_K
+`q4k_row_dot` instead of f32 BLAS — that's where the 8× slowdown
+comes from. The RAM win is huge but the trade-off is real.
+
+**Parity preserved**: `real_gguf_qwen35_token_diff_vs_llama_cpp`
+still produces argmax `[<think>, \n\n, </think>, \n\n, Hello]`
+with logits `[28.18, 24.78, 25.47, 30.39, 21.66]` and GT rank 0
+at every step, identical to the dequant baseline. The lazy path
+is bit-exact in the matvec results (modulo Q4_K dequant rounding,
+which is identical to llama.cpp's).
+
+**Remaining RAM** (~47 GiB) is mostly the embed (5.1 GiB), DeltaNet
+SSM tensors (alpha/beta/gate/qkv/out/conv1d/norm), and full-attn
+projections. Phase 2b (lazy these) would close most of the gap to
+llama.cpp's ~16 GiB resident.
+
+The Phase 3 AVX2 quant kernels are now clearly the next perf lever
+— without them, this path is unusable for serving.
+
 ## 2026-05-11 update — Phase 1 lazy-quant lm_head (PR follow-up)
 
 The `qwen35-lazy-quant-matmul` Phase 1 change introduces

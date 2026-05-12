@@ -75,6 +75,12 @@ pub struct ModelWeights {
     /// dequantized, one not) — populate this AND keep the dense form,
     /// or drop the dense form and rely on the lazy path.
     pub lm_head_quant: Option<QuantTensor>,
+    /// Lazy-quantized tensors keyed by their normalised GGUF name.
+    /// When a key appears here, the corresponding dense entry in
+    /// `tensors` has been removed so the caller is not paying for
+    /// both forms. Callers (the Qwen3.6 bridge) check this map first
+    /// and fall back to `tensors` for any tensor not lazified.
+    pub quant_tensors: HashMap<String, QuantTensor>,
     pub arch: Box<dyn ModelArchitecture>,
     // Cached from arch.config() for convenience — these are hot-path values.
     pub num_layers: usize,

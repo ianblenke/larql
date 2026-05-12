@@ -1937,6 +1937,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         embed,
         lm_head,
         lm_head_quant: None,
+        quant_tensors: std::collections::HashMap::new(),
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

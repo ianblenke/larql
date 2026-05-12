@@ -39,7 +39,8 @@ pub use vectors::{
 pub use weights::{ModelWeights, WeightArray};
 
 pub use loading::{
-    is_ffn_tensor, load_gguf, load_gguf_lazy_lm_head, load_gguf_validated, load_model_dir,
-    load_model_dir_filtered, load_model_dir_filtered_validated, load_model_dir_validated,
-    load_model_dir_walk_only, load_model_dir_walk_only_validated, resolve_model_path,
+    is_ffn_tensor, load_gguf, load_gguf_lazy_lm_head, load_gguf_lazy_tensors, load_gguf_validated,
+    load_model_dir, load_model_dir_filtered, load_model_dir_filtered_validated,
+    load_model_dir_validated, load_model_dir_walk_only, load_model_dir_walk_only_validated,
+    resolve_model_path,
 };
