@@ -10,6 +10,7 @@ categories = ["data-structures"]
 
 [dependencies]
 ndarray = "0.16"
+rayon = "1.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

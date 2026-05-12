@@ -28988,25 +28988,25 @@
     {
       "fqn": "larql_models::quant::lazy::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 169,
+      "line": 179,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 194,
+      "line": 204,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 169,
+      "line": 179,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 194,
+      "line": 204,
       "crate": "larql_models"
     },
     {

@@ -112,16 +112,26 @@ impl QuantTensor {
             .expect("Array1 is contiguous by construction");
         match self.tensor_type {
             TYPE_Q4_K => {
-                for r in 0..self.rows {
-                    let row = &self.data[r * self.row_bytes..(r + 1) * self.row_bytes];
-                    out_slice[r] = q4k_row_dot(row, x_slice)?;
-                }
+                use rayon::prelude::*;
+                let rb = self.row_bytes;
+                let data = &self.data;
+                // Parallelise per-row; each thread holds one
+                // accumulator. The kernel itself is already SIMD
+                // (AVX2 / NEON), so this stacks data-parallel and
+                // thread-parallel speedups.
+                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                    let row = &data[r * rb..(r + 1) * rb];
+                    *out_r = q4k_row_dot(row, x_slice).expect("q4k_row_dot");
+                });
             }
             TYPE_Q6_K => {
-                for r in 0..self.rows {
-                    let row = &self.data[r * self.row_bytes..(r + 1) * self.row_bytes];
-                    out_slice[r] = q6k_row_dot(row, x_slice)?;
-                }
+                use rayon::prelude::*;
+                let rb = self.row_bytes;
+                let data = &self.data;
+                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                    let row = &data[r * rb..(r + 1) * rb];
+                    *out_r = q6k_row_dot(row, x_slice).expect("q6k_row_dot");
+                });
             }
             TYPE_Q5_K => {
                 // No fused row-dot kernel for Q5_K yet; dequant the

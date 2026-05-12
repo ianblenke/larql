@@ -44,6 +44,39 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-11 update — Phase 3 AVX2 + rayon for Q4_K matvec
+
+Phase 3 adds (a) an AVX2 inner-loop kernel for `q4k_row_dot` on
+x86_64 with fully vectorised dequant + FMA, and (b) rayon
+`par_iter_mut` over the rows of every Q4_K and Q6_K matvec in
+`QuantTensor::matvec`. Same opt-ins (`LARQL_QWEN35_LAZY_FFN=1
+LARQL_QWEN35_LAZY_LM_HEAD=1`).
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| baseline (dequant + BLAS) | 0.48 | 0.49 | 105.25 GiB |
+| Phase 2 (lazy, scalar) | 0.06 | 0.06 | 46.65 GiB |
+| **Phase 3 (lazy, AVX2 + rayon)** | **0.21** | **0.20** | **46.65 GiB** |
+| Δ vs Phase 2 | +250 % | +233 % | same |
+| Δ vs baseline | −56 % | −59 % | −58.6 GiB |
+
+The AVX2 kernel on its own barely moved the needle (0.06 → 0.07)
+— LLVM auto-vectorises the scalar code well already. **Rayon
+across rows** is where the speedup came from: 192 FFN matvecs per
+token now fan out 14336 / 5120 row-dots across cores in parallel,
+saturating the multi-core machine. Per-row AVX2 is the cherry on
+top.
+
+Now only 2.4× slower than the f32 BLAS baseline at less than half
+the RAM. The remaining gap is mostly the per-row dispatch overhead
+and the fact that BLAS sgemv batches rows in cache-friendly tiles.
+Phase 3b (batched-row AVX2 matvec à la llama.cpp's
+`mul_mat_q4k_q8k`) is the next perf lever.
+
+Parity preserved: `real_gguf_qwen35_token_diff_vs_llama_cpp` still
+emits the same `[<think>, \n\n, </think>, \n\n, Hello]` sequence
+with GT rank 0 at every step.
+
 ## 2026-05-11 update — Phase 2 lazy-quant FFN
 
 Same harness, smaller workload (prefill 8 / decode 2) because the
