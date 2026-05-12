@@ -328,6 +328,7 @@ fn load_model_dir_filtered_with_validation(
         packed_byte_ranges,
         embed,
         lm_head,
+        lm_head_quant: None,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,

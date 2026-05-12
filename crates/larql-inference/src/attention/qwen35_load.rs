@@ -111,6 +111,7 @@ pub fn load_qwen35_weights(
         layers,
         final_norm,
         lm_head: weights.lm_head.clone(),
+        lm_head_quant: weights.lm_head_quant.clone(),
         ffn_dim: arch.config().intermediate_size,
     })
 }
@@ -429,6 +430,7 @@ mod tests {
             packed_byte_ranges: HashMap::new(),
             embed,
             lm_head,
+            lm_head_quant: None,
             arch: Box::new(Qwen35Arch::from_config(cfg.clone())),
             num_layers: cfg.num_layers,
             hidden_size: cfg.hidden_size,
@@ -529,6 +531,7 @@ mod tests {
             packed_byte_ranges: std::collections::HashMap::new(),
             embed: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
             lm_head: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
+            lm_head_quant: None,
             arch: Box::new(Qwen35Arch::from_config(cfg.clone())),
             num_layers: cfg.num_layers,
             hidden_size: cfg.hidden_size,
@@ -636,6 +639,7 @@ mod tests {
             packed_byte_ranges: HashMap::new(),
             embed: make_2d(1, 1, 0.0),
             lm_head: make_2d(1, 1, 0.0),
+            lm_head_quant: None,
             arch: Box::new(Qwen35Arch::from_config(cfg)),
             num_layers: 0,
             hidden_size: 0,
@@ -2114,9 +2118,14 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(16);
 
-        eprintln!("loading GGUF…");
+        let lazy_lm_head = std::env::var("LARQL_QWEN35_LAZY_LM_HEAD").is_ok();
+        eprintln!("loading GGUF (lazy_lm_head={lazy_lm_head})…");
         let load_t = std::time::Instant::now();
-        let weights = larql_models::load_gguf(&gguf_path).expect("load_gguf");
+        let weights = if lazy_lm_head {
+            larql_models::load_gguf_lazy_lm_head(&gguf_path).expect("load_gguf_lazy_lm_head")
+        } else {
+            larql_models::load_gguf(&gguf_path).expect("load_gguf")
+        };
         let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
         eprintln!("loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 

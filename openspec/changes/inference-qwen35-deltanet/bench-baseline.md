@@ -44,6 +44,27 @@ This is the single biggest item on the perf TODO list. Until that lands:
 - 100 GiB RAM means larql can't actually run a 35-B-MoE host without
   ≥ 128 GiB system memory.
 
+## 2026-05-11 update — Phase 1 lazy-quant lm_head (PR follow-up)
+
+The `qwen35-lazy-quant-matmul` Phase 1 change introduces
+`load_gguf_lazy_lm_head` and `QuantTensor::matvec` to keep
+`output.weight` (Q6_K) in its native form. Opt-in via
+`LARQL_QWEN35_LAZY_LM_HEAD=1`. Same bench harness, smaller workload
+(prefill 16 / decode 4 to keep total wall time manageable):
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| larql CPU, dequant lm_head | 0.48 | 0.49 | 105.25 GiB |
+| **larql CPU, lazy lm_head** | **0.31** | **0.31** | **101.30 GiB** |
+| Δ | −36 % | −37 % | **−3.95 GiB** |
+
+Phase 1 trades a 37 % per-step slowdown on lm_head for ~4 GiB RAM
+recovery. The slowdown is from the scalar Q6_K `q6k_row_dot` path
+beating f32 BLAS — expected per the Phase 1 proposal's non-goals.
+Phase 3 (x86 AVX2 quant kernels) will close that. Phase 2 (lazy
+FFN tensors) is where the RAM number drops toward llama.cpp's
+~16 GiB.
+
 ## Implications for Phase E / F roadmap
 
 1. **Quant-aware matmul** is now the bottleneck. Even staying on CPU,

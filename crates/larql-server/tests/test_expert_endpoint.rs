@@ -250,6 +250,7 @@ fn make_loaded_model(
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
         lm_head: embed,
+        lm_head_quant: None,
         arch: Box::new(TestMoeArch::new()),
         num_layers: 1,
         hidden_size: HIDDEN,

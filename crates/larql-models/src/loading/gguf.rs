@@ -489,6 +489,67 @@ pub fn load_gguf(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered(path, &|_| false)
 }
 
+/// Load a GGUF file into ModelWeights, but also populate
+/// `lm_head_quant` with a [`QuantTensor`] holding the raw GGUF bytes
+/// for `output.weight` (or `lm_head.weight`). The dense `lm_head`
+/// field is replaced with an empty array so the caller pays for the
+/// quantised form only — typical Q6_K Qwen3.6 27B savings: ~4 GiB.
+///
+/// Callers (the Qwen3.6 bridge) read `lm_head_quant` if present and
+/// dispatch the final matvec via [`QuantTensor::matvec`].
+pub fn load_gguf_lazy_lm_head(path: &Path) -> Result<ModelWeights, ModelError> {
+    let mut weights = load_gguf_filtered(path, &|_| false)?;
+    // Find the lm_head tensor info in the GGUF and read its raw bytes
+    // directly from mmap. This duplicates a small amount of work the
+    // dense load already did but keeps the patch self-contained — no
+    // changes to `load_tensors_filtered`'s signature.
+    let gguf = GgufFile::open(path)?;
+    let prefixes = weights.arch.key_prefixes_to_strip();
+    let mut found_idx: Option<usize> = None;
+    for (idx, info) in gguf.tensor_infos.iter().enumerate() {
+        let key = normalize_gguf_key(&info.name);
+        let key_after_prefix = super::safetensors::normalize_key(&key, prefixes);
+        if key_after_prefix == "lm_head.weight" || info.name == GGUF_OUTPUT_WEIGHT {
+            found_idx = Some(idx);
+            break;
+        }
+    }
+    let info = match found_idx {
+        Some(i) => &gguf.tensor_infos[i],
+        None => return Ok(weights), // tied embeddings — leave lm_head_quant as None
+    };
+    if info.n_dims != 2 {
+        return Ok(weights);
+    }
+    let abs_offset_usize = (gguf.data_offset + info.offset) as usize;
+    let n_elements: usize = info.dims.iter().product::<u64>() as usize;
+    let data_size = tensor_data_size(info.tensor_type, n_elements)?;
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    if abs_offset_usize + data_size > mmap.len() {
+        return Err(ModelError::Parse(format!(
+            "lazy lm_head: tensor data out of bounds (offset {} + size {} > file {})",
+            abs_offset_usize,
+            data_size,
+            mmap.len()
+        )));
+    }
+    let bytes = mmap[abs_offset_usize..abs_offset_usize + data_size].to_vec();
+    let cols = info.dims[0] as usize;
+    let rows = info.dims[1] as usize;
+    let qt = crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?;
+    weights.lm_head_quant = Some(qt);
+    // Drop the dense lm_head so the caller actually saves the RAM —
+    // both from the `lm_head` field AND from the `tensors` map, since
+    // the dense entry is held there too (the field is an Arc clone of
+    // the same buffer).
+    weights.lm_head = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
+        .expect("empty array is always valid");
+    weights.tensors.remove("lm_head.weight");
+    weights.tensors.remove(GGUF_OUTPUT_WEIGHT);
+    Ok(weights)
+}
+
 /// Load and validate a GGUF file into ModelWeights (dequantized to f32).
 pub fn load_gguf_validated(path: &Path) -> Result<ModelWeights, ModelError> {
     load_gguf_filtered_with_validation(path, &|_| false, true)
@@ -576,6 +637,7 @@ pub(crate) fn load_gguf_filtered_with_validation(
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        lm_head_quant: None,
         num_layers: cfg.num_layers,
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
