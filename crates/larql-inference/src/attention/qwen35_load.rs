@@ -2090,6 +2090,125 @@ mod tests {
     // forward is roughly right but slightly off (small numerical
     // bug). If expected token has small or negative logit →
     // forward is structurally broken.
+    /// C.5l (task #30) — minimal tok/s bench against the same Qwen3.6
+    /// GGUF used for parity. Times prefill and decode separately so the
+    /// numbers can be compared with `llama-bench`'s `pp` / `tg` metrics.
+    /// Env-gated like the other real-GGUF tests.
+    #[test]
+    fn real_gguf_qwen35_bench() {
+        let path = match std::env::var("LARQL_QWEN35_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_GGUF unset — skipping bench");
+                return;
+            }
+        };
+        let gguf_path = std::path::PathBuf::from(&path);
+
+        let n_prefill: usize = std::env::var("LARQL_QWEN35_BENCH_PREFILL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let n_decode: usize = std::env::var("LARQL_QWEN35_BENCH_DECODE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+
+        eprintln!("loading GGUF…");
+        let load_t = std::time::Instant::now();
+        let weights = larql_models::load_gguf(&gguf_path).expect("load_gguf");
+        let w = load_qwen35_weights(&weights, &*weights.arch).expect("bridge load");
+        eprintln!("loaded in {:.2}s", load_t.elapsed().as_secs_f64());
+
+        let arch = &*weights.arch;
+        let dn_dims = crate::attention::deltanet_block::DeltaNetDims {
+            hidden: weights.hidden_size,
+            head_v_dim: arch.ssm_state_size(),
+            n_v_heads: arch.ssm_dt_rank(),
+            n_k_heads: arch.ssm_group_count(),
+            d_conv: arch.ssm_conv_kernel(),
+            eps: 1e-6,
+        };
+        let rotary_dim: usize = arch
+            .rope_dimension_sections()
+            .map(|s| s.iter().sum())
+            .unwrap_or(weights.head_dim);
+        let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
+            hidden: weights.hidden_size,
+            n_head: weights.num_q_heads,
+            n_head_kv: weights.num_kv_heads,
+            head_dim: weights.head_dim,
+            rotary_dim,
+            rope_base: weights.rope_base,
+            eps: 1e-6,
+        };
+        let layer_kinds: Vec<bool> = (0..weights.num_layers)
+            .map(|l| arch.is_linear_attention_layer(l))
+            .collect();
+        let mut cache = crate::attention::qwen35_block::DeltaNetHybridCache::allocate(
+            &layer_kinds,
+            attn_dims.kv_dim(),
+            dn_dims.d_conv,
+            dn_dims.conv_dim(),
+            dn_dims.head_v_dim,
+            dn_dims.n_v_heads,
+        );
+
+        // Use a simple sequence of tokens — content doesn't matter for
+        // timing, only count.
+        let toks: Vec<u32> = (0..n_prefill).map(|i| 1 + (i as u32 % 100)).collect();
+
+        // Prefill timing.
+        let prefill_t = std::time::Instant::now();
+        let mut last_logits = ndarray::Array1::<f32>::zeros(1);
+        for &tok in &toks {
+            last_logits = crate::attention::qwen35_forward::qwen35_forward_step(
+                tok, &w, &dn_dims, &attn_dims, &mut cache, 1e-6,
+            );
+        }
+        let prefill_secs = prefill_t.elapsed().as_secs_f64();
+        eprintln!(
+            "prefill: {n_prefill} toks in {prefill_secs:.2}s → {:.2} tok/s",
+            n_prefill as f64 / prefill_secs
+        );
+
+        // Decode timing: greedy from the prefill's last logits, N steps.
+        let decode_t = std::time::Instant::now();
+        for _ in 0..n_decode {
+            let (next, _) =
+                last_logits
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+                        if v > acc.1 {
+                            (i, v)
+                        } else {
+                            acc
+                        }
+                    });
+            last_logits = crate::attention::qwen35_forward::qwen35_forward_step(
+                next as u32,
+                &w,
+                &dn_dims,
+                &attn_dims,
+                &mut cache,
+                1e-6,
+            );
+        }
+        let decode_secs = decode_t.elapsed().as_secs_f64();
+        eprintln!(
+            "decode:  {n_decode} toks in {decode_secs:.2}s → {:.2} tok/s",
+            n_decode as f64 / decode_secs
+        );
+
+        // Process RSS at this point (Linux only).
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(line) = s.lines().find(|l| l.starts_with("VmRSS:")) {
+                eprintln!("RSS:     {line}");
+            }
+        }
+    }
+
     #[test]
     fn real_gguf_qwen35_token_diff_vs_llama_cpp() {
         let path = match std::env::var("LARQL_QWEN35_GGUF") {
