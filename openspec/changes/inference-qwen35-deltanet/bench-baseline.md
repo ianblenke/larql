@@ -218,6 +218,36 @@ or the E.6 device-resident activation/weight pipeline; standalone
 host-returning hooks are correctness plumbing, not enough throughput
 plumbing.
 
+## 2026-05-12 update — Phase E.6 profile: DeltaNet linear layers dominate
+
+Before grinding into the E.6 device-resident refactor, attribute
+per-token wall-clock with `LARQL_QWEN35_PROFILE=1`, instrumenting the
+four coarse sections inside `qwen35_forward_step` (linear block,
+attn block, FFN, norm/residual).
+
+On the current Phase E.4.{1,2,3} build (RTX 4090, prefill 4 /
+decode 2, `LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1
+LARQL_QWEN35_GPU=1`):
+
+```
+PROFILE: block_lin=2.08s  block_atn=0.013s  ffn=0.81s  norm/residual=0.001s
+```
+
+- **48 DeltaNet linear layers** → **2.08 s/token (69 %)**, i.e.
+  ~43 ms per linear layer.
+- **64 FFNs** → **0.81 s/token (27 %)**, ~12 ms per FFN.
+- **16 full-attn layers** → **0.013 s/token (0.4 %)**, ~0.8 ms each
+  — already GPU-fast.
+- Norms / residual adds are negligible.
+
+Confirms the prior diagnosis: each DeltaNet block fires ~7
+host-returning `qwen35_*` hooks (attn_qkv → attn_gate → conv1d → l2
+Q → l2 K → recurrence → rms-norm-heads → ssm_out). The CUDA kernels
+themselves are fast; the cumulative `drv.sync()` + `to_host()` per
+hook is what burns 43 ms per layer. The fix is to chain the hooks
+on a single stream and sync only at the block boundary — that is
+exactly the E.6.A scope (fused device-resident DeltaNet block).
+
 ## 2026-05-12 update — Phase 2d lazy-quant embed (105 → 20 GiB, −80.9 %)
 
 Adds `QuantTensor::row_to_f32(token_id)` for the embed-lookup

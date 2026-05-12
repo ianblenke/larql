@@ -159,12 +159,35 @@ pub fn qwen35_forward_step(
         );
     }
 
+    // Optional coarse-grained timing per layer section. Set
+    // `LARQL_QWEN35_PROFILE=1` once-per-token to print where the
+    // wall-clock goes. Cumulative across one forward call.
+    let profile = std::env::var("LARQL_QWEN35_PROFILE").is_ok();
+    let mut t_block = std::time::Duration::ZERO;
+    let mut t_ffn = std::time::Duration::ZERO;
+    let mut t_norm_residual = std::time::Duration::ZERO;
+    let mut t_block_lin = std::time::Duration::ZERO;
+    let mut t_block_atn = std::time::Duration::ZERO;
+    let layer_kinds_for_profile: Vec<bool> = (0..n_layers)
+        .map(|l| {
+            matches!(
+                weights.layers[l].block,
+                crate::attention::qwen35_block::Qwen35LayerWeights::Linear(_)
+            )
+        })
+        .collect();
+
     // 2. Hybrid layer stack.
     for layer in 0..n_layers {
         let layer_w = &weights.layers[layer];
         // 2a. Block forward (linear or full-attn). The block does
         // its own pre-norm internally (`attn_norm`).
         let backend = weights.backend.as_deref();
+        let t0 = if profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let block_out = hybrid_layer_step(
             layer,
             &x,
@@ -175,13 +198,35 @@ pub fn qwen35_forward_step(
             backend,
             hybrid_cache.next_position,
         );
+        if let Some(t0) = t0 {
+            let dt = t0.elapsed();
+            t_block += dt;
+            if layer_kinds_for_profile[layer] {
+                t_block_lin += dt;
+            } else {
+                t_block_atn += dt;
+            }
+        }
         // 2b. Residual add 1 — `residual = x + block_out`.
+        let t1 = if profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let residual: Array1<f32> = &x + &block_out;
         // 2c. Post-attention RMSNorm (only on `has_post_norms`
         // architectures — Qwen 3.6 is one of them).
         let ffn_in = rms_norm_1d_pub(&residual, &layer_w.attn_post_norm, eps);
+        if let Some(t1) = t1 {
+            t_norm_residual += t1.elapsed();
+        }
         // 2d. SwiGLU FFN. Lazy-quant path takes precedence per
         //     projection; falls back to dense ndarray dot otherwise.
+        let t2 = if profile {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let ffn_out = if layer_w.ffn_gate_quant.is_some()
             || layer_w.ffn_up_quant.is_some()
             || layer_w.ffn_down_quant.is_some()
@@ -204,6 +249,9 @@ pub fn qwen35_forward_step(
                 layer_w.ffn_down.view(),
             )
         };
+        if let Some(t2) = t2 {
+            t_ffn += t2.elapsed();
+        }
         // 2e. Residual add 2 — `x = residual + ffn_out` (NOT
         // `ffn_in + ffn_out`; the FFN residual bypasses the
         // post-norm per design.md §6).
@@ -368,6 +416,16 @@ pub fn qwen35_forward_step(
             "    logits:                 l2={:.3} max_abs={:.3}",
             l2(&logits),
             max_abs(&logits),
+        );
+    }
+
+    if profile {
+        eprintln!(
+            "    PROFILE: block_lin={:.3}s block_atn={:.3}s ffn={:.3}s norm/residual={:.3}s",
+            t_block_lin.as_secs_f64(),
+            t_block_atn.as_secs_f64(),
+            t_ffn.as_secs_f64(),
+            t_norm_residual.as_secs_f64(),
         );
     }
 
