@@ -471,6 +471,10 @@ mod tests {
             attn_k_norm: Arc::from(vec![1.0_f32; attn_dims.head_dim].as_slice()),
             attn_output: Array2::from_elem((attn_dims.hidden, attn_dims.q_dim()), 0.5_f32)
                 .into_shared(),
+            attn_q_quant: None,
+            attn_k_quant: None,
+            attn_v_quant: None,
+            attn_output_quant: None,
         }
     }
 

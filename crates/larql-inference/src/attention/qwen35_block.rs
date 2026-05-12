@@ -58,6 +58,15 @@ pub struct Qwen35AttentionLayerWeights {
     pub attn_k_norm: Arc<[f32]>,
     /// Output projection `[hidden, n_head * head_dim]`.
     pub attn_output: ArcArray2<f32>,
+
+    /// Optional lazy-quantised versions of the four full-attn
+    /// projections. Same opt-in semantics as the DeltaNet quants:
+    /// when `Some`, the dense field is a 0×0 placeholder and the
+    /// matvec goes through `QuantTensor::matvec`.
+    pub attn_q_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub attn_k_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub attn_v_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub attn_output_quant: Option<larql_models::quant::lazy::QuantTensor>,
 }
 
 /// Shape constants for the full-attention layers (uniform across
@@ -146,9 +155,21 @@ pub fn qwen35_attention_block_step(
     let x_norm = super::deltanet_block::rms_norm_1d_pub(x, &weights.attn_norm, dims.eps);
 
     // 2. Projections.
-    let q_fused_1d = weights.attn_q.dot(&x_norm); // [fused_q_dim]
-    let k_1d = weights.attn_k.dot(&x_norm); // [kv_dim]
-    let v_1d = weights.attn_v.dot(&x_norm); // [kv_dim]
+    let q_fused_1d = if let Some(q) = weights.attn_q_quant.as_ref() {
+        q.matvec(&x_norm).expect("attn_q_quant matvec")
+    } else {
+        weights.attn_q.dot(&x_norm)
+    }; // [fused_q_dim]
+    let k_1d = if let Some(q) = weights.attn_k_quant.as_ref() {
+        q.matvec(&x_norm).expect("attn_k_quant matvec")
+    } else {
+        weights.attn_k.dot(&x_norm)
+    }; // [kv_dim]
+    let v_1d = if let Some(q) = weights.attn_v_quant.as_ref() {
+        q.matvec(&x_norm).expect("attn_v_quant matvec")
+    } else {
+        weights.attn_v.dot(&x_norm)
+    }; // [kv_dim]
 
     // 3. Split Q+gate. split_q_gate takes [seq_len, fused_q_dim] →
     //    (q [seq_len, q_dim], gate [seq_len, q_dim]). Wrap our
@@ -226,7 +247,11 @@ pub fn qwen35_attention_block_step(
 
     // 9. Output projection: y = attn_output @ attn_out[0].
     let attn_out_1d = attn_out.row(0).to_owned();
-    weights.attn_output.dot(&attn_out_1d)
+    if let Some(q) = weights.attn_output_quant.as_ref() {
+        q.matvec(&attn_out_1d).expect("attn_output_quant matvec")
+    } else {
+        weights.attn_output.dot(&attn_out_1d)
+    }
 }
 
 /// Autoregressive GQA softmax attention for a single new Q row over
@@ -506,6 +531,10 @@ mod tests {
             attn_q_norm: StdArc::from(attn_q_norm.as_slice()),
             attn_k_norm: StdArc::from(attn_k_norm.as_slice()),
             attn_output: attn_output.into_shared(),
+            attn_q_quant: None,
+            attn_k_quant: None,
+            attn_v_quant: None,
+            attn_output_quant: None,
         }
     }
 
