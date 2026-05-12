@@ -21371,49 +21371,61 @@
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 899,
+      "line": 968,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 806,
+      "line": 875,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::l2_and_rms_norm_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 721,
+      "line": 790,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 602,
+      "line": 671,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::silu_inplace_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 618,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 899,
+      "line": 968,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 806,
+      "line": 875,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::l2_and_rms_norm_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 721,
+      "line": 790,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 602,
+      "line": 671,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::silu_inplace_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 618,
       "crate": "larql_compute"
     },
     {

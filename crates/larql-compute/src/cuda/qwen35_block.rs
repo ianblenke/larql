@@ -41,12 +41,22 @@ use super::driver::Driver;
 use super::error::CudaInitError;
 
 const QWEN35_BLOCK_SRC: &str = r#"
-// silu_inplace_f32: x[i] *= 1 / (1 + exp(-x[i])).
+// silu_inplace_f32: x[i] = x[i] * sigmoid(x[i]).
+//
+// Matches the host's `silu(x) = x * sigmoid(x) = x * (1 / (1 + exp(-x)))`
+// formulation (NOT the algebraically equivalent `x / (1 + exp(-x))`).
+// fp32 rounding differs by a ulp between the two formulations, and
+// the host code uses the two-step `1/d` then `x*y` order — see
+// `deltanet_block::silu` and `deltanet_state::sigmoid`. Forcing the
+// kernel to match shaves a few ulp off silu drift, which matters for
+// `v` (un-normalised) feeding into the recurrence's rank-1 state
+// update.
 extern "C" __global__ void silu_inplace_f32(float* x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float v = x[i];
-    x[i] = v / (1.0f + expf(-v));
+    float sig = 1.0f / (1.0f + expf(-v));
+    x[i] = v * sig;
 }
 
 // reshape_head_to_dim_f32: convert flat head-major
@@ -84,7 +94,8 @@ extern "C" __global__ void reshape_dim_to_head_f32(
     dst[(size_t)h * head_dim + d] = src[(size_t)src_offset + (size_t)d * n_heads + h];
 }
 
-// silu_mul_inplace_f32: o[i] *= silu(z[i]).
+// silu_mul_inplace_f32: o[i] *= silu(z[i]) using host's
+// `x * sigmoid(x)` formulation (see `silu_inplace_f32` above).
 extern "C" __global__ void silu_mul_inplace_f32(
     float* __restrict__ o,
     const float* __restrict__ z,
@@ -93,7 +104,8 @@ extern "C" __global__ void silu_mul_inplace_f32(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float zv = z[i];
-    float silu = zv / (1.0f + expf(-zv));
+    float sig = 1.0f / (1.0f + expf(-zv));
+    float silu = zv * sig;
     o[i] = o[i] * silu;
 }
 "#;
@@ -592,6 +604,63 @@ mod tests {
             return None;
         }
         CudaBackend::new().ok()
+    }
+
+    /// Quantify GPU `silu` vs CPU `silu` drift at production scale.
+    /// The CUDA `expf` in `silu_inplace_f32` is implemented by the
+    /// CUDA math library (~1-2 ulp) while host `f32::exp` is glibc's
+    /// expf (also ~1 ulp, but a different polynomial). Suspected
+    /// culprit for the fused-path multi-position parity drift
+    /// (E.6.A.6): silu drift on v (which skips L2 norm and feeds
+    /// directly into the recurrence's rank-1 state update) compounds
+    /// across 9 prompt + 5 decode positions × 48 layers.
+    #[test]
+    fn silu_inplace_drift_at_qwen35_shape() {
+        let Some(backend) = gpu_or_skip() else { return };
+        let drv = backend.driver();
+        let (silu_f, _, _, _) = functions(drv).expect("module");
+
+        // conv_dim = 2 * 128 * 16 + 128 * 48 = 10240 (Qwen3.6 27B).
+        let n = 10240_usize;
+        // Diverse fp32 range: include large negatives (where expf
+        // matters), small values, and large positives.
+        let host: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = (i as f32) / (n as f32) * 12.0 - 6.0; // [-6, 6]
+                t
+            })
+            .collect();
+        let mut dev = drv.device_buf_from(&host).expect("htod");
+        launch_silu_inplace(drv, silu_f, &mut dev, n).expect("silu");
+        drv.sync().expect("sync");
+        let gpu = drv.to_host(&dev).expect("dtoh");
+
+        // CPU reference matches the actual `silu(x) = x * sigmoid(x)`
+        // formula used by `deltanet_block::silu` (NOT the algebraically
+        // equivalent `x / (1 + exp(-x))` — fp32 rounding differs by a
+        // ulp between the two formulations).
+        let mut max_abs_xtimes = 0.0_f32;
+        let mut max_abs_xdiv = 0.0_f32;
+        let mut sum_abs_xtimes = 0.0_f32;
+        let mut sum_abs_xdiv = 0.0_f32;
+        for (i, &v) in host.iter().enumerate() {
+            let cpu_xtimes = v * (1.0_f32 / (1.0_f32 + (-v).exp()));
+            let cpu_xdiv = v / (1.0_f32 + (-v).exp());
+            let d_xt = (gpu[i] - cpu_xtimes).abs();
+            let d_xd = (gpu[i] - cpu_xdiv).abs();
+            max_abs_xtimes = max_abs_xtimes.max(d_xt);
+            max_abs_xdiv = max_abs_xdiv.max(d_xd);
+            sum_abs_xtimes += d_xt;
+            sum_abs_xdiv += d_xd;
+        }
+        eprintln!(
+            "silu drift vs `x*sigmoid(x)` (host formulation): max_abs={max_abs_xtimes:.4e} mean={:.4e}",
+            sum_abs_xtimes / n as f32
+        );
+        eprintln!(
+            "silu drift vs `x/(1+exp(-x))`:                   max_abs={max_abs_xdiv:.4e} mean={:.4e}",
+            sum_abs_xdiv / n as f32
+        );
     }
 
     /// Validate the head→dim + dim→head reshape mini-kernels at
