@@ -155,9 +155,19 @@ fn load_deltanet_layer(
     // GGUF stores `(1+w)` pre-applied for attn_norm — use raw.
     let attn_norm = get_vec(weights, &arch.input_layernorm_key(layer))?;
     let attn_qkv_key = require_key(arch.attn_qkv_key(layer), layer, "attn_qkv_key", "linear")?;
-    let attn_qkv = get_tensor(weights, &attn_qkv_key)?;
+    let attn_qkv_quant = weights.quant_tensors.get(&attn_qkv_key).cloned();
+    let attn_qkv = if attn_qkv_quant.is_some() {
+        ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new()).unwrap()
+    } else {
+        get_tensor(weights, &attn_qkv_key)?
+    };
     let attn_gate_key = require_key(arch.attn_gate_key(layer), layer, "attn_gate_key", "linear")?;
-    let attn_gate = get_tensor(weights, &attn_gate_key)?;
+    let attn_gate_quant = weights.quant_tensors.get(&attn_gate_key).cloned();
+    let attn_gate = if attn_gate_quant.is_some() {
+        ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new()).unwrap()
+    } else {
+        get_tensor(weights, &attn_gate_key)?
+    };
     let ssm_conv1d_key = require_key(
         arch.ssm_conv1d_key(layer),
         layer,
@@ -184,7 +194,12 @@ fn load_deltanet_layer(
     let ssm_norm_key = require_key(arch.ssm_norm_key(layer), layer, "ssm_norm_key", "linear")?;
     let ssm_norm = get_vec(weights, &ssm_norm_key)?;
     let ssm_out_key = require_key(arch.ssm_out_key(layer), layer, "ssm_out_key", "linear")?;
-    let ssm_out = get_tensor(weights, &ssm_out_key)?;
+    let ssm_out_quant = weights.quant_tensors.get(&ssm_out_key).cloned();
+    let ssm_out = if ssm_out_quant.is_some() {
+        ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new()).unwrap()
+    } else {
+        get_tensor(weights, &ssm_out_key)?
+    };
 
     Ok(DeltaNetLayerWeights {
         attn_norm,
@@ -197,6 +212,9 @@ fn load_deltanet_layer(
         ssm_alpha,
         ssm_norm,
         ssm_out,
+        attn_qkv_quant,
+        attn_gate_quant,
+        ssm_out_quant,
     })
 }
 
@@ -2160,6 +2178,17 @@ mod tests {
                 lazy_keys.insert(arch_ref.ffn_gate_key(l));
                 lazy_keys.insert(arch_ref.ffn_up_key(l));
                 lazy_keys.insert(arch_ref.ffn_down_key(l));
+                // DeltaNet linear-attention projections — the
+                // remaining ~25 GiB of dense weights at Phase 2.
+                if let Some(k) = arch_ref.attn_qkv_key(l) {
+                    lazy_keys.insert(k);
+                }
+                if let Some(k) = arch_ref.attn_gate_key(l) {
+                    lazy_keys.insert(k);
+                }
+                if let Some(k) = arch_ref.ssm_out_key(l) {
+                    lazy_keys.insert(k);
+                }
             }
             if lazy_lm_head {
                 lazy_keys.insert("lm_head.weight".to_string());
@@ -2329,6 +2358,17 @@ mod tests {
                 lazy_keys.insert(arch_ref.ffn_gate_key(l));
                 lazy_keys.insert(arch_ref.ffn_up_key(l));
                 lazy_keys.insert(arch_ref.ffn_down_key(l));
+                // DeltaNet linear-attention projections — the
+                // remaining ~25 GiB of dense weights at Phase 2.
+                if let Some(k) = arch_ref.attn_qkv_key(l) {
+                    lazy_keys.insert(k);
+                }
+                if let Some(k) = arch_ref.attn_gate_key(l) {
+                    lazy_keys.insert(k);
+                }
+                if let Some(k) = arch_ref.ssm_out_key(l) {
+                    lazy_keys.insert(k);
+                }
             }
             if lazy_lm_head {
                 lazy_keys.insert("lm_head.weight".to_string());

@@ -482,6 +482,9 @@ mod tests {
             ssm_alpha: ssm_alpha.into_shared(),
             ssm_norm: StdArc::from(ssm_norm.as_slice()),
             ssm_out: ssm_out.into_shared(),
+            attn_qkv_quant: None,
+            attn_gate_quant: None,
+            ssm_out_quant: None,
         }
     }
 

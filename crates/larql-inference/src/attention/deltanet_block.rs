@@ -71,6 +71,15 @@ pub struct DeltaNetLayerWeights {
     pub ssm_norm: std::sync::Arc<[f32]>,
     /// Output projection `[hidden, value_dim]`.
     pub ssm_out: ArcArray2<f32>,
+
+    /// Optional lazy-quantised versions of the big projections.
+    /// When `Some`, matvec dispatches through `QuantTensor::matvec`
+    /// and the corresponding dense field above is a 0×0 placeholder.
+    /// Set by `load_qwen35_weights_lazy_*`; default `None` keeps the
+    /// dense path.
+    pub attn_qkv_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub attn_gate_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    pub ssm_out_quant: Option<larql_models::quant::lazy::QuantTensor>,
 }
 
 /// Per-layer shape constants. All architectures in scope (Qwen 3.6
@@ -124,15 +133,21 @@ pub fn deltanet_block_step(
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
-    debug_assert_eq!(weights.attn_qkv.shape(), [dims.conv_dim(), dims.hidden]);
-    debug_assert_eq!(weights.attn_gate.shape(), [dims.value_dim(), dims.hidden]);
+    if weights.attn_qkv_quant.is_none() {
+        debug_assert_eq!(weights.attn_qkv.shape(), [dims.conv_dim(), dims.hidden]);
+    }
+    if weights.attn_gate_quant.is_none() {
+        debug_assert_eq!(weights.attn_gate.shape(), [dims.value_dim(), dims.hidden]);
+    }
     debug_assert_eq!(weights.ssm_conv1d.shape(), [dims.d_conv, dims.conv_dim()]);
     debug_assert_eq!(weights.ssm_dt.len(), dims.n_v_heads);
     debug_assert_eq!(weights.ssm_a.len(), dims.n_v_heads);
     debug_assert_eq!(weights.ssm_beta.shape(), [dims.n_v_heads, dims.hidden]);
     debug_assert_eq!(weights.ssm_alpha.shape(), [dims.n_v_heads, dims.hidden]);
     debug_assert_eq!(weights.ssm_norm.len(), dims.head_v_dim);
-    debug_assert_eq!(weights.ssm_out.shape(), [dims.hidden, dims.value_dim()]);
+    if weights.ssm_out_quant.is_none() {
+        debug_assert_eq!(weights.ssm_out.shape(), [dims.hidden, dims.value_dim()]);
+    }
 
     // 1. Pre-mixer RMSNorm.
     let x_norm = rms_norm_1d(x, &weights.attn_norm, dims.eps);
@@ -155,10 +170,20 @@ pub fn deltanet_block_step(
     }
 
     // 2. Projections (matvec).
-    let qkv_mixed = weights.attn_qkv.dot(&x_norm); // [conv_dim]
-    let z = weights.attn_gate.dot(&x_norm); // [value_dim]
-                                            // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
-                                            // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
+    // Matvecs go through `QuantTensor::matvec` when the lazy form is
+    // populated; otherwise fall back to the dense f32 dot.
+    let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
+        q.matvec(&x_norm).expect("attn_qkv_quant matvec")
+    } else {
+        weights.attn_qkv.dot(&x_norm)
+    }; // [conv_dim]
+    let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
+        q.matvec(&x_norm).expect("attn_gate_quant matvec")
+    } else {
+        weights.attn_gate.dot(&x_norm)
+    }; // [value_dim]
+       // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
+       // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = qkv_mixed.len();
         eprintln!(
@@ -449,7 +474,11 @@ pub fn deltanet_block_step(
     }
 
     // 9. Output projection (matvec).
-    let block_out = weights.ssm_out.dot(&o_flat);
+    let block_out = if let Some(q) = weights.ssm_out_quant.as_ref() {
+        q.matvec(&o_flat).expect("ssm_out_quant matvec")
+    } else {
+        weights.ssm_out.dot(&o_flat)
+    };
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = block_out.len();
         eprintln!(
@@ -517,6 +546,9 @@ mod tests {
             ssm_alpha: ssm_alpha.into_shared(),
             ssm_norm: Arc::from(ssm_norm.as_slice()),
             ssm_out: ssm_out.into_shared(),
+            attn_qkv_quant: None,
+            attn_gate_quant: None,
+            ssm_out_quant: None,
         }
     }
 
