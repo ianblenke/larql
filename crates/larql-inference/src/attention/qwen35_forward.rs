@@ -67,7 +67,14 @@ pub struct Qwen35Weights {
     pub final_norm: Arc<[f32]>,
     /// LM head projection `[vocab, hidden]`. Often tied to `embed`
     /// (the caller decides; this struct just holds whichever).
+    /// May be a 0×0 placeholder when `lm_head_quant` is populated and
+    /// the caller is using the lazy-quantised matvec path.
     pub lm_head: ArcArray2<f32>,
+    /// Lazy-quantised LM head, if loaded via
+    /// `larql_models::load_gguf_lazy_lm_head`. When `Some`, the
+    /// forward dispatches the final logits matvec through
+    /// `QuantTensor::matvec` and `lm_head` is unused.
+    pub lm_head_quant: Option<larql_models::quant::lazy::QuantTensor>,
     /// FFN intermediate dim (for shape assertions in tests).
     pub ffn_dim: usize,
 }
@@ -268,7 +275,13 @@ pub fn qwen35_forward_step(
             x_final.iter().map(|v| v * v).sum::<f32>().sqrt(),
         );
     }
-    let logits = weights.lm_head.dot(&x_final);
+    // Final logits matvec. Prefer the lazy-quantised path when
+    // populated; falls back to dense f32 dot otherwise.
+    let logits = if let Some(qt) = weights.lm_head_quant.as_ref() {
+        qt.matvec(&x_final).expect("lm_head_quant matvec")
+    } else {
+        weights.lm_head.dot(&x_final)
+    };
     if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR") {
         let tag =
             std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
@@ -496,6 +509,7 @@ mod tests {
             ],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            lm_head_quant: None,
             ffn_dim,
         };
 
@@ -540,6 +554,7 @@ mod tests {
             }],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            lm_head_quant: None,
             ffn_dim,
         };
 
@@ -589,6 +604,7 @@ mod tests {
             }],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            lm_head_quant: None,
             ffn_dim,
         };
 

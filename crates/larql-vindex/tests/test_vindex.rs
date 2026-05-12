@@ -1936,6 +1936,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
+        lm_head_quant: None,
         num_layers,
         hidden_size: hidden,
         intermediate_size: intermediate,

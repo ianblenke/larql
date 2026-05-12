@@ -1,5 +1,6 @@
 //! Model weight tensors — the loaded representation of a model's parameters.
 
+use crate::quant::lazy::QuantTensor;
 use crate::ModelArchitecture;
 use memmap2::Mmap;
 use ndarray::ArcArray2;
@@ -66,6 +67,14 @@ pub struct ModelWeights {
     /// Output projection matrix. Same as embed if tie_word_embeddings=true,
     /// separate lm_head.weight otherwise.
     pub lm_head: WeightArray,
+    /// Optional lazy-quantized lm_head. When populated by
+    /// `load_gguf_lazy_lm_head`, callers may dispatch the final logits
+    /// matvec through `QuantTensor::matvec` to avoid the ~5 GiB f32
+    /// blow-up the dense `lm_head` field requires for a 248k-vocab
+    /// model. The two fields are mutually consistent (same matrix, one
+    /// dequantized, one not) — populate this AND keep the dense form,
+    /// or drop the dense form and rely on the lazy path.
+    pub lm_head_quant: Option<QuantTensor>,
     pub arch: Box<dyn ModelArchitecture>,
     // Cached from arch.config() for convenience — these are hot-path values.
     pub num_layers: usize,
