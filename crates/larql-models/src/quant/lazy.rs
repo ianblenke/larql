@@ -169,6 +169,35 @@ impl QuantTensor {
     pub fn bytes_resident(&self) -> usize {
         self.data.len()
     }
+
+    /// Dequantise a single row to `Array1<f32>`. Hot path for embed
+    /// lookups where the caller wants one row by index without
+    /// materialising the entire matrix.
+    pub fn row_to_f32(&self, row: usize) -> Result<Array1<f32>, ModelError> {
+        if row >= self.rows {
+            return Err(ModelError::Parse(format!(
+                "QuantTensor::row_to_f32: row {row} out of range [0..{})",
+                self.rows
+            )));
+        }
+        let row_bytes = &self.data[row * self.row_bytes..(row + 1) * self.row_bytes];
+        match self.tensor_type {
+            TYPE_F32 => {
+                let vec: Vec<f32> = row_bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                Ok(Array1::from(vec))
+            }
+            // For block-quantised types just delegate to the bulk
+            // dequantizer over a single row's worth of bytes. The
+            // result vec is `self.cols` elements.
+            _ => {
+                let vec = dequantize(row_bytes, self.tensor_type, self.cols)?;
+                Ok(Array1::from(vec))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +234,26 @@ mod tests {
         let qt = QuantTensor::from_f32_rows(2, 3, &[1.0; 6]);
         let x = Array1::from(vec![1.0_f32; 4]);
         assert!(qt.matvec(&x).is_err());
+    }
+
+    #[test]
+    fn row_to_f32_returns_each_row_in_order() {
+        let rows = 4;
+        let cols = 3;
+        let values: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.5 - 1.0).collect();
+        let qt = QuantTensor::from_f32_rows(rows, cols, &values);
+        for r in 0..rows {
+            let out = qt.row_to_f32(r).unwrap();
+            assert_eq!(out.len(), cols);
+            for c in 0..cols {
+                assert!((out[c] - values[r * cols + c]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn row_to_f32_oob_errors() {
+        let qt = QuantTensor::from_f32_rows(2, 3, &[0.0; 6]);
+        assert!(qt.row_to_f32(2).is_err());
     }
 }

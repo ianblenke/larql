@@ -327,6 +327,7 @@ fn load_model_dir_filtered_with_validation(
         packed_mmaps,
         packed_byte_ranges,
         embed,
+        embed_quant: None,
         lm_head,
         lm_head_quant: None,
         quant_tensors: HashMap::new(),

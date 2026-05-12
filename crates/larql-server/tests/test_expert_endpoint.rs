@@ -249,6 +249,7 @@ fn make_loaded_model(
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
+        embed_quant: None,
         lm_head: embed,
         lm_head_quant: None,
         quant_tensors: HashMap::new(),

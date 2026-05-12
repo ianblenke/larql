@@ -134,6 +134,7 @@ pub fn load_qwen35_weights(
 
     Ok(Qwen35Weights {
         embed: weights.embed.clone(),
+        embed_quant: weights.embed_quant.clone(),
         layers,
         final_norm,
         lm_head: weights.lm_head.clone(),
@@ -502,6 +503,7 @@ mod tests {
             skipped_tensors: Vec::new(),
             packed_byte_ranges: HashMap::new(),
             embed,
+            embed_quant: None,
             lm_head,
             lm_head_quant: None,
             quant_tensors: HashMap::new(),
@@ -604,6 +606,7 @@ mod tests {
             skipped_tensors: Vec::new(),
             packed_byte_ranges: std::collections::HashMap::new(),
             embed: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
+            embed_quant: None,
             lm_head: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
             lm_head_quant: None,
             quant_tensors: HashMap::new(),
@@ -713,6 +716,7 @@ mod tests {
             skipped_tensors: Vec::new(),
             packed_byte_ranges: HashMap::new(),
             embed: make_2d(1, 1, 0.0),
+            embed_quant: None,
             lm_head: make_2d(1, 1, 0.0),
             lm_head_quant: None,
             quant_tensors: HashMap::new(),
@@ -2230,6 +2234,10 @@ mod tests {
                 lazy_keys.insert("lm_head.weight".to_string());
                 lazy_keys.insert("output.weight".to_string());
             }
+            // Embed: lazified when `LARQL_QWEN35_LAZY_FFN=1` is on,
+            // since it's the biggest single remaining tensor and the
+            // user opting into the lazy path almost always wants it.
+            lazy_keys.insert(arch_ref.embed_key().to_string());
             drop(probe);
             larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
                 .expect("load_gguf_lazy_tensors")
@@ -2417,6 +2425,10 @@ mod tests {
                 lazy_keys.insert("lm_head.weight".to_string());
                 lazy_keys.insert("output.weight".to_string());
             }
+            // Embed: lazified when `LARQL_QWEN35_LAZY_FFN=1` is on,
+            // since it's the biggest single remaining tensor and the
+            // user opting into the lazy path almost always wants it.
+            lazy_keys.insert(arch_ref.embed_key().to_string());
             drop(probe);
             larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
                 .expect("load_gguf_lazy_tensors")
