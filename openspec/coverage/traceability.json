@@ -22435,7 +22435,7 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2301,
+      "line": 2310,
       "crate": "larql_inference"
     },
     {
@@ -22483,7 +22483,7 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2238,
+      "line": 2247,
       "crate": "larql_inference"
     },
     {
@@ -22555,7 +22555,7 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2301,
+      "line": 2310,
       "crate": "larql_inference"
     },
     {
@@ -22603,7 +22603,7 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2238,
+      "line": 2247,
       "crate": "larql_inference"
     },
     {
