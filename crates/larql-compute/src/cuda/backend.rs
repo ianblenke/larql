@@ -43,6 +43,7 @@ pub struct CudaBackend {
     // for the lifetime of the model — Arc::clone is the right
     // primitive.
     q4k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    q5k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     q6k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     q6k_packed_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     q4k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
@@ -111,6 +112,7 @@ impl CudaBackend {
             drv,
             kv_cache: Mutex::new(None),
             q4k_device_cache: Mutex::new(HashMap::new()),
+            q5k_device_cache: Mutex::new(HashMap::new()),
             q6k_f32_device_cache: Mutex::new(HashMap::new()),
             q6k_packed_device_cache: Mutex::new(HashMap::new()),
             q4k_f32_device_cache: Mutex::new(HashMap::new()),
@@ -141,6 +143,38 @@ impl CudaBackend {
     ) -> Result<R, CudaInitError> {
         let arc = self.arc_q4k_device_buf(host)?;
         f(&arc)
+    }
+
+    /// Same content-keyed cache as [`with_q4k_device_buf`] but for
+    /// Q5_K weight bytes. The two formats have different bytes-per-
+    /// block (144 vs 176) so they live in separate caches; the
+    /// content hash overlap would still be safe (the lookup would
+    /// only ever return a buffer derived from the same host slice)
+    /// but a dedicated cache keeps the semantics obvious.
+    pub(crate) fn with_q5k_device_buf<R>(
+        &self,
+        host: &[u8],
+        f: impl FnOnce(&CudaSlice<u8>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self
+                .q5k_device_cache
+                .lock()
+                .map_err(|_| CudaInitError::DriverMissing("q5k device cache poisoned".into()))?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let arc = Arc::new(self.drv.device_u8_buf_from(host)?);
+        let mut cache = self
+            .q5k_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("q5k device cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc_clone = Arc::clone(entry);
+        drop(cache);
+        f(&arc_clone)
     }
 
     /// `cuda-decode-cuda-graph`: Arc-cloned device buffer for the

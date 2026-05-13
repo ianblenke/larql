@@ -21191,55 +21191,55 @@
     {
       "fqn": "larql_compute::cuda::backend::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 989,
+      "line": 1023,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::driver_missing_returns_typed_error",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 909,
+      "line": 943,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 974,
+      "line": 1008,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_decode_after_cuda_decode_backend",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 966,
+      "line": 1000,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_f32_gemv_after_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 926,
+      "line": 960,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_fa2_after_fused_attention",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 951,
+      "line": 985,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_q4_matvec_after_q4_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 940,
+      "line": 974,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 989,
+      "line": 1023,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 974,
+      "line": 1008,
       "crate": "larql_compute"
     },
     {
@@ -21360,6 +21360,18 @@
       "fqn": "larql_compute::cuda::q4k_mmvq::tests::q4k_mmvq_rows_per_block_sweep",
       "file": "crates/larql-compute/src/cuda/q4k_mmvq.rs",
       "line": 834,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::q5k_direct::q5k_matvec_matches_cpu_dequant_dot",
+      "file": "crates/larql-compute/src/cuda/q5k_direct.rs",
+      "line": 236,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::q5k_direct::tests::q5k_matvec_matches_cpu_dequant_dot",
+      "file": "crates/larql-compute/src/cuda/q5k_direct.rs",
+      "line": 236,
       "crate": "larql_compute"
     },
     {
@@ -21593,43 +21605,43 @@
     {
       "fqn": "larql_compute::pipeline::activation_from_bool",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 401,
+      "line": 403,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::default_layer_accepts_local_borrows_via_spread",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 485,
+      "line": 487,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::is_gated_matches_ffn_type",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 407,
+      "line": 409,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::is_hybrid_moe_reflects_option",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 416,
+      "line": 418,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_classifiers",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 453,
+      "line": 455,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_equality",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 444,
+      "line": 446,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_reports_packed_matrix_bytes",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 473,
+      "line": 475,
       "crate": "larql_compute"
     },
     {

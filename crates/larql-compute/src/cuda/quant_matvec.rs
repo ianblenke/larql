@@ -11,6 +11,7 @@ use super::backend::CudaBackend;
 use super::dequant;
 use super::matmul as kernels;
 use super::q4k_direct;
+use super::q5k_direct;
 
 impl QuantMatVec for CudaBackend {
     fn q4_matvec(
@@ -81,6 +82,19 @@ impl QuantMatVec for CudaBackend {
         }
         let w = dequant::dequant_q4_kf(q4kf_data, num_rows * hidden).ok()?;
         kernels::gemv(self.driver(), &w, x, num_rows, hidden).ok()
+    }
+
+    fn q5k_matvec(
+        &self,
+        q5k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        if x.len() != hidden {
+            return None;
+        }
+        q5k_direct::matvec(self, q5k_data, x, num_rows, hidden).ok()
     }
 
     fn q6k_matvec(

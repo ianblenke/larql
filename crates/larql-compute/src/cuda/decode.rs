@@ -346,6 +346,7 @@ fn dequant_weight(weight: QuantWeight<'_>, rows: usize, cols: usize) -> Option<V
         QuantFormat::Q4_0 => dequant::dequant_q4_0(weight.data, rows * cols).ok(),
         QuantFormat::Q4_K => dequant::dequant_q4_k(weight.data, rows * cols).ok(),
         QuantFormat::Q4_KF => dequant::dequant_q4_kf(weight.data, rows * cols).ok(),
+        QuantFormat::Q5_K => dequant::dequant_q5_k(weight.data, rows * cols).ok(),
         QuantFormat::Q6_K => dequant::dequant_q6_k(weight.data, rows * cols).ok(),
         QuantFormat::F32 => {
             if weight.data.len() != rows * cols * std::mem::size_of::<f32>() {

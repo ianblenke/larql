@@ -1,7 +1,11 @@
 # Qwen3.6 27B bench baseline — larql vs llama.cpp
 
 Captured 2026-05-11 on the same host, immediately after C.5k landed
-(parity test green, GT rank 0 at every step).
+(parity test green, GT rank 0 at every step). **The headline
+numbers below are the original CPU-only baseline; the gap closed
+sharply with Phase E.6.D (Q5_K direct CUDA matvec), which lifted
+decode 0.49 → 5.19 t/s (≈10× the original baseline, ≈15× over the
+prior best GPU build). See the E.6.D section further down.**
 
 ## Setup
 
@@ -167,6 +171,58 @@ around the recurrence output and moving per-head L2/RMSNorm/z-gate
 operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
+
+## 2026-05-12 update — Phase E.6.D: Q5_K direct CUDA matvec — 0.35 → 5.19 t/s decode (≈15×)
+
+What landed:
+
+- New `cuda::q5k_direct::matvec` / `matvec_device` modeled after
+  the existing `q4k_direct` kernel. Reads packed Q5_K super-blocks
+  (176 bytes / 256 elements: f16 d, f16 dmin, 12 byte scale+min,
+  32 byte high-bits, 128 byte low-nibbles) directly on device and
+  computes the matvec without dequantising.
+- New `QuantFormat::Q5_K` variant, `QuantMatVec::q5k_matvec` trait
+  method, CudaBackend impl, and a content-keyed
+  `with_q5k_device_buf` weight cache (same pattern as Q4_K).
+- `quant_dispatch::ggml_type_to_quant_format` now maps
+  `TYPE_Q5_K → Some(QuantFormat::Q5_K)` so the lazy-quant matvecs
+  for `ssm_out`, `ffn_down`, DeltaNet `attn_qkv`, and full-attn
+  `attn_k`/`attn_v` go onto the GPU instead of CPU rayon.
+- Bit-exact CPU-reference parity test
+  (`q5k_matvec_matches_cpu_dequant_dot`) at 2 rows × 2 super-blocks
+  validates the kernel matches `dequantize_q5_k` + scalar dot to
+  relative 1e-4.
+
+Bench (RTX 4090, prefill 16 / decode 8):
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.6.A.8 (paired matvec, all Q5_K on CPU) | 0.32 | 0.35 | 21.16 GiB |
+| **Phase E.6.D (+ Q5_K direct CUDA)** | **3.99** | **5.19** | **21.16 GiB** |
+| llama.cpp CUDA GPU (reference) | 2097 | 50.6 | 14.76 GiB VRAM |
+
+**12× prefill, 15× decode.** Parity preserved
+(`[<think>, \n\n, </think>, \n\n, Hello]`, GT rank 0 every step).
+larql is now within an order of magnitude of llama.cpp CUDA on
+this model.
+
+Post-Q5K fine profile (steady-state decode = 177 ms / token):
+
+```
+LM_HEAD              87.7 ms  (50 %)   Q6_K matvec (single per-token, already on GPU)
+FFN_GATE_UP_PAIR     28.5 ms  (16 %)
+FFN_DOWN             15.9 ms  ( 9 %)
+DN_RECURRENCE         7.6 ms  ( 4 %)
+ATTN_BLOCK            7.2 ms  ( 4 %)
+FFN_SILU_LOOP         6.9 ms  ( 4 %)   CPU silu*up loop
+DN_SSM_OUT            5.1 ms  ( 3 %)
+…rest                                  <3 ms each
+```
+
+The new dominant cost is the LM_HEAD Q6_K matvec at 87 ms /
+token. Same family of optimisations (paired matvecs, device-
+resident chain, CUDA Graphs) now apply on top of a much smaller
+absolute baseline.
 
 ## 2026-05-12 update — Phase E.6.A.9 fine profile: 87 % of decode time is Q5_K CPU fallback
 

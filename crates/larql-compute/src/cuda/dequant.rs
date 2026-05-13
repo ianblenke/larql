@@ -19,6 +19,11 @@ pub(crate) fn dequant_q4_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, C
         .map_err(|e| CudaInitError::DriverMissing(format!("dequant_q4_k: {e}")))
 }
 
+pub(crate) fn dequant_q5_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, CudaInitError> {
+    ggml::dequantize_q5_k(data, n_elements)
+        .map_err(|e| CudaInitError::DriverMissing(format!("dequant_q5_k: {e}")))
+}
+
 pub(crate) fn dequant_q4_kf(data: &[u8], n_elements: usize) -> Result<Vec<f32>, CudaInitError> {
     const BLOCK_ELEMS: usize = 256;
     const BLOCK_BYTES: usize = crate::pipeline::Q4_KF_BLOCK_BYTES;

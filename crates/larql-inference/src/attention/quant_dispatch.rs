@@ -23,9 +23,9 @@ use ndarray::Array1;
 pub fn ggml_type_to_quant_format(t: u32) -> Option<QuantFormat> {
     match t {
         TYPE_Q4_K => Some(QuantFormat::Q4_K),
+        TYPE_Q5_K => Some(QuantFormat::Q5_K),
         TYPE_Q6_K => Some(QuantFormat::Q6_K),
         TYPE_F32 => Some(QuantFormat::F32),
-        TYPE_Q5_K => None,
         _ => None,
     }
 }
