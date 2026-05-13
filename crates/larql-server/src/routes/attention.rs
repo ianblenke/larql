@@ -1131,7 +1131,7 @@ mod tests {
             api_key: None,
             sessions: crate::session::SessionManager::new(60),
             describe_cache: crate::cache::DescribeCache::new(0),
-            attention_sessions: Arc::new(AttentionSessionMap::new(60, 16)),
+            attention_sessions: AttentionSessionMap::new(60, 16),
             default_kv_format: None,
         })
     }

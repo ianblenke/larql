@@ -628,18 +628,7 @@ fn compute_full_vocab_probs_batched(
     let inv_scale = 1.0 / logits_scale;
     let softcap_f = final_softcap.unwrap_or(0.0);
     let probs_flat: Vec<f32> = if backend.has_q4() {
-        let q4_bytes: Option<&[u8]> = index
-            .projections
-            .lm_head_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
-            .or_else(|| {
-                index
-                    .projections
-                    .lm_head_q4_synth
-                    .as_ref()
-                    .map(|v| v.as_slice())
-            });
+        let q4_bytes: Option<&[u8]> = index.storage.lm_head_q4_view().map(|b| b.as_ref());
         match q4_bytes {
             Some(q4) => match backend
                 .q4k_matmul_softmax(q4, &h_normed, vocab, hidden, m, inv_scale, softcap_f)
@@ -719,19 +708,7 @@ fn compute_full_vocab_logits(
     // 1. Q4_K path (CudaBackend's q4k_matvec falls back to dequant +
     //    cuBLAS GEMV when the kernel constraint isn't met).
     if backend.has_q4() {
-        let q4_bytes: Option<&[u8]> = index
-            .projections
-            .lm_head_q4_mmap
-            .as_ref()
-            .map(|m| m.as_ref() as &[u8])
-            .or_else(|| {
-                index
-                    .projections
-                    .lm_head_q4_synth
-                    .as_ref()
-                    .map(|v| v.as_slice())
-            });
-        if let Some(q4_data) = q4_bytes {
+        if let Some(q4_data) = index.storage.lm_head_q4_view().map(|b| b.as_ref() as &[u8]) {
             if let Some(scores) = backend.q4k_matvec(q4_data, x, vocab, hidden) {
                 if scores.len() == vocab {
                     return scores;
@@ -740,8 +717,9 @@ fn compute_full_vocab_logits(
         }
     }
     // 2. f16 mmap path (tied embeddings re-used as lm_head).
-    if let Some(ref f16_mmap) = index.projections.lm_head_f16_mmap {
+    if let Some(f16_view) = index.storage.lm_head_f16_view() {
         let expected = vocab * hidden * 2;
+        let f16_mmap: &[u8] = f16_view.as_ref();
         if f16_mmap.len() >= expected {
             if let Some(scores) = backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden) {
                 if scores.len() == vocab {

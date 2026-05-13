@@ -90,6 +90,28 @@ pub mod residual_diff;
 pub mod speculative;
 pub mod tokenizer;
 pub mod trace;
+
+/// Shim that re-exports the engine-level synthetic test fixtures at
+/// `crate::test_utils::*` (and at the public
+/// `larql_inference::test_utils::*` path when the `test-utils`
+/// feature is enabled). The fork's source of truth lives at
+/// `engines::test_utils`; downstream crates' tests (larql-kv,
+/// larql-vindex) reach for `larql_inference::test_utils`, so this
+/// alias keeps them compiling without duplicating the synthetic-
+/// weights factory.
+///
+/// Includes `make_gemma3_test_weights()` and `make_starcoder2_test_weights()`
+/// which exercise the dormant Gemma3 (QK norm + post-norms + GeluTanh) and
+/// StarCoder2 (LayerNorm + non-gated FFN + biases) branches respectively.
+///
+/// Visibility is `pub` when the `test-utils` feature is on so other
+/// crates' `[dev-dependencies] larql-inference = { features =
+/// ["test-utils"] }` declarations resolve. Under `#[cfg(test)]`
+/// alone the module is the crate's own test fixture entry point.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils {
+    pub use crate::engines::test_utils::*;
+}
 pub mod trie;
 pub mod vindex;
 pub mod walker;
@@ -137,7 +159,7 @@ pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallback
 pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
-    ShardConfig, SparseFfn, WeightFfn,
+    ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
 pub use forward::{
     apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,

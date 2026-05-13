@@ -28,7 +28,14 @@ larql-router-protocol = { path = "../larql-router-protocol" }
 larql-compute = { path = "../larql-compute" }
 
 axum = { version = "0.8", features = ["ws"] }
+half = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
+# Constant-time byte equality for API-key comparison (auth middleware).
+# Already in the lockfile via rustls; declared here as a direct dep so the
+# threat-model rationale is visible at the crate boundary.
+subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.13"
@@ -50,6 +57,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 base64 = "0.22"
+utoipa = { version = "5", features = ["axum_extras", "preserve_order"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 [features]
 default = []
@@ -66,6 +75,12 @@ cuda = [
 
 [build-dependencies]
 tonic-build = "0.13"
+
+# See `crates/larql-router-protocol/Cargo.toml` for the Windows
+# rationale: `protobuf-src` builds protoc via cmake and the link step
+# fails on windows-latest. On Windows we rely on a system protoc
+# (installed by CI via `arduino/setup-protoc`).
+[target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2"
 
 [dev-dependencies]

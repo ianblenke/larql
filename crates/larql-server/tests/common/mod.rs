@@ -139,12 +139,19 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        tokenizer_cache: std::sync::Arc::new(larql_server::tokenizer_cache::TokenizerCache::new(
-            0, 0,
-        )),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
 
@@ -173,12 +180,19 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        tokenizer_cache: std::sync::Arc::new(larql_server::tokenizer_cache::TokenizerCache::new(
-            0, 0,
-        )),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
 
@@ -246,12 +260,19 @@ impl ModelBuilder {
             weights: std::sync::OnceLock::new(),
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(
+                larql_server::metrics::LayerLatencyTracker::new(),
+            ),
+            requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            tokenizer_cache: std::sync::Arc::new(
-                larql_server::tokenizer_cache::TokenizerCache::new(0, 0),
-            ),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+            metal_backend: std::sync::OnceLock::new(),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+            moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+            metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         })
     }
 }
@@ -272,10 +293,6 @@ pub fn state(models: Vec<Arc<LoadedModel>>) -> Arc<AppState> {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
-        attention_sessions: std::sync::Arc::new(
-            larql_server::attention_session::AttentionSessionMap::new(600, 256),
-        ),
-        default_kv_format: None,
     })
 }
 
@@ -287,10 +304,6 @@ pub fn state_with_key(models: Vec<Arc<LoadedModel>>, key: &str) -> Arc<AppState>
         api_key: Some(key.to_string()),
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(0),
-        attention_sessions: std::sync::Arc::new(
-            larql_server::attention_session::AttentionSessionMap::new(600, 256),
-        ),
-        default_kv_format: None,
     })
 }
 
@@ -302,10 +315,6 @@ pub fn state_with_cache(models: Vec<Arc<LoadedModel>>, cache_size: u64) -> Arc<A
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(cache_size),
-        attention_sessions: std::sync::Arc::new(
-            larql_server::attention_session::AttentionSessionMap::new(600, 256),
-        ),
-        default_kv_format: None,
     })
 }
 

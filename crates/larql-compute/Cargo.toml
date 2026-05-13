@@ -17,7 +17,7 @@ rayon = "1.10"
 # Tests/benches depend on it too — keep both lists in sync.
 larql-models = { path = "../larql-models" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
 openblas-src = { version = "0.10", features = ["system"] }
 # cudarc — high-level CUDA bindings. Pinned to 0.19.x (first version
@@ -83,6 +83,13 @@ cuda = ["dep:cudarc", "dep:half"]
 # so future Rust-authored kernels can be evaluated without changing the
 # default cudarc/cuBLAS path.
 cuda-oxide = ["dep:cudarc", "dep:cuda-device", "dep:cuda-host"]
+# Opt-in gate for the slow non-Metal integration suites. Plain
+# `cargo test -p larql-compute` skips them so the dev loop stays under
+# ~10 s; CI / release runs flip this on (and `metal` separately) to get
+# coverage. Metal kernel tests stay on the `metal` feature so a Metal
+# devloop (`cargo test -p larql-compute --features metal`) still runs
+# them — the two axes are independent on purpose.
+heavy_tests = []
 
 [build-dependencies]
 cc = "1.0"
@@ -107,5 +114,13 @@ harness = false
 name = "quant_matvec"
 harness = false
 
-[lints]
-workspace = true
+# `objc 0.2.x` (an abandoned-but-still-required transitive dep through
+# `metal`) uses `cfg(cargo-clippy)` inside its `msg_send!` / `sel_impl!`
+# macros. From rustc 1.95 onwards, `cargo-clippy` isn't a recognised
+# cfg name, so every macro expansion in our crate emits an
+# `unexpected_cfgs` warning that promotes to error under
+# `clippy -- -D warnings`. Function- and module-level `#[allow]` don't
+# reach into the macro expansion. Suppress crate-wide via the Cargo
+# `[lints]` table — the only place that reliably wires through.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [] }

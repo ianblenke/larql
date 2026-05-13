@@ -1,4 +1,4 @@
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 //! Kernel-level bisect for the CPU/Metal LM-head divergence surfaced
 //! by `test_logits_goldens` on tied-embedding models (Gemma 3 4B,
@@ -203,7 +203,7 @@ fn q4_matvec_pipeline_max_threads_per_tg() {
     // test surface so a regression in the cap → row-drop chain is
     // visible in a focused per-kernel test, not just at backend init.
     let kernel = &metal.q4.matvec;
-    let limit = kernel.state.max_total_threads_per_threadgroup() as u64;
+    let limit = kernel.state.max_total_threads_per_threadgroup();
     eprintln!(
         "  {} pipeline maxTotalThreadsPerThreadgroup = {limit} \
          (handle requests {})",

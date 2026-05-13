@@ -151,23 +151,31 @@ fn gguf_tensor_info(f: &mut impl Write, name: &str, dims: &[u64], ty: u32, offse
     f.write_all(&offset.to_le_bytes()).unwrap();
 }
 
+fn write_minimal_gguf(path: &Path) {
+    write_minimal_gguf_custom(path, 100, None, true, true);
+}
+
 /// Write a minimal but complete GGUF file that `load_gguf` can successfully parse.
 ///
-/// Architecture: llama, hidden=4, vocab=3000, 1 layer.
+/// Architecture: llama, hidden=4, 1 layer.
 /// Tensors: token_embd (embed), output (lm_head), output_norm (norm vector).
-fn write_minimal_gguf(path: &Path) {
-    // Tensor dimensions:
-    //   token_embd.weight  : [hidden=4, vocab=3000] F32  = 12000 × 4 = 48000 bytes
-    //   output.weight      : [hidden=4, vocab=3000] F32  = 12000 × 4 = 48000 bytes
-    //   output_norm.weight : [hidden=4]            F32  =     4 × 4 =    16 bytes
-    // Use vocab=100 to keep the file small.
-    const VOCAB: u64 = 100;
+fn write_minimal_gguf_custom(
+    path: &Path,
+    vocab: u64,
+    metadata_vocab_size: Option<u32>,
+    include_kv_heads: bool,
+    include_key_length: bool,
+) {
     const HIDDEN: u64 = 4;
-    let embed_elems = (HIDDEN * VOCAB) as usize;
+    let embed_elems = (HIDDEN * vocab) as usize;
     let norm_elems = HIDDEN as usize;
 
     let embed_bytes = (embed_elems * 4) as u64; // F32
     let norm_bytes = (norm_elems * 4) as u64;
+    let metadata_count: u64 = 6
+        + if include_kv_heads { 1 } else { 0 }
+        + if include_key_length { 1 } else { 0 }
+        + if metadata_vocab_size.is_some() { 1 } else { 0 };
 
     let mut f = std::fs::File::create(path).unwrap();
 
@@ -175,25 +183,31 @@ fn write_minimal_gguf(path: &Path) {
     f.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap();
     f.write_all(&3u32.to_le_bytes()).unwrap(); // version 3
     f.write_all(&3u64.to_le_bytes()).unwrap(); // n_tensors
-    f.write_all(&8u64.to_le_bytes()).unwrap(); // n_metadata
+    f.write_all(&metadata_count.to_le_bytes()).unwrap(); // n_metadata
 
-    // Metadata (8 entries)
+    // Metadata
     gguf_meta_str(&mut f, "general.architecture", "llama");
     gguf_meta_u32(&mut f, "llama.embedding_length", HIDDEN as u32);
     gguf_meta_u32(&mut f, "llama.block_count", 1);
     gguf_meta_u32(&mut f, "llama.feed_forward_length", 16);
     gguf_meta_u32(&mut f, "llama.attention.head_count", 2);
-    gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
-    gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    if include_kv_heads {
+        gguf_meta_u32(&mut f, "llama.attention.head_count_kv", 2);
+    }
+    if include_key_length {
+        gguf_meta_u32(&mut f, "llama.attention.key_length", 2);
+    }
     gguf_meta_f32(&mut f, "llama.rope.freq_base", 10000.0);
-    // note: no llama.vocab_size → will use default 262144
+    if let Some(vocab_size) = metadata_vocab_size {
+        gguf_meta_u32(&mut f, "llama.vocab_size", vocab_size);
+    }
 
     // Tensor infos (offsets are relative to the data section start)
-    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, VOCAB], GGUF_F32, 0);
+    gguf_tensor_info(&mut f, "token_embd.weight", &[HIDDEN, vocab], GGUF_F32, 0);
     gguf_tensor_info(
         &mut f,
         "output.weight",
-        &[HIDDEN, VOCAB],
+        &[HIDDEN, vocab],
         GGUF_F32,
         embed_bytes,
     );
@@ -323,7 +337,7 @@ fn load_model_dir_validated_rejects_invalid_config() {
             "intermediate_size": 16,
             "num_attention_heads": 3,
             "num_key_value_heads": 2,
-            "head_dim": 2,
+            "head_dim": 0,
             "vocab_size": 10,
         }),
         &minimal_tensors(),
@@ -352,7 +366,7 @@ fn load_model_dir_walk_only_validated_rejects_invalid_config() {
             "intermediate_size": 16,
             "num_attention_heads": 3,
             "num_key_value_heads": 2,
-            "head_dim": 2,
+            "head_dim": 0,
             "vocab_size": 10,
         }),
         &minimal_tensors(),
@@ -826,7 +840,18 @@ fn mlx_weights_subdir_is_found() {
 #[test]
 fn no_safetensors_files_returns_error() {
     let dir = TempDir::new().unwrap();
-    let config = serde_json::json!({"model_type": "llama"});
+    // Complete config.json: the loader must reach the safetensors-scan
+    // step (and report no files) rather than erroring earlier on a
+    // partial config.
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+    });
     std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
     // No .safetensors files → NoSafetensors error
     match load_model_dir(dir.path()) {
@@ -861,6 +886,7 @@ fn load_gguf_via_load_model_dir() {
     let weights = load_model_dir(dir.path()).unwrap();
     // embed_tokens: dims=[4, 100] in GGUF → shape [100, 4] after GGUF dim swap
     assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
     assert_eq!(weights.hidden_size, 4);
 }
@@ -873,7 +899,45 @@ fn load_gguf_single_file() {
 
     let weights = load_model_dir(&path).unwrap();
     assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
+}
+
+#[test]
+fn load_gguf_preserves_explicit_small_vocab_metadata() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("small-vocab.gguf");
+    write_minimal_gguf_custom(&path, 128, Some(128), true, true);
+
+    let weights = load_model_dir(&path).unwrap();
+
+    assert_eq!(weights.embed.shape(), &[128, 4]);
+    assert_eq!(weights.vocab_size, 128);
+}
+
+#[test]
+fn load_gguf_uses_shape_vocab_when_metadata_and_tokenizer_are_absent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("shape-vocab.gguf");
+    write_minimal_gguf_custom(&path, 64, None, true, true);
+
+    let weights = load_model_dir(&path).unwrap();
+
+    assert_eq!(weights.embed.shape(), &[64, 4]);
+    assert_eq!(weights.vocab_size, 64);
+}
+
+#[test]
+fn load_gguf_defaults_missing_kv_heads_and_key_length() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("missing-attn-metadata.gguf");
+    write_minimal_gguf_custom(&path, 100, Some(100), false, false);
+
+    let weights = load_model_dir_validated(&path).unwrap();
+
+    assert_eq!(weights.num_q_heads, 2);
+    assert_eq!(weights.num_kv_heads, 2);
+    assert_eq!(weights.head_dim, 2);
 }
 
 #[test]
@@ -918,4 +982,224 @@ fn gguf_vectors_map_includes_1d_norms() {
         "1D output_norm should be in vectors as norm.weight; keys: {:?}",
         weights.vectors.keys().collect::<Vec<_>>()
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPT-OSS MXFP4 (load_mxfp4_expert_tensors): full-load path
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `walk_only_excludes_gpt_oss_packed_mxfp4_experts` exercises only the
+// walk-only path which short-circuits before dequantising. The full
+// `load_model_dir` path runs `load_mxfp4_expert_tensors`, which:
+//   1. iterates safetensors looking for `*.gate_up_proj_blocks` tensors,
+//   2. pairs each with its scales companion + the down companion,
+//   3. dequantises them via `crate::quant::mxfp4::split_gate_up_experts`.
+//
+// This test pins that path against a tiny synthetic GPT-OSS fixture.
+
+#[test]
+fn load_full_gpt_oss_dequantises_packed_mxfp4_experts() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "gpt_oss",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "num_local_experts": 1,
+        "num_experts_per_tok": 1,
+        "head_dim": 2,
+        "vocab_size": 10,
+    });
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            (
+                "embed_tokens.weight",
+                "F32",
+                &[10, 4],
+                f32_bytes(&[1.0f32; 40]),
+            ),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            ("lm_head.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            (
+                "layers.0.mlp.router.weight",
+                "F32",
+                &[1, 4],
+                f32_bytes(&[1.0f32; 4]),
+            ),
+            // Packed MXFP4: gate+up fused, 1 expert, out_features=8 (2×inter=4),
+            // groups=1, packed_bytes=16 per (expert, out, group).
+            // shape = [num_experts=1, out_features=8, groups=1, 16].
+            (
+                "layers.0.mlp.experts.gate_up_proj_blocks",
+                "U8",
+                &[1, 8, 1, 16],
+                vec![0x22; 8 * 16],
+            ),
+            (
+                "layers.0.mlp.experts.gate_up_proj_scales",
+                "U8",
+                &[1, 8, 1],
+                vec![127; 8],
+            ),
+            // Down: 1 expert, out_features=4 (=hidden), groups=1.
+            (
+                "layers.0.mlp.experts.down_proj_blocks",
+                "U8",
+                &[1, 4, 1, 16],
+                vec![0x22; 4 * 16],
+            ),
+            (
+                "layers.0.mlp.experts.down_proj_scales",
+                "U8",
+                &[1, 4, 1],
+                vec![127; 4],
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).expect("full GPT-OSS load");
+    // The dequantiser splits gate_up into gate (w1) + up (w3) per expert,
+    // and emits down (w2). Each per-expert key uses the
+    // `block_sparse_moe.experts.<E>.<proj>` shape from
+    // `mxfp4_expert_key`. Pin that we got non-empty tensors back.
+    let any_expert_key = weights
+        .tensors
+        .keys()
+        .any(|k| k.contains("block_sparse_moe.experts.0"));
+    assert!(
+        any_expert_key,
+        "load_mxfp4_expert_tensors must populate per-expert keys; got: {:?}",
+        weights.tensors.keys().collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DeepSeek-V4 per-expert MXFP4 (dequantize_per_expert_mxfp4)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// V4 stores expert weights as separate `(.weight=I8, .scale=F8_E8M0)`
+// pairs per (expert, projection). The `dequantize_per_expert_mxfp4`
+// detector inside the standard load branch finds those pairs by
+// dtype + naming pattern, regardless of architecture metadata. This
+// test exercises that path against a synthetic V4-style fixture.
+
+fn f8_e8m0_bytes(n: usize) -> Vec<u8> {
+    // Byte = 127 → 2^0 = 1.0 (per-group scale of unity).
+    vec![127u8; n]
+}
+
+#[test]
+fn load_full_deepseek_v4_dequantises_per_expert_mxfp4() {
+    let dir = TempDir::new().unwrap();
+    // V4 detection in detect.rs requires `model_type = "deepseek_v4"`,
+    // and uses_mla() requires kv/q_lora_rank present.
+    let config = serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 10,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 0,
+        "kv_lora_rank": 4,
+        "q_lora_rank": 4,
+    });
+    // V4 strips no `model.` prefix and uses `embed.weight` + `norm.weight`
+    // (see `architectures/deepseek_v4.rs`).
+    //
+    // Per-expert MXFP4 layout: weight [out_features, packed_cols=groups*16],
+    // scale [out_features, groups]. We use out_features=2, groups=1 →
+    // packed_cols=16 → unpacked_cols=32.
+    let out_features = 2usize;
+    let groups = 1usize;
+    let packed_cols = groups * 16;
+    let weight_bytes = vec![0u8; out_features * packed_cols]; // all-zero nibbles → all-zero unpacked
+    let scale_bytes = f8_e8m0_bytes(out_features * groups);
+
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            ("embed.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            // V4 doesn't necessarily have lm_head; loader falls back to embed.
+            // Per-expert MXFP4 weight + scale pair for w1 (gate_proj).
+            (
+                "layers.0.ffn.experts.0.w1.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.experts.0.w1.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes.clone(),
+            ),
+            // Plus w2 (down) and w3 (up) — same shape.
+            (
+                "layers.0.ffn.experts.0.w2.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.experts.0.w2.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.experts.0.w3.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes,
+            ),
+            (
+                "layers.0.ffn.experts.0.w3.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes,
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).expect("full V4 load");
+    // The V4 dequantiser writes the dequantised weight under the
+    // (prefix-stripped) tensor name. With V4's empty prefix list, that's
+    // exactly `layers.0.ffn.experts.0.w1.weight`.
+    assert!(
+        weights
+            .tensors
+            .contains_key("layers.0.ffn.experts.0.w1.weight"),
+        "V4 dequantiser must emit the unpacked weight; got: {:?}",
+        weights.tensors.keys().collect::<Vec<_>>()
+    );
+    let arr = weights
+        .tensors
+        .get("layers.0.ffn.experts.0.w1.weight")
+        .unwrap();
+    // Output cols = packed_cols * 2 = 32 (the dequantiser unpacks
+    // nibbles).
+    assert_eq!(arr.shape(), &[out_features, packed_cols * 2]);
+}
+
+#[test]
+fn load_filtered_validated_runs_with_validation() {
+    // `load_model_dir_filtered_validated` is the public validated
+    // entrypoint that callers like the streaming extractor use. Pin that
+    // it accepts a passing predicate + invokes the validation path.
+    let dir = TempDir::new().unwrap();
+    write_model_dir(dir.path(), &minimal_tensors());
+    let weights = larql_models::load_model_dir_filtered_validated(dir.path(), |_| false)
+        .expect("validated filter accepts minimal model");
+    assert!(weights.tensors.contains_key("embed_tokens.weight"));
 }

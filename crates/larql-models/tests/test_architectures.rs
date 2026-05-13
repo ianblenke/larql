@@ -375,13 +375,6 @@ fn detect_from_json_validated_returns_validation_error() {
 
 #[test]
 fn validation_rejects_invalid_attention_geometry() {
-    // The historical "head_dim must divide hidden_size" check was
-    // relaxed in the gemma-3-270m drafter slice (hidden=640 head_dim=256
-    // is a valid non-square QKV architecture; q_dim and kv_dim are
-    // sized by num_q_heads/num_kv_heads * head_dim, not by hidden).
-    // The remaining attention-geometry check ("Q heads divide evenly
-    // by KV heads") still flags `num_attention_heads=10` /
-    // `num_key_value_heads=3`.
     let arch = detect_from_json(&serde_json::json!({
         "model_type": "llama",
         "hidden_size": 4100,
@@ -575,10 +568,8 @@ fn drop_ffn_weights_removes_ffn_tensors() {
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
-        embed_quant: None,
         lm_head: small.clone(),
-        lm_head_quant: None,
-        quant_tensors: HashMap::new(),
+        position_embed: None,
         arch,
         num_layers: 2,
         hidden_size: 4,
@@ -659,10 +650,8 @@ fn drop_ffn_weights_removes_moe_experts() {
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
-        embed_quant: None,
         lm_head: small.clone(),
-        lm_head_quant: None,
-        quant_tensors: HashMap::new(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -733,10 +722,8 @@ fn drop_ffn_weights_removes_starcoder2_ffn_tensors_and_biases() {
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
-        embed_quant: None,
         lm_head: small.clone(),
-        lm_head_quant: None,
-        quant_tensors: HashMap::new(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -1480,10 +1467,8 @@ fn minimal_weights() -> larql_models::ModelWeights {
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
         embed: small.clone(),
-        embed_quant: None,
         lm_head: small.clone(),
-        lm_head_quant: None,
-        quant_tensors: HashMap::new(),
+        position_embed: None,
         arch,
         num_layers: 1,
         hidden_size: 4,
@@ -1563,6 +1548,27 @@ fn get_packed_bytes_from_mmap_range_takes_precedence() {
         .insert("tensor.key".into(), ("packed.bin".into(), 2, 3));
 
     assert_eq!(w.get_packed_bytes("tensor.key").unwrap(), &[12u8, 13, 14]);
+}
+
+#[test]
+fn get_packed_bytes_out_of_bounds_mmap_range_returns_none() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.bin");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&[10u8, 11, 12, 13]).unwrap();
+    file.flush().unwrap();
+    drop(file);
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let mut w = minimal_weights();
+    w.packed_mmaps.insert("packed.bin".into(), mmap);
+    w.packed_byte_ranges
+        .insert("tensor.key".into(), ("packed.bin".into(), 3, 4));
+
+    assert!(w.get_packed_bytes("tensor.key").is_none());
 }
 
 #[test]

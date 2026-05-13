@@ -618,7 +618,7 @@ mod tests {
             api_key: None,
             sessions: SessionManager::new(60),
             describe_cache: DescribeCache::new(0),
-            attention_sessions: Arc::new(AttentionSessionMap::new(60, 16)),
+            attention_sessions: AttentionSessionMap::new(60, 16),
             default_kv_format: None,
         })
     }

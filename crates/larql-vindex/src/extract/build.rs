@@ -908,6 +908,7 @@ mod tests {
             embed_quant: None,
             lm_head,
             lm_head_quant: None,
+            position_embed: None,
             quant_tensors: std::collections::HashMap::new(),
             num_layers: NUM_LAYERS,
             hidden_size: HIDDEN,
