@@ -14,8 +14,9 @@ use std::sync::Arc;
 use ndarray::Array1;
 
 use crate::quant::ggml::{
-    dequantize, q4k_row_dot, q6k_row_dot, tensor_data_size, type_name, TYPE_F32, TYPE_Q4_K,
-    TYPE_Q5_K, TYPE_Q6_K,
+    dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_row_dot, q8_0_row_dot,
+    quantize_to_q8_k, tensor_data_size, type_name, Q8_K_BLOCK_BYTES, TYPE_F32, TYPE_Q4_K,
+    TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
 };
 use crate::ModelError;
 
@@ -28,12 +29,39 @@ use crate::ModelError;
 /// `expert_slice` produces a per-expert sub-view of a 3D-packed MoE
 /// tensor without copying. All internal `data[i..j]` accesses go
 /// through `bytes()`, which respects the current view's offset.
+/// Backing storage for a `QuantTensor`. Either an owned heap buffer
+/// (the existing `from_raw` / `from_f32_rows` path that copies bytes)
+/// or an `Arc<Mmap>` window with `byte_offset`/`byte_len` carving out
+/// a per-tensor sub-range (Phase G.1 ktransformers-style zero-copy).
+///
+/// The Mmap variant means weights stay resident in the page cache,
+/// not in RSS — RSS only reflects actually-touched pages. The
+/// `prefetch_willneed` method on `QuantTensor` calls
+/// `Mmap::advise_range(WillNeed, ...)` so the kernel starts paging
+/// in the next active expert's bytes during the current expert's
+/// compute.
+#[derive(Clone)]
+pub enum QuantBacking {
+    Heap(Arc<[u8]>),
+    Mmap(Arc<memmap2::Mmap>),
+}
+
+impl QuantBacking {
+    #[inline]
+    fn as_full_slice(&self) -> &[u8] {
+        match self {
+            Self::Heap(b) => b,
+            Self::Mmap(m) => &m[..],
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct QuantTensor {
     /// Raw GGUF tensor bytes (shared parent buffer). For block-
     /// quantised types, contiguous super-blocks fill the `cols`
     /// axis first, then rows.
-    data: Arc<[u8]>,
+    data: QuantBacking,
     /// Byte offset into `data` where this view starts.
     byte_offset: usize,
     /// Byte length of this view (= `rows * row_bytes`).
@@ -70,8 +98,45 @@ impl QuantTensor {
         let row_bytes = tensor_data_size(tensor_type, cols)?;
         let byte_len = data.len();
         Ok(Self {
-            data: data.into(),
+            data: QuantBacking::Heap(data.into()),
             byte_offset: 0,
+            byte_len,
+            tensor_type,
+            rows,
+            cols,
+            row_bytes,
+        })
+    }
+
+    /// Phase G.1 — mmap-backed constructor. Shares the parent mmap
+    /// `Arc<Mmap>` and carves out `[offset .. offset + len]`. No
+    /// bytes are copied. The mmap stays alive as long as any tensor
+    /// view holds the `Arc`, so partial drops are safe.
+    pub fn from_mmap_region(
+        mmap: Arc<memmap2::Mmap>,
+        byte_offset: usize,
+        byte_len: usize,
+        tensor_type: u32,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, ModelError> {
+        let expected = tensor_data_size(tensor_type, rows * cols)?;
+        if byte_len != expected {
+            return Err(ModelError::Parse(format!(
+                "QuantTensor::from_mmap_region: byte_len {byte_len} != expected {expected} for {} {rows}×{cols}",
+                type_name(tensor_type),
+            )));
+        }
+        if byte_offset.checked_add(byte_len).map_or(true, |end| end > mmap.len()) {
+            return Err(ModelError::Parse(format!(
+                "QuantTensor::from_mmap_region: range {byte_offset}+{byte_len} out of mmap (len {})",
+                mmap.len()
+            )));
+        }
+        let row_bytes = tensor_data_size(tensor_type, cols)?;
+        Ok(Self {
+            data: QuantBacking::Mmap(mmap),
+            byte_offset,
             byte_len,
             tensor_type,
             rows,
@@ -92,7 +157,7 @@ impl QuantTensor {
         let row_bytes = cols * 4;
         let byte_len = bytes.len();
         Self {
-            data: bytes.into(),
+            data: QuantBacking::Heap(bytes.into()),
             byte_offset: 0,
             byte_len,
             tensor_type: TYPE_F32,
@@ -105,7 +170,26 @@ impl QuantTensor {
     /// Bytes of this view (respects `byte_offset` and `byte_len`).
     #[inline]
     fn bytes(&self) -> &[u8] {
-        &self.data[self.byte_offset..self.byte_offset + self.byte_len]
+        let all = self.data.as_full_slice();
+        &all[self.byte_offset..self.byte_offset + self.byte_len]
+    }
+
+    /// Phase G.1 — issue a `MADV_WILLNEED` hint for this tensor's
+    /// byte range. No-op for `Heap`-backed tensors (already resident).
+    /// For `Mmap`-backed views, signals the kernel to start paging
+    /// in this range from the page cache / underlying file. Called
+    /// before per-expert dispatch in `swiglu_moe_lazy` so the next
+    /// expert's pages arrive while the current expert is computing.
+    pub fn prefetch_willneed(&self) {
+        if let QuantBacking::Mmap(mmap) = &self.data {
+            // `advise_range` clips to page boundaries internally on
+            // memmap2 0.9+. Ignore errors — prefetch is a hint.
+            let _ = mmap.advise_range(
+                memmap2::Advice::WillNeed,
+                self.byte_offset,
+                self.byte_len,
+            );
+        }
     }
 
     /// Per-expert 2D slice of a 3D-packed MoE weight tensor.
@@ -153,7 +237,7 @@ impl QuantTensor {
             )));
         }
         Ok(Self {
-            data: Arc::clone(&self.data),
+            data: self.data.clone(),
             byte_offset: expert_byte_offset,
             byte_len: bytes_per_expert,
             tensor_type: self.tensor_type,
@@ -194,14 +278,27 @@ impl QuantTensor {
                 use rayon::prelude::*;
                 let rb = self.row_bytes;
                 let data = view_bytes;
-                // Parallelise per-row; each thread holds one
-                // accumulator. The kernel itself is already SIMD
-                // (AVX2 / NEON), so this stacks data-parallel and
-                // thread-parallel speedups.
-                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                    let row = &data[r * rb..(r + 1) * rb];
-                    *out_r = q4k_row_dot(row, x_slice).expect("q4k_row_dot");
-                });
+                let use_q8k = x_slice.len().is_multiple_of(256)
+                    && std::env::var("LARQL_Q4K_USE_F32_DOT").ok().as_deref() != Some("1");
+                if use_q8k {
+                    // E.8 step 2c: thread-local cache of the Q8_K
+                    // conversion. In MoE the same `x` is fed into 16+
+                    // matvec calls (gate × 8 experts + up × 8 experts);
+                    // the cache makes those reuse one quantise instead
+                    // of doing it per call.
+                    with_q8k_for(x_slice, |q8k_bytes| {
+                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                            let row = &data[r * rb..(r + 1) * rb];
+                            *out_r = q4k_q8k_row_dot(row, q8k_bytes).expect("q4k_q8k_row_dot");
+                        });
+                    });
+                } else {
+                    out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q4k_row_dot(row, x_slice).expect("q4k_row_dot");
+                    });
+                }
+                let _ = Q8_K_BLOCK_BYTES;
             }
             TYPE_Q6_K => {
                 use rayon::prelude::*;
@@ -213,15 +310,53 @@ impl QuantTensor {
                 });
             }
             TYPE_Q5_K => {
-                // No fused row-dot kernel for Q5_K yet; dequant the
-                // row (256-element blocks) and dot. Allocates per row,
-                // which is fine for an lm_head matvec (one call per
-                // decode step).
-                for r in 0..self.rows {
-                    let row = &view_bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
-                    let deq = dequantize(row, self.tensor_type, self.cols)?;
-                    out_slice[r] = deq.iter().zip(x_slice).map(|(a, b)| a * b).sum();
+                // E.8 step 2d: AVX2 Q5_K × Q8_K fast path. FFN_DOWN is
+                // 50.5 % of all-CPU MoE decode time per the
+                // LARQL_QWEN35_FINE_PROFILE breakdown — this is the
+                // single biggest hot spot on the CPU value-prop tier.
+                // Path mirrors the Q4_K case: pre-quantise `x` to Q8_K
+                // once, then per-row int-arithmetic dot via
+                // `q5k_q8k_row_dot`. The legacy dequant-per-row path
+                // stays for shapes that aren't a multiple of 256, and
+                // can be forced via `LARQL_Q5K_USE_DEQUANT_DOT=1`.
+                let use_q8k = x_slice.len().is_multiple_of(256)
+                    && std::env::var("LARQL_Q5K_USE_DEQUANT_DOT")
+                        .ok()
+                        .as_deref()
+                        != Some("1");
+                if use_q8k {
+                    use rayon::prelude::*;
+                    let rb = self.row_bytes;
+                    let data = view_bytes;
+                    with_q8k_for(x_slice, |q8k_bytes| {
+                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                            let row = &data[r * rb..(r + 1) * rb];
+                            *out_r = q5k_q8k_row_dot(row, q8k_bytes).expect("q5k_q8k_row_dot");
+                        });
+                    });
+                } else {
+                    for r in 0..self.rows {
+                        let row = &view_bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
+                        let deq = dequantize(row, self.tensor_type, self.cols)?;
+                        out_slice[r] = deq.iter().zip(x_slice).map(|(a, b)| a * b).sum();
+                    }
                 }
+            }
+            TYPE_Q8_0 => {
+                // Legacy Q8_0 — 32-element blocks of int8 + f16 scale.
+                // Mixed-quant GGUFs like Qwen3.6-35B-A3B-UD-Q4_K_M use
+                // Q8_0 for attn projections + shared-expert FFN. E.8
+                // contained step: drop the allocation-per-row dequant
+                // for the in-place `q8_0_row_dot` (AVX2 on x86_64,
+                // scalar elsewhere). Without this, the old path
+                // allocated a `Vec<f32>` for every per-token row.
+                use rayon::prelude::*;
+                let rb = self.row_bytes;
+                let data = view_bytes;
+                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                    let row = &data[r * rb..(r + 1) * rb];
+                    *out_r = q8_0_row_dot(row, x_slice).expect("q8_0_row_dot");
+                });
             }
             TYPE_F32 => {
                 for r in 0..self.rows {
@@ -288,6 +423,40 @@ impl QuantTensor {
             }
         }
     }
+}
+
+/// Thread-local Q8_K conversion cache used by `QuantTensor::matvec`'s
+/// Q4_K and Q5_K arms (E.8 step 2c amortisation).
+///
+/// MoE feeds the same `x` (post-norm hidden state) into 16+ matvec
+/// calls per layer (gate × 8 experts + up × 8 experts). Without
+/// caching, each call re-runs `quantize_to_q8_k(x)` — a 256-element
+/// scan + Q8_K block-pack. The cache keys on `(x.as_ptr(), x.len())`:
+/// consecutive calls with the same `x` slice reuse the cached bytes
+/// inside one thread.
+///
+/// Caveat: `x.as_ptr()` can ABA-collide if a `Vec<f32>` is dropped
+/// and a new one lands at the same address. In the larql forward path
+/// `x` is kept alive across all sibling matvec calls in one MoE FFN,
+/// so this doesn't fire in practice.
+#[inline]
+fn with_q8k_for<R>(x: &[f32], f: impl FnOnce(&[u8]) -> R) -> R {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(usize, usize, Vec<u8>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let ptr = x.as_ptr() as usize;
+        let len = x.len();
+        let needs_refresh =
+            !matches!(*cell, Some((p, l, _)) if p == ptr && l == len);
+        if needs_refresh {
+            *cell = Some((ptr, len, quantize_to_q8_k(x)));
+        }
+        let bytes = cell.as_ref().expect("just initialised").2.as_slice();
+        f(bytes)
+    })
 }
 
 #[cfg(test)]
@@ -384,16 +553,23 @@ mod tests {
         }
     }
 
-    /// `expert_slice` shares the parent's `Arc<[u8]>` — verified via
-    /// `Arc::strong_count`. Cheap clone, no per-expert copy.
+    /// `expert_slice` shares the parent's backing Arc — verified via
+    /// `Arc::strong_count` on the heap-backed variant. Cheap clone,
+    /// no per-expert copy.
     #[test]
     fn expert_slice_shares_arc_with_parent() {
         let parent = QuantTensor::from_f32_rows(4, 2, &[1.0_f32; 8]);
-        let arc_before = Arc::strong_count(&parent.data);
+        let arc = match &parent.data {
+            QuantBacking::Heap(arc) => Arc::clone(arc),
+            QuantBacking::Mmap(_) => panic!("from_f32_rows builds heap-backed tensors"),
+        };
+        // After the explicit clone above the parent's Arc has +1
+        // strong refcount. expert_slice clones the enum (which clones
+        // the inner Arc) so each slice further bumps by +1.
+        let arc_before = Arc::strong_count(&arc);
         let _s0 = parent.expert_slice(0, 2).unwrap();
         let _s1 = parent.expert_slice(1, 2).unwrap();
-        let arc_after = Arc::strong_count(&parent.data);
-        // Each slice bumps the refcount by 1.
+        let arc_after = Arc::strong_count(&arc);
         assert_eq!(arc_after, arc_before + 2);
     }
 
