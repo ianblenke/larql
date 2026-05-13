@@ -156,6 +156,7 @@ pub fn make_test_weights_with(dims: SyntheticDims) -> ModelWeights {
         embed_quant: None,
         lm_head,
         lm_head_quant: None,
+        position_embed: None,
         quant_tensors: HashMap::new(),
         arch,
         num_layers: dims.num_layers,

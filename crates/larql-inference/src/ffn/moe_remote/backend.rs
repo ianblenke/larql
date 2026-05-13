@@ -339,8 +339,9 @@ impl RemoteMoeBackend {
         let hidden = h.len();
         if hidden == 0 || router.num_experts == 0 || router.top_k == 0 || streams.is_empty() {
             return Ok(InflightMoe {
+                layer,
                 hidden,
-                n_streams: 0,
+                active_stream_indices: Vec::new(),
                 post_experts_norm: Vec::new(),
                 norm_offset,
                 eps,
@@ -418,8 +419,9 @@ impl RemoteMoeBackend {
         }
 
         Ok(InflightMoe {
+            layer,
             hidden,
-            n_streams: streams.len(),
+            active_stream_indices: (0..streams.len()).collect(),
             post_experts_norm: router.post_experts_norm.to_vec(),
             norm_offset,
             eps,
@@ -453,12 +455,14 @@ impl RemoteMoeBackend {
         inflight: InflightMoe,
     ) -> Result<(Vec<f32>, Vec<(f32, f32)>), RemoteMoeError> {
         let InflightMoe {
+            layer: _,
             hidden,
-            n_streams,
+            active_stream_indices,
             post_experts_norm,
             norm_offset,
             eps,
         } = inflight;
+        let n_streams = active_stream_indices.len();
 
         if hidden == 0 || n_streams == 0 {
             return Ok((vec![0.0f32; hidden], Vec::new()));

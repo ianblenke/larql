@@ -70,6 +70,13 @@ pub struct LoadedModel {
     pub probe_labels: HashMap<(usize, usize), String>,
     /// L2 FFN output cache — shared across all clients, persists for server lifetime.
     pub ffn_l2_cache: FfnL2Cache,
+    /// Per-layer latency tracker — records compute time per walk-ffn layer.
+    /// Snapshots are sent to the router in HeartbeatMsg.layer_stats (GT3).
+    pub layer_latency_tracker: std::sync::Arc<crate::metrics::LayerLatencyTracker>,
+    /// Active walk-ffn request counter — incremented on request entry,
+    /// decremented on return. Used by GT6 drain to know when it is safe
+    /// to send DroppingMsg(reason="reassigned").
+    pub requests_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Expert ID range this server owns (from `--experts START-END`).
     /// `None` = serve all experts. Used by the expert endpoint to reject
     /// requests for experts this shard doesn't hold.
@@ -89,13 +96,13 @@ pub struct LoadedModel {
     /// `Some(Some(backend))` = initialised, available; `Some(None)` =
     /// initialised, Metal not available; `None` = not yet initialised.
     /// Only present under `--features metal-experts`.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_backend: std::sync::OnceLock<Option<larql_compute::MetalBackend>>,
     /// Cached MoE scratch per `(top_k, hidden, inter)` shape — one entry
     /// per architecture in practice.  `MoeScratch` contains mutable Metal
     /// staging buffers, so Metal expert dispatch holds this mutex while
     /// using a scratch entry.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub moe_scratches: std::sync::Mutex<
         std::collections::HashMap<(usize, usize, usize), Arc<larql_compute::MoeScratch>>,
     >,
@@ -104,60 +111,29 @@ pub struct LoadedModel {
     /// Metal FFN request from the interleaved Q4K mmap (zero-copy via
     /// `new_buffer_with_bytes_no_copy` for page-aligned mmap data).
     /// Only populated when the server has interleaved Q4K data loaded.
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_ffn_layer_bufs: std::sync::OnceLock<Vec<[larql_compute::MetalBuffer; 3]>>,
-    /// Two-tier tokenizer cache (L0 exact-match + L1 prefix-aware).
-    /// Constructed once per LoadedModel; shared across requests via
-    /// `Arc`. See `larql_server::tokenizer_cache`. Sized by env vars
-    /// `LARQL_TOKENIZER_CACHE_L0_SIZE` /
-    /// `LARQL_TOKENIZER_CACHE_L1_SIZE`. `server-tokenizer-cache` change.
-    pub tokenizer_cache: Arc<crate::tokenizer_cache::TokenizerCache>,
 }
 
 impl LoadedModel {
-    /// Encode `text` to token IDs, consulting the per-model
-    /// tokenizer cache before falling back to the cold tokeniser.
+    /// Tokenise `text` and return owned `Vec<u32>` ids.
     ///
-    /// `with_specials` mirrors `tokenizers::Tokenizer::encode`'s
-    /// boolean — it's mixed into the cache key so the same text
-    /// with different special-token treatment doesn't collide.
-    ///
-    /// Returns the IDs as `Vec<u32>`. Call sites that need the full
-    /// `tokenizers::Encoding` (offsets, attention mask) should keep
-    /// using the raw tokeniser; the cache only holds IDs.
-    pub fn encode_cached_ids(&self, text: &str, with_specials: bool) -> Result<Vec<u32>, String> {
-        // The cache key folds in `with_specials` as a single-byte
-        // prefix so the two namespaces never collide.
-        let key_owned: String;
-        let key: &str = if with_specials {
-            text
-        } else {
-            key_owned = format!("\u{1}{text}");
-            &key_owned
-        };
-        if let Some((tokens, prefix_len)) = self.tokenizer_cache.get(key) {
-            if prefix_len == key.len() {
-                return Ok(tokens);
-            }
-            // L1 hit — tokenise the suffix cold and concatenate.
-            let suffix_offset = prefix_len.saturating_sub(if with_specials { 0 } else { 1 });
-            let suffix = &text[suffix_offset..];
-            let enc = self
-                .tokenizer
-                .encode(suffix, false)
-                .map_err(|e| format!("tokenize suffix: {e}"))?;
-            let mut full = tokens;
-            full.extend_from_slice(enc.get_ids());
-            self.tokenizer_cache.insert(key, &full);
-            return Ok(full);
-        }
-        let enc = self
-            .tokenizer
-            .encode(text, with_specials)
-            .map_err(|e| format!("tokenize: {e}"))?;
-        let tokens = enc.get_ids().to_vec();
-        self.tokenizer_cache.insert(key, &tokens);
-        Ok(tokens)
+    /// Shim over `tokenizer.encode(..)` that mirrors the upstream
+    /// `encode_cached_ids` signature so route handlers (which were
+    /// written against the per-LoadedModel TokenizerCache) keep
+    /// compiling against the fork. The actual `TokenizerCache` is not
+    /// merged on this branch — this falls back to the underlying
+    /// tokenizer on every call. If/when the cache lands, swap in a
+    /// real LRU here.
+    pub fn encode_cached_ids(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, String> {
+        self.tokenizer
+            .encode(text, add_special_tokens)
+            .map(|enc| enc.get_ids().to_vec())
+            .map_err(|e| format!("tokenizer encode failed: {e}"))
     }
 
     /// Get or lazy-load model weights for inference.
@@ -261,12 +237,10 @@ pub struct AppState {
     pub sessions: SessionManager,
     /// DESCRIBE result cache.
     pub describe_cache: DescribeCache,
-    /// Attention KV-cache sessions (lifecycle map for the planned
-    /// `/v1/attention/{session,prefill,decode}` routes).
-    /// `attention-service-routes` change.
-    pub attention_sessions: Arc<crate::attention_session::AttentionSessionMap>,
-    /// Default KV compression format for newly-created attention sessions
-    /// when the request omits `kv_format`.
+    /// Attention sessions registry (REST attention API).
+    pub attention_sessions: crate::attention_session::AttentionSessionMap,
+    /// Default KV format applied when a client doesn't pin one explicitly.
+    /// `None` ⇒ uncompressed fp32 fallback.
     pub default_kv_format: Option<larql_rotorquant::KvFormat>,
 }
 
@@ -438,15 +412,16 @@ mod loaded_model_tests {
             weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+            requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::new(0, 0)),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             moe_scratches: std::sync::Mutex::new(HashMap::new()),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         }
     }

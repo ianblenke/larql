@@ -1,5 +1,20 @@
 #![allow(clippy::doc_overindented_list_items)]
 #![allow(clippy::type_complexity)]
+// Architectural lints suppressed crate-wide:
+//
+//  - `too_many_arguments`: most command runners have wide signatures
+//    (`run(args, output, callbacks, ...)`) reflecting CLI surface, not
+//    internal coupling. Reducing to ≤7 args would mean introducing
+//    parameter structs across every command, which is a bigger refactor
+//    than a lint cleanup.
+//  - `large_enum_variant`: a few command-arg enums (notably `OvRdArgs`)
+//    have one or two large variants. Boxing them would change call
+//    sites everywhere.
+//
+// Mechanical lints (iter-on-map-keys, ptr_arg, needless_deref,
+// map_entry, etc.) are fixed in place rather than suppressed.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
 
 use clap::{Parser, Subcommand};
 
@@ -8,6 +23,7 @@ mod formatting;
 mod utils;
 
 use commands::dev::*;
+use commands::diagnostics::*;
 use commands::extraction::*;
 use commands::primary::*;
 use commands::query::*;
@@ -47,6 +63,11 @@ enum Commands {
     /// Download a vindex from HuggingFace and cache it locally.
     Pull(pull_cmd::PullArgs),
 
+    /// Manage HuggingFace *model* repos (safetensors + tokenizer + config).
+    /// Companion to `pull` (which is vindex-only). Use `model pull` to
+    /// stage a raw HF model for `convert safetensors-to-vindex`.
+    Model(model_cmd::ModelArgs),
+
     /// Register a local vindex directory with the cache so `run` / `list`
     /// / `show` can find it by shorthand.
     Link(link_cmd::LinkArgs),
@@ -68,6 +89,10 @@ enum Commands {
 
     /// Benchmark decode throughput on a real vindex (Metal / CUDA / CPU / Ollama).
     Bench(bench_cmd::BenchArgs),
+
+    /// Shannon-style next-token bit measurements and demo compression.
+    #[command(subcommand)]
+    Shannon(shannon_cmd::ShannonCommand),
 
     // ── Server ──────────────────────────────────────────────────────
     #[command(next_help_heading = "Server")]
@@ -111,6 +136,14 @@ enum Commands {
     #[command(next_help_heading = "Build")]
     /// Verify vindex file integrity (SHA256 checksums).
     Verify(verify_cmd::VerifyArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Engine diagnostic — print which kernel paths fire for a vindex.
+    Diag(diag_cmd::DiagArgs),
+
+    #[command(next_help_heading = "Build")]
+    /// Cross-backend numerical parity diff (CPU vs Metal vs reference).
+    Parity(parity::ParityArgs),
 
     // ── Query (legacy, pre-LQL graph-file surface) ──────────────────
     #[command(next_help_heading = "Query")]
@@ -477,6 +510,22 @@ fn rewrite_legacy_argv(args: Vec<String>) -> Vec<String> {
 }
 
 fn main() {
+    // Windows defaults the main thread to a 1 MiB stack, which our large
+    // clap-derived `Commands` enum overflows during parse_from in debug
+    // builds. Spawn the real entrypoint on a worker thread with a roomy
+    // stack so the binary behaves the same as on Linux/macOS (where the
+    // default main stack is ~8 MiB).
+    let code = std::thread::Builder::new()
+        .name("larql-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn larql-main thread")
+        .join()
+        .expect("larql-main thread panicked");
+    std::process::exit(code);
+}
+
+fn real_main() -> i32 {
     let raw_args: Vec<String> = std::env::args().collect();
     let args = rewrite_legacy_argv(raw_args);
     let cli = Cli::parse_from(args);
@@ -486,7 +535,9 @@ fn main() {
         Commands::Run(args) => run_cmd::run(args),
         Commands::Chat(args) => run_cmd::run(args.into()),
         Commands::Bench(args) => bench_cmd::run(args),
+        Commands::Shannon(cmd) => shannon_cmd::run(cmd),
         Commands::Pull(args) => pull_cmd::run(args),
+        Commands::Model(args) => model_cmd::run(args),
         Commands::Link(args) => link_cmd::run(args),
         Commands::List(args) => list_cmd::run(args),
         Commands::Show(args) => show_cmd::run(args),
@@ -502,6 +553,8 @@ fn main() {
         Commands::Convert(args) => convert_cmd::run(args),
         Commands::Hf(args) => hf_cmd::run(args),
         Commands::Verify(args) => verify_cmd::run(args),
+        Commands::Diag(args) => diag_cmd::run(args),
+        Commands::Parity(args) => parity::run(args),
 
         // ── Query (legacy graph-file surface) ──
         Commands::Query(args) => query_cmd::run(args),
@@ -535,8 +588,9 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
-        std::process::exit(1);
+        return 1;
     }
+    0
 }
 
 fn run_dev(cmd: DevCommand) -> Result<(), Box<dyn std::error::Error>> {

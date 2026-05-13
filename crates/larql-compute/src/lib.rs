@@ -25,7 +25,7 @@
 //! |---------|---------|------------|
 //! | CPU | (always) | BLAS f32, C kernel Q4 (ARM vdotq_s32), vector ops |
 //! | Metal | `metal` | Tiled f32, simdgroup Q4, multi-layer pipeline |
-//! | CUDA | `cuda` | cuBLAS f32, correctness-first Q4/Q6 matvec, fused attention helpers |
+//! | CUDA | (planned) | — |
 //!
 //! ## Quick start
 //!
@@ -55,33 +55,26 @@
 //!
 //! - `metal`: Metal GPU backend (macOS only). Adds optimised Q4 shaders,
 //!   multi-layer pipeline, zero-copy mmap buffers.
-//! - `cuda`: CUDA GPU backend (Linux + NVIDIA). `default_backend()`
-//!   will return a `CudaBackend` when the driver is reachable. The
-//!   current backend covers cuBLAS f32 GEMM/GEMV and correctness-first
-//!   Q4/Q6 matvec dispatch; full fused layer-pipeline integration is
-//!   still staged through follow-up changes.
-
-#[cfg(all(feature = "cuda", feature = "cuda-oxide"))]
-compile_error!(
-    "features `cuda` and `cuda-oxide` are mutually exclusive; enable only one CUDA custom-kernel backend"
-);
+//! - `cuda`: (planned) CUDA GPU backend.
 
 extern crate blas_src;
 
 pub mod backend;
 pub mod cpu;
+pub mod options;
 pub mod pipeline;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
-
-#[cfg(any(feature = "cuda", feature = "cuda-oxide"))]
-pub mod cuda;
 
 // ── Re-exports: pipeline types ──
 
 pub use pipeline::{
-    Activation, FfnType, FullPipelineLayer, MoeLayerWeights, NormType, QuantFormat, QuantWeight,
+    Activation, AttentionSpec, AttentionWeights, FfnSpec, FfnType, FfnWeights, FullPipelineLayer,
+    LayerNorms, LayerWeights, MoeDownPaddingPolicy, MoeExpertScalePolicy, MoeInputSource,
+    MoeLayerWeights, MoePostExpertNormPolicy, MoeRouterNormPolicy, MoeRoutingPolicy, MoeSpec,
+    MoeTopKWeightPolicy, MoeWeightLayout, NormType, PositionEncodingType, QuantFormat, QuantWeight,
+    RemoteFfnSpec, RMSNORM_EPSILON_DEFAULT, ROPE_BASE_DEFAULT, ROPE_BASE_GLOBAL,
 };
 
 // ── Re-exports: backend ──
@@ -111,28 +104,39 @@ pub use cpu::CpuBackend;
 /// Metal decode step. Returns `None` when `LARQL_PROFILE_SPLIT` is unset
 /// or no step has run yet. Used by the generate loop to accumulate
 /// gate+up / act+down averages into `StageTimings`.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use metal::take_last_split_timings as metal_take_last_split_timings;
-#[cfg(feature = "metal")]
-pub use metal::{MetalBackend, MoeScratch};
+
+/// `MetalBackend` is the Metal-feature compute backend. `MoeScratch`
+/// is the pre-allocated per-shape MoE scratch struct that
+/// `decode_token_q4k_moe` reuses across calls so the per-token
+/// 15-buffer allocation cost (~120 ms on Gemma 4 26B-A4B M3 Max) is
+/// paid once at first use; downstream `larql-server` keeps a cache of
+/// these by shape.
+///
+/// `BackendOptions` and `DecodeFlags` configure backend-startup choices
+/// (kernel-variant selection, decode-path fusion). `MetalBackend::new()`
+/// reads them from the env via `BackendOptions::from_env()`;
+/// `MetalBackend::with_options(...)` lets callers pass an explicit
+/// configuration without env mediation.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use metal::{BackendOptions, DecodeFlags, MetalBackend, MoeScratch};
 
 /// Re-export of the metal-rs `Buffer` type so downstream crates (e.g.
 /// `larql-server`) can hold cached `(gate_up, down)` Metal buffer pairs
 /// without taking a direct dependency on the `metal` crate.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub use ::metal::Buffer as MetalBuffer;
 
-/// Create the best available backend.
+/// Create the best available backend with env-derived defaults.
 ///
-/// Precedence: **CUDA → Metal → CPU**, gated by feature flags and runtime
-/// availability. The `LARQL_BACKEND` env var (`cpu`, `metal`, `cuda`)
-/// overrides the auto-selection; an unrecognised value logs a warning
-/// and proceeds with auto-selection.
+/// With `--features metal`: tries Metal GPU first
+/// ([`MetalBackend::new`]), auto-calibrates the FLOP threshold for
+/// hybrid CPU/GPU dispatch, falls back to CPU. Without: returns CPU
+/// (Accelerate BLAS on macOS, OpenBLAS on Linux).
 ///
-/// - With `--features cuda` on Linux + working CUDA driver → CUDA.
-/// - With `--features metal` on macOS → Metal GPU + hybrid dispatch
-///   calibration.
-/// - Otherwise → CPU (Accelerate BLAS on macOS, OpenBLAS on Linux).
+/// To override env-driven choices programmatically, see
+/// [`default_backend_with_options`].
 ///
 /// # Example
 /// ```rust,no_run
@@ -140,40 +144,7 @@ pub use ::metal::Buffer as MetalBuffer;
 /// println!("{} ({})", backend.name(), backend.device_info());
 /// ```
 pub fn default_backend() -> Box<dyn ComputeBackend> {
-    // Honour LARQL_BACKEND override before any auto-selection.
-    if let Ok(forced) = std::env::var("LARQL_BACKEND") {
-        match forced.as_str() {
-            "cpu" => return Box::new(cpu::CpuBackend),
-            #[cfg(feature = "metal")]
-            "metal" => {
-                if let Some(m) = metal::MetalBackend::new() {
-                    m.calibrate();
-                    return Box::new(m);
-                }
-                eprintln!("[compute] LARQL_BACKEND=metal but Metal not available; falling back");
-            }
-            #[cfg(feature = "cuda")]
-            "cuda" => match cuda::CudaBackend::new() {
-                Ok(c) => return Box::new(c),
-                Err(e) => eprintln!(
-                    "[compute] LARQL_BACKEND=cuda but CUDA init failed: {e}; falling back"
-                ),
-            },
-            other => {
-                eprintln!("[compute] LARQL_BACKEND={other:?} not recognised; auto-selecting");
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        match cuda::CudaBackend::new() {
-            Ok(c) => return Box::new(c),
-            Err(e) => eprintln!("[compute] CUDA not available ({e}); trying next backend"),
-        }
-    }
-
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         if let Some(m) = metal::MetalBackend::new() {
             m.calibrate();
@@ -181,7 +152,33 @@ pub fn default_backend() -> Box<dyn ComputeBackend> {
         }
         eprintln!("[compute] Metal not available, falling back to CPU");
     }
+    Box::new(cpu::CpuBackend)
+}
 
+/// Create the best available backend with explicit options.
+///
+/// Same fall-back behaviour as [`default_backend`], but the Metal
+/// backend is constructed via [`MetalBackend::with_options`] — env
+/// vars are not consulted for the choices `BackendOptions` covers.
+/// Useful for embedding LARQL in a host that owns its own
+/// configuration surface, or for tests that want a reproducible
+/// backend independent of process env.
+///
+/// On non-macOS (or `--no-default-features`) the `_options` argument
+/// is ignored and the CPU backend is returned.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn default_backend_with_options(options: BackendOptions) -> Box<dyn ComputeBackend> {
+    if let Some(m) = metal::MetalBackend::with_options(options) {
+        m.calibrate();
+        return Box::new(m);
+    }
+    eprintln!("[compute] Metal not available, falling back to CPU");
+    Box::new(cpu::CpuBackend)
+}
+
+/// CPU-only fallback for the explicit-options API on non-macOS hosts.
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+pub fn default_backend_with_options<T>(_options: T) -> Box<dyn ComputeBackend> {
     Box::new(cpu::CpuBackend)
 }
 
@@ -191,4 +188,28 @@ pub fn default_backend() -> Box<dyn ComputeBackend> {
 /// CPU vs GPU paths.
 pub fn cpu_backend() -> Box<dyn ComputeBackend> {
     Box::new(cpu::CpuBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_backend_exposes_cpu_backend_capabilities() {
+        let backend = cpu_backend();
+
+        assert!(backend.name().starts_with("cpu"));
+        assert!(!backend.device_info().is_empty());
+        assert!(backend.supports(Capability::QuantMatVec));
+    }
+
+    #[test]
+    fn default_backend_is_usable_through_prelude_traits() {
+        fn assert_compute_backend<T: prelude::ComputeBackend + ?Sized>(backend: &T) {
+            assert!(backend.supports(prelude::Capability::QuantMatVec));
+        }
+
+        let backend = default_backend();
+        assert_compute_backend(backend.as_ref());
+    }
 }

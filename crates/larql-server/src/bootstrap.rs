@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::middleware;
-use clap::{Parser, ValueEnum};
-use larql_rotorquant::KvFormat;
+use clap::Parser;
 use larql_vindex::format::filenames::*;
 use larql_vindex::{
     load_vindex_config, load_vindex_embeddings, load_vindex_tokenizer, PatchedVindex,
@@ -35,6 +34,26 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 100;
 pub const DEFAULT_DESCRIBE_CACHE_TTL_SECS: u64 = 0;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
+
+/// Parse a human-readable RAM size string into bytes.
+/// Supports: "24GB", "16384MB", "4096KB", raw decimal bytes.
+pub fn parse_ram_bytes(s: &str) -> Result<u64, BoxError> {
+    let s = s.trim();
+    let (num_str, mult) = if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+        (n, 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("--available-ram: invalid number '{num_str}'"))?;
+    Ok(n * mult)
+}
 
 pub fn parse_layer_range(s: &str) -> Result<(usize, usize), BoxError> {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
@@ -336,16 +355,17 @@ pub fn load_single_vindex(
         weights: std::sync::OnceLock::new(),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
+        layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
-        #[cfg(feature = "metal-experts")]
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
-        tokenizer_cache: Arc::new(crate::tokenizer_cache::TokenizerCache::from_env()),
     })
 }
 
@@ -374,53 +394,6 @@ pub fn normalize_serve_alias(args: Vec<String>) -> Vec<String> {
 }
 
 // ── CLI definition ────────────────────────────────────────────────────────────
-
-/// Capability role this server advertises to the router. Drives
-/// `AnnounceMsg.capabilities` and (eventually) the bootstrap's
-/// decision of which weights to mmap.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ServerRole {
-    /// Attention-only shard. Announces `["attention"]`.
-    Attention,
-    /// FFN-only / expert-only shard. Announces `["expert"]`.
-    Expert,
-    /// Both attention and expert (single-binary deployment).
-    /// Announces `["attention","expert"]`. Default; matches the
-    /// pre-extension router's legacy fallback.
-    Both,
-}
-
-impl ServerRole {
-    /// Capability strings to send on the announce.
-    pub fn capabilities(self) -> Vec<String> {
-        match self {
-            ServerRole::Attention => vec!["attention".into()],
-            ServerRole::Expert => vec!["expert".into()],
-            ServerRole::Both => vec!["attention".into(), "expert".into()],
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum CliKvFormat {
-    Fp32,
-    Iso3,
-    Planar3,
-    Iso4,
-    Planar4,
-}
-
-impl CliKvFormat {
-    pub fn into_kv_format(self) -> Option<KvFormat> {
-        match self {
-            CliKvFormat::Fp32 => None,
-            CliKvFormat::Iso3 => Some(KvFormat::Iso3),
-            CliKvFormat::Planar3 => Some(KvFormat::Planar3),
-            CliKvFormat::Iso4 => Some(KvFormat::Iso4),
-            CliKvFormat::Planar4 => Some(KvFormat::Planar4),
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -572,6 +545,10 @@ pub struct Cli {
     #[arg(long)]
     pub cors: bool,
 
+    /// Disable the built-in Swagger UI and /v1/openapi.json endpoint.
+    #[arg(long)]
+    pub no_docs: bool,
+
     /// API key for authentication (clients send Authorization: Bearer <key>).
     #[arg(long)]
     pub api_key: Option<String>,
@@ -637,30 +614,18 @@ pub struct Cli {
     #[arg(long, env = "LARQL_GRID_KEY")]
     pub grid_key: Option<String>,
 
-    /// Capability role this server advertises to the router. Controls
-    /// which router-side `route_for_capability` filters select this
-    /// shard. Default `both` keeps backwards compat with pre-extension
-    /// shards (= the legacy default of `["attention", "expert"]`).
-    /// attention-service-routes change.
-    #[arg(long, value_enum, default_value_t = ServerRole::Both)]
-    pub role: ServerRole,
+    /// Mode B: advertise available RAM to the router (no vindex preloaded).
+    /// The router will assign a shard via AssignMsg.
+    /// Example: "24GB" or "16384MB" or raw bytes "17179869184".
+    /// Requires --join and --vindex-store.
+    #[arg(long, value_name = "SIZE")]
+    pub available_ram: Option<String>,
 
-    /// Idle TTL for attention KV sessions, in seconds. Sessions whose
-    /// `last_used` is older than this are reaped on the next 30 s
-    /// reaper tick. attention-service-routes change.
-    #[arg(long, default_value_t = 600)]
-    pub attention_session_ttl_secs: u64,
-
-    /// Max concurrent attention KV sessions. Beyond this cap the
-    /// server returns 503 from `POST /v1/attention/session`.
-    /// attention-service-routes change.
-    #[arg(long, default_value_t = 256)]
-    pub max_attention_sessions: usize,
-
-    /// Default KV-cache format for newly-created attention sessions
-    /// whose create request omits `kv_format`.
-    #[arg(long, value_enum)]
-    pub kv_format: Option<CliKvFormat>,
+    /// Mode B: directory where assigned shards will be downloaded.
+    /// The router assigns a shard; this server downloads it here.
+    /// Example: "/mnt/shards/"
+    #[arg(long, value_name = "PATH")]
+    pub vindex_store: Option<String>,
 
     /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
     /// The walk-ffn handler dispatches MoE expert calls to these remote servers.
@@ -831,30 +796,11 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         api_key: cli.api_key.clone(),
         sessions: SessionManager::new(DEFAULT_SESSION_TTL_SECS),
         describe_cache: DescribeCache::new(cli.cache_ttl),
-        attention_sessions: std::sync::Arc::new(
-            crate::attention_session::AttentionSessionMap::new(
-                cli.attention_session_ttl_secs,
-                cli.max_attention_sessions,
-            ),
-        ),
-        default_kv_format: cli.kv_format.and_then(CliKvFormat::into_kv_format),
+        // REST attention sessions: defaults align with upstream's stub.
+        // TTL: 1 hour, cap: 128 in-flight sessions.
+        attention_sessions: crate::attention_session::AttentionSessionMap::new(3600, 128),
+        default_kv_format: None,
     });
-
-    // attention-service-routes change. Reap idle attention sessions
-    // every 30 s; sessions older than the configured TTL are dropped.
-    {
-        let sessions = state.attention_sessions.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let reaped = sessions.reap_idle();
-                if reaped > 0 {
-                    tracing::debug!(reaped, active = sessions.len(), "attention-session reaper");
-                }
-            }
-        });
-    }
 
     if cli.cache_ttl > 0 {
         info!("DESCRIBE cache: {}s TTL", cli.cache_ttl);
@@ -924,7 +870,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
     }
 
     // Metal expert cache warmup (cfg=metal-experts only).
-    #[cfg(feature = "metal-experts")]
+    #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     for m in &state.models {
         if m.expert_filter.is_none() {
             continue;
@@ -964,6 +910,14 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         if cli.trust_forwarded_for {
             info!("Rate limit: trusting X-Forwarded-For");
         }
+    }
+
+    // OpenAPI / Swagger UI. Mounted before auth so the docs stay reachable
+    // without the API key — consistent with --cors behavior. Flip the
+    // ordering if operators want docs gated.
+    if !cli.no_docs {
+        app = app.merge(crate::openapi::swagger_router());
+        info!("OpenAPI: /swagger-ui and /v1/openapi.json enabled");
     }
 
     // Auth middleware.
@@ -1034,30 +988,37 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
         if join_urls.len() > 1 {
             info!("Joining {} routers (stateless fan-out)", join_urls.len());
         }
+        // Mode B: --available-ram without a loaded model → advertise capacity.
+        if let Some(ref ram_str) = cli.available_ram {
+            match parse_ram_bytes(ram_str) {
+                Ok(ram_bytes) => {
+                    let store_path = cli
+                        .vindex_store
+                        .clone()
+                        .unwrap_or_else(|| "/tmp/larql-shards".to_string());
+                    for join_url in &join_urls {
+                        announce::run_announce_available(announce::AvailableConfig {
+                            join_url: join_url.clone(),
+                            listen_url: listen_url.clone(),
+                            ram_bytes,
+                            disk_bytes: 0, // TODO: query disk
+                            store_path: store_path.clone(),
+                            grid_key: cli.grid_key.clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!("--available-ram parse error: {e} — falling through to Mode A");
+                }
+            }
+        }
+
         for m in &models {
             let (layer_start, layer_end) = match layer_range {
                 Some((s, e)) => (s as u32, (e - 1) as u32),
                 None => (0, (m.config.num_layers.saturating_sub(1)) as u32),
             };
             let vhash = announce::vindex_identity_hash(&m.id, m.config.num_layers);
-            // attention-service-routes change. The provider closure
-            // captures the AppState's SessionMap so every heartbeat
-            // emits a fresh bloom of the prefix hashes the shard
-            // currently has cached. None ⇒ no sessions = empty bloom
-            // (the router falls back to least-loaded routing).
-            let sessions = state.attention_sessions.clone();
-            let bloom_provider: std::sync::Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync> =
-                std::sync::Arc::new(move || {
-                    let hashes = sessions.prefix_hashes(16);
-                    if hashes.is_empty() {
-                        return None;
-                    }
-                    let mut bloom = larql_router_protocol::PrefixBloomEncoded::default();
-                    for h in hashes {
-                        bloom.insert(h);
-                    }
-                    Some(bloom.to_bytes().to_vec())
-                });
             for join_url in &join_urls {
                 announce::run_announce(announce::AnnounceConfig {
                     join_url: join_url.clone(),
@@ -1068,8 +1029,8 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     ram_bytes: 0,
                     grid_key: cli.grid_key.clone(),
                     vindex_hash: vhash.clone(),
-                    capabilities: cli.role.capabilities(),
-                    cached_prefixes_provider: Some(bloom_provider.clone()),
+                    latency_tracker: m.layer_latency_tracker.clone(),
+                    requests_in_flight: m.requests_in_flight.clone(),
                 });
             }
         }
@@ -1092,27 +1053,38 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
             .await?;
     } else {
         // Optional Unix domain socket alongside TCP (for same-host MoE
-        // shard clients).
+        // shard clients). Unix-only — `tokio::net::UnixListener` is
+        // gated on `cfg(unix)`. On Windows we warn and serve TCP only;
+        // the same-host MoE optimisation is unavailable.
         if let Some(uds_path) = cli.uds_path.clone() {
-            let _ = std::fs::remove_file(&uds_path);
-            match tokio::net::UnixListener::bind(&uds_path) {
-                Ok(uds_listener) => {
-                    info!("Listening: unix://{}", uds_path.display());
-                    let uds_app = app.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = axum::serve(uds_listener, uds_app).await {
-                            tracing::error!(
-                                "UDS listener crashed: {e:#}; same-host MoE shard \
-                                 clients will need to fall back to TCP"
-                            );
-                        }
-                    });
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(&uds_path);
+                match tokio::net::UnixListener::bind(&uds_path) {
+                    Ok(uds_listener) => {
+                        info!("Listening: unix://{}", uds_path.display());
+                        let uds_app = app.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = axum::serve(uds_listener, uds_app).await {
+                                tracing::error!(
+                                    "UDS listener crashed: {e:#}; same-host MoE shard \
+                                     clients will need to fall back to TCP"
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => warn!(
+                        "failed to bind UDS at {}: {e:#}; serving TCP only",
+                        uds_path.display()
+                    ),
                 }
-                Err(e) => warn!(
-                    "failed to bind UDS at {}: {e:#}; serving TCP only",
-                    uds_path.display()
-                ),
             }
+            #[cfg(not(unix))]
+            warn!(
+                "--uds-path {} ignored: Unix domain sockets are unix-only; \
+                 serving TCP only",
+                uds_path.display()
+            );
         }
 
         info!("Listening: http://{}", addr);
@@ -1142,49 +1114,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_attention_announces_attention_only() {
-        assert_eq!(
-            ServerRole::Attention.capabilities(),
-            vec!["attention".to_string()]
-        );
+    fn parse_ram_bytes_gb() {
+        assert_eq!(parse_ram_bytes("24GB").unwrap(), 24 * 1024 * 1024 * 1024);
+        assert_eq!(parse_ram_bytes("16gb").unwrap(), 16 * 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn role_expert_announces_expert_only() {
-        assert_eq!(
-            ServerRole::Expert.capabilities(),
-            vec!["expert".to_string()]
-        );
+    fn parse_ram_bytes_mb() {
+        assert_eq!(parse_ram_bytes("4096MB").unwrap(), 4096 * 1024 * 1024);
     }
 
     #[test]
-    fn role_both_announces_attention_and_expert() {
-        let caps = ServerRole::Both.capabilities();
-        assert_eq!(caps.len(), 2);
-        assert!(caps.contains(&"attention".to_string()));
-        assert!(caps.contains(&"expert".to_string()));
+    fn parse_ram_bytes_raw() {
+        assert_eq!(parse_ram_bytes("1073741824").unwrap(), 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn cli_defaults_role_to_both() {
-        let cli = Cli::parse_from(["larql-server", "/tmp/dummy"]);
-        assert_eq!(cli.role, ServerRole::Both);
-    }
-
-    #[test]
-    fn cli_role_flag_parses_attention() {
-        let cli = Cli::parse_from(["larql-server", "/tmp/dummy", "--role", "attention"]);
-        assert_eq!(cli.role, ServerRole::Attention);
-    }
-
-    #[test]
-    fn cli_kv_format_flag_parses_iso3() {
-        let cli = Cli::parse_from(["larql-server", "/tmp/dummy", "--kv-format", "iso3"]);
-        assert_eq!(cli.kv_format, Some(CliKvFormat::Iso3));
-        assert_eq!(
-            cli.kv_format.and_then(CliKvFormat::into_kv_format),
-            Some(KvFormat::Iso3)
-        );
+    fn parse_ram_bytes_invalid() {
+        assert!(parse_ram_bytes("notanumber").is_err());
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {

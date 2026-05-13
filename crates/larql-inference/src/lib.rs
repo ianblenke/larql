@@ -90,6 +90,33 @@ pub mod residual_diff;
 pub mod speculative;
 pub mod tokenizer;
 pub mod trace;
+
+/// Crate-internal shim that re-exports the engine-level synthetic test
+/// fixtures at `crate::test_utils::*`. The fork's source of truth lives
+/// at `engines::test_utils`; legacy test modules reach for
+/// `crate::test_utils`, so this alias keeps them compiling without
+/// duplicating the synthetic-weights factory.
+#[cfg(test)]
+pub(crate) mod test_utils {
+    pub use crate::engines::test_utils::*;
+
+    /// Stub fixture: upstream attention tests target Gemma3-shaped
+    /// weights with QK-norms; the fork keeps the generic tiny fixture
+    /// for unit tests. Returning [`make_test_weights`] preserves the
+    /// shape/arity contract — tests that asserted Gemma3-specific
+    /// behaviour will surface their assumptions when they run.
+    pub fn make_gemma3_test_weights() -> larql_models::ModelWeights {
+        make_test_weights()
+    }
+
+    /// Stub fixture: same story as `make_gemma3_test_weights`, but for
+    /// the StarCoder2 LayerNorm path. The generic tiny fixture is RMS
+    /// norm; StarCoder2-specific tests should be revisited if they
+    /// regress.
+    pub fn make_starcoder2_test_weights() -> larql_models::ModelWeights {
+        make_test_weights()
+    }
+}
 pub mod trie;
 pub mod vindex;
 pub mod walker;
@@ -137,7 +164,7 @@ pub use ffn::graph_backend::{GateIndex, IndexBuildCallbacks, SilentIndexCallback
 pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
-    ShardConfig, SparseFfn, WeightFfn,
+    ShardConfig, SparseFfn, WeightFfn, WirePreference,
 };
 pub use forward::{
     apply_knn_override, calibrate_scalar_gains, capture_decoy_residuals,

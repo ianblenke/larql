@@ -164,12 +164,19 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
         weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        tokenizer_cache: std::sync::Arc::new(larql_server::tokenizer_cache::TokenizerCache::new(
-            0, 0,
-        )),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     })
 }
 

@@ -181,6 +181,12 @@ pub fn build_arch_params<'a>(
             .moe_post_outer_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k))
             .map(|v| v.as_slice()),
+        // Per-Layer Embeddings (Gemma 4 E2B) — None for non-PLE archs (default).
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
+        // KV-cache sharing source — None for non-shared layers (default).
+        kv_shared_source: None,
     }
 }
 
@@ -268,6 +274,10 @@ pub(crate) fn build_moe_weights<'a>(
     Some(MoeLayerWeights {
         experts_gate_up,
         experts_down,
+        // Architecture-driven defaults — model archs that need explicit
+        // policy/layout overrides set them via the loader path.
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         expert_data_format,
         router_proj,
         router_scale,
@@ -515,6 +525,8 @@ fn build_moe_stub<'a>(
     MoeLayerWeights {
         experts_gate_up: vec![],
         experts_down: vec![],
+        routing_policy: larql_compute::MoeRoutingPolicy::default(),
+        weight_layout: larql_compute::MoeWeightLayout::default(),
         expert_data_format,
         router_proj: &[],
         router_scale: sl(arch.moe_router_scale_key(layer)),

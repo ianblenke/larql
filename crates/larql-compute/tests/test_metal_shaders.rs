@@ -6,7 +6,7 @@
 //!
 //! Run with: cargo test -p larql-compute --features metal
 
-#![cfg(feature = "metal")]
+#![cfg(all(feature = "metal", target_os = "macos"))]
 
 extern crate blas_src;
 
@@ -1430,22 +1430,21 @@ fn full_pipeline_seq1_produces_nonzero() {
         ffn_is_remote: false,
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
+        kv_shared_source: None,
+        ple_input_gate: None,
+        ple_projection: None,
+        ple_post_norm: None,
     };
 
+    let _ = (q_dim, kv_dim, num_q_heads, num_kv_heads, head_dim);
     let result = metal.full_pipeline_q4(
         &[layer],
         &x,
         hidden,
         inter,
-        q_dim,
-        kv_dim,
-        1,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        10000.0,
-        false,
-        0.0,
+        1,     // seq_len
+        false, // use_qk_norm
+        0.0,   // softcap
     );
 
     assert!(result.is_some(), "full_pipeline_q4 should return Some");
@@ -1495,7 +1494,7 @@ fn silu_standalone_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.silu_pipeline);
+    enc.set_compute_pipeline_state(&metal.ffn.silu_pipeline);
     enc.set_buffer(0, Some(&input_buf), 0);
     enc.set_buffer(1, Some(&output_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1532,7 +1531,7 @@ fn gelu_tanh_standalone_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.gelu_tanh_pipeline);
+    enc.set_compute_pipeline_state(&metal.ffn.gelu_tanh_pipeline);
     enc.set_buffer(0, Some(&input_buf), 0);
     enc.set_buffer(1, Some(&output_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1578,7 +1577,7 @@ fn layer_norm_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.layer_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.layer_norm_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&w_buf), 0);
     enc.set_buffer(2, Some(&b_buf), 0);
@@ -1622,7 +1621,7 @@ fn layer_norm_no_bias_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.layer_norm_no_bias_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.layer_norm_no_bias_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&w_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -1663,7 +1662,7 @@ fn v_norm_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.v_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.v_norm_pipeline);
     enc.set_buffer(0, Some(&x_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1695,7 +1694,7 @@ fn scale_vector_matches_cpu() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.scale_vector_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.scale_vector_pipeline);
     enc.set_buffer(0, Some(&input_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_bytes(2, 4, &n_val as *const u32 as *const std::ffi::c_void);
@@ -1732,7 +1731,7 @@ fn rms_norm_with_different_eps() {
     {
         let cmd = metal.queue().new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.rms_norm_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.rms_norm_pipeline);
         enc.set_buffer(0, Some(&x_buf), 0);
         enc.set_buffer(1, Some(&w_buf), 0);
         enc.set_buffer(2, Some(&out1), 0);
@@ -1754,7 +1753,7 @@ fn rms_norm_with_different_eps() {
     {
         let cmd = metal.queue().new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&metal.rms_norm_pipeline);
+        enc.set_compute_pipeline_state(&metal.norms.rms_norm_pipeline);
         enc.set_buffer(0, Some(&x_buf), 0);
         enc.set_buffer(1, Some(&w_buf), 0);
         enc.set_buffer(2, Some(&out2), 0);
@@ -2027,7 +2026,7 @@ fn geglu_gelu_tanh_no_nan_on_large_gate() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.geglu_gelu_tanh_pipeline);
+    enc.set_compute_pipeline_state(&metal.ffn.geglu_gelu_tanh_pipeline);
     enc.set_buffer(0, Some(&g_buf), 0);
     enc.set_buffer(1, Some(&u_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2091,7 +2090,7 @@ fn q4kf_proj_matches_cpu_reference() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2162,7 +2161,7 @@ fn q4kf_proj_matches_cpu_reference_gemma3_shape() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4kf_proj_pipeline.state);
     enc.set_buffer(0, Some(&w_buf), 0);
     enc.set_buffer(1, Some(&x_buf), 0);
     enc.set_buffer(2, Some(&out_buf), 0);
@@ -2255,7 +2254,7 @@ fn q4kf_qkv_proj_matches_individual_projections() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.q4kf_qkv_proj_pipeline.state);
+    enc.set_compute_pipeline_state(&metal.attention.q4kf_qkv_proj_pipeline.state);
     enc.set_buffer(0, Some(&wq_buf), 0);
     enc.set_buffer(1, Some(&wk_buf), 0);
     enc.set_buffer(2, Some(&wv_buf), 0);
@@ -2349,7 +2348,7 @@ fn qk_norm_matches_cpu_reference() {
 
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&metal.qk_norm_pipeline);
+    enc.set_compute_pipeline_state(&metal.norms.qk_norm_pipeline);
     enc.set_buffer(0, Some(&in_buf), 0);
     enc.set_buffer(1, Some(&out_buf), 0);
     enc.set_buffer(2, Some(&w_buf), 0);

@@ -44,17 +44,26 @@ fn bench_matmul_transb(c: &mut Criterion) {
 
     let cpu = CpuBackend;
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     let metal = larql_compute::metal::MetalBackend::new();
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     if let Some(ref m) = metal {
         m.set_flop_threshold(1);
     }
 
+    // The 262144 lm-head shape allocates a 2.5 GB weight matrix. On
+    // CI runners with shared GPU memory it's enough to push the
+    // following bench's Metal alloc into null-pointer territory; cap
+    // at 32 K rows there (320 MB) — same kernel coverage, no OOM.
+    let lmhead_n = if std::env::var_os("CI").is_some() {
+        32_768usize
+    } else {
+        262_144usize
+    };
     for &(m, n, k) in &[
         (6usize, 2_560usize, 2_560usize),
         (6, 10_240, 2_560),
-        (1, 262_144, 2_560),
+        (1, lmhead_n, 2_560),
     ] {
         let a = synth_matrix(m, k, 42);
         let b = synth_matrix(n, k, 43);
@@ -69,7 +78,7 @@ fn bench_matmul_transb(c: &mut Criterion) {
             },
         );
 
-        #[cfg(feature = "metal")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         if let Some(ref m_be) = metal {
             group.bench_with_input(
                 BenchmarkId::from_parameter(format!("metal/{label}")),
@@ -85,17 +94,31 @@ fn bench_matmul_transb(c: &mut Criterion) {
 
 /// Specialised single-row gemv at the lm-head shape (Metal-only —
 /// CPU's `f32_gemv` returns `None` and the caller falls back to
-/// `matmul_transb`). Bench covers the N=262144 vocab projection where
-/// `M=1` makes the tiled sgemm waste 31/32 threads, and the
+/// `matmul_transb`). Bench covers the vocab projection where `M=1`
+/// makes the tiled sgemm waste 31/32 threads, and the
 /// row-per-simdgroup `f32_gemv` shader's the specialised replacement.
-#[cfg(feature = "metal")]
+///
+/// Default shape is Gemma's full 262144-vocab × 2560-hidden (2.5 GB
+/// weight matrix). On CI we drop to N=32768 — same kernel, same
+/// arithmetic intensity, but a 320 MB buffer that fits comfortably on
+/// shared GitHub mac runners. Override either with
+/// `LARQL_BENCH_LMHEAD_N` if you want a specific size.
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn bench_f32_gemv_lmhead(c: &mut Criterion) {
     let Some(metal) = larql_compute::metal::MetalBackend::new() else {
         return;
     };
     metal.set_flop_threshold(1);
 
-    let n = 262_144usize;
+    let default_n = if std::env::var_os("CI").is_some() {
+        32_768usize
+    } else {
+        262_144usize
+    };
+    let n = std::env::var("LARQL_BENCH_LMHEAD_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_n);
     let k = 2_560usize;
     let w = synth_matrix(n, k, 42);
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin() * 0.5).collect();
@@ -103,16 +126,14 @@ fn bench_f32_gemv_lmhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("f32_gemv_lmhead");
     group.sample_size(20);
     group.throughput(Throughput::Elements((n * k) as u64));
-    group.bench_function(
-        BenchmarkId::from_parameter("metal/N262144_K2560"),
-        |bench| {
-            bench.iter(|| metal.f32_gemv_force(w.view(), &x));
-        },
-    );
+    let label = format!("metal/N{n}_K{k}");
+    group.bench_function(BenchmarkId::from_parameter(label), |bench| {
+        bench.iter(|| metal.f32_gemv_force(w.view(), &x));
+    });
     group.finish();
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn bench_f32_gemv_lmhead(_c: &mut Criterion) { /* metal-only */
 }
 

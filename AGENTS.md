@@ -113,6 +113,6 @@ Each capability spec already references its own per-crate docs and ADRs. The leg
 - Operations + patches: [crates/larql-vindex/docs/operations-spec.md](crates/larql-vindex/docs/operations-spec.md)
 - Ecosystem (HF publish, Vindexfile): [crates/larql-vindex/docs/ecosystem-spec.md](crates/larql-vindex/docs/ecosystem-spec.md)
 - Inference engine internals: [docs/inference-engine.md](docs/inference-engine.md), [docs/ffn-graph-layer.md](docs/ffn-graph-layer.md)
-- Trace format: [crates/larql-inference/docs/trace-format.md](crates/larql-inference/docs/trace-format.md), [docs/residual-trace.md](docs/residual-trace.md)
-- Experimental work: [experiments/](experiments/) — numbered 01-07, each self-contained
+- Trace format: [crates/larql-inference/docs/trace-format.md](crates/larql-inference/docs/trace-format.md), [docs/specs/trace-format-spec.md](docs/specs/trace-format-spec.md), [docs/residual-trace.md](docs/residual-trace.md)
+- Experimental work: [experiments/](experiments/) — fork's numbered 01-07 series; upstream maintains a separate 01-45 series grouped into foundations, compilation, routing, and shannon
 - Python bindings docs: [crates/larql-python/README.md](crates/larql-python/README.md), [docs/larql-python.md](docs/larql-python.md)
