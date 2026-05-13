@@ -182,6 +182,26 @@ pub struct GgufTensorInfo {
     offset: u64,
 }
 
+impl GgufTensorInfo {
+    /// Tensor name as stored in the GGUF (post-normalisation done at
+    /// `tensor_infos.push`). Used by external tools that need to
+    /// inspect the on-disk tensor layout (e.g., the MoE probe in
+    /// larql-inference).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Logical dimensions (GGML layout — fastest-moving axis first;
+    /// the loader's standard dim-swap produces row-major HF shape).
+    pub fn dims(&self) -> &[u64] {
+        &self.dims
+    }
+    /// GGML tensor type id (see `larql_models::quant::ggml`'s
+    /// `TYPE_*` constants).
+    pub fn tensor_type(&self) -> u32 {
+        self.tensor_type
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // GGUF reader
 // ═══════════════════════════════════════════════════════════════
@@ -493,6 +513,22 @@ impl GgufFile {
             }
         }
 
+        // ── MoE metadata flow-through ──
+        // GGUF stores `{arch}.expert_count`, `expert_used_count`, and
+        // `expert_feed_forward_length` (Qwen3.6-35B-A3B + similar MoE
+        // GGUFs). detect.rs reads `num_experts`, `num_experts_per_token`,
+        // and `moe_intermediate_size` from the HF-style config, so
+        // forward the values under those keys.
+        if let Some(v) = get_arch_u32_opt("expert_count") {
+            config["num_experts"] = serde_json::json!(v);
+        }
+        if let Some(v) = get_arch_u32_opt("expert_used_count") {
+            config["num_experts_per_tok"] = serde_json::json!(v);
+        }
+        if let Some(v) = get_arch_u32_opt("expert_feed_forward_length") {
+            config["moe_intermediate_size"] = serde_json::json!(v);
+        }
+
         config
     }
 }
@@ -586,9 +622,18 @@ pub fn load_gguf_lazy_tensors(
     let gguf = GgufFile::open(path)?;
     let prefixes = weights.arch.key_prefixes_to_strip();
     let file = std::fs::File::open(path)?;
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    // Phase G.1: keep the mmap alive in an Arc so per-tensor
+    // QuantTensor views can be zero-copy slices into it. RSS only
+    // accrues for pages actually touched during forward — the
+    // inactive ~95 % of MoE expert weights never enter RSS.
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
     for info in &gguf.tensor_infos {
-        if info.n_dims != 2 {
+        // Accept 2D tensors plus 3D MoE expert tensors. 3D GGUF tensors
+        // (e.g. `ffn_gate_exps.weight` with dims `[hidden, ffn_dim,
+        // num_experts]`) are flattened to a 2D `[rows = dims[1] *
+        // dims[2], cols = dims[0]]` view; `QuantTensor::expert_slice`
+        // then carves out per-expert subviews without copying.
+        if info.n_dims != 2 && info.n_dims != 3 {
             continue;
         }
         let key_raw = normalize_gguf_key(&info.name);
@@ -608,10 +653,25 @@ pub fn load_gguf_lazy_tensors(
                 mmap.len(),
             )));
         }
-        let bytes = mmap[abs_offset_usize..abs_offset_usize + data_size].to_vec();
         let cols = info.dims[0] as usize;
-        let rows = info.dims[1] as usize;
-        let qt = crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?;
+        let rows = if info.n_dims == 2 {
+            info.dims[1] as usize
+        } else {
+            // 3D: outer dims fold into rows. Expert axis (slowest in
+            // memory) is outermost, so per-expert slices remain
+            // contiguous byte ranges.
+            (info.dims[1] as usize) * (info.dims[2] as usize)
+        };
+        // Phase G.1: zero-copy view into the mmap. No to_vec() — only
+        // pages actually touched during forward accrue RSS.
+        let qt = crate::quant::lazy::QuantTensor::from_mmap_region(
+            std::sync::Arc::clone(&mmap),
+            abs_offset_usize,
+            data_size,
+            info.tensor_type,
+            rows,
+            cols,
+        )?;
         // Special-case the embed tensor: it has its own dedicated
         // field on `ModelWeights` (a 5 GiB f32 for Qwen3.6 248k vocab)
         // and is consumed via row lookup rather than matvec. Steer it
@@ -621,9 +681,21 @@ pub fn load_gguf_lazy_tensors(
             &normalize_gguf_key(weights.arch.embed_key()),
             prefixes,
         );
+        // Same special-case for lm_head / output.weight — `ModelWeights`
+        // has a dedicated `lm_head_quant` field that the Qwen3.6 bridge
+        // reads when dispatching the final logits matvec. Without this,
+        // the lazy lm_head ends up in the generic `quant_tensors` map,
+        // `lm_head_quant` stays None, and the forward falls back to a
+        // CPU dense `ndarray.dot` on the 5 GiB f32 weight — a hidden
+        // 80 ms / token cost that all of E.6.F's GPU-vs-GPU dispatch
+        // microbenchmarks were inadvertently bypassing.
         if key == embed_key_normalised {
             weights.embed_quant = Some(qt);
             weights.embed = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
+                .expect("empty array is always valid");
+        } else if key == "lm_head.weight" || key_raw == GGUF_OUTPUT_WEIGHT {
+            weights.lm_head_quant = Some(qt);
+            weights.lm_head = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
                 .expect("empty array is always valid");
         } else {
             weights.quant_tensors.insert(key.clone(), qt);

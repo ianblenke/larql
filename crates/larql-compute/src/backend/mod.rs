@@ -127,6 +127,132 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Fused Qwen3.6 DeltaNet recurrence block: L2 normalise Q and K,
+    /// run the delta-rule recurrence with the cached device-resident
+    /// state, then RMSNorm the head-major output. Four GPU kernels
+    /// chained on the same stream with a single sync at exit, saving
+    /// ~3 per-call sync round-trips per linear DeltaNet layer × 48
+    /// layers ≈ 10-15 ms / token at the current decode rate.
+    ///
+    /// Inputs `q` / `k` (`[head_v_dim * n_k_heads]` dim-major flat),
+    /// `v` (`[head_v_dim * n_v_heads]` dim-major flat), `log_g` /
+    /// `beta` (`[n_v_heads]`) are produced by the unchanged host code
+    /// (conv1d → silu → split/reshape on host), so the
+    /// `silu(qkv_conv)` step that drove the E.6.A multi-position
+    /// drift remains CPU. `ssm_norm_weight` is the per-head RMSNorm
+    /// weight `[head_v_dim]`. `recurrent_state` is the per-layer
+    /// host slice that the backend caches device-side, keyed by
+    /// pointer; the kernel mutates the device buffer in place and
+    /// leaves the host slice stale until a `sequence_pos == 0` reset.
+    /// Returns the `[n_v_heads * head_v_dim]` head-major output ready
+    /// for the caller to apply `silu(z) *` and the `ssm_out` matvec.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_recurrence_block(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _log_g: &[f32],
+        _beta: &[f32],
+        _ssm_norm_weight: &[f32],
+        _recurrent_state: &mut [f32],
+        _head_v_dim: usize,
+        _n_v_heads: usize,
+        _n_k_heads: usize,
+        _eps: f32,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Fused Qwen3.6 SwiGLU FFN block on the GPU. Chains all three
+    /// projection matvecs (`gate`, `up`, `down`) on the same stream
+    /// with `silu(gate) * up` computed device-resident between them,
+    /// so the host only ever sees the final `[hidden]` output.
+    ///
+    /// `gate_data` / `up_data` are the residual stream after the
+    /// post-attn norm; both share the same `x` input. `down_data`
+    /// projects the gated intermediate back to `hidden`. Formats are
+    /// per-tensor (Qwen3.6-27B-Q4_K_S has `gate`/`up` as Q4_K and
+    /// `down` as Q5_K), so the implementation must accept a mix.
+    ///
+    /// Saves the per-call htod x + dtoh intermediate transfers and 2
+    /// stream syncs vs the host-bouncing path through
+    /// `qwen35_paired_q4k_matvec` + CPU silu loop + `quant_matvec`.
+    /// Returns `None` if the backend can't handle the format combo
+    /// (caller falls back to per-call dispatch).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_ffn_lazy_block(
+        &self,
+        _x: &[f32],
+        _gate_data: &[u8],
+        _gate_format: crate::QuantFormat,
+        _gate_rows: usize,
+        _up_data: &[u8],
+        _up_format: crate::QuantFormat,
+        _up_rows: usize,
+        _down_data: &[u8],
+        _down_format: crate::QuantFormat,
+        _down_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Paired Q4_K matvec sharing one `x` input. Two weight matrices
+    /// (`a_rows × hidden` and `b_rows × hidden`) feed off the same
+    /// activation; backend uploads `x` once, runs both kernels on the
+    /// same stream, syncs once, returns `(a_out, b_out)`.
+    ///
+    /// Qwen3.6's DeltaNet block runs `attn_qkv` (10240 rows) and
+    /// `attn_gate` (6144 rows) back-to-back on `x_norm`. The full-attn
+    /// block similarly chains its Q/K/V projections. Pairing them
+    /// halves the per-call sync overhead. `None` falls back to two
+    /// independent `q4k_matvec` calls.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_paired_q4k_matvec(
+        &self,
+        _a_data: &[u8],
+        _a_rows: usize,
+        _b_data: &[u8],
+        _b_rows: usize,
+        _x: &[f32],
+        _hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
+
+    /// Optional fused Qwen3.6 DeltaNet post-projection chain (Phase
+    /// E.6.A). Composes conv1d → silu → split + reshape → L2 Q/K →
+    /// recurrence → reshape → rms_norm_heads → silu(z) * o on the
+    /// device with a single sync at the end. Caller has already
+    /// computed the projection outputs (`qkv_mixed`, `z`, `log_g`,
+    /// `beta`) and supplies them as host slices.
+    ///
+    /// Returns the post-rms-norm, post-silu-z output `[value_dim]` in
+    /// head-major layout, ready for the `ssm_out` projection. `None`
+    /// means the backend declined to handle this call (CPU fallback).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_postproj_step(
+        &self,
+        _qkv_mixed: &[f32],
+        _ssm_conv1d_weight: &[f32],
+        _log_g: &[f32],
+        _beta: &[f32],
+        _z: &[f32],
+        _ssm_norm_weight: &[f32],
+        _conv_state: &mut [f32],
+        _recurrent_state: &mut [f32],
+        _head_v_dim: usize,
+        _n_v_heads: usize,
+        _n_k_heads: usize,
+        _d_conv: usize,
+        _eps: f32,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 }

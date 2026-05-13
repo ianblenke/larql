@@ -21191,55 +21191,55 @@
     {
       "fqn": "larql_compute::cuda::backend::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 939,
+      "line": 1112,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::driver_missing_returns_typed_error",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 859,
+      "line": 1032,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 924,
+      "line": 1097,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_decode_after_cuda_decode_backend",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 916,
+      "line": 1089,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_f32_gemv_after_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 876,
+      "line": 1049,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_fa2_after_fused_attention",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 901,
+      "line": 1074,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_q4_matvec_after_q4_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 890,
+      "line": 1063,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 939,
+      "line": 1112,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 924,
+      "line": 1097,
       "crate": "larql_compute"
     },
     {
@@ -21269,49 +21269,49 @@
     {
       "fqn": "larql_compute::cuda::deltanet::causal_conv1d_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 610,
+      "line": 645,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::deltanet_step_matches_cpu_tiny_decay_first",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 650,
+      "line": 685,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::l2_normalize_per_head_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 708,
+      "line": 743,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::rms_norm_heads_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 739,
+      "line": 774,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::causal_conv1d_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 610,
+      "line": 645,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::deltanet_step_matches_cpu_tiny_decay_first",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 650,
+      "line": 685,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::l2_normalize_per_head_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 708,
+      "line": 743,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::deltanet::tests::rms_norm_heads_matches_cpu_tiny",
       "file": "crates/larql-compute/src/cuda/deltanet.rs",
-      "line": 739,
+      "line": 774,
       "crate": "larql_compute"
     },
     {
@@ -21321,15 +21321,27 @@
       "crate": "larql_compute"
     },
     {
+      "fqn": "larql_compute::cuda::matmul::bench_cublas_sgemv_at_lm_head_shape",
+      "file": "crates/larql-compute/src/cuda/matmul.rs",
+      "line": 413,
+      "crate": "larql_compute"
+    },
+    {
       "fqn": "larql_compute::cuda::matmul::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 334,
+      "line": 397,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::matmul::tests::bench_cublas_sgemv_at_lm_head_shape",
+      "file": "crates/larql-compute/src/cuda/matmul.rs",
+      "line": 413,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::matmul::tests::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 334,
+      "line": 397,
       "crate": "larql_compute"
     },
     {
@@ -21363,9 +21375,81 @@
       "crate": "larql_compute"
     },
     {
+      "fqn": "larql_compute::cuda::q5k_direct::q5k_matvec_matches_cpu_dequant_dot",
+      "file": "crates/larql-compute/src/cuda/q5k_direct.rs",
+      "line": 236,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::q5k_direct::tests::q5k_matvec_matches_cpu_dequant_dot",
+      "file": "crates/larql-compute/src/cuda/q5k_direct.rs",
+      "line": 236,
+      "crate": "larql_compute"
+    },
+    {
       "fqn": "larql_compute::cuda::q6k_mmvq::q6k_mmvq_matches_q6k_f32_on_dequantized_input",
       "file": "crates/larql-compute/src/cuda/q6k_mmvq.rs",
       "line": 383,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::deltanet_postproj_matches_unfused_gpu_chain",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 1109,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::deltanet_step_matches_cpu_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 1016,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::l2_and_rms_norm_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 931,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::reshape_kernels_match_cpu_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 812,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::silu_inplace_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 759,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_postproj_matches_unfused_gpu_chain",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 1109,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_step_matches_cpu_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 1016,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::l2_and_rms_norm_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 931,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::reshape_kernels_match_cpu_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 812,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::qwen35_block::tests::silu_inplace_drift_at_qwen35_shape",
+      "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
+      "line": 759,
       "crate": "larql_compute"
     },
     {
@@ -21533,43 +21617,43 @@
     {
       "fqn": "larql_compute::pipeline::activation_from_bool",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 401,
+      "line": 403,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::default_layer_accepts_local_borrows_via_spread",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 485,
+      "line": 487,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::is_gated_matches_ffn_type",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 407,
+      "line": 409,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::is_hybrid_moe_reflects_option",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 416,
+      "line": 418,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_classifiers",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 453,
+      "line": 455,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_equality",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 444,
+      "line": 446,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::pipeline::quant_format_reports_packed_matrix_bytes",
       "file": "crates/larql-compute/src/pipeline.rs",
-      "line": 473,
+      "line": 475,
       "crate": "larql_compute"
     },
     {
@@ -21905,73 +21989,73 @@
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 733,
+      "line": 938,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 648,
+      "line": 853,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 769,
+      "line": 974,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 697,
+      "line": 902,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 759,
+      "line": 964,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 749,
+      "line": 954,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 733,
+      "line": 938,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 648,
+      "line": 853,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 769,
+      "line": 974,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 697,
+      "line": 902,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 759,
+      "line": 964,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 749,
+      "line": 954,
       "crate": "larql_inference"
     },
     {
@@ -22229,13 +22313,13 @@
     {
       "fqn": "larql_inference::attention::quant_dispatch::no_backend_falls_back_to_cpu_matvec",
       "file": "crates/larql-inference/src/attention/quant_dispatch.rs",
-      "line": 70,
+      "line": 90,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::quant_dispatch::tests::no_backend_falls_back_to_cpu_matvec",
       "file": "crates/larql-inference/src/attention/quant_dispatch.rs",
-      "line": 70,
+      "line": 90,
       "crate": "larql_inference"
     },
     {
@@ -22313,421 +22397,433 @@
     {
       "fqn": "larql_inference::attention::qwen35_block::append_row_from_empty_slab",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 627,
+      "line": 632,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::append_row_grows_slab",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 612,
+      "line": 617,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::attention_dims_helpers",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 584,
+      "line": 589,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::attention_dims_qwen35_27b_values",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 594,
+      "line": 599,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::hybrid_cache_allocates_correct_per_layer_kind",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 636,
+      "line": 641,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::hybrid_cache_reset_clears_state_and_position",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 656,
+      "line": 661,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::hybrid_layer_step_panics_on_kind_mismatch",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 738,
+      "line": 743,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::hybrid_layer_step_routes_to_deltanet_on_linear",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 686,
+      "line": 691,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::silu_helper_is_reachable",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 778,
+      "line": 783,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::append_row_from_empty_slab",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 627,
+      "line": 632,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::append_row_grows_slab",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 612,
+      "line": 617,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::attention_dims_helpers",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 584,
+      "line": 589,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::attention_dims_qwen35_27b_values",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 594,
+      "line": 599,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::hybrid_cache_allocates_correct_per_layer_kind",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 636,
+      "line": 641,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::hybrid_cache_reset_clears_state_and_position",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 656,
+      "line": 661,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::hybrid_layer_step_panics_on_kind_mismatch",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 738,
+      "line": 743,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::hybrid_layer_step_routes_to_deltanet_on_linear",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 686,
+      "line": 691,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_block::tests::silu_helper_is_reachable",
       "file": "crates/larql-inference/src/attention/qwen35_block.rs",
-      "line": 778,
+      "line": 783,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::qwen35_forward_step_dn_state_carries_across_calls",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 688,
+      "line": 816,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::qwen35_forward_step_returns_vocab_shape",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 570,
+      "line": 698,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::qwen35_forward_step_two_calls_advances_position_and_grows_cache",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 634,
+      "line": 762,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::swiglu_ffn_matches_definition_unit_vectors",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 553,
+      "line": 681,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::swiglu_ffn_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 538,
+      "line": 666,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::tests::qwen35_forward_step_dn_state_carries_across_calls",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 688,
+      "line": 816,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::tests::qwen35_forward_step_returns_vocab_shape",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 570,
+      "line": 698,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::tests::qwen35_forward_step_two_calls_advances_position_and_grows_cache",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 634,
+      "line": 762,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::tests::swiglu_ffn_matches_definition_unit_vectors",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 553,
+      "line": 681,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_forward::tests::swiglu_ffn_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/qwen35_forward.rs",
-      "line": 538,
+      "line": 666,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_loads_hybrid_layer_kinds_correctly",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 553,
+      "line": 563,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_missing_tensor_errors_with_key_name",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 706,
+      "line": 716,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_missing_vector_errors_with_key_name",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 721,
+      "line": 731,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_passes_norm_weights_through_verbatim",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 593,
+      "line": 603,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_propagates_ffn_dim_and_embed_lm_head",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 570,
+      "line": 580,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::bridge_rejects_non_hybrid_arch",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 735,
+      "line": 745,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::integration_bridge_forward_dn_state_carries_across_two_tokens",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 887,
+      "line": 897,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::integration_bridge_forward_grows_kv_and_advances_position_over_two_tokens",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 840,
+      "line": 850,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::integration_bridge_forward_one_token_returns_finite_vocab_logits",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 811,
+      "line": 821,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::qwen35_load::probe_qwen35_moe_gguf_layout",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2225,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2642,
+      "line": 2757,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_bench",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2211,
+      "line": 2301,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_bridge_smoke",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 953,
+      "line": 963,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_chat_prompt_forward",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1493,
+      "line": 1503,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_chat_prompt_temperature_sampling",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2014,
+      "line": 2024,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_forward_one_token_smoke",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1043,
+      "line": 1053,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_lm_head_row_norms_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1797,
+      "line": 1807,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_lm_head_vs_their_xfinal_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1648,
+      "line": 1658,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_multi_token_argmax_decode",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1131,
+      "line": 1141,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2579,
+      "line": 2694,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2376,
+      "line": 2491,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_tokenizer_roundtrip",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1271,
+      "line": 1281,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_loads_hybrid_layer_kinds_correctly",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 553,
+      "line": 563,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_missing_tensor_errors_with_key_name",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 706,
+      "line": 716,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_missing_vector_errors_with_key_name",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 721,
+      "line": 731,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_passes_norm_weights_through_verbatim",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 593,
+      "line": 603,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_propagates_ffn_dim_and_embed_lm_head",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 570,
+      "line": 580,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::bridge_rejects_non_hybrid_arch",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 735,
+      "line": 745,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::integration_bridge_forward_dn_state_carries_across_two_tokens",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 887,
+      "line": 897,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::integration_bridge_forward_grows_kv_and_advances_position_over_two_tokens",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 840,
+      "line": 850,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::integration_bridge_forward_one_token_returns_finite_vocab_logits",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 811,
+      "line": 821,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::qwen35_load::tests::probe_qwen35_moe_gguf_layout",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2225,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2642,
+      "line": 2757,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_bench",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2211,
+      "line": 2301,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_bridge_smoke",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 953,
+      "line": 963,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_chat_prompt_forward",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1493,
+      "line": 1503,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_chat_prompt_temperature_sampling",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2014,
+      "line": 2024,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_forward_one_token_smoke",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1043,
+      "line": 1053,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_lm_head_row_norms_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1797,
+      "line": 1807,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_lm_head_vs_their_xfinal_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1648,
+      "line": 1658,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_multi_token_argmax_decode",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1131,
+      "line": 1141,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2579,
+      "line": 2694,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2376,
+      "line": 2491,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_tokenizer_roundtrip",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 1271,
+      "line": 1281,
       "crate": "larql_inference"
     },
     {
@@ -29061,51 +29157,111 @@
       "crate": "larql_models"
     },
     {
+      "fqn": "larql_models::quant::lazy::expert_slice_matvec_matches_standalone",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 418,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::expert_slice_rejects_mismatched_num_experts",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 401,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::expert_slice_rejects_oob_expert_id",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 408,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::expert_slice_returns_per_expert_subview_f32",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 356,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::expert_slice_shares_arc_with_parent",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 390,
+      "crate": "larql_models"
+    },
+    {
       "fqn": "larql_models::quant::lazy::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 215,
+      "line": 298,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 240,
+      "line": 323,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::row_to_f32_oob_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 262,
+      "line": 345,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::row_to_f32_returns_each_row_in_order",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 247,
+      "line": 330,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::tests::expert_slice_matvec_matches_standalone",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 418,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::tests::expert_slice_rejects_mismatched_num_experts",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 401,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::tests::expert_slice_rejects_oob_expert_id",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 408,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::tests::expert_slice_returns_per_expert_subview_f32",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 356,
+      "crate": "larql_models"
+    },
+    {
+      "fqn": "larql_models::quant::lazy::tests::expert_slice_shares_arc_with_parent",
+      "file": "crates/larql-models/src/quant/lazy.rs",
+      "line": 390,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 215,
+      "line": 298,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 240,
+      "line": 323,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::row_to_f32_oob_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 262,
+      "line": 345,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::row_to_f32_returns_each_row_in_order",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 247,
+      "line": 330,
       "crate": "larql_models"
     },
     {

@@ -22,7 +22,7 @@ use larql_models::{ModelArchitecture, ModelWeights};
 
 use super::deltanet_block::DeltaNetLayerWeights;
 use super::qwen35_block::{Qwen35AttentionLayerWeights, Qwen35LayerWeights};
-use super::qwen35_forward::{Qwen35FullLayerWeights, Qwen35Weights};
+use super::qwen35_forward::{Qwen35FullLayerWeights, Qwen35MoeFfnWeights, Qwen35Weights};
 
 /// Bridge errors — every variant names the missing tensor key so
 /// the user can grep the GGUF for "did this load?" diagnostics.
@@ -92,32 +92,58 @@ pub fn load_qwen35_weights(
         // No `add_one_to_vec` needed here despite Qwen3-Next using
         // `Qwen3NextRMSNorm(x) = x * inv_rms * (1 + w)` semantically.
         let attn_post_norm = get_vec(weights, &arch.post_attention_layernorm_key(layer))?;
-        let ffn_gate_key = arch.ffn_gate_key(layer);
-        let ffn_up_key = arch.ffn_up_key(layer);
-        let ffn_down_key = arch.ffn_down_key(layer);
-        // Lazy-quant takes precedence per projection. The dense
-        // field gets a 0×0 placeholder when the quant form is
-        // available so we don't pay RAM twice.
-        let ffn_gate_quant = weights.quant_tensors.get(&ffn_gate_key).cloned();
-        let ffn_up_quant = weights.quant_tensors.get(&ffn_up_key).cloned();
-        let ffn_down_quant = weights.quant_tensors.get(&ffn_down_key).cloned();
         let empty_arr = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
             .expect("empty array is always valid");
-        let ffn_gate = if ffn_gate_quant.is_some() {
-            empty_arr.clone()
-        } else {
-            get_tensor(weights, &ffn_gate_key)?
-        };
-        let ffn_up = if ffn_up_quant.is_some() {
-            empty_arr.clone()
-        } else {
-            get_tensor(weights, &ffn_up_key)?
-        };
-        let ffn_down = if ffn_down_quant.is_some() {
-            empty_arr.clone()
-        } else {
-            get_tensor(weights, &ffn_down_key)?
-        };
+        // MoE arch ships per-layer expert tensors instead of the
+        // dense `mlp.{gate,up,down}_proj.weight` set. Branch up front
+        // so we never try to pull the absent dense keys.
+        let (ffn_gate, ffn_up, ffn_down, ffn_gate_quant, ffn_up_quant, ffn_down_quant, moe) =
+            if arch.is_moe() {
+                let moe = load_qwen35_moe_ffn(weights, arch, layer)?;
+                (
+                    empty_arr.clone(),
+                    empty_arr.clone(),
+                    empty_arr.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(moe),
+                )
+            } else {
+                let ffn_gate_key = arch.ffn_gate_key(layer);
+                let ffn_up_key = arch.ffn_up_key(layer);
+                let ffn_down_key = arch.ffn_down_key(layer);
+                // Lazy-quant takes precedence per projection. The dense
+                // field gets a 0×0 placeholder when the quant form is
+                // available so we don't pay RAM twice.
+                let ffn_gate_quant = weights.quant_tensors.get(&ffn_gate_key).cloned();
+                let ffn_up_quant = weights.quant_tensors.get(&ffn_up_key).cloned();
+                let ffn_down_quant = weights.quant_tensors.get(&ffn_down_key).cloned();
+                let ffn_gate = if ffn_gate_quant.is_some() {
+                    empty_arr.clone()
+                } else {
+                    get_tensor(weights, &ffn_gate_key)?
+                };
+                let ffn_up = if ffn_up_quant.is_some() {
+                    empty_arr.clone()
+                } else {
+                    get_tensor(weights, &ffn_up_key)?
+                };
+                let ffn_down = if ffn_down_quant.is_some() {
+                    empty_arr.clone()
+                } else {
+                    get_tensor(weights, &ffn_down_key)?
+                };
+                (
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    ffn_gate_quant,
+                    ffn_up_quant,
+                    ffn_down_quant,
+                    None,
+                )
+            };
         layers.push(Qwen35FullLayerWeights {
             block,
             attn_post_norm,
@@ -127,6 +153,7 @@ pub fn load_qwen35_weights(
             ffn_gate_quant,
             ffn_up_quant,
             ffn_down_quant,
+            moe,
         });
     }
 
@@ -152,6 +179,119 @@ pub fn load_qwen35_weights(
 // actual Qwen 3.6 27B Q4_K_S GGUF showed stored norm weights are
 // already ≈ 1.0 (i.e. `(1 + w)` is pre-applied in the conversion
 // path), so adding 1.0 again double-applies the offset.
+
+/// GGUF-side tensor keys for the per-layer MoE FFN.
+///
+/// All keys live in `weights.quant_tensors` (the bench harness adds
+/// them to the lazy-load set explicitly). Names follow llama.cpp's
+/// GGUF convention rewritten through the loader's `blk.` → `layers.`
+/// substitution — no other rewrite rule fires.
+///
+/// Layout (per F.0 probe of Qwen3.6-35B-A3B):
+/// - `ffn_gate_exps.weight`  Q4_K, 3D `[hidden, ffn_dim, num_experts]`
+///   → flattened by the lazy loader to `[num_experts * ffn_dim, hidden]`.
+/// - `ffn_up_exps.weight`    Q4_K, same shape.
+/// - `ffn_down_exps.weight`  Q5_K, 3D `[ffn_dim, hidden, num_experts]`
+///   → flattened to `[num_experts * hidden, ffn_dim]`.
+/// - `ffn_gate_inp.weight`   f32, 2D `[hidden, num_experts]`
+///   → flattened to `[num_experts, hidden]` (the router matvec produces
+///   one logit per expert from the token vector).
+/// - `ffn_{gate,up,down}_shexp.weight` shared expert (optional). Same
+///   shapes as a dense SwiGLU but with `expert_ffn_dim`.
+fn load_qwen35_moe_ffn(
+    weights: &ModelWeights,
+    arch: &dyn larql_models::ModelArchitecture,
+    layer: usize,
+) -> Result<Qwen35MoeFfnWeights, Qwen35LoadError> {
+    let prefix = format!("layers.{layer}.");
+    let key = |suffix: &str| format!("{prefix}{suffix}");
+
+    let pull = |suffix: &str| -> Result<larql_models::quant::lazy::QuantTensor, Qwen35LoadError> {
+        let k = key(suffix);
+        weights
+            .quant_tensors
+            .get(&k)
+            .cloned()
+            .ok_or(Qwen35LoadError::MissingTensor(k))
+    };
+    let pull_opt = |suffix: &str| weights.quant_tensors.get(&key(suffix)).cloned();
+
+    let router = pull("ffn_gate_inp.weight")?;
+    let gate_exps = pull("ffn_gate_exps.weight")?;
+    let up_exps = pull("ffn_up_exps.weight")?;
+    let down_exps = pull("ffn_down_exps.weight")?;
+
+    // Shared expert (always-on). Qwen3.6-35B-A3B has one; some MoE
+    // variants don't. Treat as a single unit — either all three are
+    // present or none are.
+    let shexp_gate = pull_opt("ffn_gate_shexp.weight");
+    let shexp_up = pull_opt("ffn_up_shexp.weight");
+    let shexp_down = pull_opt("ffn_down_shexp.weight");
+    let (shexp_gate, shexp_up, shexp_down) =
+        match (shexp_gate, shexp_up, shexp_down) {
+            (Some(g), Some(u), Some(d)) => (Some(g), Some(u), Some(d)),
+            (None, None, None) => (None, None, None),
+            // Partial set is almost certainly a bug — fail loudly so
+            // we don't silently drop a shared expert that's in the
+            // GGUF.
+            (g, u, d) => {
+                return Err(Qwen35LoadError::MissingTensor(format!(
+                    "partial shared-expert tensors for layer {layer}: \
+                     gate={present_g}, up={present_u}, down={present_d}",
+                    present_g = g.is_some(),
+                    present_u = u.is_some(),
+                    present_d = d.is_some(),
+                )));
+            }
+        };
+
+    let num_experts = arch.num_experts();
+    let top_k = arch.num_experts_per_token();
+    if num_experts == 0 {
+        return Err(Qwen35LoadError::NotHybrid {
+            field: "num_experts",
+        });
+    }
+    if top_k == 0 {
+        return Err(Qwen35LoadError::NotHybrid {
+            field: "num_experts_per_token",
+        });
+    }
+
+    Ok(Qwen35MoeFfnWeights {
+        router,
+        gate_exps,
+        up_exps,
+        down_exps,
+        shexp_gate,
+        shexp_up,
+        shexp_down,
+        num_experts,
+        top_k,
+    })
+}
+
+/// Tensor keys to lazify when loading a Qwen3.6 MoE GGUF (e.g.
+/// 35B-A3B). The bench harness folds these into the regular
+/// `lazy_keys` set before calling `load_gguf_lazy_tensors`. Returns
+/// every per-layer MoE tensor name (`layers.{L}.ffn_*_exps.weight`,
+/// `ffn_gate_inp.weight`, `ffn_*_shexp.weight`) — `lazy_tensors`
+/// silently ignores keys that don't exist in the GGUF, so listing
+/// the shared-expert tensors for archs without one is safe.
+pub fn qwen35_moe_lazy_keys(n_layers: usize) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for l in 0..n_layers {
+        let p = format!("layers.{l}.");
+        out.insert(format!("{p}ffn_gate_inp.weight"));
+        out.insert(format!("{p}ffn_gate_exps.weight"));
+        out.insert(format!("{p}ffn_up_exps.weight"));
+        out.insert(format!("{p}ffn_down_exps.weight"));
+        out.insert(format!("{p}ffn_gate_shexp.weight"));
+        out.insert(format!("{p}ffn_up_shexp.weight"));
+        out.insert(format!("{p}ffn_down_shexp.weight"));
+    }
+    out
+}
 
 fn load_deltanet_layer(
     weights: &ModelWeights,
@@ -187,8 +327,18 @@ fn load_deltanet_layer(
     // and cols = conv_dim (per-tap-channel layout), so transpose
     // once at load time. Trivial cost: 48 layers × 4 × 10240 f32
     // ≈ 7.8 MB total for Qwen 3.6 27B, done once.
+    //
+    // `t().to_owned()` keeps the transposed strides (non-standard
+    // layout), which silently disables every `as_slice()`-based GPU
+    // dispatch downstream. `as_standard_layout().to_owned()` forces
+    // a row-major copy so the resulting ArcArray's `as_slice()` is
+    // `Some` — required by the Phase E.4 / E.6 CUDA hooks.
     let ssm_conv1d_raw = get_tensor(weights, &ssm_conv1d_key)?;
-    let ssm_conv1d = ssm_conv1d_raw.t().to_owned().into_shared();
+    let ssm_conv1d = ssm_conv1d_raw
+        .t()
+        .as_standard_layout()
+        .to_owned()
+        .into_shared();
     let ssm_dt_key = require_key(arch.ssm_dt_key(layer), layer, "ssm_dt_key", "linear")?;
     let ssm_dt = get_vec(weights, &ssm_dt_key)?;
     let ssm_a_key = require_key(arch.ssm_a_key(layer), layer, "ssm_a_key", "linear")?;
@@ -2206,6 +2356,86 @@ mod tests {
     // forward is roughly right but slightly off (small numerical
     // bug). If expected token has small or negative logit →
     // forward is structurally broken.
+    /// Phase A: probe the Qwen3.6-35B-A3B MoE GGUF to discover its
+    /// actual tensor layout. The Qwen35MoeArch handler assumes
+    /// per-expert `mlp.experts.N.{gate,up,down}_proj.weight` tensors,
+    /// but llama.cpp's GGUF convention typically packs them as 3D
+    /// `ffn_*_exps.weight` tensors. This test prints the relevant
+    /// MoE metadata + expert/router tensor names + shapes so we can
+    /// decide which layout to target. Env-gated by
+    /// `LARQL_QWEN35_MOE_GGUF=/path/to/Qwen3.6-35B-A3B.gguf`.
+    #[test]
+    fn probe_qwen35_moe_gguf_layout() {
+        let path = match std::env::var("LARQL_QWEN35_MOE_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_MOE_GGUF unset — skipping probe");
+                return;
+            }
+        };
+        let gguf = larql_models::loading::gguf::GgufFile::open(std::path::Path::new(&path))
+            .expect("open MoE GGUF");
+        eprintln!("=== Qwen3.6-35B-A3B GGUF probe ===");
+        eprintln!("path: {path}");
+        eprintln!("tensors: {}", gguf.tensor_infos.len());
+        eprintln!("metadata entries: {}", gguf.metadata.len());
+
+        // Print relevant MoE / arch metadata.
+        eprintln!("\n-- metadata (MoE / arch keys) --");
+        let mut keys: Vec<&String> = gguf.metadata.keys().collect();
+        keys.sort();
+        for k in &keys {
+            let lower = k.to_lowercase();
+            if lower.contains("expert")
+                || lower.contains("moe")
+                || lower.contains("arch")
+                || lower.contains("ffn")
+                || lower.contains("intermediate")
+                || lower.contains("layer")
+                || lower.contains("hidden")
+                || lower.contains("vocab")
+                || lower.contains("ssm")
+            {
+                let v = &gguf.metadata[*k];
+                eprintln!("  {k} = {v:?}");
+            }
+        }
+
+        // Print first-layer MoE-relevant tensor names + shapes + types.
+        // Filter to layer 0 for brevity.
+        eprintln!("\n-- layer 0 MoE / FFN tensors (names + shapes + type) --");
+        let mut layer0_tensors: Vec<&larql_models::loading::gguf::GgufTensorInfo> = gguf
+            .tensor_infos
+            .iter()
+            .filter(|t| {
+                let n = t.name();
+                n.contains("blk.0.") || n.contains("layers.0.")
+            })
+            .collect();
+        layer0_tensors.sort_by_key(|t| t.name().to_string());
+        for t in &layer0_tensors {
+            eprintln!(
+                "  {:60} dims={:?} type={}",
+                t.name(),
+                t.dims(),
+                t.tensor_type()
+            );
+        }
+
+        // Print any non-layer (top-level) tensor names for embed / lm_head / etc.
+        eprintln!("\n-- top-level (non-blk) tensors --");
+        for t in &gguf.tensor_infos {
+            if !t.name().contains("blk.") && !t.name().contains("layers.") {
+                eprintln!(
+                    "  {:60} dims={:?} type={}",
+                    t.name(),
+                    t.dims(),
+                    t.tensor_type()
+                );
+            }
+        }
+    }
+
     /// C.5l (task #30) — minimal tok/s bench against the same Qwen3.6
     /// GGUF used for parity. Times prefill and decode separately so the
     /// numbers can be compared with `llama-bench`'s `pp` / `tg` metrics.
@@ -2270,6 +2500,14 @@ mod tests {
             // since it's the biggest single remaining tensor and the
             // user opting into the lazy path almost always wants it.
             lazy_keys.insert(arch_ref.embed_key().to_string());
+            // Phase F.3: MoE GGUFs ship router + 3D-packed expert
+            // tensors + (optional) shared expert. None of these are
+            // covered by `ffn_gate_key` / `ffn_up_key` / `ffn_down_key`
+            // (those return the dense-FFN names), so add them
+            // explicitly. For dense GGUFs this set stays empty.
+            if arch_ref.is_moe() {
+                lazy_keys.extend(qwen35_moe_lazy_keys(n_layers));
+            }
             drop(probe);
             larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
                 .expect("load_gguf_lazy_tensors")
@@ -2373,6 +2611,31 @@ mod tests {
                 eprintln!("RSS:     {line}");
             }
         }
+
+        // Phase E.7: VRAM use via nvidia-smi (process-scoped, in MiB).
+        // Needed to make larql's value prop measurable against
+        // llama.cpp on the VRAM axis. Falls through silently when
+        // nvidia-smi isn't on PATH.
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let my_pid = std::process::id();
+            for line in stdout.lines() {
+                let mut parts = line.split(',').map(|s| s.trim());
+                if let (Some(pid_s), Some(mem_s)) = (parts.next(), parts.next()) {
+                    if let Ok(pid) = pid_s.parse::<u32>() {
+                        if pid == my_pid {
+                            eprintln!("VRAM:    {mem_s} MiB (this process, via nvidia-smi)");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2466,6 +2729,14 @@ mod tests {
             // since it's the biggest single remaining tensor and the
             // user opting into the lazy path almost always wants it.
             lazy_keys.insert(arch_ref.embed_key().to_string());
+            // Phase F.3: MoE GGUFs ship router + 3D-packed expert
+            // tensors + (optional) shared expert. None of these are
+            // covered by `ffn_gate_key` / `ffn_up_key` / `ffn_down_key`
+            // (those return the dense-FFN names), so add them
+            // explicitly. For dense GGUFs this set stays empty.
+            if arch_ref.is_moe() {
+                lazy_keys.extend(qwen35_moe_lazy_keys(n_layers));
+            }
             drop(probe);
             larql_models::load_gguf_lazy_tensors(&gguf_path, &lazy_keys)
                 .expect("load_gguf_lazy_tensors")

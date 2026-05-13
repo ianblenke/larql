@@ -57,26 +57,50 @@ pub trait QuantMatVec {
         match format {
             QuantFormat::Q4_K => self.q4k_matvec(weights, x, num_rows, hidden),
             QuantFormat::Q4_KF => self.q4kf_matvec(weights, x, num_rows, hidden),
+            QuantFormat::Q5_K => self.q5k_matvec(weights, x, num_rows, hidden),
             QuantFormat::Q6_K => self.q6k_matvec(weights, x, num_rows, hidden),
             QuantFormat::Q4_0 => {
                 let (q8_x, q8_scales) = crate::cpu::ops::q4_common::quantize_to_q8(x);
                 self.q4_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
             }
             QuantFormat::Q8_0 => {
-                // Q8_0 weights are NOT a Q4_0 kernel input — Q8_0 blocks are 34
-                // bytes per 32 values (32 i8 quants + f16 scale) while Q4_0 is
-                // 18 (16 nibble bytes + f16 scale). Pre-2026-05-09 this branch
-                // routed Q8_0 weights through `q4_matvec`, which read the wrong
-                // byte stride and produced garbage. Returning `None` makes the
-                // missing capability loud — callers fall back to a dequant
-                // path or fail explicitly. Production decode reaches Q8_0
-                // weights via dedicated kernels (`q8_qkv_proj` /
-                // `q8_matvec_pipeline`), not through this trait method.
-                let (q8_x, q8_scales) = crate::cpu::ops::q4_common::quantize_to_q8(x);
-                self.q8_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
+                // Phase F.4 / F.6: try the f32-input direct path first
+                // (CUDA q8_0_direct kernel reads packed Q8_0 bytes in
+                // place). If the backend doesn't override `q8_0_matvec`,
+                // fall back to the pre-quantised-activation route
+                // through `q8_matvec`. Both are correct end-to-end;
+                // the direct path is faster on CUDA and the
+                // pre-quantised path is what production CPU decode
+                // uses via the dedicated q8 kernels.
+                if let Some(out) = self.q8_0_matvec(weights, x, num_rows, hidden) {
+                    Some(out)
+                } else {
+                    let (q8_x, q8_scales) = crate::cpu::ops::q4_common::quantize_to_q8(x);
+                    self.q8_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
+                }
             }
             QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
+    }
+
+    /// Q8_0 weights × f32 input matvec.
+    ///
+    /// Distinct from `q4_matvec`, which takes pre-quantised Q8 *activations*
+    /// against Q4_0 weights — that path mis-routes Q8_0 weights through
+    /// the Q4_0 dequantiser. F.4 introduces this dedicated entry point so
+    /// the dispatch table can keep weight-format and activation-quant
+    /// flows separate.
+    ///
+    /// Default returns `None` (no Q8_0 support on the backend); the CUDA
+    /// backend overrides with host-dequant + cuBLAS GEMV.
+    fn q8_0_matvec(
+        &self,
+        _q8_0_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        None
     }
 
     /// Format-aware matvec on **pre-quantised** Q8 input.
@@ -108,7 +132,7 @@ pub trait QuantMatVec {
         match format {
             QuantFormat::Q4_0 => self.q4_matvec(weights, q8_x, q8_scales, num_rows, hidden),
             QuantFormat::Q8_0 => self.q8_matvec(weights, q8_x, q8_scales, num_rows, hidden),
-            QuantFormat::Q4_K | QuantFormat::Q4_KF | QuantFormat::Q6_K => {
+            QuantFormat::Q4_K | QuantFormat::Q4_KF | QuantFormat::Q5_K | QuantFormat::Q6_K => {
                 // f32-input shaders — dequantise Q8 first.
                 let x_f32 = dequantise_q8(q8_x, q8_scales);
                 self.quant_matvec(format, weights, &x_f32, num_rows, hidden)
@@ -270,6 +294,17 @@ pub trait QuantMatVec {
         _num_rows: usize,
         _hidden: usize,
         _seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Q5_K matvec: `scores[N] = Q5_K[N, K] @ f32_x[K]`.
+    fn q5k_matvec(
+        &self,
+        _q5k_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
     ) -> Option<Vec<f32>> {
         None
     }

@@ -164,19 +164,24 @@ pub fn qwen35_attention_block_step(
     let x_norm = super::deltanet_block::rms_norm_1d_pub(x, &weights.attn_norm, dims.eps);
 
     // 2. Projections.
+    use crate::attention::gpu_tier::{self, GpuClass};
     use crate::attention::quant_dispatch::matvec_with_backend;
+    // Phase E.7: route full-attn q/k/v/o through the AttnProj class
+    // so they can be independently pushed back to CPU via
+    // `LARQL_QWEN35_GPU_NO_ATTN_PROJ=1`.
+    let proj_backend = gpu_tier::backend_for(GpuClass::AttnProj, backend);
     let q_fused_1d = if let Some(q) = weights.attn_q_quant.as_ref() {
-        matvec_with_backend(q, &x_norm, backend)
+        matvec_with_backend(q, &x_norm, proj_backend)
     } else {
         weights.attn_q.dot(&x_norm)
     }; // [fused_q_dim]
     let k_1d = if let Some(q) = weights.attn_k_quant.as_ref() {
-        matvec_with_backend(q, &x_norm, backend)
+        matvec_with_backend(q, &x_norm, proj_backend)
     } else {
         weights.attn_k.dot(&x_norm)
     }; // [kv_dim]
     let v_1d = if let Some(q) = weights.attn_v_quant.as_ref() {
-        matvec_with_backend(q, &x_norm, backend)
+        matvec_with_backend(q, &x_norm, proj_backend)
     } else {
         weights.attn_v.dot(&x_norm)
     }; // [kv_dim]
@@ -258,7 +263,7 @@ pub fn qwen35_attention_block_step(
     // 9. Output projection: y = attn_output @ attn_out[0].
     let attn_out_1d = attn_out.row(0).to_owned();
     if let Some(q) = weights.attn_output_quant.as_ref() {
-        matvec_with_backend(q, &attn_out_1d, backend)
+        matvec_with_backend(q, &attn_out_1d, proj_backend)
     } else {
         weights.attn_output.dot(&attn_out_1d)
     }

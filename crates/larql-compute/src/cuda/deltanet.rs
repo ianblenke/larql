@@ -9,7 +9,7 @@
 use std::sync::OnceLock;
 
 use cudarc::driver::{CudaFunction, CudaModule, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use super::backend::CudaBackend;
 use super::driver::Driver;
@@ -131,17 +131,22 @@ extern "C" __global__ void l2_norm_dim_major_f32(
     int bdim = blockDim.x;
     extern __shared__ float smem[];
 
-    float ss = 0.0f;
-    for (int d = tid; d < head_dim; d += bdim) {
-        float v = x[(size_t)d * n_heads + h];
-        ss += v * v;
+    // Compute sum-of-squares with the same per-element addition order
+    // as the host's `l2_normalize_per_head_eps` (single sequential
+    // accumulator over d = 0..head_dim). Parallel tree reduction
+    // would give bit-different results from CPU and the drift
+    // compounds non-trivially through the per-position recurrence
+    // (E.6.A.6). One thread sums; the others wait at the barrier and
+    // then help with the elementwise normalize step.
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            float v = x[(size_t)d * n_heads + h];
+            ss += v * v;
+        }
+        smem[0] = ss;
     }
-    smem[tid] = ss;
     __syncthreads();
-    for (int s = bdim / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
-        __syncthreads();
-    }
     float inv = rsqrtf(smem[0] + eps);
     for (int d = tid; d < head_dim; d += bdim) {
         size_t off = (size_t)d * n_heads + h;
@@ -164,17 +169,18 @@ extern "C" __global__ void rms_norm_heads_head_major_f32(
     extern __shared__ float smem[];
     size_t off = (size_t)h * head_dim;
 
-    float ss = 0.0f;
-    for (int d = tid; d < head_dim; d += bdim) {
-        float v = x[off + d];
-        ss += v * v;
+    // Sequential per-element accumulator in thread 0 so the sum order
+    // matches `residual::rms_norm_heads` on the host. See the matching
+    // comment in `l2_norm_dim_major_f32` above for the why.
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            float v = x[off + d];
+            ss += v * v;
+        }
+        smem[0] = ss;
     }
-    smem[tid] = ss;
     __syncthreads();
-    for (int s = bdim / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
-        __syncthreads();
-    }
     float inv_rms = rsqrtf(smem[0] / (float)head_dim + eps);
     for (int d = tid; d < head_dim; d += bdim) {
         out[off + d] = x[off + d] * inv_rms * weight[d];
@@ -189,6 +195,24 @@ static DELTANET_MODULE: OnceLock<(
     CudaFunction,
     CudaFunction,
 )> = OnceLock::new();
+
+/// Public accessor for the (conv1d, deltanet, l2_norm, rms_norm)
+/// kernel function references compiled from `DELTANET_SRC`. Used by
+/// `qwen35_block::deltanet_postproj_step_cached` to chain the kernels
+/// onto its own stream without redundant module loads.
+pub(crate) fn module_functions(
+    drv: &Driver,
+) -> Result<
+    (
+        &'static CudaFunction,
+        &'static CudaFunction,
+        &'static CudaFunction,
+        &'static CudaFunction,
+    ),
+    CudaInitError,
+> {
+    functions(drv)
+}
 
 fn functions(
     drv: &Driver,
@@ -205,7 +229,18 @@ fn functions(
         return Ok((conv, recurrence, l2_norm, rms_norm));
     }
 
-    let ptx = compile_ptx(DELTANET_SRC)
+    // Disable fused multiply-add so the kernel's `acc += a * b`
+    // produces the same fp32 rounding as the host's separate
+    // multiply + add. With fmad enabled the accumulated drift
+    // across 9 prompt + 5 decode positions × 48 layers × hundreds
+    // of FMAs per layer breaks the multi-position parity check
+    // against llama.cpp even though every individual call matches
+    // CPU to ~1e-8 (E.6.A.6).
+    let opts = CompileOptions {
+        fmad: Some(false),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(DELTANET_SRC, opts)
         .map_err(|e| CudaInitError::DriverMissing(format!("nvrtc compile deltanet: {e:?}")))?;
     let module = drv
         .ctx

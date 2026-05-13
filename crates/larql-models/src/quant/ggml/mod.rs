@@ -26,24 +26,55 @@ use crate::detect::ModelError;
 
 pub mod legacy;
 pub mod q4_k;
+pub mod q4k_q8k;
 pub mod q5_k;
+pub mod q5k_q8k;
 pub mod q6_k;
 pub mod quantize;
 
-pub use legacy::{dequantize_q4_0, dequantize_q5_0, dequantize_q5_1};
+pub use legacy::{
+    dequantize_q4_0, dequantize_q5_0, dequantize_q5_1, dequantize_q8_0, q8_0_row_dot,
+};
 pub use q4_k::{dequantize_q4_k, q4k_row_dot, q4k_row_scaled_add};
+pub use q4k_q8k::{q4k_q8k_row_dot, quantize_to_q8_k, Q8_K_BLOCK_BYTES, Q8_K_BLOCK_ELEMS};
 pub use q5_k::dequantize_q5_k;
+pub use q5k_q8k::q5k_q8k_row_dot;
 pub use q6_k::{dequantize_q6_k, q6k_row_dot, q6k_row_scaled_add};
 pub use quantize::{quantize_q4_0, quantize_q8_0};
 
 // ── Tensor-type IDs (match GGML wire format) ────────────────────────────
+//
+// Values come straight from llama.cpp's `enum ggml_type` in `ggml.h`:
+//
+// ```
+// GGML_TYPE_F32     = 0,
+// GGML_TYPE_F16     = 1,
+// GGML_TYPE_Q4_0    = 2,
+// GGML_TYPE_Q4_1    = 3,
+// // (4, 5) — Q4_2 / Q4_3 deprecated
+// GGML_TYPE_Q5_0    = 6,
+// GGML_TYPE_Q5_1    = 7,
+// GGML_TYPE_Q8_0    = 8,
+// GGML_TYPE_Q8_1    = 9,
+// GGML_TYPE_Q2_K    = 10,
+// GGML_TYPE_Q3_K    = 11,
+// GGML_TYPE_Q4_K    = 12,
+// GGML_TYPE_Q5_K    = 13,
+// GGML_TYPE_Q6_K    = 14,
+// ```
+//
+// (Prior to 2026-05-13 this file had `Q8_0=6, Q5_0=8` — wrong vs the
+//  on-disk format. Hit during F.3 MoE bring-up when Qwen3.6-35B-A3B's
+//  attention/shared-expert tensors come through as the legacy Q8_0
+//  type and started decoding as Q5_0 garbage.)
 pub const TYPE_F32: u32 = 0;
 pub const TYPE_F16: u32 = 1;
 pub const TYPE_Q4_0: u32 = 2;
 pub const TYPE_Q4_1: u32 = 3;
-pub const TYPE_Q8_0: u32 = 6;
-pub const TYPE_Q5_0: u32 = 8;
-pub const TYPE_Q5_1: u32 = 9;
+pub const TYPE_Q5_0: u32 = 6;
+pub const TYPE_Q5_1: u32 = 7;
+pub const TYPE_Q8_0: u32 = 8;
+pub const TYPE_Q8_1: u32 = 9;
 pub const TYPE_Q2_K: u32 = 10;
 pub const TYPE_Q3_K: u32 = 11;
 pub const TYPE_Q4_K: u32 = 12;

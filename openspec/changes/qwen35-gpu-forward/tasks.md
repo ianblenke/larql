@@ -76,6 +76,28 @@ way. Already plumbed via Phase 2's lazy lookup.
 - [ ] E.6.4 Bench: expect ≥ 30 t/s decode (within 2× of llama.cpp
       GPU).
 
+## E.6.A — Foundations: fused post-projection chain (~700 LoC)
+
+- [x] E.6.A.1 Loader fix: `ssm_conv1d` uses `as_standard_layout()` so
+      `as_slice()` is `Some`, enabling the previously-dormant GPU
+      conv1d kernel.
+- [x] E.6.A.2 New PTX module `cuda::qwen35_block` with reshape +
+      silu mini-kernels.
+- [x] E.6.A.3 Trait method `qwen35_deltanet_postproj_step` (default
+      `None`); CudaBackend implementation chains all five existing
+      deltanet kernels on a single stream with one sync at exit.
+- [x] E.6.A.4 Unit tests at Qwen3.6 production shapes (head_v_dim=128,
+      n_v_heads=48, n_k_heads=16) for both reshape and recurrence.
+- [x] E.6.A.5 Inference-side fast-path in `deltanet_block_step` gated
+      by `LARQL_QWEN35_E6A_FUSED=1`; default OFF until multi-token
+      parity is sorted.
+- [ ] E.6.A.6 Diagnose multi-position parity drift. Single-call
+      parity is bit-near-exact (~7e-9 vs CPU at production shape);
+      across 9 prompt + 5 decode positions the residual stream
+      diverges enough to flip argmax. Suspected cause: fp32 reduction
+      order in L2 / rms_norm reductions compounded through the
+      recurrent state's per-position update cycle.
+
 ## Validation
 
 - [x] V.1 `cargo test -p larql-inference --release --lib

@@ -43,6 +43,21 @@ pub struct CudaBackend {
     // for the lifetime of the model — Arc::clone is the right
     // primitive.
     q4k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    q5k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    /// F.6: byte-cache for Q8_0 weights — uploads the packed bytes
+    /// once per tensor; the direct kernel reads scale + int8 in place
+    /// (no f32 expansion). Replaces the F.4 f32 cache for the direct
+    /// path; the f32 cache below stays for the cuBLAS fallback.
+    q8_0_byte_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    /// F.4: dequantised f32 cache for Q8_0 weights. Qwen3.6-35B-A3B's
+    /// attention/shared-expert projections are Q8_0; without this
+    /// cache each per-token matvec re-dequants 50+ MiB on the host
+    /// and re-uploads to the device — the F.4 first-light measurement
+    /// showed this drops decode from 1.20 → 0.24 t/s. Caching the
+    /// dequantised weight once per tensor recovers the cost. F.6
+    /// replaces the dispatch with the direct kernel (q8_0_byte_device_cache);
+    /// this stays as the fallback when the direct kernel rejects the shape.
+    q8_0_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     q6k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     q6k_packed_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     q4k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
@@ -111,7 +126,10 @@ impl CudaBackend {
             drv,
             kv_cache: Mutex::new(None),
             q4k_device_cache: Mutex::new(HashMap::new()),
+            q5k_device_cache: Mutex::new(HashMap::new()),
             q6k_f32_device_cache: Mutex::new(HashMap::new()),
+            q8_0_byte_device_cache: Mutex::new(HashMap::new()),
+            q8_0_f32_device_cache: Mutex::new(HashMap::new()),
             q6k_packed_device_cache: Mutex::new(HashMap::new()),
             q4k_f32_device_cache: Mutex::new(HashMap::new()),
             q4k_f16_device_cache: Mutex::new(HashMap::new()),
@@ -141,6 +159,66 @@ impl CudaBackend {
     ) -> Result<R, CudaInitError> {
         let arc = self.arc_q4k_device_buf(host)?;
         f(&arc)
+    }
+
+    /// Same content-keyed cache as [`with_q4k_device_buf`] but for
+    /// Q5_K weight bytes. The two formats have different bytes-per-
+    /// block (144 vs 176) so they live in separate caches; the
+    /// content hash overlap would still be safe (the lookup would
+    /// only ever return a buffer derived from the same host slice)
+    /// but a dedicated cache keeps the semantics obvious.
+    pub(crate) fn with_q5k_device_buf<R>(
+        &self,
+        host: &[u8],
+        f: impl FnOnce(&CudaSlice<u8>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self
+                .q5k_device_cache
+                .lock()
+                .map_err(|_| CudaInitError::DriverMissing("q5k device cache poisoned".into()))?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let arc = Arc::new(self.drv.device_u8_buf_from(host)?);
+        let mut cache = self
+            .q5k_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("q5k device cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc_clone = Arc::clone(entry);
+        drop(cache);
+        f(&arc_clone)
+    }
+
+    /// Same content-keyed byte cache as `with_q5k_device_buf` but for
+    /// Q8_0 weight bytes (34-byte blocks). Used by the F.6 direct
+    /// matvec kernel so each Q8_0 tensor uploads once instead of
+    /// re-dequanting to f32 per call.
+    pub(crate) fn with_q8_0_device_buf<R>(
+        &self,
+        host: &[u8],
+        f: impl FnOnce(&CudaSlice<u8>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self.q8_0_byte_device_cache.lock().map_err(|_| {
+                CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into())
+            })?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let arc = Arc::new(self.drv.device_u8_buf_from(host)?);
+        let mut cache = self.q8_0_byte_device_cache.lock().map_err(|_| {
+            CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into())
+        })?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc_clone = Arc::clone(entry);
+        drop(cache);
+        f(&arc_clone)
     }
 
     /// `cuda-decode-cuda-graph`: Arc-cloned device buffer for the
@@ -387,6 +465,37 @@ impl CudaBackend {
             .q6k_f32_device_cache
             .lock()
             .map_err(|_| CudaInitError::DriverMissing("q6k device cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc = Arc::clone(entry);
+        drop(cache);
+        f(&arc)
+    }
+
+    /// Mirror of `with_q6k_f32_device_buf` for Q8_0 weights. See the
+    /// note on `q8_0_f32_device_cache` for why the cache exists.
+    pub(crate) fn with_q8_0_f32_device_buf<R>(
+        &self,
+        host: &[u8],
+        n_elements: usize,
+        f: impl FnOnce(&CudaSlice<f32>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self
+                .q8_0_f32_device_cache
+                .lock()
+                .map_err(|_| CudaInitError::DriverMissing("q8_0 device cache poisoned".into()))?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let w = dequant::dequant_q8_0(host, n_elements)
+            .map_err(|e| CudaInitError::DriverMissing(format!("q8_0 dequant: {e:?}")))?;
+        let arc = Arc::new(self.drv.device_buf_from(&w)?);
+        let mut cache = self
+            .q8_0_f32_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("q8_0 device cache poisoned".into()))?;
         let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
         let arc = Arc::clone(entry);
         drop(cache);
@@ -842,6 +951,145 @@ impl ComputeBackend for CudaBackend {
         eps: f32,
     ) -> Option<Vec<f32>> {
         super::deltanet::rms_norm_heads(self, x, weight, num_heads, head_dim, eps).ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_recurrence_block(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        log_g: &[f32],
+        beta: &[f32],
+        ssm_norm_weight: &[f32],
+        recurrent_state: &mut [f32],
+        head_v_dim: usize,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        eps: f32,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::qwen35_block::deltanet_recurrence_block_cached(
+            self,
+            q,
+            k,
+            v,
+            log_g,
+            beta,
+            ssm_norm_weight,
+            recurrent_state,
+            head_v_dim,
+            n_v_heads,
+            n_k_heads,
+            eps,
+            sequence_pos,
+        )
+        .ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_ffn_lazy_block(
+        &self,
+        x: &[f32],
+        gate_data: &[u8],
+        gate_format: crate::QuantFormat,
+        gate_rows: usize,
+        up_data: &[u8],
+        up_format: crate::QuantFormat,
+        up_rows: usize,
+        down_data: &[u8],
+        down_format: crate::QuantFormat,
+        down_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::QuantFormat;
+        // Only handle gate/up sharing input dim = hidden and producing
+        // rows=ffn_dim, then down going ffn_dim → hidden. Mismatched
+        // dims fall back to caller.
+        if x.len() != hidden || gate_rows != up_rows {
+            return None;
+        }
+        let ffn_dim = gate_rows;
+        let drv = self.driver();
+
+        // Dispatch per-format matvec to its device-resident variant.
+        // Returns CudaSlice<f32> for downstream chaining.
+        let matvec_dev = |data: &[u8],
+                          format: QuantFormat,
+                          rows: usize,
+                          cols: usize,
+                          x_dev: &cudarc::driver::CudaSlice<f32>|
+         -> Option<cudarc::driver::CudaSlice<f32>> {
+            match format {
+                QuantFormat::Q4_K => {
+                    super::q4k_direct::matvec_device(self, data, x_dev, rows, cols).ok()
+                }
+                QuantFormat::Q5_K => {
+                    super::q5k_direct::matvec_device(self, data, x_dev, rows, cols).ok()
+                }
+                _ => None,
+            }
+        };
+
+        let x_dev = drv.device_buf_from(x).ok()?;
+        let gate_dev = matvec_dev(gate_data, gate_format, ffn_dim, hidden, &x_dev)?;
+        let up_dev = matvec_dev(up_data, up_format, ffn_dim, hidden, &x_dev)?;
+        // silu(gate) * up element-wise on device.
+        let inter_dev =
+            super::elem::silu_gate_up_device(self, &gate_dev, &up_dev, ffn_dim, false).ok()?;
+        let down_dev = matvec_dev(down_data, down_format, down_rows, ffn_dim, &inter_dev)?;
+        drv.sync().ok()?;
+        drv.to_host(&down_dev).ok()
+    }
+
+    fn qwen35_paired_q4k_matvec(
+        &self,
+        a_data: &[u8],
+        a_rows: usize,
+        b_data: &[u8],
+        b_rows: usize,
+        x: &[f32],
+        hidden: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        super::q4k_direct::matvec_pair(self, a_data, a_rows, b_data, b_rows, x, hidden).ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_postproj_step(
+        &self,
+        qkv_mixed: &[f32],
+        ssm_conv1d_weight: &[f32],
+        log_g: &[f32],
+        beta: &[f32],
+        z: &[f32],
+        ssm_norm_weight: &[f32],
+        conv_state: &mut [f32],
+        recurrent_state: &mut [f32],
+        head_v_dim: usize,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        d_conv: usize,
+        eps: f32,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::qwen35_block::deltanet_postproj_step_cached(
+            self,
+            qkv_mixed,
+            ssm_conv1d_weight,
+            log_g,
+            beta,
+            z,
+            ssm_norm_weight,
+            conv_state,
+            recurrent_state,
+            head_v_dim,
+            n_v_heads,
+            n_k_heads,
+            d_conv,
+            eps,
+            sequence_pos,
+        )
+        .ok()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

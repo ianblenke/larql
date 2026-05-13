@@ -28,8 +28,11 @@ mod oxide_kernels;
 pub mod q4k_batched;
 mod q4k_direct;
 mod q4k_mmvq;
+mod q5k_direct;
 mod q6k_mmvq;
+mod q8_0_direct;
 mod quant_matvec;
+mod qwen35_block;
 pub mod sampling;
 mod scratch;
 

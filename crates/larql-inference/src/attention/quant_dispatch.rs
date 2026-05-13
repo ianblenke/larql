@@ -13,7 +13,7 @@
 
 use larql_compute::ComputeBackend;
 use larql_compute::QuantFormat;
-use larql_models::quant::ggml::{TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K};
+use larql_models::quant::ggml::{TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
 use larql_models::quant::lazy::QuantTensor;
 use ndarray::Array1;
 
@@ -23,9 +23,10 @@ use ndarray::Array1;
 pub fn ggml_type_to_quant_format(t: u32) -> Option<QuantFormat> {
     match t {
         TYPE_Q4_K => Some(QuantFormat::Q4_K),
+        TYPE_Q5_K => Some(QuantFormat::Q5_K),
         TYPE_Q6_K => Some(QuantFormat::Q6_K),
+        TYPE_Q8_0 => Some(QuantFormat::Q8_0),
         TYPE_F32 => Some(QuantFormat::F32),
-        TYPE_Q5_K => None,
         _ => None,
     }
 }
@@ -56,6 +57,26 @@ pub fn matvec_with_backend(
     }
 
     // CPU fallback (rayon + AVX2/NEON inside `QuantTensor::matvec`).
+    // Diagnostic env var prints the first 20 fallback dispatches so we
+    // can see at a glance which tensors aren't taking the GPU path:
+    //   LARQL_QWEN35_DISPATCH_TRACE=1
+    // type=13 is GGML's Q5_K — the format that, on Qwen3.6-27B-Q4_K_S,
+    // covers `attn_qkv` (DeltaNet), `ssm_out`, `ffn_down`, and the
+    // full-attn `attn_k`/`attn_v`. Those four are the dominant
+    // per-token cost (E.6.A.9 fine-profile finding).
+    if std::env::var("LARQL_QWEN35_DISPATCH_TRACE").is_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "[dispatch] CPU fallback: type={} rows={} cols={}",
+                qt.tensor_type(),
+                rows,
+                cols
+            );
+        }
+    }
     qt.matvec(x).expect("QuantTensor::matvec CPU fallback")
 }
 
