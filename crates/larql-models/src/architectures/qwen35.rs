@@ -99,7 +99,17 @@ impl ModelArchitecture for Qwen35Arch {
         if !self.is_linear_attention_layer(layer) {
             return None;
         }
-        Some(format!("{}attn_qkv.weight", self.layer_prefix(layer)))
+        // The GGUF→HF normalizer rewrites `attn_qkv.` → `self_attn.qkv_proj.`
+        // (originally for GPT-2's fused-QKV split path). Qwen 3.6's
+        // DeltaNet block uses the same tensor name in the GGUF, so the
+        // post-normalise key is `layers.{L}.self_attn.qkv_proj.weight`.
+        // Pre-merge this returned the GGUF-original `attn_qkv.weight`;
+        // updating after upstream backfill of the rewrite table to keep
+        // the bridge lookup matching what the lazy loader stores.
+        Some(format!(
+            "{}self_attn.qkv_proj.weight",
+            self.layer_prefix(layer)
+        ))
     }
 
     fn attn_gate_key(&self, layer: usize) -> Option<String> {
@@ -438,7 +448,7 @@ mod tests {
         assert!(arch.is_linear_attention_layer(0));
         assert_eq!(
             arch.attn_qkv_key(0),
-            Some("layers.0.attn_qkv.weight".into())
+            Some("layers.0.self_attn.qkv_proj.weight".into())
         );
         assert_eq!(
             arch.attn_gate_key(0),

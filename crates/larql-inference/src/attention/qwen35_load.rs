@@ -610,7 +610,7 @@ mod tests {
 
             if arch.is_linear_attention_layer(layer) {
                 tensors.insert(
-                    format!("{prefix}attn_qkv.weight"),
+                    format!("{prefix}self_attn.qkv_proj.weight"),
                     make_2d(conv_dim, hidden, 0.1),
                 );
                 tensors.insert(
