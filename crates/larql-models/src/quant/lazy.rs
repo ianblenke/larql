@@ -15,7 +15,7 @@ use ndarray::Array1;
 
 use crate::quant::ggml::{
     dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_q8k_row_dot, q6k_row_dot,
-    q8_0_row_dot,
+    q8_0_q8k_row_dot, q8_0_row_dot,
     quantize_to_q8_k, tensor_data_size, type_name, Q8_K_BLOCK_BYTES, TYPE_F32, TYPE_Q4_K,
     TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
 };
@@ -362,18 +362,33 @@ impl QuantTensor {
             TYPE_Q8_0 => {
                 // Legacy Q8_0 — 32-element blocks of int8 + f16 scale.
                 // Mixed-quant GGUFs like Qwen3.6-35B-A3B-UD-Q4_K_M use
-                // Q8_0 for attn projections + shared-expert FFN. E.8
-                // contained step: drop the allocation-per-row dequant
-                // for the in-place `q8_0_row_dot` (AVX2 on x86_64,
-                // scalar elsewhere). Without this, the old path
-                // allocated a `Vec<f32>` for every per-token row.
+                // Q8_0 for attn projections + shared-expert FFN.
+                //
+                // E.8 step 2f: AVX2 Q8_0 × Q8_K fast path. When
+                // `x.len() % 256 == 0` (a multiple of one Q8_K
+                // super-block), pre-quantise `x` once and dispatch
+                // the int8 × int8 → int32 dot via `q8_0_q8k_row_dot`.
+                // Otherwise fall back to the f32-input `q8_0_row_dot`
+                // (AVX2 on x86_64, scalar elsewhere). Force the f32
+                // path for A/B with `LARQL_Q8_0_USE_F32_DOT=1`.
                 use rayon::prelude::*;
                 let rb = self.row_bytes;
                 let data = view_bytes;
-                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                    let row = &data[r * rb..(r + 1) * rb];
-                    *out_r = q8_0_row_dot(row, x_slice).expect("q8_0_row_dot");
-                });
+                let use_q8k = x_slice.len().is_multiple_of(256)
+                    && std::env::var("LARQL_Q8_0_USE_F32_DOT").ok().as_deref() != Some("1");
+                if use_q8k {
+                    with_q8k_for(x_slice, |q8k_bytes| {
+                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                            let row = &data[r * rb..(r + 1) * rb];
+                            *out_r = q8_0_q8k_row_dot(row, q8k_bytes).expect("q8_0_q8k_row_dot");
+                        });
+                    });
+                } else {
+                    out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q8_0_row_dot(row, x_slice).expect("q8_0_row_dot");
+                    });
+                }
             }
             TYPE_F32 => {
                 for r in 0..self.rows {
