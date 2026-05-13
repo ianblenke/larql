@@ -172,6 +172,36 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.E diagnostic: Q6_K mmvq vs cuBLAS sgemv — both ~87 ms/call
+
+Investigated whether switching the LM_HEAD Q6_K matvec from the
+default "dequant + cuBLAS sgemv" path to the packed-format
+`q6k_mmvq` direct kernel would reduce its 87 ms / token cost
+(now 50 % of decode wall-clock at 5 t/s).
+
+Result: **no change.** Both paths land at 85–117 ms per call for
+the Qwen3.6-27B lm_head shape `[vocab=248320, hidden=5120]`.
+Bench decode held at 5.0–5.2 t/s (within noise) either way. Same
+expected memory traffic, same observed runtime → the bottleneck is
+either kernel-launch / cuBLAS setup overhead at this matrix shape
+or VRAM pressure from the cached dequantized f32 weight (5.1 GB
+inside the existing 21 GB resident set). Reverted to the cuBLAS
+path (simpler, no Q8_1 quantisation per call), gated future
+investigation by `LARQL_CUDA_Q6K_HOST_DEQUANT=1` /
+`LARQL_CUDA_Q6K_F32_GEMV=1` toggles.
+
+Next levers for LM_HEAD specifically:
+
+- Top-K-on-device (`f32_gemv_topk1`-style) — for greedy decode we
+  don't need the full 248320-vocab logits dtoh, only top-1.
+- Direct Q6_K matvec without the dequant cache — would save
+  ~5 GB VRAM and might unlock a more cache-friendly kernel.
+- cuBLAS sgemv vs sgemm-with-n=1 micro-bench at this exact shape
+  to see whether cudarc's dispatch is picking the optimal path.
+
+These are follow-up scope; the headline 0.35 → 5.19 t/s win from
+E.6.D stands.
+
 ## 2026-05-12 update — Phase E.6.D: Q5_K direct CUDA matvec — 0.35 → 5.19 t/s decode (≈15×)
 
 What landed:
