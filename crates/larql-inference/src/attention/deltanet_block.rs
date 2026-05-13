@@ -470,7 +470,70 @@ pub fn deltanet_block_step(
         (q, k, v)
     });
 
-    // 5. L2-norm Q and K per head. V passes through.
+    // 5+6+7. Fused L2 norm Q/K + delta-rule recurrence + rms_norm_heads
+    // on the GPU when the backend exposes it. Saves ~3 stream syncs
+    // per linear DeltaNet layer (vs the four-call per-step path
+    // below). silu(qkv_conv) above and silu(z)*o below stay on host,
+    // which keeps the recurrence input bit-exact to llama.cpp's CPU
+    // libm-expf (the E.6.A.6 multi-position drift culprit).
+    //
+    // Returns `o_normed_flat[value_dim]` in head-major layout,
+    // bypassing the per-step `o.t().to_owned()` + `rms_norm_heads`
+    // pair below. If the backend hook is None / unavailable, falls
+    // through to the legacy per-step path.
+    let fused_o_normed = if std::env::var("LARQL_QWEN35_DN_FUSED_DISABLE").is_err() {
+        time_section!(
+            DN_RECURRENCE,
+            backend.and_then(|b| {
+                let q_slice = q.as_slice()?;
+                let k_slice = k.as_slice()?;
+                let v_slice = v.as_slice()?;
+                let log_g_slice = log_g.as_slice()?;
+                let beta_slice = beta.as_slice()?;
+                let rec_state_slice = state.recurrent_state.as_slice_mut()?;
+                b.qwen35_deltanet_recurrence_block(
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                    log_g_slice,
+                    beta_slice,
+                    &weights.ssm_norm,
+                    rec_state_slice,
+                    dims.head_v_dim,
+                    dims.n_v_heads,
+                    dims.n_k_heads,
+                    crate::residual::DEFAULT_EPS as f32,
+                    sequence_pos,
+                )
+            })
+        )
+    } else {
+        None
+    };
+
+    if let Some(o_normed) = fused_o_normed {
+        let mut o_flat = Array1::from(o_normed);
+        // silu(z) * o_normed on host (stays CPU to match the per-step
+        // path's parity behaviour). The fused chain returns the
+        // already-rms_norm-ed output; we just need the gate
+        // multiply + the ssm_out matvec.
+        time_section!(DN_SILU_Z, {
+            for c in 0..value_dim {
+                o_flat[c] *= silu(z[c]);
+            }
+        });
+        let block_out = time_section!(
+            DN_SSM_OUT,
+            if let Some(q) = weights.ssm_out_quant.as_ref() {
+                matvec_with_backend(q, &o_flat, backend)
+            } else {
+                weights.ssm_out.dot(&o_flat)
+            }
+        );
+        return block_out;
+    }
+
+    // Legacy per-step path: backend hook unavailable or disabled.
     let (q, k) = time_section!(DN_L2_NORM, {
         let q = backend
             .and_then(|b| {

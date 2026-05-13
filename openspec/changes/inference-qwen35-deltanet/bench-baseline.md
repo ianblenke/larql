@@ -172,6 +172,47 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.B.2: partial DeltaNet fusion (L2 + recurrence + rms_norm)
+
+Bundles the four GPU calls inside the DeltaNet block's tail (L2-Q,
+L2-K, delta-rule recurrence, rms_norm_heads) into a single
+`ComputeBackend::qwen35_deltanet_recurrence_block` call. The four
+kernels now run on the same stream with one sync at exit; the
+intermediate `q_normed`, `k_normed`, `o_dim`, `o_flat`, `o_normed`
+buffers stay device-resident through the chain.
+
+Crucially, `silu(qkv_conv)` and `silu(z) * o` remain on the host
+side — that's the parity-critical boundary identified in E.6.A.6
+(GPU `expf` vs glibc `expf` differs by ~1-2 ulp; running silu on
+GPU feeds that drift into the recurrence's rank-1 state update and
+compounds across positions). With those two CPU loops preserved,
+the per-step parity invariant is maintained.
+
+Parity preserved (token-diff vs llama.cpp emits GT rank 0 every
+step). Bench held at 3.99 t/s prefill, 5.19 t/s decode — within
+noise of the prior E.6.B.1 numbers (4.24 / 5.34).
+
+Per-token fine profile attribution (steady-state):
+
+```
+                       E.6.B.1     E.6.B.2
+DN_L2_NORM             1.9 ms      0.0 ms (folded into DN_RECURRENCE)
+DN_RECURRENCE          7.8 ms      8.5 ms (now the fused 4-kernel block)
+DN_RMS_NORM_HEADS      1.1 ms      0.0 ms (folded)
+DN_O_RESHAPE           0.8 ms      0.0 ms (folded, dim→head reshape on device)
+combined               11.6 ms     8.5 ms (3.1 ms saved per token)
+```
+
+3 ms / token = ~2 % decode. Less than the 14 ms predicted from
+removing 3 syncs × 48 layers × ~100 µs each — turns out the cudarc
+0.19 per-call sync overhead on this device is closer to 10-20 µs
+than 100 µs. The infrastructure value is the bigger payoff: with
+the DeltaNet recurrence chunk now sync-free internally, future
+work can capture it as part of a CUDA Graph (E.6.C).
+
+Opt-out: `LARQL_QWEN35_DN_FUSED_DISABLE=1` reverts to the per-step
+path.
+
 ## 2026-05-12 update — Phase E.6.B.1: device-resident FFN block (gate+up+silu+down)
 
 First slice of the E.6.B device-resident projection chain: a new

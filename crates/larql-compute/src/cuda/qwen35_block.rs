@@ -389,6 +389,147 @@ fn launch_silu_mul_inplace(
     Ok(())
 }
 
+/// Partial DeltaNet fusion (Phase E.6.B.2): chains L2 normalise Q +
+/// L2 normalise K + delta-rule recurrence + RMSNorm-heads on the
+/// device with a single sync at exit. Inputs come from host (q/k/v/
+/// log_g/beta already host-computed by the unchanged conv1d → silu →
+/// split/reshape pipeline), output is the head-major-flat
+/// `o_normed[n_v_heads * head_v_dim]` ready for the caller to apply
+/// `silu(z) *` on host and the `ssm_out` matvec separately.
+///
+/// Distinct from `deltanet_postproj_step_cached` in two ways:
+///   1. **Excludes** the silu/conv1d/silu_z steps so the GPU-side
+///      `silu` expf drift (the E.6.A.6 multi-position parity culprit)
+///      doesn't enter the recurrence input. Per-step parity test was
+///      validated to hold under this exact host-cpu-silu split.
+///   2. **Excludes** the matvec projections (attn_qkv, attn_gate,
+///      ssm_out, ssm_beta, ssm_alpha) — those stay on their existing
+///      per-call paths.
+///
+/// Saves ~3 stream syncs per linear DeltaNet layer (L2-Q + L2-K +
+/// recurrence + rms_norm_heads currently sync individually → now one
+/// combined sync). At ~100 µs / sync × 48 layers that's ~14 ms /
+/// token.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deltanet_recurrence_block_cached(
+    backend: &CudaBackend,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    log_g: &[f32],
+    beta: &[f32],
+    ssm_norm_weight: &[f32],
+    recurrent_state: &mut [f32],
+    head_v_dim: usize,
+    n_v_heads: usize,
+    n_k_heads: usize,
+    eps: f32,
+    sequence_pos: usize,
+) -> Result<Vec<f32>, CudaInitError> {
+    let key_dim = head_v_dim * n_k_heads;
+    let value_dim = head_v_dim * n_v_heads;
+    if head_v_dim == 0
+        || n_v_heads == 0
+        || n_k_heads == 0
+        || q.len() != key_dim
+        || k.len() != key_dim
+        || v.len() != value_dim
+        || log_g.len() != n_v_heads
+        || beta.len() != n_v_heads
+        || ssm_norm_weight.len() != head_v_dim
+        || recurrent_state.len() != head_v_dim * head_v_dim * n_v_heads
+    {
+        return Err(CudaInitError::DriverMissing(format!(
+            "invalid recurrence_block shape: q={} k={} v={} log_g={} beta={} norm_w={} rec_state={} hd={head_v_dim} h_v={n_v_heads} h_k={n_k_heads}",
+            q.len(),
+            k.len(),
+            v.len(),
+            log_g.len(),
+            beta.len(),
+            ssm_norm_weight.len(),
+            recurrent_state.len()
+        )));
+    }
+
+    let drv = backend.driver();
+    let (_silu_f, _head_to_dim_f, dim_to_head_f, _silu_mul_f) = functions(drv)?;
+    let (_conv1d_f, deltanet_f, l2_f, rms_norm_f) = super::deltanet::module_functions(drv)?;
+
+    let q_dev = drv.device_buf_from(q)?;
+    let k_dev = drv.device_buf_from(k)?;
+    let v_dev = drv.device_buf_from(v)?;
+    let log_g_dev = drv.device_buf_from(log_g)?;
+    let beta_dev = drv.device_buf_from(beta)?;
+
+    let mut q_norm_dev = drv.device_alloc_uninit(key_dim)?;
+    let mut k_norm_dev = drv.device_alloc_uninit(key_dim)?;
+    let mut o_dim_dev = drv.device_alloc_uninit(value_dim)?;
+    let mut o_flat_dev = drv.device_alloc_uninit(value_dim)?;
+    let mut o_normed_dev = drv.device_alloc_uninit(value_dim)?;
+
+    launch_l2_normalize_device(
+        drv,
+        l2_f,
+        &q_dev,
+        &mut q_norm_dev,
+        head_v_dim,
+        n_k_heads,
+        1e-6,
+    )?;
+    launch_l2_normalize_device(
+        drv,
+        l2_f,
+        &k_dev,
+        &mut k_norm_dev,
+        head_v_dim,
+        n_k_heads,
+        1e-6,
+    )?;
+
+    backend.with_qwen35_state_device_buf(recurrent_state, sequence_pos, |state_dev| {
+        launch_deltanet_step_device(
+            drv,
+            deltanet_f,
+            &q_norm_dev,
+            &k_norm_dev,
+            &v_dev,
+            &log_g_dev,
+            &beta_dev,
+            state_dev,
+            &mut o_dim_dev,
+            head_v_dim,
+            n_k_heads,
+            n_v_heads,
+        )
+    })?;
+
+    launch_reshape(
+        drv,
+        dim_to_head_f,
+        &o_dim_dev,
+        &mut o_flat_dev,
+        head_v_dim,
+        n_v_heads,
+        0,
+    )?;
+
+    backend.with_norm_device_buf(ssm_norm_weight, |w_dev| {
+        launch_rms_norm_heads_device(
+            drv,
+            rms_norm_f,
+            &o_flat_dev,
+            w_dev,
+            &mut o_normed_dev,
+            n_v_heads,
+            head_v_dim,
+            eps,
+        )
+    })?;
+
+    drv.sync()?;
+    drv.to_host(&o_normed_dev)
+}
+
 /// Fused device-resident DeltaNet post-projection chain (Phase E.6.A).
 ///
 /// Inputs are host slices (the calling code already has them on host).

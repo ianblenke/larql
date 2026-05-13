@@ -21191,55 +21191,55 @@
     {
       "fqn": "larql_compute::cuda::backend::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1078,
+      "line": 1112,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::driver_missing_returns_typed_error",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 998,
+      "line": 1032,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1063,
+      "line": 1097,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_decode_after_cuda_decode_backend",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1055,
+      "line": 1089,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_f32_gemv_after_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1015,
+      "line": 1049,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_fa2_after_fused_attention",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1040,
+      "line": 1074,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_q4_matvec_after_q4_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1029,
+      "line": 1063,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1078,
+      "line": 1112,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 1063,
+      "line": 1097,
       "crate": "larql_compute"
     },
     {
@@ -21383,61 +21383,61 @@
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 968,
+      "line": 1109,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 875,
+      "line": 1016,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::l2_and_rms_norm_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 790,
+      "line": 931,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 671,
+      "line": 812,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::silu_inplace_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 618,
+      "line": 759,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_postproj_matches_unfused_gpu_chain",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 968,
+      "line": 1109,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::deltanet_step_matches_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 875,
+      "line": 1016,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::l2_and_rms_norm_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 790,
+      "line": 931,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::reshape_kernels_match_cpu_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 671,
+      "line": 812,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::qwen35_block::tests::silu_inplace_drift_at_qwen35_shape",
       "file": "crates/larql-compute/src/cuda/qwen35_block.rs",
-      "line": 618,
+      "line": 759,
       "crate": "larql_compute"
     },
     {
@@ -21977,73 +21977,73 @@
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 867,
+      "line": 930,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 782,
+      "line": 845,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 903,
+      "line": 966,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 831,
+      "line": 894,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 893,
+      "line": 956,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 883,
+      "line": 946,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_dims_helpers",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 867,
+      "line": 930,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_output_has_hidden_shape",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 782,
+      "line": 845,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_two_calls_state_carries_forward",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 903,
+      "line": 966,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::deltanet_block_step_zero_input_zero_output",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 831,
+      "line": 894,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_applies_weight",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 893,
+      "line": 956,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::deltanet_block::tests::rms_norm_1d_unit_weight_normalises",
       "file": "crates/larql-inference/src/attention/deltanet_block.rs",
-      "line": 883,
+      "line": 946,
       "crate": "larql_inference"
     },
     {

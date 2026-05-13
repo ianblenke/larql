@@ -879,6 +879,40 @@ impl ComputeBackend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_recurrence_block(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        log_g: &[f32],
+        beta: &[f32],
+        ssm_norm_weight: &[f32],
+        recurrent_state: &mut [f32],
+        head_v_dim: usize,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        eps: f32,
+        sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        super::qwen35_block::deltanet_recurrence_block_cached(
+            self,
+            q,
+            k,
+            v,
+            log_g,
+            beta,
+            ssm_norm_weight,
+            recurrent_state,
+            head_v_dim,
+            n_v_heads,
+            n_k_heads,
+            eps,
+            sequence_pos,
+        )
+        .ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn qwen35_ffn_lazy_block(
         &self,
         x: &[f32],

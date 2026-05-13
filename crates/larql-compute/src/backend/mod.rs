@@ -127,6 +127,44 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Fused Qwen3.6 DeltaNet recurrence block: L2 normalise Q and K,
+    /// run the delta-rule recurrence with the cached device-resident
+    /// state, then RMSNorm the head-major output. Four GPU kernels
+    /// chained on the same stream with a single sync at exit, saving
+    /// ~3 per-call sync round-trips per linear DeltaNet layer × 48
+    /// layers ≈ 10-15 ms / token at the current decode rate.
+    ///
+    /// Inputs `q` / `k` (`[head_v_dim * n_k_heads]` dim-major flat),
+    /// `v` (`[head_v_dim * n_v_heads]` dim-major flat), `log_g` /
+    /// `beta` (`[n_v_heads]`) are produced by the unchanged host code
+    /// (conv1d → silu → split/reshape on host), so the
+    /// `silu(qkv_conv)` step that drove the E.6.A multi-position
+    /// drift remains CPU. `ssm_norm_weight` is the per-head RMSNorm
+    /// weight `[head_v_dim]`. `recurrent_state` is the per-layer
+    /// host slice that the backend caches device-side, keyed by
+    /// pointer; the kernel mutates the device buffer in place and
+    /// leaves the host slice stale until a `sequence_pos == 0` reset.
+    /// Returns the `[n_v_heads * head_v_dim]` head-major output ready
+    /// for the caller to apply `silu(z) *` and the `ssm_out` matvec.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_deltanet_recurrence_block(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _log_g: &[f32],
+        _beta: &[f32],
+        _ssm_norm_weight: &[f32],
+        _recurrent_state: &mut [f32],
+        _head_v_dim: usize,
+        _n_v_heads: usize,
+        _n_k_heads: usize,
+        _eps: f32,
+        _sequence_pos: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Fused Qwen3.6 SwiGLU FFN block on the GPU. Chains all three
     /// projection matvecs (`gate`, `up`, `down`) on the same stream
     /// with `silu(gate) * up` computed device-resident between them,
