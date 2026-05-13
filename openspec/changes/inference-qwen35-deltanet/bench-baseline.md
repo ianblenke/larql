@@ -172,6 +172,70 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.I: load_gguf_lazy_tensors lm_head dispatch fix (decode 5.19 → 10.61 t/s)
+
+**Hidden bug found while microbenching E.6.F.** Standalone
+`cublasSgemv` at the lm_head shape (vocab=248320, hidden=5120,
+device-resident inputs, no dtoh) ran at **5.3 ms / call** — exactly
+memory-bandwidth-limited at HBM. But our LM_HEAD section was
+measuring 85-89 ms / call. A 16× gap.
+
+Bisecting via `LARQL_CUDA_GEMV_TRACE=1` revealed that `matvec_with_backend`
+was **never called** with rows=248320. The LM_HEAD was running through
+the dense fallback `weights.lm_head.dot(&x_final)` on CPU the entire
+time. Every E.6.F "GPU path investigation" was a microbench of three
+GPU code paths that the model never actually exercised.
+
+**Root cause** in `larql_models::loading::gguf::load_gguf_lazy_tensors`:
+the generic lazy-tensor loader put `lm_head.weight` / `output.weight`
+into the generic `weights.quant_tensors` HashMap, but the Qwen3.6
+bridge only reads `weights.lm_head_quant` (which only the dedicated
+`load_gguf_lazy_lm_head` populates). With both `LARQL_QWEN35_LAZY_FFN=1`
+and `LARQL_QWEN35_LAZY_LM_HEAD=1` set, the bench used
+`load_gguf_lazy_tensors`, so `lm_head_quant` stayed `None` and the
+forward fell back to the dense f32 `ndarray.dot` — a 1.27 GFLOP CPU
+call that takes ~85 ms.
+
+Fix: `load_gguf_lazy_tensors` now special-cases `lm_head.weight` /
+`output.weight` (same pattern already in place for the embed
+tensor), populating `weights.lm_head_quant` and emptying
+`weights.lm_head`. Bridge dispatch unchanged — it already routed
+through `matvec_with_backend` when `lm_head_quant` was `Some`.
+
+Bench (RTX 4090, prefill 16 / decode 8):
+
+| Config | Prefill (t/s) | Decode (t/s) | VmRSS |
+|---|---:|---:|---:|
+| Phase E.6.B.2 (lm_head still on CPU, hidden) | 3.99 | 5.19 | 21.16 GiB |
+| **Phase E.6.I (lm_head actually on GPU)** | **2.73** | **10.61** | **16.2 GiB** |
+| llama.cpp CUDA GPU | 2097 | 50.6 | 14.76 GiB |
+
+Decode **doubled** (5.19 → 10.61 t/s). VmRSS dropped 5 GiB because
+the dense f32 lm_head (5.1 GiB) is no longer held in host RAM.
+Prefill regressed because the FIRST forward call now pays a 4 s
+Q6_K → f32 GPU dequant + cache warmup; that amortises out over
+longer prompts (and won't appear at all on the decode path which
+runs after the warmup).
+
+Steady-state fine profile (79 ms / token):
+
+```
+FFN_GATE_UP_PAIR  41.8 ms (53 %)   fused FFN block
+DN_RECURRENCE      8.0 ms (10 %)   fused L2 + recurrence + rms_norm
+ATTN_BLOCK         6.6 ms ( 8 %)
+LM_HEAD            5.5 ms ( 7 %)   ← was 89 ms!
+DN_SSM_OUT         5.0 ms ( 6 %)
+…                                  rest <3 ms each
+```
+
+The new top cost is FFN_GATE_UP_PAIR at 53 % (42 ms / token across
+64 FFN layers = 0.65 ms each). Already device-resident; the only
+further win is a custom Q4_K matvec kernel or cuBLAS Hgemm with
+Tensor Cores. **larql is now within ~5× of llama.cpp CUDA on
+Qwen3.6-27B decode** (10.6 vs 50.6 t/s).
+
+Session arc: 0.35 → 10.61 t/s = **≈30× over the original baseline.**
+
 ## 2026-05-12 update — Phase E.6.B.2: partial DeltaNet fusion (L2 + recurrence + rms_norm)
 
 Bundles the four GPU calls inside the DeltaNet block's tail (L2-Q,

@@ -138,6 +138,43 @@ pub(crate) fn gemv(
     matmul_transb(drv, x, w, 1, n, k)
 }
 
+/// `cuBLAS` sgemv on already-device-resident `W` and `x`. Output
+/// also stays on device. Use this when the caller is composing a
+/// device-resident chain and doesn't want the htod / sync / dtoh
+/// round-trip that `gemv_device_w` does on every call.
+///
+/// Layout: same row-major `[N, K]` flat → col-major reinterpretation
+/// as `[K, N]`, `op=T`, `lda=K`. See the comment over
+/// `gemv_device_w` for the math.
+pub(crate) fn gemv_device_w_into_dev(
+    drv: &Driver,
+    w_dev: &CudaSlice<f32>,
+    x_dev: &CudaSlice<f32>,
+    n: usize,
+    k: usize,
+) -> Result<CudaSlice<f32>, CudaInitError> {
+    debug_assert_eq!(w_dev.len(), n * k, "W length mismatch");
+    debug_assert_eq!(x_dev.len(), k, "x length mismatch");
+
+    let mut y_dev = drv.device_alloc_uninit(n)?;
+    let cfg = GemvConfig {
+        trans: CUBLAS_OP_T,
+        m: k as i32,
+        n: n as i32,
+        alpha: 1.0_f32,
+        lda: k as i32,
+        incx: 1,
+        beta: 0.0_f32,
+        incy: 1,
+    };
+    unsafe {
+        drv.blas
+            .gemv(cfg, w_dev, x_dev, &mut y_dev)
+            .map_err(|e| CudaInitError::DriverMissing(format!("cublas sgemv dev: {e:?}")))?;
+    }
+    Ok(y_dev)
+}
+
 pub(crate) fn gemv_device_w(
     drv: &Driver,
     w_dev: &CudaSlice<f32>,
@@ -148,8 +185,12 @@ pub(crate) fn gemv_device_w(
     debug_assert_eq!(w_dev.len(), n * k, "W length mismatch");
     debug_assert_eq!(x.len(), k, "x length mismatch");
 
+    let trace = std::env::var("LARQL_CUDA_GEMV_TRACE").is_ok() && n >= 100_000;
+    let t0 = std::time::Instant::now();
     let x_dev = drv.device_buf_from(x)?;
+    let t_htod = t0.elapsed();
     let mut y_dev = drv.device_alloc_uninit(n)?;
+    let t_alloc = t0.elapsed() - t_htod;
     // Use direct cublasSgemv instead of gemm-with-n=1. The latter
     // worked but cuBLAS's gemv path picks better tile dimensions and
     // memory access patterns for skewed [N=large, K=hidden] matvecs
@@ -174,8 +215,24 @@ pub(crate) fn gemv_device_w(
             .gemv(cfg, w_dev, &x_dev, &mut y_dev)
             .map_err(|e| CudaInitError::DriverMissing(format!("cublas sgemv: {e:?}")))?;
     }
+    let t_launch = t0.elapsed() - t_htod - t_alloc;
     drv.sync()?;
-    drv.to_host(&y_dev)
+    let t_sync = t0.elapsed() - t_htod - t_alloc - t_launch;
+    let out = drv.to_host(&y_dev)?;
+    let t_dtoh = t0.elapsed() - t_htod - t_alloc - t_launch - t_sync;
+    if trace {
+        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "[gemv n={n} k={k}] htod={:.3} alloc={:.3} launch={:.3} sync={:.3} dtoh={:.3} total={:.3} ms",
+            to_ms(t_htod),
+            to_ms(t_alloc),
+            to_ms(t_launch),
+            to_ms(t_sync),
+            to_ms(t_dtoh),
+            to_ms(t0.elapsed()),
+        );
+    }
+    Ok(out)
 }
 
 /// Device-resident GEMM `C = A * B^T` where both `A` and `B` are
@@ -341,5 +398,64 @@ mod tests {
         // Sanity: catch a regression where the cuBLAS op enum collapses.
         use cudarc::cublas::sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
         assert_ne!(CUBLAS_OP_N as i32, CUBLAS_OP_T as i32);
+    }
+
+    /// Microbench: standalone cuBLAS sgemv at the Qwen3.6-27B
+    /// LM_HEAD shape `[vocab=248320, hidden=5120]`. Times pure GPU
+    /// work with weights and x already device-resident, isolated from
+    /// the rest of the model. Goal: separate the actually-cuBLAS cost
+    /// from any larql-side overhead in the E.6.F LM_HEAD investigation.
+    ///
+    /// Gated by `LARQL_CUDA_BENCH_GEMV_LM_HEAD=1` to avoid running on
+    /// every test invocation. Prints elapsed time per call across
+    /// 20 warm calls so the first-call setup cost is excluded.
+    #[test]
+    fn bench_cublas_sgemv_at_lm_head_shape() {
+        use crate::cuda::backend::CudaBackend;
+        if std::env::var("LARQL_CUDA_AVAILABLE").ok().as_deref() != Some("1") {
+            return;
+        }
+        if std::env::var("LARQL_CUDA_BENCH_GEMV_LM_HEAD")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let Ok(backend) = CudaBackend::new() else {
+            return;
+        };
+        let drv = backend.driver();
+
+        let n = 248320_usize; // vocab
+        let k = 5120_usize; // hidden
+        let w_host: Vec<f32> = (0..n * k)
+            .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as f32 / 256.0 - 0.5)
+            .collect();
+        let x_host: Vec<f32> = (0..k).map(|i| (i as f32).sin() * 0.1).collect();
+
+        eprintln!("[bench] uploading weight ({} MB)", n * k * 4 / 1_000_000);
+        let w_dev = drv.device_buf_from(&w_host).expect("htod w");
+        let x_dev = drv.device_buf_from(&x_host).expect("htod x");
+        drv.sync().expect("warmup sync");
+
+        // Warmup (first call has cuBLAS handle setup).
+        let _y_warm = super::gemv_device_w_into_dev(drv, &w_dev, &x_dev, n, k).expect("warmup");
+        drv.sync().expect("warmup sync");
+
+        let n_calls = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_calls {
+            let _y = super::gemv_device_w_into_dev(drv, &w_dev, &x_dev, n, k).expect("gemv");
+        }
+        drv.sync().expect("final sync");
+        let elapsed = t0.elapsed();
+        let per_call_ms = elapsed.as_secs_f64() * 1000.0 / n_calls as f64;
+        eprintln!(
+            "[bench] cuBLAS sgemv @ [n={n}, k={k}] (device-resident inputs, no dtoh): {per_call_ms:.3} ms / call across {n_calls} calls"
+        );
+        // Theoretical lower bound at 1 TB/s HBM: 1.27 GB read = 1.3 ms.
+        // No assert — diagnostic-only.
+        let _ = per_call_ms;
     }
 }

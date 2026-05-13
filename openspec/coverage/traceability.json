@@ -21321,15 +21321,27 @@
       "crate": "larql_compute"
     },
     {
+      "fqn": "larql_compute::cuda::matmul::bench_cublas_sgemv_at_lm_head_shape",
+      "file": "crates/larql-compute/src/cuda/matmul.rs",
+      "line": 413,
+      "crate": "larql_compute"
+    },
+    {
       "fqn": "larql_compute::cuda::matmul::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 340,
+      "line": 397,
+      "crate": "larql_compute"
+    },
+    {
+      "fqn": "larql_compute::cuda::matmul::tests::bench_cublas_sgemv_at_lm_head_shape",
+      "file": "crates/larql-compute/src/cuda/matmul.rs",
+      "line": 413,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::matmul::tests::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 340,
+      "line": 397,
       "crate": "larql_compute"
     },
     {

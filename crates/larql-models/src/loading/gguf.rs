@@ -608,9 +608,21 @@ pub fn load_gguf_lazy_tensors(
             &normalize_gguf_key(weights.arch.embed_key()),
             prefixes,
         );
+        // Same special-case for lm_head / output.weight — `ModelWeights`
+        // has a dedicated `lm_head_quant` field that the Qwen3.6 bridge
+        // reads when dispatching the final logits matvec. Without this,
+        // the lazy lm_head ends up in the generic `quant_tensors` map,
+        // `lm_head_quant` stays None, and the forward falls back to a
+        // CPU dense `ndarray.dot` on the 5 GiB f32 weight — a hidden
+        // 80 ms / token cost that all of E.6.F's GPU-vs-GPU dispatch
+        // microbenchmarks were inadvertently bypassing.
         if key == embed_key_normalised {
             weights.embed_quant = Some(qt);
             weights.embed = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
+                .expect("empty array is always valid");
+        } else if key == "lm_head.weight" || key_raw == GGUF_OUTPUT_WEIGHT {
+            weights.lm_head_quant = Some(qt);
+            weights.lm_head = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
                 .expect("empty array is always valid");
         } else {
             weights.quant_tensors.insert(key.clone(), qt);
