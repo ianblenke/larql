@@ -22617,15 +22617,21 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::qwen35_load::probe_qwen35_moe_gguf_layout",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2225,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2677,
+      "line": 2757,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_bench",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2221,
+      "line": 2301,
       "crate": "larql_inference"
     },
     {
@@ -22673,13 +22679,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2614,
+      "line": 2694,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2411,
+      "line": 2491,
       "crate": "larql_inference"
     },
     {
@@ -22743,15 +22749,21 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::qwen35_load::tests::probe_qwen35_moe_gguf_layout",
+      "file": "crates/larql-inference/src/attention/qwen35_load.rs",
+      "line": 2225,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_attn_norm_weight_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2677,
+      "line": 2757,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_bench",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2221,
+      "line": 2301,
       "crate": "larql_inference"
     },
     {
@@ -22799,13 +22811,13 @@
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_ssm_a_sign_diagnostic",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2614,
+      "line": 2694,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::qwen35_load::tests::real_gguf_qwen35_token_diff_vs_llama_cpp",
       "file": "crates/larql-inference/src/attention/qwen35_load.rs",
-      "line": 2411,
+      "line": 2491,
       "crate": "larql_inference"
     },
     {

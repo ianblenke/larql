@@ -178,6 +178,26 @@ pub struct GgufTensorInfo {
     offset: u64,
 }
 
+impl GgufTensorInfo {
+    /// Tensor name as stored in the GGUF (post-normalisation done at
+    /// `tensor_infos.push`). Used by external tools that need to
+    /// inspect the on-disk tensor layout (e.g., the MoE probe in
+    /// larql-inference).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Logical dimensions (GGML layout — fastest-moving axis first;
+    /// the loader's standard dim-swap produces row-major HF shape).
+    pub fn dims(&self) -> &[u64] {
+        &self.dims
+    }
+    /// GGML tensor type id (see `larql_models::quant::ggml`'s
+    /// `TYPE_*` constants).
+    pub fn tensor_type(&self) -> u32 {
+        self.tensor_type
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // GGUF reader
 // ═══════════════════════════════════════════════════════════════

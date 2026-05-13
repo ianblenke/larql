@@ -2213,6 +2213,86 @@ mod tests {
     // forward is roughly right but slightly off (small numerical
     // bug). If expected token has small or negative logit →
     // forward is structurally broken.
+    /// Phase A: probe the Qwen3.6-35B-A3B MoE GGUF to discover its
+    /// actual tensor layout. The Qwen35MoeArch handler assumes
+    /// per-expert `mlp.experts.N.{gate,up,down}_proj.weight` tensors,
+    /// but llama.cpp's GGUF convention typically packs them as 3D
+    /// `ffn_*_exps.weight` tensors. This test prints the relevant
+    /// MoE metadata + expert/router tensor names + shapes so we can
+    /// decide which layout to target. Env-gated by
+    /// `LARQL_QWEN35_MOE_GGUF=/path/to/Qwen3.6-35B-A3B.gguf`.
+    #[test]
+    fn probe_qwen35_moe_gguf_layout() {
+        let path = match std::env::var("LARQL_QWEN35_MOE_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("LARQL_QWEN35_MOE_GGUF unset — skipping probe");
+                return;
+            }
+        };
+        let gguf = larql_models::loading::gguf::GgufFile::open(std::path::Path::new(&path))
+            .expect("open MoE GGUF");
+        eprintln!("=== Qwen3.6-35B-A3B GGUF probe ===");
+        eprintln!("path: {path}");
+        eprintln!("tensors: {}", gguf.tensor_infos.len());
+        eprintln!("metadata entries: {}", gguf.metadata.len());
+
+        // Print relevant MoE / arch metadata.
+        eprintln!("\n-- metadata (MoE / arch keys) --");
+        let mut keys: Vec<&String> = gguf.metadata.keys().collect();
+        keys.sort();
+        for k in &keys {
+            let lower = k.to_lowercase();
+            if lower.contains("expert")
+                || lower.contains("moe")
+                || lower.contains("arch")
+                || lower.contains("ffn")
+                || lower.contains("intermediate")
+                || lower.contains("layer")
+                || lower.contains("hidden")
+                || lower.contains("vocab")
+                || lower.contains("ssm")
+            {
+                let v = &gguf.metadata[*k];
+                eprintln!("  {k} = {v:?}");
+            }
+        }
+
+        // Print first-layer MoE-relevant tensor names + shapes + types.
+        // Filter to layer 0 for brevity.
+        eprintln!("\n-- layer 0 MoE / FFN tensors (names + shapes + type) --");
+        let mut layer0_tensors: Vec<&larql_models::loading::gguf::GgufTensorInfo> = gguf
+            .tensor_infos
+            .iter()
+            .filter(|t| {
+                let n = t.name();
+                n.contains("blk.0.") || n.contains("layers.0.")
+            })
+            .collect();
+        layer0_tensors.sort_by_key(|t| t.name().to_string());
+        for t in &layer0_tensors {
+            eprintln!(
+                "  {:60} dims={:?} type={}",
+                t.name(),
+                t.dims(),
+                t.tensor_type()
+            );
+        }
+
+        // Print any non-layer (top-level) tensor names for embed / lm_head / etc.
+        eprintln!("\n-- top-level (non-blk) tensors --");
+        for t in &gguf.tensor_infos {
+            if !t.name().contains("blk.") && !t.name().contains("layers.") {
+                eprintln!(
+                    "  {:60} dims={:?} type={}",
+                    t.name(),
+                    t.dims(),
+                    t.tensor_type()
+                );
+            }
+        }
+    }
+
     /// C.5l (task #30) — minimal tok/s bench against the same Qwen3.6
     /// GGUF used for parity. Times prefill and decode separately so the
     /// numbers can be compared with `llama-bench`'s `pp` / `tg` metrics.

@@ -172,6 +172,86 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase F.0: Qwen3.6-35B-A3B MoE GGUF probe (the right target model)
+
+After the E.7 curve showed that "Attn-only GPU" buys almost nothing
+on dense Qwen3.6-27B (0.25 vs 0.23 t/s — adding 1.5 GiB of VRAM for
+attention/recurrence/conv1d compute saves <10 %), the conclusion is
+that **dense models aren't the right fit for larql's value prop**.
+Every FFN runs every token, so "FFN on CPU" is the full FFN cost.
+
+Pivoting to Qwen3.6-35B-A3B — the MoE variant where 8 of 256 FFN
+experts activate per token. New test `probe_qwen35_moe_gguf_layout`
+in `qwen35_load.rs` (env-gated by `LARQL_QWEN35_MOE_GGUF=…`) dumps
+the on-disk tensor layout. Findings:
+
+| Dim                                | Qwen3.6-35B-A3B   | Qwen3.6-27B |
+|---|---|---|
+| layers                             | 40                | 64          |
+| hidden                             | 2048              | 5120        |
+| **expert_count**                   | **256**           | dense       |
+| **expert_used_count**              | **8** + 1 shared  | dense       |
+| expert_ffn_dim                     | 512               | 17408       |
+| ssm.inner_size                     | 4096              | 6144        |
+| ssm.time_step_rank                 | 32                | 48          |
+| ssm.group_count                    | 16                | 16          |
+| full_attention_interval            | 4 (10 attn layers)| 4 (16 attn) |
+| context_length                     | 262144            | 65536       |
+| file size                          | 21.6 GB           | 14.76 GB    |
+
+Per-layer MoE tensors are **3D packed**:
+
+```
+ffn_gate_exps.weight   [hidden, expert_ffn_dim, num_experts]  Q4_K
+ffn_up_exps.weight     [hidden, expert_ffn_dim, num_experts]  Q4_K
+ffn_down_exps.weight   [expert_ffn_dim, hidden, num_experts]  Q5_K
+ffn_gate_inp.weight    [hidden, num_experts]                  f32   (router)
+ffn_*_shexp.weight     [hidden, expert_ffn_dim] etc.          (always-on shared)
+```
+
+### Active-weights estimate (per token)
+
+| Class                            | Bytes (Q4_K avg) |
+|---|---:|
+| 10 full-attn × Q+K+V+O proj      | ~330 MB |
+| 30 DeltaNet linear × projections | ~150 MB |
+| 40 FFN × (8 active + 1 shared)   | ~280 MB |
+| LM_head (Q6_K)                   | ~390 MB |
+| **active per token**             | **~1.2 GB** |
+| total file                       | ~22 GB |
+
+**~5 % of weights are active per token.** This is exactly larql's
+design target: the inactive 95 % stays on CPU/disk, with only the
+active slice paged in. llama.cpp loads the entire model into VRAM
+(or all-CPU); it can't selectively offload by expert. larql's
+per-class residency mechanism (E.7) extends naturally to per-expert
+residency once the MoE forward path is in.
+
+### Status: forward path not yet built
+
+`Qwen35MoeArch` (Phase B.2) has the metadata + tensor-key formatters,
+but `qwen35_forward_step` still calls dense `swiglu_ffn_lazy` for
+every layer. To produce real numbers we need:
+
+1. **MoE FFN forward**: router (f32 matmul) → top-K + softmax →
+   per-expert SwiGLU with weighted sum + shared-expert add.
+2. **3D expert weight slicing**: the GGUF packs all experts in one
+   tensor; need a `QuantTensor` view that lazily slices expert E's
+   2D submatrix without re-decoding the whole 3D packed block grid.
+3. **Bridge**: extend `load_qwen35_weights` (or write a sibling)
+   for the MoE arch: per-layer `MoeLayerWeights` with router +
+   expert tensors + shared expert.
+4. **Bench harness**: extend to take the MoE GGUF path and time
+   the same prefill/decode pattern.
+
+Once those exist, the same E.7 tier curve becomes meaningful: at
+the "Attn-only" tier on this MoE model, with FFN streamed from
+CPU + only 8 experts loaded per token, larql should fit in ~3-4
+GiB VRAM at meaningful throughput. llama.cpp's `--gpu-layers N`
+can't replicate this — it offloads whole layers, not per-expert.
+
+This is the bench that decides whether the value prop is real.
+
 ## 2026-05-12 update — Phase E.7: per-class GPU residency + the VRAM/throughput curve
 
 larql's value proposition is *VRAM-minimal* inference: push as much
