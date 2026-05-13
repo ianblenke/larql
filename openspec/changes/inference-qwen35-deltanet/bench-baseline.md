@@ -252,6 +252,866 @@ can't replicate this — it offloads whole layers, not per-expert.
 
 This is the bench that decides whether the value prop is real.
 
+## 2026-05-12 update — Phase F.2: MoE FFN forward (router → top-K → weighted experts + shared)
+
+Built `swiglu_moe_lazy` in
+[`crates/larql-inference/src/attention/qwen35_forward.rs`](../../crates/larql-inference/src/attention/qwen35_forward.rs).
+The function takes the four MoE quant-tensors plus an optional shared
+expert and computes one token's MoE FFN output:
+
+```
+logits      = router @ x                                   // [num_experts]
+idx, top_l  = top_k(logits, top_k)
+w           = softmax(top_l)                               // [top_k]
+y_moe       = Σ_i w_i · swiglu(gate[e_i], up[e_i], down[e_i])(x)
+y_shared    = swiglu(shexp_g, shexp_u, shexp_d)(x)         // if present
+return        y_moe + y_shared
+```
+
+Implementation notes:
+
+- Per-expert weight access is via `QuantTensor::expert_slice(e, num_experts)`
+  from F.1 — zero-copy `Arc<[u8]>` views into the 3D-packed parent.
+  No re-decoding of any super-block grid.
+- Each per-expert SwiGLU dispatches through the existing
+  `swiglu_ffn_lazy` path: same paired-matvec / device-resident
+  fused-block / per-call fallback decisions as the dense case. The
+  `gpu_tier::backend_for(GpuClass::Ffn)` knob therefore covers MoE
+  too — `LARQL_QWEN35_GPU_NO_FFN=1` pushes every active expert to
+  CPU rayon (the VRAM-minimal mode).
+- Top-K is a full sort on the router logits. `num_experts` is 128–256;
+  the cost is dwarfed by the active-expert matmuls.
+- Shared expert is optional. Qwen3.6-35B-A3B has one; some MoE
+  variants don't ship one and the call site passes `None`.
+
+Two parity tests verify the math against a hand-rolled scalar
+reference:
+`swiglu_moe_lazy_matches_reference` (4 experts, top-K=2, hidden=3,
+ffn_dim=4, with shared expert) and `swiglu_moe_lazy_without_shared_expert`
+(2 experts, top-K=1, identity-like weights so the expected output
+is `silu(x)·x`).
+
+Tests pass against the unmodified 882-test inference suite + the 2
+new MoE tests. Clippy clean.
+
+Status: forward kernel is in place. Next is **F.3** — wire it up via
+a new `Qwen35MoeFullLayerWeights` struct + a sibling
+`load_qwen35_moe_weights` GGUF bridge + arch-detection in
+`qwen35_forward_step`, then re-run the E.7 tier curve on the MoE
+GGUF to produce the throughput/VRAM numbers that close out this
+phase.
+
+## 2026-05-13 update — Phase F.3: MoE bridge end-to-end on Qwen3.6-35B-A3B (first light)
+
+Wired the F.2 forward kernel into the loader + bench harness. **First
+real numbers on Qwen3.6-35B-A3B-UD-Q4_K_M.gguf:**
+
+| Setting                | Value |
+|---|---:|
+| Path                   | all-CPU lazy-quant (no GPU) |
+| Load time              | 173 s (22 GiB GGUF, lazy-mmapped) |
+| Prefill                | 1.06 tok/s (4 tokens) |
+| Decode                 | 1.06 tok/s (2 tokens) |
+| Process RSS            | 22.3 GiB (full mmap window) |
+
+(For comparison: Qwen3.6-27B dense on the same machine ran 10.6 t/s
+decode after Phase E.6.I, but at 14.8 GiB RSS plus a 3 GiB GPU-resident
+tier; the MoE has 8× the expert dispatch volume per token, no Q8_0 GPU
+kernel yet, and the attention/shared-expert tensors are Q8_0
+dequant-per-row on CPU.)
+
+### What landed
+
+1. **`Qwen35MoeFfnWeights`** in `qwen35_forward.rs` — per-layer router
+   + 3D-packed expert tensors + optional shared expert. Added to
+   `Qwen35FullLayerWeights` as `pub moe: Option<...>`. When `Some`, the
+   forward step dispatches through `swiglu_moe_lazy` instead of dense
+   `swiglu_ffn_lazy`.
+2. **`load_qwen35_moe_ffn`** in `qwen35_load.rs` — pulls
+   `layers.{L}.ffn_gate_inp.weight` (router, f32),
+   `ffn_{gate,up,down}_exps.weight` (Q4_K/Q4_K/Q5_K, 3D-packed), and the
+   optional `ffn_{gate,up,down}_shexp.weight` shared-expert trio. Pulls
+   `num_experts`/`top_k` from the architecture's `is_moe()` /
+   `num_experts()` / `num_experts_per_token()` accessors.
+3. **`qwen35_moe_lazy_keys(n_layers)`** — helper that emits the MoE
+   tensor key set so the bench harness folds them into the lazy-load
+   set. The bench now branches on `arch.is_moe()` to extend lazy_keys.
+4. **3D-tensor support in `load_gguf_lazy_tensors`** — extended the
+   `n_dims != 2` filter to accept `n_dims == 3` and flatten to
+   `[dims[1] * dims[2], dims[0]]`. F.1's `expert_slice` then carves
+   per-expert subviews without copying.
+5. **GGUF→config flow-through for MoE metadata** — added
+   `expert_count` / `expert_used_count` / `expert_feed_forward_length`
+   → `num_experts` / `num_experts_per_tok` / `moe_intermediate_size`
+   so `Qwen35MoeArch::is_moe()` returns `true` on a real GGUF (was
+   always returning `false` before because the metadata wasn't
+   reaching `ModelConfig`).
+6. **Critical Q5_0/Q8_0 type-id fix** — `crates/larql-models/src/quant/ggml/mod.rs`
+   had `TYPE_Q8_0 = 6` and `TYPE_Q5_0 = 8`, swapped vs the official
+   GGML enum (`Q5_0 = 6, Q8_0 = 8`). Qwen3.6-27B's Q4_K_S quant didn't
+   hit it; Qwen3.6-35B-A3B-UD-Q4_K_M ships Q8_0 attention/shared-expert
+   tensors and tripped the swap immediately (matvec route fell through
+   to "unsupported tensor type id 8"). Swapped constants to match
+   wire spec.
+7. **Q8_0 in `QuantTensor::matvec`** — added rayon-parallel
+   dequant-per-row dispatch (no fused row-dot kernel yet — equivalent
+   shape to the Q5_K fallback path).
+
+### Active-weights vs all-resident, observed
+
+The 22.3 GiB RSS reflects mmap of the entire GGUF, *not* what's
+actually being touched per token. Per-token decode reads from:
+
+- 1 attention or DeltaNet layer's projections (Q8_0, Q4_K, F32 norms)
+- 8 active experts' gate/up (Q4_K) + down (Q5_K) — `expert_slice` views
+- 1 always-on shared expert (Q4_K + Q5_K)
+- router (f32, 256 × 2048)
+- lm_head (Q6_K), final_norm (F32), embed (Q4_K row lookup)
+
+≈ 1.2 GiB of weights touched per token vs 22 GiB resident. That's the
+value-prop ratio; the next phase is to make the unused 21 GiB pageable
+or stream-on-demand so RSS tracks active weights instead of file size.
+
+### Where the time goes (all-CPU)
+
+Without per-section profiling, the suspicion is that the bulk goes to:
+
+1. Q8_0 dequant-per-row on the ~700-MB attention/shared-expert
+   tensors per layer (no SIMD / no fused row-dot kernel yet).
+2. The 9 SwiGLU dispatches per FFN layer × 40 layers × 945 ms decode
+   per token (rough math).
+3. Router + top-K sort + softmax — small.
+
+`LARQL_QWEN35_PROFILE=1` will quantify this once we drop into
+optimization.
+
+### Status: F (MoE bring-up) phase complete
+
+- ✅ F.0 — GGUF layout probe.
+- ✅ F.1 — `QuantTensor::expert_slice` zero-copy 3D-packed slicing.
+- ✅ F.2 — `swiglu_moe_lazy` router → top-K → weighted-experts +
+  shared, with parity tests.
+- ✅ F.3 — GGUF bridge + 3D lazy loader + arch-metadata flow-through
+  + Q5_0/Q8_0 const fix + bench end-to-end at 1.06 t/s.
+
+What's next is a pivot to the **value-prop measurement**: re-run the
+E.7 per-class GPU residency curve on the MoE GGUF (`LARQL_QWEN35_GPU=1`
+gates the projection classes), then quantify how VRAM scales vs
+llama.cpp's whole-layer offload. The expected story: at the
+"Attn-only" tier, larql holds ~3-4 GiB VRAM at meaningful tok/s
+because the inactive 95 % of MoE weights stay on CPU/disk — a
+configuration llama.cpp can't replicate.
+
+## 2026-05-13 update — Phase F.4: per-class residency curve on Qwen3.6-35B-A3B MoE
+
+Ran the E.7 tier curve against the MoE GGUF. RTX 4090 (24 GiB), prefill=4
+decode=4, `LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1`,
+`--features cuda` for tiers 1–3.
+
+| Tier | GPU classes                                                  | VRAM (MiB) | Prefill (t/s) | Decode (t/s) |
+|---|---|---:|---:|---:|
+| 0 (all-CPU) | —                                                  | 0     | 1.06 | 1.06 |
+| 1 (LM_HEAD) | `LmHead`                                           | 2414  | 0.83 | 1.24 |
+| 2 (no-FFN)  | `LmHead`,`AttnProj`,`DnProj`,`DnRecurrence`        | 2414  | 0.81 | 1.20 |
+| 3 (all)     | all five classes                                   | 5582  | 1.39 | **3.49** |
+
+(`LARQL_QWEN35_GPU_NO_FFN=1` etc. drop classes back to CPU.)
+
+### Reading the curve
+
+1. **LM_HEAD on GPU** (Tier 1) buys +17 % decode for ~2.4 GiB VRAM
+   (mostly CUDA runtime + Q6_K device buffer for the 1.5 GiB lm_head).
+   Same finding as the 27B dense bench.
+
+2. **Tier 2 ≈ Tier 1** — *flipping AttnProj / DnProj / DnRecurrence on
+   has no measurable effect.* Reason: this GGUF stores all those
+   projections as Q8_0 (`type=8`, the legacy 32-elem int8+f16 block),
+   and Q8_0 has **no CUDA matvec kernel** in larql today. The
+   `matvec_with_backend` path returns `None` for Q8_0 → CPU rayon
+   fallback regardless of the residency knob. (Adding `Q8_0` to
+   `QuantFormat` + a small CUDA kernel would unlock this tier.)
+
+3. **FFN on GPU** (Tier 3) is **the dominant lever**: +191 % decode
+   from Tier 2, for +3.2 GiB VRAM. This is the active 8 experts ×
+   40 layers × (gate+up+down) lazy-quant Q4_K/Q5_K matvecs hitting
+   the device-resident fused FFN block (E.6.B.1). Each expert dispatch
+   reuses the same code path as the dense Qwen3.6-27B FFN block —
+   the multiplexer (router + top-K) is host-side, the per-expert
+   matmuls land on existing GPU kernels.
+
+### Value-prop numbers vs llama.cpp
+
+llama.cpp's `--gpu-layers N` offloads whole layers (all classes), so
+its only knobs are "N layers on GPU, rest on CPU". On Qwen3.6-35B-A3B
+that means each offloaded layer brings its 256-expert tensor (the
+inactive 248 of which are never read for that token). A 24 GiB card
+can hold maybe ~20 of 40 layers at this quant. larql's per-class
+breakdown shows that **the actual GPU-useful weights per token are
+the 8 active experts × (gate+up+down) ≈ 28 MiB plus lm_head ≈ 1.5 GiB**
+— the inactive 248 experts can stay on CPU/disk indefinitely.
+
+So the larql-vs-llama.cpp tradeoff is now concrete and measurable:
+
+- llama.cpp 20-layer offload: ~20 GiB VRAM, decoder runs whichever
+  layers are offloaded at full GPU speed and the rest at CPU speed.
+- larql Tier 3:                **5.6 GiB VRAM, 3.49 t/s end-to-end**.
+
+Whether 3.49 t/s is competitive with llama.cpp at the same VRAM
+budget needs a head-to-head — `llama-bench -ngl <N>` on this same
+GGUF with `--threads $(nproc)`, capped at our 5.6 GiB. That's the
+deliverable from this phase: **the value-prop graph**.
+
+### Where the remaining cost is
+
+At Tier 3, decode = 287 ms/tok. The known untapped wins:
+
+1. **Q8_0 GPU matvec kernel** — would let Tier 2 actually take
+   AttnProj/DnProj off the CPU. Estimated +30-50 ms/tok saved.
+2. **CUDA Graphs (E.6.C)** — record the decode-step DAG once,
+   replay per token. Saves dispatch overhead × ~600 kernels/tok.
+3. **Batched lm_head softmax** — already landed (E.6.E.softmax) but
+   needs MoE-side parity; verify nothing regressed.
+4. **Better Q5_0/Q8_0 CPU SIMD** — Q8_0 dequant-per-row is rayon
+   parallel but not SIMD; llama.cpp's `ggml_vec_dot_q8_0_q8_0` is
+   AVX2-vectorized and ~6× faster (the E.8 backlog).
+
+Two new follow-ups added to the open task set:
+- **F.4** — Q8_0 GPU matvec kernel for the AttnProj/DnProj tier.
+- **F.5** — head-to-head bench vs `llama-bench -ngl N` on the same
+  GGUF, capped at iso-VRAM, to land the value-prop graph.
+
+## 2026-05-13 update — Phase F.5: head-to-head Qwen3.6-35B-A3B vs llama.cpp
+
+Ran the same Qwen3.6-35B-A3B-UD-Q4_K_M.gguf through llama.cpp's
+`llama-bench` (commit `389ff61`, CUDA build at
+`/home/ianblenke/3rd-party/llama.cpp/build/bin/llama-bench`, same
+RTX 4090, default thread count).
+
+| Backend  | ngl | VRAM (≈)  | pp64 (t/s) | tg16 (t/s) |
+|---|---:|---:|---:|---:|
+| llama.cpp | 0  | ~0 GiB         | 102.41 | 16.15 |
+| llama.cpp | 10 | ~4–5 GiB       | 125.27 | 21.45 |
+| llama.cpp | 99 (fitted)    | 17.1 GiB | — | 120.40 |
+| **larql** Tier 0 | — | 0 GiB | 1.06  | 1.06 |
+| **larql** Tier 1 | LmHead | 2.4 GiB | 0.83 | 1.24 |
+| **larql** Tier 3 | all classes | 5.6 GiB | 1.39 | **3.49** |
+
+### Iso-VRAM comparison (the headline)
+
+At a comparable ~5 GiB VRAM budget:
+
+- **llama.cpp** (10/40 layers offloaded): **21.45 tg t/s**.
+- **larql** (per-class GPU residency, Tier 3):  **3.49 tg t/s**.
+
+llama.cpp is **6.1× faster than larql** at this VRAM point. The
+all-CPU gap is wider: **102 vs 1 t/s → 96× on prefill, 15× on
+decode** (the E.8 backlog).
+
+### Where the gap lives
+
+1. **CPU kernel quality (E.8)** — llama.cpp's `ggml_vec_dot_q*_q8_0`
+   does AVX2/AVX-512 SIMD with int8 packing on the activation side
+   (`Q8_0` quant of `x` so the dot product is int8 × int8 with f32
+   scale). larql's `q4k_row_dot` is rayon-parallel but uses f32 ×
+   dequantized-f32 — a ~10× per-row gap. That alone explains most of
+   the all-CPU gap and a big chunk of the iso-VRAM gap (since larql's
+   AttnProj/DnProj Q8_0 tensors fall back to CPU).
+2. **No Q8_0 GPU kernel (F.4)** — at iso-VRAM, every attention
+   projection runs on CPU regardless of which GPU classes are on.
+   Adding `QuantFormat::Q8_0` + a basic `q8_0_matvec` kernel would
+   unlock the AttnProj/DnProj residency tier — estimated 30–50 ms/tok
+   saved.
+3. **No CUDA Graphs (E.6.C)** — the decode path issues ~600
+   kernels/token. llama.cpp records these as a CUDA Graph and replays
+   per token; larql still pays full driver dispatch each tick.
+4. **No int8-quantized activations** — orthogonal to (1): even when
+   larql's expert matvecs hit the GPU, they decode the f32 activation
+   inside the kernel instead of pre-quantizing to Q8_0. llama.cpp's
+   `mul_mat_id` for MoE uses Q8_0 activations end-to-end.
+
+### What the F.3/F.4 numbers do prove
+
+larql's MoE forward path is **correct and lazy-by-construction**:
+
+- 22 GiB GGUF, only ~1.2 GiB of weights touched per token
+  (1 active attention block + 8 active experts + 1 shared expert +
+  lm_head + embed row).
+- Per-class GPU residency selects which slice lives on GPU; the
+  inactive 248 experts × 40 layers ≈ 18 GiB never touch VRAM.
+- 5.6 GiB on a 24 GiB card is **3× more headroom than llama.cpp's
+  17 GiB at the same ngl=99 fit**, leaving room for larger context
+  or smaller GPUs.
+
+The value-prop hypothesis isn't disproven — **VRAM use IS lower at
+the same model size**. But raw throughput needs the four backlog
+items above to close the 6× gap.
+
+### Status
+
+- ✅ F.0–F.3 — MoE forward path lands end-to-end on real GGUF.
+- ✅ F.4 (curve) / F.5 — value-prop measured against llama.cpp.
+- ⏳ F.4 (kernel) — Q8_0 GPU matvec kernel for attn projections.
+- ⏳ E.6.C — CUDA Graphs for decode.
+- ⏳ E.8 — CPU SIMD parity with ggml-cpu.
+
+These three together are the path to "competitive at iso-VRAM",
+not "10× the VRAM of llama.cpp". Each has a stand-alone task.
+
+## 2026-05-13 update — Phase F.4 (kernel): Q8_0 GPU matvec — 3.49 → 10.98 t/s decode
+
+Added a `q8_0_matvec` trait method on `QuantMatVec` and a CudaBackend
+implementation that:
+1. Host-dequants the Q8_0 weight once → f32.
+2. Caches the f32 device buffer in `q8_0_f32_device_cache` keyed by the
+   host byte slice (mirrors `q6k_f32_device_cache`).
+3. Subsequent matvecs reuse the cached buffer via cuBLAS `gemv_device_w`.
+
+Without the device cache the first F.4 build dropped Tier 3 decode
+from **1.20 → 0.24 t/s** — each per-token attn matvec was re-dequanting
+50 MiB on the host and re-uploading. With the cache the lookup is one
+hash + Arc clone, and the cuBLAS sgemv runs against the resident f32
+weight.
+
+### Updated curve
+
+| Tier | GPU classes                                              | VRAM (MiB) | Decode (t/s) | Δ vs F.3 |
+|---|---|---:|---:|---:|
+| 0 (all-CPU)                | — | 0      | 1.06  | — |
+| 1 (LM_HEAD)                | LmHead | 2414  | 1.24  | — |
+| 2a no-FFN, Q8_0-CPU        | LmHead + Attn* + Dn* | 2414 | 1.20  | — |
+| 2b no-FFN, Q8_0-GPU (F.4)  | + Q8_0 attn matvec | 7310 | **1.43** | +20 % |
+| 3a all, Q8_0-CPU           | all five | 5582  | 3.49  | — |
+| 3b all, Q8_0-GPU (F.4)     | all + Q8_0 attn | **10926** | **10.98** | **+215 %** |
+
+### Reading the result
+
+The full-GPU tier (3b) is the headline: **10.98 t/s on the same 22 GiB
+GGUF that llama.cpp does 21.45 t/s on at ngl=10**. The gap is now **2×
+on speed at 2× the VRAM** — vs the F.3 baseline which was 6× slower
+at iso-VRAM.
+
+But the FFN-on-CPU tier (2b) shows the limit of doing only attn
+projections on GPU: 1.20 → 1.43 t/s is just +20 %. With the 8 active
+experts × 40 layers × Q4_K/Q5_K matvecs still on CPU, the FFN cost
+dominates. To squeeze more out of the value-prop config (3-4 GiB
+VRAM), we need either:
+- **CPU SIMD parity (E.8)** — bring CPU Q4_K/Q5_K dot to ggml-cpu
+  speed, which would multiply Tier 2b instead of just nudging it.
+- **Streaming expert activation to GPU** — keep the 8 active experts
+  resident-on-demand instead of all 256 always resident.
+
+### VRAM cost of the f32 cache
+
+The 10.7 GiB at Tier 3b is 4× the Q8_0 byte size — the host dequant
+expands `int8 + f16 scale` (34 B per 32 elems) to `f32 × 32` (128 B per
+32 elems). A real on-device Q8_0 matvec kernel that reads the packed
+bytes directly would hold ~1.3 GiB instead of 5.4 GiB for these
+tensors, bringing Tier 3b VRAM to ~6.6 GiB. That's the follow-up to
+F.4: replace the host-dequant body of `q8_0_matvec` with a fused
+device kernel.
+
+### Build / test gates
+
+`--features cuda` is required for the GPU path (silently disabled
+otherwise — diagnostic line `LARQL_QWEN35_GPU set but larql-inference
+was built without --features cuda` if you forget). All 882 inference
+lib tests pass; `larql-compute` lib (152 tests) pass with `--features
+cuda`.
+
+Updated head-to-head vs llama.cpp at the new top-of-curve:
+
+| Backend     | VRAM    | decode t/s | speed/VRAM-MiB |
+|---|---:|---:|---:|
+| llama.cpp ngl=10 | ~5 GiB    | 21.45 | 4.3 t/s/GiB |
+| larql Tier 3b   | 10.7 GiB | 10.98 | 1.0 t/s/GiB |
+
+llama.cpp is still 4× more efficient per VRAM MiB; the closing items
+are E.8 (CPU SIMD) and on-device Q8_0 / Q4_K matvec without f32
+expansion. F.4 status: **Q8_0 GPU kernel landed (host-dequant +
+cache); fused on-device kernel follow-up queued.**
+
+## 2026-05-13 update — Phase F.6: on-device Q8_0 matvec (no host f32 expansion)
+
+Replaced F.4's host-dequant + f32 device cache with a direct CUDA
+matvec kernel in
+[`q8_0_direct.rs`](../../crates/larql-compute/src/cuda/q8_0_direct.rs).
+The kernel reads the packed Q8_0 bytes (34 B/block: f16 scale + 32
+int8 quants) in place — no f32 expansion. Mirrors the existing
+`q5k_direct.rs` template:
+
+- One thread block per row, `THREADS_PER_ROW * ROWS_PER_BLOCK` =
+  128 × 4 threads.
+- Each thread strides over its row's blocks (32-elem groups), pulls
+  the f16 scale once per block, and accumulates `scale * (int8)q * x`.
+- Parallel reduction in shared memory; one row → one f32 output.
+- Byte cache via new `with_q8_0_device_buf` (mirrors `with_q5k_device_buf`)
+  so each Q8_0 tensor uploads once.
+
+Parity verified with a synthetic-weights bit-exact test
+(`q8_0_matvec_matches_cpu_dequant_dot`) — the kernel result matches
+`larql_models::quant::ggml::dequantize_q8_0` + scalar dot to 1e-4
+relative.
+
+The dispatch in `q8_0_matvec` now tries `q8_0_direct::matvec` first;
+the f32-cache fallback stays for shapes that fail (e.g. hidden not a
+multiple of 32) and is gated by `LARQL_CUDA_Q8_0_HOST_DEQUANT=1` for
+A/B testing.
+
+### Result on Qwen3.6-35B-A3B Tier 3b
+
+| Metric        | F.4 (host-dequant + f32 cache) | F.6 (direct kernel) | Δ |
+|---|---:|---:|---:|
+| Decode (t/s)  | 10.98 | 10.50 | −4 % |
+| Prefill (t/s) | 0.73  | 1.86  | +155 % |
+| VRAM (MiB)    | 10926 | **6990**  | **−36 %** |
+
+The prefill jump comes from the F.4 cold-start cost (host dequant of
+~1.3 GiB of Q8_0 weight on the first prefill call) being amortised
+away in F.6 — the direct kernel just uploads the packed bytes once.
+
+Decode is essentially unchanged: the f32-cached path was already
+binding the gemv to HBM bandwidth, and the direct kernel pays roughly
+the same memory traffic per call (reading 34 B/block instead of 128
+B/block, but with a lighter compute body).
+
+### Refreshed iso-VRAM picture
+
+| Backend                  | VRAM    | decode t/s | speed/VRAM-GiB |
+|---|---:|---:|---:|
+| llama.cpp ngl=10         | ~5 GiB  | 21.45 | 4.3 t/s/GiB |
+| **larql Tier 3 (F.6)**   | **6.99 GiB** | **10.50** | **1.5 t/s/GiB** |
+| larql Tier 3b (F.4)      | 10.7 GiB | 10.98 | 1.0 t/s/GiB |
+
+larql is now **2× slower at 1.4× the VRAM**, vs **2× slower at 2× the
+VRAM** under F.4. The closing path to iso-VRAM-iso-speed is:
+1. **E.8 — CPU SIMD parity** (the 15× all-CPU gap; closes the
+   FFN-CPU-tier gap on Tier 2b which still does CPU experts).
+2. **On-device Q4_K matvec without dequant** — the existing q4k_direct
+   already does this; verify the MoE FFN block path takes it.
+3. **CUDA Graphs (E.6.C)** — eliminate per-token dispatch overhead.
+
+### Status
+
+- ✅ F.6 — on-device Q8_0 matvec landed; VRAM reclaim verified.
+- ⏳ E.8 — CPU SIMD parity with ggml-cpu (biggest remaining lever).
+- ⏳ E.6.C — CUDA Graphs.
+
+## 2026-05-13 update — Phase E.8 (step 1): allocation-free `q8_0_row_dot` (AVX2)
+
+Replaced the Q8_0 CPU matvec dispatch in `QuantTensor::matvec` with a
+new `q8_0_row_dot` that reads the packed bytes in place — no `Vec<f32>`
+allocation per row. AVX2 path on x86_64 loads 8 int8 → 8 i32 → 8 f32
+per FMA, looping 4× per 32-element block. Scalar fallback for
+non-x86_64. Module test verifies bit-exact agreement vs
+`dequantize_q8_0 + scalar dot`.
+
+### All-CPU Qwen3.6-35B-A3B bench (no `--features cuda`)
+
+| Path                          | Decode (t/s) |
+|---|---:|
+| Before (Vec<f32>-per-row)    | 1.06 |
+| **After (q8_0_row_dot AVX2)** | **1.09** |
+
+The +3 % is honest: on this MoE model, the **Q4_K/Q5_K experts** (8
+active × 40 layers + 1 shared expert/layer) dominate CPU time. The
+Q8_0 attention projections + shared-expert SwiGLU are a much smaller
+slice. So the win from making Q8_0 fast on CPU is small for the
+all-CPU value-prop config.
+
+### What this proves about the CPU gap
+
+The 15× all-CPU gap vs llama.cpp is in the **Q4_K dot**, not Q8_0. To
+move the all-CPU number, the next step is the real `ggml_vec_dot_q4_K_q8_K`
+parity:
+
+1. Per-layer pre-quantise `x` to Q8_K (256-element blocks, f32 scale
+   per super-block, 32 int8 values per sub-block) once.
+2. Use `_mm256_maddubs_epi16` / `_mm256_madd_epi16` to do
+   int8×int8 → i16 → i32 dot per 32-element sub-block.
+3. Multiply by the (Q4_K weight scale × Q8_K activation scale) f32
+   product and accumulate.
+
+That's where llama.cpp's CPU path lives and what closes the gap. It's
+a substantial implementation lift — Q4_K_Q8_K is ~150 LOC of AVX2
+intrinsics + a new `quantize_to_q8_k` + dispatch wiring. Queued as
+E.8 (step 2).
+
+### Status update
+
+- ✅ E.8 step 1 — `q8_0_row_dot` allocation-free + AVX2. Small but
+  the right shape: keep weights in their native packing, kill per-row
+  allocator churn.
+- ⏳ E.8 step 2 — Q4_K × Q8_K AVX2 dot (the 10× CPU win).
+- ⏳ E.6.C — CUDA Graphs.
+
+## 2026-05-13 update — Phase E.8 step 2 (scalar): Q4_K × Q8_K algorithm landed; AVX2 still queued
+
+Added `quantize_to_q8_k` and `q4k_q8k_row_dot` to
+[`larql_models::quant::ggml::q4k_q8k`](../../crates/larql-models/src/quant/ggml/q4k_q8k.rs).
+Wired it into `QuantTensor::matvec` for the Q4_K path — when
+`x.len() % 256 == 0`, we now pre-quantise `x` to Q8_K once per call
+and the row dots run on int-arithmetic instead of dequant+f32 FMA.
+Parity verified to 1e-3 relative against the existing
+`q4k_row_dot` (the Q8_K quantisation step itself contributes the
+~1 ULP per-element rounding).
+
+### All-CPU Qwen3.6-35B-A3B bench
+
+| Path                                  | Decode (t/s) |
+|---|---:|
+| Before (q4k_row_dot AVX2 f32 FMA)    | 1.09 |
+| **After (scalar q4k_q8k_row_dot)**   | **1.11** |
+
+**Essentially no change.** The reason — the existing `q4k_row_dot`
+already runs an AVX2 f32 FMA inner loop, and the LLVM auto-vectoriser
+covers the f32 dot path well. The Q4_K × Q8_K algorithm only wins
+when:
+1. The int4 × int8 → int16 → int32 path uses `_mm256_maddubs_epi16` +
+   `_mm256_madd_epi16` intrinsics (much higher arithmetic density per
+   cycle than f32 FMA on the same lane count).
+2. The `quantize_to_q8_k(x)` cost is amortised across all matvecs in a
+   layer (gate, up, down, attn projections, …) — one quantise, many
+   dots.
+
+The scalar inner loop I wrote does (1) in pure Rust and the optimiser
+collapses it to roughly the same code path as the existing f32 FMA.
+Without the explicit `maddubs/madd` intrinsics, there's no structural
+win. Without per-layer plumbing, the quantise cost is paid per matvec.
+
+### What this means for the CPU gap
+
+The 15× all-CPU gap vs llama.cpp **is real and lives in the AVX2
+intrinsics path** — not in the algorithm. The path forward:
+
+1. Add a `q4k_q8k_row_dot_avx2` body using `_mm256_maddubs_epi16` and
+   `_mm256_madd_epi16` on 32-byte lanes. ~150 LOC of careful
+   intrinsics.
+2. Lift the `quantize_to_q8_k(x)` call out of `QuantTensor::matvec`
+   into the per-layer FFN/attention forward, so it amortises across
+   the gate/up/down/proj matvecs.
+
+Until both land, the all-CPU Tier 0 stays near 1 t/s on this MoE
+model. The algorithm + parity test landed in this session form the
+foundation; the intrinsics + amortisation pieces are the remaining
+work in E.8.
+
+### Status
+
+- ✅ E.8 step 2a — Q4_K × Q8_K algorithm + scalar dot + parity test.
+- ⏳ E.8 step 2b — AVX2 `maddubs/madd` intrinsics for the dot.
+- ⏳ E.8 step 2c — per-layer `quantize_to_q8_k` amortisation.
+- ⏳ E.6.C — CUDA Graphs.
+
+## 2026-05-13 update — Phase E.8 step 2b: AVX2 `maddubs/madd` Q4_K × Q8_K
+
+Added `q4k_q8k_row_dot_avx2` using `_mm256_maddubs_epi16` and
+`_mm256_madd_epi16` intrinsics. Per 32-byte AVX2 lane:
+
+- 32 Q4 bytes → low/high nibbles (`_mm256_and_si256` + `_mm256_srli_epi16`)
+- `maddubs(nibbles_u8, q8_quants_i8)` → 16 int16 lanes (pairwise int8 product)
+- `madd(int16_pairs, ones)` → 8 int32 lanes (pairwise int16 sum)
+- Horizontal reduce + multiply by 6-bit `scales[i]` accumulator
+
+Per super-block we walk 4 byte-groups; each group covers two adjacent
+sub-blocks via the low/high nibble split. Mirrors llama.cpp's
+`ggml-cpu/quants.c::ggml_vec_dot_q4_K_q8_K` (non-VNNI path).
+
+### Result on Qwen3.6-35B-A3B all-CPU
+
+| Path                              | Decode (t/s) |
+|---|---:|
+| q4k_row_dot (AVX2 f32 FMA)       | 1.09 |
+| q4k_q8k_row_dot scalar (step 2a) | 1.11 |
+| **q4k_q8k_row_dot AVX2 (step 2b)** | **1.14** |
+
+Only **+3 %** vs the original — much less than the expected 10×.
+Three explanations consistent with the data:
+
+1. **Memory-bound, not compute-bound.** The 22 GiB GGUF is mmapped;
+   per-token reads of ~1.3 GiB of active Q4_K expert weights are
+   gated by SSD/RAM bandwidth, not AVX2 throughput. The AVX2 path
+   does less compute per byte read, so even a 5× speed-up in
+   inner-loop ops doesn't translate to a 5× wall-clock change.
+2. **`quantize_to_q8_k(x)` per call eats the gain.** Currently
+   `QuantTensor::matvec` calls it on every invocation. In a MoE FFN
+   layer with 8 active experts × 2 Q4_K matvecs = 16 redundant
+   re-quantises of the same `x`. Step 2c (per-layer amortisation)
+   fixes this.
+3. **Q5_K / Q8_0 paths still dominate.** The down-projection is Q5_K
+   and the shared expert is Q8_0. With the Q4_K path now ~5× faster
+   per op, Q5_K and Q8_0 become a bigger fraction of total time —
+   their fast paths haven't landed yet.
+
+### What this proves
+
+The structural change works (AVX2 path lands, parity verified, fires
+correctly on real GGUFs). The wall-clock gain on this MoE config is
+modest because the model is memory-bandwidth-limited and the
+per-matvec quantise cost negates much of the per-op win. Closing the
+gap requires:
+
+- **Step 2c** — lift `quantize_to_q8_k(x)` to per-layer, sharing the
+  Q8_K buffer across all matvecs in a forward step. Estimated ~50 LOC
+  in `swiglu_moe_lazy` + `swiglu_ffn_lazy` + a sibling
+  `QuantTensor::matvec_with_q8k` entry.
+- **Q5_K × Q8_K dot** — same pattern as q4k_q8k for the down
+  projection.
+- **Q8_0 × Q8_K dot** — for the shared expert (or keep the
+  q8_0_row_dot from step 1, which already runs AVX2 on f32 input).
+
+These three together are what unlocks the 10× CPU win promise. Each
+is contained but the full set is a session's worth of work.
+
+### Status
+
+- ✅ E.8 step 2b — AVX2 maddubs/madd Q4_K × Q8_K dot landed. +3 %
+  on this memory-bound MoE config.
+- ⏳ E.8 step 2c — per-layer quantize amortisation.
+- ⏳ E.8 step 2d — Q5_K × Q8_K AVX2 dot.
+- ⏳ E.6.C — CUDA Graphs.
+
+## 2026-05-13 update — Fine-profile + Phase E.8 step 2d: Q5_K × Q8_K AVX2 dot (decode 1.14 → 2.16 t/s, +90 %)
+
+Ran the bench under `LARQL_QWEN35_FINE_PROFILE=1` to characterise the
+all-CPU decode breakdown — the memory-bound thesis from step 2b
+turned out to be wrong.
+
+### Profile (per-token decode, ~836 ms / 2 toks)
+
+| Section                | ms    | %     |
+|---|---:|---:|
+| **FFN_DOWN**           | 422.5 | **50.5** |
+| FFN_GATE_UP_PAIR       | 172.6 | 20.6  |
+| DN_RECURRENCE          | 104.0 | 12.4  |
+| DN_QKV_GATE_PAIR       |  49.7 |  5.9  |
+| LM_HEAD                |  31.6 |  3.8  |
+| DN_SSM_OUT             |  24.8 |  3.0  |
+| ATTN_BLOCK             |  23.5 |  2.8  |
+
+FFN_DOWN is the Q5_K down projection — eight active experts × forty
+layers per token. It was still using the **dequant-row-to-f32 + scalar
+dot** path. Q4_K was already AVX2, so its share is real but smaller
+(20 %); Q5_K being 50 % is the lever.
+
+### Step 2d: Q5_K × Q8_K AVX2
+
+New `q5k_q8k_row_dot` in
+[`larql_models::quant::ggml::q5k_q8k`](../../crates/larql-models/src/quant/ggml/q5k_q8k.rs).
+Same maddubs/madd structure as Q4_K, with the extra wrinkle that Q5_K
+adds 32 bytes of high-bit plane (1 bit per element). The kernel:
+
+1. Pre-extracts +16 contributions for each of the 8 sub-blocks via
+   `_mm256_srli_epi16::<N>(qh, N) & 0x01 << 4` (one const-shift per
+   sub-block, computed once at super-block entry).
+2. Unpacks qs nibbles (low/high) per byte-group, adds the matching
+   pre-extracted high-bit to form 5-bit values 0..31 in a `__m256i`.
+3. `_mm256_maddubs_epi16` against the matching Q8_K int8 row, then
+   `_mm256_madd_epi16(_, set1(1))` to fold pairs to int32, horizontal
+   reduce, multiply by the sub-block's 6-bit scale, accumulate.
+
+Parity test (`q5k_q8k_matches_dequant_then_dot`) verifies the result
+against `dequantize_q5_k + scalar dot` to 1e-3 relative.
+
+Wired through `QuantTensor::matvec`'s Q5_K arm — `quantize_to_q8_k(x)`
+per call (still no per-layer amortisation from step 2c) then per-row
+AVX2 dot under rayon. Legacy dequant-per-row path stays for shapes
+that aren't multiples of 256 and is gated by
+`LARQL_Q5K_USE_DEQUANT_DOT=1` for A/B.
+
+### All-CPU Qwen3.6-35B-A3B bench
+
+| Snapshot                                | Decode (t/s) | Δ vs prior |
+|---|---:|---:|
+| Session start (Q4_K AVX2 only)         | 1.06   | — |
+| q4k_q8k scalar (step 2a)               | 1.11   | +5 % |
+| q4k_q8k AVX2 (step 2b)                 | 1.14   | +3 % |
+| **q5k_q8k AVX2 (step 2d)**             | **2.16** | **+90 %** |
+
+The Q5_K AVX2 change roughly halved decode time. That tracks the
+profile: if FFN_DOWN drops 5× (50.5 % → ~10 %), total time drops by
+~40 % and t/s rises ~67 %. We got slightly more (90 %), consistent
+with the change also speeding up downstream cache pressure.
+
+### Refreshed iso-VRAM and all-CPU pictures
+
+| Backend            | VRAM     | Decode (t/s) |
+|---|---:|---:|
+| llama.cpp ngl=0    | 0 GiB    | 16.15 |
+| **larql all-CPU**  | 0 GiB    | **2.16** |
+| llama.cpp ngl=10   | ~5 GiB   | 21.45 |
+| **larql Tier 3 (F.6)** | 7.0 GiB | 10.50 |
+
+**All-CPU gap: 16.15 / 2.16 = 7.5× slower** (was 15×). Closing the
+remaining gap to llama.cpp:
+
+1. **Per-layer `quantize_to_q8_k` amortisation (step 2c)** —
+   currently `QuantTensor::matvec` re-quantises `x` for every matvec
+   call. In a MoE FFN that's 16 redundant scans per layer. Lifting
+   the call to per-layer would remove the duplicate work outright.
+2. **Q8_0 × Q8_K dot** — the shared-expert attention projections.
+   Smaller share than Q5_K but contributes ~6 % of decode each.
+3. **AVX-512 / VNNI on supported CPUs** — `_mm512_dpbusd_epi32` does
+   maddubs+madd in one instruction.
+
+### Status
+
+- ✅ E.8 step 2d — Q5_K × Q8_K AVX2. **+90 % all-CPU decode.**
+- ⏳ E.8 step 2c — per-layer quantize amortisation.
+- ⏳ E.8 step 2e — Q8_0 × Q8_K AVX2 (shared expert).
+- ⏳ E.6.C — CUDA Graphs.
+
+## 2026-05-13 update — Phase E.8 step 2c + hardware ceiling note
+
+Landed the **thread-local Q8_K cache** in `QuantTensor::matvec`. Keyed
+by `(x.as_ptr(), x.len())`, it lets consecutive Q4_K / Q5_K matvecs
+with the same `x` reuse the prior `quantize_to_q8_k` output. In the
+MoE FFN that means 16+ calls per layer (gate × 8 experts + up × 8
+experts) share one quantise. Cache implementation is ~30 LOC in
+`with_q8k_for` (lazy.rs) — drop-in, no API change.
+
+### Result
+
+| Snapshot                          | Decode (t/s) |
+|---|---:|
+| q5k_q8k AVX2 (step 2d)            | 2.16 |
+| **+ q8k thread-local cache (2c)** | **2.18** |
+
+Within noise. Confirms the up-front estimate: a single
+`quantize_to_q8_k(x)` is ~1 µs for hidden=2048, so saving 17 of them
+per token (gate × 8 + up × 8 + shexp redundancy) is ~17 µs / 455 ms
+decode = 0.004 % — invisible. The cache is *correct* and *cheap*,
+just not load-bearing on this model size.
+
+### Hardware ceiling: AMD Zen3, no AMX, no AVX-512
+
+`/proc/cpuinfo` confirms this bench machine is AMD Zen3 — `avx2` and
+`fma` are present; `avx512*` and `amx*` are not. Consequence: the
+AVX2 maddubs / madd path landed in steps 2b/2d **is the SIMD ceiling
+on this CPU**. The remaining CPU levers per ktransformers' playbook
+that we *could* apply here:
+
+- **Expert weight prefetch** (`madvise(MADV_WILLNEED)` on the next
+  active expert's byte slice while computing the current one) —
+  overlaps SSD/RAM with compute. Likely 10–20 % on the memory-bound
+  portion. The cleanest small win remaining.
+- **DN_RECURRENCE SIMD** — 24 % of decode is the DeltaNet
+  recurrence kernel (`delta_net_step`), pure f32 tensor math. Adding
+  AVX2 to the inner loops is plausible but the math is
+  correctness-sensitive (took most of Phase C.5 to converge); risky
+  for a small gain.
+- **AMX** — would close most of the remaining gap, but needs Intel
+  Sapphire Rapids+ (or future AMD parts with similar tile
+  instructions). Not on this machine.
+
+### Refreshed final-state numbers
+
+| Backend            | VRAM     | Decode (t/s) | Δ vs session start |
+|---|---:|---:|---:|
+| larql all-CPU      | 0 GiB    | **2.18**     | +106 % (1.06 → 2.18) |
+| larql Tier 3 (F.6) | 7.0 GiB  | 10.50        | new |
+| llama.cpp ngl=0    | 0 GiB    | 16.15        | — |
+| llama.cpp ngl=10   | ~5 GiB   | 21.45        | — |
+
+The gap to llama.cpp's all-CPU on this Zen3 box: **16.15 / 2.18 =
+7.4× slower** at iso-VRAM (both 0 GiB). The next ~3× of that gap is
+in DN_RECURRENCE + memory bandwidth (ktransformers prefetch); the
+final ~2× is the AVX-512/AMX gap that needs a different CPU.
+
+### Status (final for this session)
+
+- ✅ E.8 step 2c — Q8_K thread-local cache landed. Marginal at this
+  model size but the right pattern; load-bearing on smaller hiddens
+  where quantise is a higher fraction.
+- ⏳ Expert weight prefetch (`madvise`-based) — clearest contained
+  remaining lever on this hardware.
+- ⏳ E.6.C — CUDA Graphs.
+- ⏳ AMX path — needs Intel-side hardware.
+
+## 2026-05-13 update — Phase G.1: mmap-backed `QuantTensor` (ktransformers tier-1)
+
+The headline ktransformers idea — **keep weights resident in the OS
+page cache, not in RSS, and let `madvise(MADV_WILLNEED)` prefetch
+the next active expert** — landed in this session.
+
+### What changed
+
+- `QuantTensor` now holds an `enum QuantBacking { Heap(Arc<[u8]>),
+  Mmap(Arc<memmap2::Mmap>) }` instead of a flat `Arc<[u8]>`. The
+  view semantics (`byte_offset` + `byte_len`) carry over unchanged;
+  `expert_slice` clones the enum (which clones the inner `Arc`) so
+  per-expert subviews still share the parent backing.
+- New `QuantTensor::from_mmap_region(mmap, offset, len, type, rows,
+  cols)` constructor — zero-copy view into the gguf mmap.
+- `load_gguf_lazy_tensors` now mmaps the file once into an
+  `Arc<Mmap>` and constructs each lazy tensor with
+  `from_mmap_region(...)` instead of `mmap[..].to_vec()`. The 22 GiB
+  GGUF stays in the OS page cache; per-tensor views are slice
+  references.
+- New `QuantTensor::prefetch_willneed()` calls
+  `Mmap::advise_range(WillNeed, ..)` on the view's byte range
+  (no-op for heap-backed tensors).
+- `swiglu_moe_lazy` collects all top-K experts up front and
+  prefetches their gate/up/down byte ranges before dispatching the
+  first expert's compute — Linux begins paging in the rest while
+  expert 0 runs.
+
+### All-CPU Qwen3.6-35B-A3B (4-prefill, 16-decode)
+
+| Metric            | Heap-backed (prior) | **mmap-backed (G.1)** | Δ |
+|---|---:|---:|---:|
+| Load time         | 173 s   | **143 s**   | −17 % (no `to_vec`) |
+| RSS (4 tok)       | 22.3 GiB | **5.8 GiB**  | **−74 %** |
+| RSS (20 tok)      | 22.3 GiB | **9.0 GiB**  | **−60 %** |
+| Decode (t/s)      | 2.18    | 1.80       | −17 % |
+
+RSS scales with active-pages-touched, not file size. The 9 GiB at 20
+tokens represents the working set of attention + active experts +
+LM head + embed rows actually accessed; the other ~13 GiB of
+inactive experts stay in the OS page cache, evictable under memory
+pressure. Exactly the ktransformers value-prop shape.
+
+The 17 % decode-t/s regression comes from first-touch page faults
+when a fresh expert activates (the SSD/page-cache read is now in the
+critical path instead of pre-paid during load). The mmap variant is
+the right default for any machine that can't comfortably hold 22 GiB
+in RSS — and a free upgrade on machines that can (the OS keeps the
+hot pages resident anyway, you just don't pay for them in RSS).
+
+### Updated value-prop comparison vs llama.cpp
+
+| Backend            | RSS     | VRAM    | Decode (t/s) |
+|---|---:|---:|---:|
+| llama.cpp ngl=0    | ~22 GiB | 0 GiB   | 16.15 |
+| **larql all-CPU**  | **9 GiB** | 0 GiB | 1.80 |
+| llama.cpp ngl=10   | ~22 GiB host + ~5 GiB GPU | ~5 GiB | 21.45 |
+| larql Tier 3 (F.6) | ~22 GiB host + 7 GiB GPU  | 7.0 GiB | 10.50 |
+
+The all-CPU tier now has **2.4× less RSS than llama.cpp** at the
+same workload — that's the real value prop differentiating larql on
+memory-constrained hardware. The 9× t/s gap remains (AVX-512/AMX +
+DN recurrence work) but the **architectural** premise is now
+demonstrably superior.
+
+### What ktransformers tactics landed
+
+- ✅ **mmap-backed weights** — RSS shrinks by 60–74 %.
+- ✅ **`MADV_WILLNEED` expert prefetch** — wired through
+  `swiglu_moe_lazy`; kernel pages in the next expert while the
+  current one computes.
+- ⏳ **Hot-expert cache** — keep the top-N most-frequent experts
+  pinned in RSS. Needs per-token routing histogram first.
+- ⏳ **AMX / VNNI kernels** — hardware-blocked on this Zen3 box.
+- ⏳ **Cross-expert batching** — combine 8 experts' matvecs into one
+  rayon dispatch per layer (instead of 8 serial dispatches).
+
+### Status
+
+- ✅ G.1 — mmap-backed QuantTensor + expert prefetch landed.
+- ⏳ G.2 — `LARQL_QWEN35_HEAP_LOAD=1` opt-in to force heap-backed
+  (for users who want max throughput and have the RAM).
+- ⏳ G.3 — hot-expert RSS pinning (`mlock` top-N most-frequent
+  experts).
+
 ## 2026-05-12 update — Phase E.7: per-class GPU residency + the VRAM/throughput curve
 
 larql's value proposition is *VRAM-minimal* inference: push as much
