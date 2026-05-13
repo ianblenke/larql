@@ -151,8 +151,11 @@ pub fn deltanet_block_step(
         debug_assert_eq!(weights.ssm_out.shape(), [dims.hidden, dims.value_dim()]);
     }
 
+    use crate::attention::fine_profile::*;
+    use crate::time_section;
+
     // 1. Pre-mixer RMSNorm.
-    let x_norm = rms_norm_1d(x, &weights.attn_norm, dims.eps);
+    let x_norm = time_section!(DN_RMS_NORM_X, rms_norm_1d(x, &weights.attn_norm, dims.eps));
     // Diagnostic dump for layer 0 tensor comparison vs
     // llama-eval-callback. Verified C.5a: x_norm matches llama.cpp
     // bit-exactly at positions 0, 1, 2, N-3, N-2, N-1 for
@@ -209,21 +212,24 @@ pub fn deltanet_block_step(
         }
         _ => None,
     };
-    let (qkv_mixed, z) = if let Some((qkv_out, gate_out)) = paired {
-        (Array1::from(qkv_out), Array1::from(gate_out))
-    } else {
-        let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
-            matvec_with_backend(q, &x_norm, backend)
+    let (qkv_mixed, z) = time_section!(
+        DN_QKV_GATE_PAIR,
+        if let Some((qkv_out, gate_out)) = paired {
+            (Array1::from(qkv_out), Array1::from(gate_out))
         } else {
-            weights.attn_qkv.dot(&x_norm)
-        };
-        let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
-            matvec_with_backend(q, &x_norm, backend)
-        } else {
-            weights.attn_gate.dot(&x_norm)
-        };
-        (qkv_mixed, z)
-    };
+            let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
+                matvec_with_backend(q, &x_norm, backend)
+            } else {
+                weights.attn_qkv.dot(&x_norm)
+            };
+            let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
+                matvec_with_backend(q, &x_norm, backend)
+            } else {
+                weights.attn_gate.dot(&x_norm)
+            };
+            (qkv_mixed, z)
+        }
+    );
     // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
     // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
@@ -294,51 +300,47 @@ pub fn deltanet_block_step(
             z_l2[z_l2.len() - 3].0, z_l2[z_l2.len() - 3].1, z_l2[z_l2.len() - 3].2,
         );
     }
-    let beta_raw = weights.ssm_beta.dot(&x_norm); // [n_v_heads]
-    let alpha_raw = weights.ssm_alpha.dot(&x_norm); // [n_v_heads]
+    let (beta_raw, alpha_raw) = time_section!(DN_BETA_ALPHA_DOTS, {
+        let b = weights.ssm_beta.dot(&x_norm);
+        let a = weights.ssm_alpha.dot(&x_norm);
+        (b, a)
+    });
 
-    // Per-head non-linearities.
-    let beta: Array1<f32> = beta_raw.iter().map(|&v| sigmoid(v)).collect();
-    // Decay-rate computation: `log_g = ssm_a * softplus(alpha + dt)`.
-    //
-    // The GGUF stores ssm_a as the PRE-COMPUTED `-exp(A_log)`, not
-    // the raw `A_log` trained parameter. (Verified: real-GGUF values
-    // are negative in [-0.34, -0.004]; if stored as raw A_log,
-    // `-exp(A_log)` would be much larger in magnitude.)
-    //
-    // This matches llama.cpp's `qwen35.cpp:326`:
-    //     ggml_mul(alpha_softplus, model.layers[il].ssm_a)
-    // which multiplies the stored value directly.
-    //
-    // Attempted in C.4v: switching to `-exp(ssm_a) * softplus(...)`
-    // empirically regressed step-0 rank from 16,054 to 99,056 —
-    // confirming the GGUF storage convention.
-    let log_g: Array1<f32> = (0..dims.n_v_heads)
-        .map(|h| weights.ssm_a[h] * softplus(alpha_raw[h] + weights.ssm_dt[h]))
-        .collect();
+    let (beta, log_g) = time_section!(DN_SIGMOID_SOFTPLUS, {
+        let beta: Array1<f32> = beta_raw.iter().map(|&v| sigmoid(v)).collect();
+        let log_g: Array1<f32> = (0..dims.n_v_heads)
+            .map(|h| weights.ssm_a[h] * softplus(alpha_raw[h] + weights.ssm_dt[h]))
+            .collect();
+        (beta, log_g)
+    });
 
     // 3. Causal Conv1D-with-state, then SiLU element-wise.
-    let mut qkv_conv = backend
-        .and_then(|b| {
-            let weight = weights.ssm_conv1d.as_slice()?;
-            let conv_state = state.conv_state.as_slice_mut()?;
-            let new = qkv_mixed.as_slice()?;
-            b.qwen35_causal_conv1d_step(
-                weight,
-                conv_state,
-                new,
-                dims.d_conv,
-                dims.conv_dim(),
-                sequence_pos,
-            )
-        })
-        .map(Array1::from)
-        .unwrap_or_else(|| {
-            causal_conv1d_step(weights.ssm_conv1d.view(), &mut state.conv_state, &qkv_mixed)
-        });
-    for v in qkv_conv.iter_mut() {
-        *v = silu(*v);
-    }
+    let mut qkv_conv = time_section!(
+        DN_CONV1D,
+        backend
+            .and_then(|b| {
+                let weight = weights.ssm_conv1d.as_slice()?;
+                let conv_state = state.conv_state.as_slice_mut()?;
+                let new = qkv_mixed.as_slice()?;
+                b.qwen35_causal_conv1d_step(
+                    weight,
+                    conv_state,
+                    new,
+                    dims.d_conv,
+                    dims.conv_dim(),
+                    sequence_pos,
+                )
+            })
+            .map(Array1::from)
+            .unwrap_or_else(|| {
+                causal_conv1d_step(weights.ssm_conv1d.view(), &mut state.conv_state, &qkv_mixed)
+            })
+    );
+    time_section!(DN_SILU_QKV_CONV, {
+        for v in qkv_conv.iter_mut() {
+            *v = silu(*v);
+        }
+    });
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = qkv_conv.len();
         eprintln!(
@@ -446,73 +448,82 @@ pub fn deltanet_block_step(
     // `LARQL_QWEN35_GPU=1`. Without this they silently fall back to
     // CPU regardless of backend availability. Layout convention
     // unchanged: `q[d, h]` is still head h, dim d.
-    let q = q_raw
-        .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
-        .expect("q reshape")
-        .reversed_axes()
-        .as_standard_layout()
-        .to_owned();
-    let k = k_raw
-        .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
-        .expect("k reshape")
-        .reversed_axes()
-        .as_standard_layout()
-        .to_owned();
-    let v = v_raw
-        .into_shape_with_order((dims.n_v_heads, dims.head_v_dim))
-        .expect("v reshape")
-        .reversed_axes()
-        .as_standard_layout()
-        .to_owned();
+    let (q, k, v) = time_section!(DN_SPLIT_RESHAPE, {
+        let q = q_raw
+            .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
+            .expect("q reshape")
+            .reversed_axes()
+            .as_standard_layout()
+            .to_owned();
+        let k = k_raw
+            .into_shape_with_order((dims.n_k_heads, dims.head_v_dim))
+            .expect("k reshape")
+            .reversed_axes()
+            .as_standard_layout()
+            .to_owned();
+        let v = v_raw
+            .into_shape_with_order((dims.n_v_heads, dims.head_v_dim))
+            .expect("v reshape")
+            .reversed_axes()
+            .as_standard_layout()
+            .to_owned();
+        (q, k, v)
+    });
 
     // 5. L2-norm Q and K per head. V passes through.
-    let q = backend
-        .and_then(|b| {
-            let q_slice = q.as_slice()?;
-            b.qwen35_l2_normalize_per_head(q_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
-        })
-        .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
-        .unwrap_or_else(|| l2_normalize_per_head(&q));
-    let k = backend
-        .and_then(|b| {
-            let k_slice = k.as_slice()?;
-            b.qwen35_l2_normalize_per_head(k_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
-        })
-        .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
-        .unwrap_or_else(|| l2_normalize_per_head(&k));
-
-    // 6. Delta-rule recurrence.
-    let o = if std::env::var("LARQL_QWEN35_PAPER_ORDER").is_err() {
-        backend
+    let (q, k) = time_section!(DN_L2_NORM, {
+        let q = backend
             .and_then(|b| {
                 let q_slice = q.as_slice()?;
+                b.qwen35_l2_normalize_per_head(q_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
+            })
+            .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
+            .unwrap_or_else(|| l2_normalize_per_head(&q));
+        let k = backend
+            .and_then(|b| {
                 let k_slice = k.as_slice()?;
-                let v_slice = v.as_slice()?;
-                let log_g_slice = log_g.as_slice()?;
-                let beta_slice = beta.as_slice()?;
-                let recurrent_state = state.recurrent_state.as_slice_mut()?;
-                b.qwen35_deltanet_step(
-                    q_slice,
-                    k_slice,
-                    v_slice,
-                    log_g_slice,
-                    beta_slice,
-                    recurrent_state,
-                    dims.head_v_dim,
-                    dims.n_k_heads,
-                    dims.n_v_heads,
-                    sequence_pos,
-                )
+                b.qwen35_l2_normalize_per_head(k_slice, dims.head_v_dim, dims.n_k_heads, 1e-6)
             })
-            .and_then(|out| {
-                ndarray::Array2::from_shape_vec((dims.head_v_dim, dims.n_v_heads), out).ok()
-            })
-            .unwrap_or_else(|| {
-                delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
-            })
-    } else {
-        delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
-    };
+            .and_then(|out| Array2::from_shape_vec((dims.head_v_dim, dims.n_k_heads), out).ok())
+            .unwrap_or_else(|| l2_normalize_per_head(&k));
+        (q, k)
+    });
+
+    // 6. Delta-rule recurrence.
+    let o = time_section!(
+        DN_RECURRENCE,
+        if std::env::var("LARQL_QWEN35_PAPER_ORDER").is_err() {
+            backend
+                .and_then(|b| {
+                    let q_slice = q.as_slice()?;
+                    let k_slice = k.as_slice()?;
+                    let v_slice = v.as_slice()?;
+                    let log_g_slice = log_g.as_slice()?;
+                    let beta_slice = beta.as_slice()?;
+                    let recurrent_state = state.recurrent_state.as_slice_mut()?;
+                    b.qwen35_deltanet_step(
+                        q_slice,
+                        k_slice,
+                        v_slice,
+                        log_g_slice,
+                        beta_slice,
+                        recurrent_state,
+                        dims.head_v_dim,
+                        dims.n_k_heads,
+                        dims.n_v_heads,
+                        sequence_pos,
+                    )
+                })
+                .and_then(|out| {
+                    ndarray::Array2::from_shape_vec((dims.head_v_dim, dims.n_v_heads), out).ok()
+                })
+                .unwrap_or_else(|| {
+                    delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+                })
+        } else {
+            delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+        }
+    );
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let mut per_head: Vec<(usize, f32)> = (0..dims.n_v_heads)
             .map(|h| {
@@ -553,41 +564,48 @@ pub fn deltanet_block_step(
     // heads, producing a 46× amplification (l2: 0.6 → 27.4) where
     // llama.cpp produces 5× less. Transpose first so the flatten
     // yields head-major.
-    let o_flat_pre: Array1<f32> = o.t().to_owned().into_iter().collect();
+    let o_flat_pre: Array1<f32> = time_section!(DN_O_RESHAPE, {
+        let r: Array1<f32> = o.t().to_owned().into_iter().collect();
+        r
+    });
     debug_assert_eq!(o_flat_pre.len(), value_dim);
 
     // 7. Per-head RMSNorm by ssm_norm (weight is [head_v_dim], shared
     //    across heads). Reshape to [1, value_dim] for rms_norm_heads.
-    let gpu_o_normed = backend.and_then(|b| {
-        let o_slice = o_flat_pre.as_slice()?;
-        b.qwen35_rms_norm_heads(
-            o_slice,
-            &weights.ssm_norm,
-            dims.n_v_heads,
-            dims.head_v_dim,
-            crate::residual::DEFAULT_EPS as f32,
-        )
+    let mut o_flat = time_section!(DN_RMS_NORM_HEADS, {
+        let gpu_o_normed = backend.and_then(|b| {
+            let o_slice = o_flat_pre.as_slice()?;
+            b.qwen35_rms_norm_heads(
+                o_slice,
+                &weights.ssm_norm,
+                dims.n_v_heads,
+                dims.head_v_dim,
+                crate::residual::DEFAULT_EPS as f32,
+            )
+        });
+        if let Some(out) = gpu_o_normed {
+            Array1::from(out)
+        } else {
+            let o_2d = o_flat_pre
+                .into_shape_with_order((1, value_dim))
+                .expect("o reshape");
+            let o_normed = crate::residual::rms_norm_heads(
+                &o_2d,
+                &weights.ssm_norm,
+                dims.n_v_heads,
+                dims.head_v_dim,
+                0.0,
+            );
+            o_normed.index_axis_move(Axis(0), 0)
+        }
     });
-    let mut o_flat = if let Some(out) = gpu_o_normed {
-        Array1::from(out)
-    } else {
-        let o_2d = o_flat_pre
-            .into_shape_with_order((1, value_dim))
-            .expect("o reshape");
-        let o_normed = crate::residual::rms_norm_heads(
-            &o_2d,
-            &weights.ssm_norm,
-            dims.n_v_heads,
-            dims.head_v_dim,
-            0.0,
-        );
-        o_normed.index_axis_move(Axis(0), 0)
-    };
 
     // 8. Multiply by SiLU(Z) element-wise.
-    for c in 0..value_dim {
-        o_flat[c] *= silu(z[c]);
-    }
+    time_section!(DN_SILU_Z, {
+        for c in 0..value_dim {
+            o_flat[c] *= silu(z[c]);
+        }
+    });
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = o_flat.len();
         // Optional: dump full final_out (and other vectors) to binary file
@@ -662,11 +680,14 @@ pub fn deltanet_block_step(
     }
 
     // 9. Output projection (matvec).
-    let block_out = if let Some(q) = weights.ssm_out_quant.as_ref() {
-        matvec_with_backend(q, &o_flat, backend)
-    } else {
-        weights.ssm_out.dot(&o_flat)
-    };
+    let block_out = time_section!(
+        DN_SSM_OUT,
+        if let Some(q) = weights.ssm_out_quant.as_ref() {
+            matvec_with_backend(q, &o_flat, backend)
+        } else {
+            weights.ssm_out.dot(&o_flat)
+        }
+    );
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = block_out.len();
         eprintln!(

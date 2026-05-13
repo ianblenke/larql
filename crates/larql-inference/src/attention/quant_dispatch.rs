@@ -56,6 +56,26 @@ pub fn matvec_with_backend(
     }
 
     // CPU fallback (rayon + AVX2/NEON inside `QuantTensor::matvec`).
+    // Diagnostic env var prints the first 20 fallback dispatches so we
+    // can see at a glance which tensors aren't taking the GPU path:
+    //   LARQL_QWEN35_DISPATCH_TRACE=1
+    // type=13 is GGML's Q5_K — the format that, on Qwen3.6-27B-Q4_K_S,
+    // covers `attn_qkv` (DeltaNet), `ssm_out`, `ffn_down`, and the
+    // full-attn `attn_k`/`attn_v`. Those four are the dominant
+    // per-token cost (E.6.A.9 fine-profile finding).
+    if std::env::var("LARQL_QWEN35_DISPATCH_TRACE").is_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "[dispatch] CPU fallback: type={} rows={} cols={}",
+                qt.tensor_type(),
+                rows,
+                cols
+            );
+        }
+    }
     qt.matvec(x).expect("QuantTensor::matvec CPU fallback")
 }
 

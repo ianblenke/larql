@@ -168,6 +168,71 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.A.9 fine profile: 87 % of decode time is Q5_K CPU fallback
+
+Added per-section accumulators (`LARQL_QWEN35_FINE_PROFILE=1`) that
+attribute decode time to the actual operations inside
+`qwen35_forward_step`, `deltanet_block_step`, and `swiglu_ffn_lazy`.
+The breakdown on the current E.6.A.7+8 build with `LARQL_QWEN35_GPU=1`
+(steady-state token, 2.81 s total):
+
+```
+DN_SSM_OUT            1661 ms  (59.17 %)   ssm_out matvec × 48 layers
+FFN_DOWN               797 ms  (28.39 %)   ffn_down matvec × 64 layers
+DN_QKV_GATE_PAIR       191 ms  ( 6.80 %)   attn_qkv + attn_gate × 48
+LM_HEAD                 86 ms  ( 3.07 %)   final lm_head matvec
+FFN_GATE_UP_PAIR        30 ms  ( 1.09 %)   ffn_gate + ffn_up × 64
+ATTN_BLOCK              13 ms  ( 0.46 %)   16 full-attn layers (entire)
+DN_RECURRENCE            8 ms  ( 0.29 %)   GPU recurrence × 48
+…all other sections      9 ms  ( 0.32 %)   conv1d / L2 / rms_norm / silu / split / norms
+```
+
+Bisecting via `LARQL_QWEN35_DISPATCH_TRACE=1` (logs every
+CPU-fallback in `matvec_with_backend`):
+
+```
+[dispatch] CPU fallback: type=13 rows=10240 cols=5120     # DeltaNet attn_qkv
+[dispatch] CPU fallback: type=13 rows=1024 cols=5120      # full-attn attn_k or attn_v
+[dispatch] CPU fallback: type=13 rows=5120 cols=17408     # ffn_down
+[dispatch] CPU fallback: type=13 rows=5120 cols=6144      # ssm_out
+```
+
+**Type 13 is GGML's Q5_K.** Our GPU dispatcher
+(`ggml_type_to_quant_format`) currently returns `None` for Q5_K and
+falls back to the CPU rayon dequant-per-row path. So:
+
+| Q5_K tensor in Qwen3.6-27B-Q4_K_S | Per-call cost | Calls/token | Per-token cost |
+|---|---:|---:|---:|
+| `ssm_out` (5120×6144)              | ~34.6 ms | 48 | 1661 ms |
+| `ffn_down` (5120×17408)            | ~12.5 ms | 64 |  797 ms |
+| `attn_qkv` Δ (10240×5120) — but the paired path's qkv side falls back to per-call CPU because the pair gate Q5_K never fires | — | 48 | (part of the 191 ms in DN_QKV_GATE_PAIR) |
+| full-attn `attn_k`/`attn_v` (1024×5120) | trivial | 32 |    ~5 ms |
+
+**~2.45 s / token of CPU rayon dequant work** is the lever. Every
+other optimisation in E.6.A.1–8 was working around the wrong
+bottleneck. Implementing Q5_K GPU dispatch (a direct-matvec kernel
+or cached f16 dequant + cuBLAS hgemv) should drop decode time from
+~2.8 s to ~0.3–0.5 s and lift throughput from 0.35 t/s to ~2–3 t/s
+— closing the gap with llama.cpp GPU (50 t/s) to a single decimal
+order of magnitude.
+
+| Tensor | Current path | Target path | Memory cost (f16 cached) |
+|---|---|---|---:|
+| ssm_out × 48          | CPU rayon | Q5_K → f16 cache + hgemv | 2.9 GB |
+| ffn_down × 64         | CPU rayon | Q5_K → f16 cache + hgemv | 10.9 GB |
+| attn_qkv × 48 (DN)    | CPU rayon | Q5_K → f16 cache + hgemv | 4.8 GB |
+| attn_k/v × 32 (full)  | CPU rayon | Q5_K → f16 cache + hgemv | 0.3 GB |
+| **Q5_K f16 cache total** | | | **~19 GB** |
+
+19 GB pushes against the 4090's 24 GB budget alongside the existing
+Q4_K device cache (~15 GB) — the f16 path doesn't fit fully. The
+right implementation is therefore a **direct Q5_K × f32/q8_1 matvec
+kernel** that operates on the packed bytes (the same approach the
+existing `q4k_direct` and `q6k_mmvq` kernels use). Per-byte memory
+cost stays at Q5_K (~5.5 bits/weight) — fits easily.
+
+This is the E.6.A.10 / E.6.D work.
+
 ## 2026-05-12 update — Phase E.6.A.8: paired Q4_K matvec (attn_qkv+attn_gate, ffn_gate+ffn_up)
 
 New `ComputeBackend::qwen35_paired_q4k_matvec` trait method that

@@ -128,21 +128,27 @@ pub fn qwen35_forward_step(
         std::env::set_var("LARQL_QWEN35_DUMP_TOKEN_TAG", format!("tok{tok}"));
     }
 
+    use crate::attention::fine_profile::{self, *};
+    use crate::time_section;
+
     // 1. Embed lookup. Lazy-quant path takes precedence when set;
     //    falls back to dense `embed.row(token_id)` otherwise.
-    let mut x: Array1<f32> = if let Some(qt) = weights.embed_quant.as_ref() {
-        let [vocab, hidden] = qt.shape();
-        debug_assert!((token_id as usize) < vocab);
-        debug_assert_eq!(hidden, dn_dims.hidden);
-        qt.row_to_f32(token_id as usize)
-            .expect("embed_quant row_to_f32")
-    } else {
-        let vocab = weights.embed.shape()[0];
-        let hidden = weights.embed.shape()[1];
-        debug_assert!((token_id as usize) < vocab);
-        debug_assert_eq!(hidden, dn_dims.hidden);
-        weights.embed.row(token_id as usize).to_owned()
-    };
+    let mut x: Array1<f32> = time_section!(
+        EMBED,
+        if let Some(qt) = weights.embed_quant.as_ref() {
+            let [vocab, hidden] = qt.shape();
+            debug_assert!((token_id as usize) < vocab);
+            debug_assert_eq!(hidden, dn_dims.hidden);
+            qt.row_to_f32(token_id as usize)
+                .expect("embed_quant row_to_f32")
+        } else {
+            let vocab = weights.embed.shape()[0];
+            let hidden = weights.embed.shape()[1];
+            debug_assert!((token_id as usize) < vocab);
+            debug_assert_eq!(hidden, dn_dims.hidden);
+            weights.embed.row(token_id as usize).to_owned()
+        }
+    );
 
     // Optional per-layer trace, enabled via `LARQL_QWEN35_TRACE=1`.
     // Prints residual stream stats to stderr at each layer so a
@@ -165,21 +171,48 @@ pub fn qwen35_forward_step(
         // 2a. Block forward (linear or full-attn). The block does
         // its own pre-norm internally (`attn_norm`).
         let backend = weights.backend.as_deref();
-        let block_out = hybrid_layer_step(
-            layer,
-            &x,
+        // Linear-block timing is attributed by the per-section
+        // accumulators inside `deltanet_block_step`; full-attn time
+        // lands in ATTN_BLOCK so the totals reflect the actual block
+        // kind. Match on the discriminant cheaply.
+        let is_full_attn = matches!(
             &layer_w.block,
-            dn_dims,
-            attn_dims,
-            hybrid_cache,
-            backend,
-            hybrid_cache.next_position,
+            crate::attention::qwen35_block::Qwen35LayerWeights::Attention(_)
         );
+        let block_out = if is_full_attn {
+            time_section!(
+                ATTN_BLOCK,
+                hybrid_layer_step(
+                    layer,
+                    &x,
+                    &layer_w.block,
+                    dn_dims,
+                    attn_dims,
+                    hybrid_cache,
+                    backend,
+                    hybrid_cache.next_position,
+                )
+            )
+        } else {
+            hybrid_layer_step(
+                layer,
+                &x,
+                &layer_w.block,
+                dn_dims,
+                attn_dims,
+                hybrid_cache,
+                backend,
+                hybrid_cache.next_position,
+            )
+        };
         // 2b. Residual add 1 — `residual = x + block_out`.
-        let residual: Array1<f32> = &x + &block_out;
+        let residual: Array1<f32> = time_section!(RESIDUAL_ADDS, &x + &block_out);
         // 2c. Post-attention RMSNorm (only on `has_post_norms`
         // architectures — Qwen 3.6 is one of them).
-        let ffn_in = rms_norm_1d_pub(&residual, &layer_w.attn_post_norm, eps);
+        let ffn_in = time_section!(
+            FFN_RMS_NORM,
+            rms_norm_1d_pub(&residual, &layer_w.attn_post_norm, eps)
+        );
         // 2d. SwiGLU FFN. Lazy-quant path takes precedence per
         //     projection; falls back to dense ndarray dot otherwise.
         let ffn_out = if layer_w.ffn_gate_quant.is_some()
@@ -207,7 +240,7 @@ pub fn qwen35_forward_step(
         // 2e. Residual add 2 — `x = residual + ffn_out` (NOT
         // `ffn_in + ffn_out`; the FFN residual bypasses the
         // post-norm per design.md §6).
-        x = &residual + &ffn_out;
+        x = time_section!(RESIDUAL_ADDS, &residual + &ffn_out);
 
         // Optional per-layer binary tensor dump for elementwise parity
         // diff vs llama-eval-callback (`LLAMA_DUMP_BIN_DIR` on llama.cpp
@@ -289,7 +322,7 @@ pub fn qwen35_forward_step(
     }
 
     // 3. Final norm + lm_head.
-    let x_final = rms_norm_1d_pub(&x, &weights.final_norm, eps);
+    let x_final = time_section!(FINAL_NORM, rms_norm_1d_pub(&x, &weights.final_norm, eps));
     // Optional final-norm + logits dump for elementwise parity diff
     // vs llama.cpp's `result_norm.bin` / `result_output.bin`. Triggered
     // by `LARQL_QWEN35_DUMP_FINAL_BIN_DIR=<dir>` (single-shot, dumps
@@ -332,15 +365,18 @@ pub fn qwen35_forward_step(
     // populated; falls back to dense f32 dot otherwise. When a
     // GPU backend is attached, the lazy path routes through
     // `matvec_with_backend` for cuBLAS-style GEMV.
-    let logits = if let Some(qt) = weights.lm_head_quant.as_ref() {
-        crate::attention::quant_dispatch::matvec_with_backend(
-            qt,
-            &x_final,
-            weights.backend.as_deref(),
-        )
-    } else {
-        weights.lm_head.dot(&x_final)
-    };
+    let logits = time_section!(
+        LM_HEAD,
+        if let Some(qt) = weights.lm_head_quant.as_ref() {
+            crate::attention::quant_dispatch::matvec_with_backend(
+                qt,
+                &x_final,
+                weights.backend.as_deref(),
+            )
+        } else {
+            weights.lm_head.dot(&x_final)
+        }
+    );
     if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR") {
         let tag =
             std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
@@ -373,6 +409,10 @@ pub fn qwen35_forward_step(
 
     // 4. Advance position for the next token's RoPE.
     hybrid_cache.next_position += 1;
+
+    if fine_profile::enabled() {
+        fine_profile::dump_and_reset();
+    }
 
     logits
 }
@@ -424,56 +464,64 @@ fn swiglu_ffn_lazy(
     down_dense: &ArcArray2<f32>,
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
+    use crate::attention::fine_profile::*;
     use crate::attention::quant_dispatch::{ggml_type_to_quant_format, matvec_with_backend};
+    use crate::time_section;
     use larql_compute::QuantFormat;
 
-    // Fast-path: gate + up are both lazy Q4_K and a backend exposes
-    // `qwen35_paired_q4k_matvec`. Both projections feed off `x` (the
-    // post-attn-norm residual), so pairing them onto one htod + one
-    // sync saves a host bounce per FFN × 64 layers per token.
-    let paired = match (backend, gate_q, up_q) {
-        (Some(b), Some(gq), Some(uq)) => {
-            let gfmt = ggml_type_to_quant_format(gq.tensor_type());
-            let ufmt = ggml_type_to_quant_format(uq.tensor_type());
-            if matches!(gfmt, Some(QuantFormat::Q4_K)) && matches!(ufmt, Some(QuantFormat::Q4_K)) {
-                let x_slice = x.as_slice().expect("Array1 contiguous");
-                let g_shape = gq.shape();
-                let u_shape = uq.shape();
-                b.qwen35_paired_q4k_matvec(
-                    gq.raw_bytes(),
-                    g_shape[0],
-                    uq.raw_bytes(),
-                    u_shape[0],
-                    x_slice,
-                    g_shape[1],
-                )
-            } else {
-                None
+    let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
+        let paired = match (backend, gate_q, up_q) {
+            (Some(b), Some(gq), Some(uq)) => {
+                let gfmt = ggml_type_to_quant_format(gq.tensor_type());
+                let ufmt = ggml_type_to_quant_format(uq.tensor_type());
+                if matches!(gfmt, Some(QuantFormat::Q4_K))
+                    && matches!(ufmt, Some(QuantFormat::Q4_K))
+                {
+                    let x_slice = x.as_slice().expect("Array1 contiguous");
+                    let g_shape = gq.shape();
+                    let u_shape = uq.shape();
+                    b.qwen35_paired_q4k_matvec(
+                        gq.raw_bytes(),
+                        g_shape[0],
+                        uq.raw_bytes(),
+                        u_shape[0],
+                        x_slice,
+                        g_shape[1],
+                    )
+                } else {
+                    None
+                }
             }
+            _ => None,
+        };
+        if let Some((gv, uv)) = paired {
+            (Array1::from(gv), Array1::from(uv))
+        } else {
+            let g = match gate_q {
+                Some(q) => matvec_with_backend(q, x, backend),
+                None => gate_dense.dot(x),
+            };
+            let u = match up_q {
+                Some(q) => matvec_with_backend(q, x, backend),
+                None => up_dense.dot(x),
+            };
+            (g, u)
         }
-        _ => None,
-    };
-    let (g, u) = if let Some((gv, uv)) = paired {
-        (Array1::from(gv), Array1::from(uv))
-    } else {
-        let g = match gate_q {
-            Some(q) => matvec_with_backend(q, x, backend),
-            None => gate_dense.dot(x),
-        };
-        let u = match up_q {
-            Some(q) => matvec_with_backend(q, x, backend),
-            None => up_dense.dot(x),
-        };
-        (g, u)
-    };
-    let mut inter = Array1::<f32>::zeros(g.len());
-    for i in 0..g.len() {
-        inter[i] = (g[i] * sigmoid(g[i])) * u[i];
-    }
-    match down_q {
-        Some(q) => matvec_with_backend(q, &inter, backend),
-        None => down_dense.dot(&inter),
-    }
+    });
+    let inter = time_section!(FFN_SILU_LOOP, {
+        let mut inter = Array1::<f32>::zeros(g.len());
+        for i in 0..g.len() {
+            inter[i] = (g[i] * sigmoid(g[i])) * u[i];
+        }
+        inter
+    });
+    time_section!(
+        FFN_DOWN,
+        match down_q {
+            Some(q) => matvec_with_backend(q, &inter, backend),
+            None => down_dense.dot(&inter),
+        }
+    )
 }
 
 #[cfg(test)]
