@@ -34,6 +34,32 @@ use super::qwen35_block::{
     hybrid_layer_step, DeltaNetHybridCache, Qwen35AttentionDims, Qwen35LayerWeights,
 };
 
+/// Per-layer MoE FFN weights for `Qwen35MoeArch` (e.g.
+/// Qwen3.6-35B-A3B). When a `Qwen35FullLayerWeights` has `moe =
+/// Some(...)`, the forward step routes through `swiglu_moe_lazy`
+/// instead of the dense `swiglu_ffn_lazy`.
+///
+/// Tensor layouts (matching the GGUF probe from F.0):
+///   - `router`        f32, `[num_experts, hidden]`
+///   - `gate_exps`     Q4_K, `[num_experts * expert_ffn_dim, hidden]`
+///   - `up_exps`       Q4_K, `[num_experts * expert_ffn_dim, hidden]`
+///   - `down_exps`     Q5_K, `[num_experts * hidden, expert_ffn_dim]`
+///   - shexp_*         optional shared expert (always-on). Same
+///                     layouts as a dense SwiGLU but with `expert_ffn_dim`
+///                     (Qwen3.6-35B-A3B has one).
+#[derive(Clone)]
+pub struct Qwen35MoeFfnWeights {
+    pub router: larql_models::quant::lazy::QuantTensor,
+    pub gate_exps: larql_models::quant::lazy::QuantTensor,
+    pub up_exps: larql_models::quant::lazy::QuantTensor,
+    pub down_exps: larql_models::quant::lazy::QuantTensor,
+    pub shexp_gate: Option<larql_models::quant::lazy::QuantTensor>,
+    pub shexp_up: Option<larql_models::quant::lazy::QuantTensor>,
+    pub shexp_down: Option<larql_models::quant::lazy::QuantTensor>,
+    pub num_experts: usize,
+    pub top_k: usize,
+}
+
 /// Full weights for one layer (both kinds): the block weights
 /// (linear or attention) PLUS the post-attention norm + SwiGLU FFN.
 #[derive(Clone)]
@@ -59,6 +85,11 @@ pub struct Qwen35FullLayerWeights {
     pub ffn_gate_quant: Option<larql_models::quant::lazy::QuantTensor>,
     pub ffn_up_quant: Option<larql_models::quant::lazy::QuantTensor>,
     pub ffn_down_quant: Option<larql_models::quant::lazy::QuantTensor>,
+    /// MoE FFN. When `Some(_)`, the forward step dispatches through
+    /// `swiglu_moe_lazy` and the dense `ffn_*` / `ffn_*_quant` fields
+    /// are unused. Populated by `load_qwen35_moe_weights` for
+    /// `Qwen35MoeArch` GGUFs.
+    pub moe: Option<Qwen35MoeFfnWeights>,
 }
 
 /// Full Qwen 3.6 model weights — embed, every layer's weights, and
@@ -213,9 +244,23 @@ pub fn qwen35_forward_step(
             FFN_RMS_NORM,
             rms_norm_1d_pub(&residual, &layer_w.attn_post_norm, eps)
         );
-        // 2d. SwiGLU FFN. Lazy-quant path takes precedence per
-        //     projection; falls back to dense ndarray dot otherwise.
-        let ffn_out = if layer_w.ffn_gate_quant.is_some()
+        // 2d. SwiGLU FFN. MoE arch takes precedence; then the
+        //     lazy-quant dense path; then dense ndarray dot fallback.
+        let ffn_out = if let Some(moe) = layer_w.moe.as_ref() {
+            swiglu_moe_lazy(
+                &ffn_in,
+                &moe.router,
+                &moe.gate_exps,
+                &moe.up_exps,
+                &moe.down_exps,
+                moe.shexp_gate.as_ref(),
+                moe.shexp_up.as_ref(),
+                moe.shexp_down.as_ref(),
+                moe.num_experts,
+                moe.top_k,
+                weights.backend.as_deref(),
+            )
+        } else if layer_w.ffn_gate_quant.is_some()
             || layer_w.ffn_up_quant.is_some()
             || layer_w.ffn_down_quant.is_some()
         {
@@ -456,6 +501,161 @@ fn swiglu_ffn(
 /// (or to drop in AVX2-accelerated `QuantTensor::matvec` in a
 /// follow-up without touching the call sites).
 #[allow(clippy::too_many_arguments)]
+/// MoE FFN forward for Qwen3.6-35B-A3B and similar architectures.
+///
+/// Layout matches the Qwen35MoeArch GGUFs:
+///   - `router`        `[num_experts, hidden]` f32 — produces a
+///                     `[num_experts]` vector of routing logits.
+///   - `gate_exps`     `[num_experts * ffn_dim, hidden]` Q4_K, 3D-packed
+///   - `up_exps`       same shape, same quant
+///   - `down_exps`     `[num_experts * hidden, ffn_dim]` Q5_K, 3D-packed
+///   - shared expert (optional): the always-on dense SwiGLU with its
+///     own `[ffn_dim, hidden]` gate/up and `[hidden, ffn_dim]` down.
+///     If `shexp_*` is `None` this term is dropped (some Qwen MoE
+///     variants don't have a shared expert).
+///
+/// Algorithm (per token):
+///   1. `logits = router @ x`                                      // [num_experts]
+///   2. `(idx, top_logits) = top_k(logits, top_k)`
+///   3. `w = softmax(top_logits)`                                  // [top_k]
+///   4. for each chosen expert `e_i`:
+///        `y_i = swiglu(gate_exps[e_i] @ x, up_exps[e_i] @ x) @ down_exps[e_i]`
+///   5. `y_moe = sum_i (w_i * y_i)`
+///   6. `y_shared = swiglu(shexp_gate @ x, shexp_up @ x) @ shexp_down`
+///   7. return `y_moe + y_shared`
+///
+/// Each expert dispatch reuses the existing `swiglu_ffn_lazy` path
+/// (which already plumbs through gpu_tier::Ffn / paired matvec / the
+/// device-resident fused block when the backend supports it). The
+/// per-expert weight slicing is via `QuantTensor::expert_slice` —
+/// zero-copy `Arc<[u8]>` views, F.1.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_moe_lazy(
+    x: &Array1<f32>,
+    router: &larql_models::quant::lazy::QuantTensor,
+    gate_exps: &larql_models::quant::lazy::QuantTensor,
+    up_exps: &larql_models::quant::lazy::QuantTensor,
+    down_exps: &larql_models::quant::lazy::QuantTensor,
+    shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    num_experts: usize,
+    top_k: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+) -> Array1<f32> {
+    use crate::attention::gpu_tier::{self, GpuClass};
+    use crate::attention::quant_dispatch::matvec_with_backend;
+    use ndarray::ArcArray2;
+
+    // The FFN GPU residency knob covers MoE too — pushing FFN to CPU
+    // means all expert dispatches run CPU rayon (which is the
+    // VRAM-minimal mode larql's value prop targets).
+    let backend = gpu_tier::backend_for(GpuClass::Ffn, backend);
+
+    // 1. Router logits.
+    let logits = matvec_with_backend(router, x, backend);
+    debug_assert_eq!(logits.len(), num_experts);
+
+    // 2. Top-K selection on host. num_experts is typically 128-256 so a
+    //    full sort is cheap; top_k is 8 so we don't bother with a
+    //    proper partial-sort heap.
+    let mut idx_logit: Vec<(usize, f32)> =
+        logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    idx_logit.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top: Vec<(usize, f32)> = idx_logit.into_iter().take(top_k).collect();
+
+    // 3. Softmax over the top-K logits (numerically stable).
+    let max_logit = top
+        .iter()
+        .map(|&(_, l)| l)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = top.iter().map(|&(_, l)| (l - max_logit).exp()).collect();
+    let sum_exp: f32 = exps.iter().sum();
+    let weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+    // 4. Per-expert SwiGLU. Each expert_slice is a zero-copy view of
+    //    the 3D-packed parent tensor (F.1).
+    let hidden = x.len();
+    let mut y_moe = Array1::<f32>::zeros(hidden);
+    // Cheap empty placeholders for the dense-fallback slots in
+    // swiglu_ffn_lazy — we never use them when the lazy form is set.
+    let empty_2d: ArcArray2<f32> = ArcArray2::from_shape_vec((0, 0), vec![])
+        .expect("0x0 array is always valid");
+
+    // Phase G.1: pre-slice all top-K experts and issue
+    // MADV_WILLNEED hints up front. The kernel starts paging in
+    // every selected expert's gate/up/down byte range while we
+    // dispatch the first expert's compute. No-op for heap-backed
+    // tensors; real win for mmap-backed views (the load_gguf_lazy
+    // path). Plus the shared expert, which is always-on.
+    let expert_slices: Vec<(
+        usize,
+        larql_models::quant::lazy::QuantTensor,
+        larql_models::quant::lazy::QuantTensor,
+        larql_models::quant::lazy::QuantTensor,
+    )> = top
+        .iter()
+        .map(|&(expert_id, _)| {
+            let gate_e = gate_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("expert_slice gate");
+            let up_e = up_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("expert_slice up");
+            let down_e = down_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("expert_slice down");
+            gate_e.prefetch_willneed();
+            up_e.prefetch_willneed();
+            down_e.prefetch_willneed();
+            (expert_id, gate_e, up_e, down_e)
+        })
+        .collect();
+    if let (Some(g), Some(u), Some(d)) = (shexp_gate, shexp_up, shexp_down) {
+        g.prefetch_willneed();
+        u.prefetch_willneed();
+        d.prefetch_willneed();
+    }
+
+    for (i, (_expert_id, gate_e, up_e, down_e)) in expert_slices.iter().enumerate() {
+        let y_i = swiglu_ffn_lazy(
+            x,
+            Some(gate_e),
+            Some(up_e),
+            Some(down_e),
+            &empty_2d,
+            &empty_2d,
+            &empty_2d,
+            backend,
+        );
+        let w = weights[i];
+        for h in 0..hidden {
+            y_moe[h] += w * y_i[h];
+        }
+    }
+
+    // 5. Shared expert (always-on, no routing weight). Some Qwen MoE
+    //    variants ship without one — in which case the parameters are
+    //    `None` and we skip.
+    if let (Some(g), Some(u), Some(d)) = (shexp_gate, shexp_up, shexp_down) {
+        let y_shared = swiglu_ffn_lazy(
+            x,
+            Some(g),
+            Some(u),
+            Some(d),
+            &empty_2d,
+            &empty_2d,
+            &empty_2d,
+            backend,
+        );
+        for h in 0..hidden {
+            y_moe[h] += y_shared[h];
+        }
+    }
+
+    y_moe
+}
+
 fn swiglu_ffn_lazy(
     x: &Array1<f32>,
     gate_q: Option<&larql_models::quant::lazy::QuantTensor>,
@@ -694,6 +894,200 @@ mod tests {
         assert!(y[1].abs() < 1e-5);
     }
 
+    /// Parity test for `swiglu_moe_lazy` against a hand-rolled scalar
+    /// reference. Tiny setup: hidden=3, ffn_dim=4, num_experts=4,
+    /// top_k=2. F32-typed QuantTensors so the GPU fast-paths
+    /// fall through to the per-call `matvec_with_backend` fallback
+    /// (which routes f32 through `QuantTensor::matvec`).
+    #[test]
+    fn swiglu_moe_lazy_matches_reference() {
+        use larql_models::quant::lazy::QuantTensor;
+
+        let hidden = 3usize;
+        let ffn_dim = 4usize;
+        let num_experts = 4usize;
+        let top_k = 2usize;
+
+        // Reproducible synthetic weights — each tensor gets a distinct
+        // per-element pattern so the reference and the impl exercise
+        // every slot.
+        let mk = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32) * 0.07 + seed).sin() * 0.3).collect()
+        };
+        let router_v = mk(num_experts * hidden, 0.1);
+        let gate_exps_v = mk(num_experts * ffn_dim * hidden, 0.2);
+        let up_exps_v = mk(num_experts * ffn_dim * hidden, 0.3);
+        let down_exps_v = mk(num_experts * hidden * ffn_dim, 0.4);
+        let shexp_g_v = mk(ffn_dim * hidden, 0.5);
+        let shexp_u_v = mk(ffn_dim * hidden, 0.6);
+        let shexp_d_v = mk(hidden * ffn_dim, 0.7);
+
+        let router = QuantTensor::from_f32_rows(num_experts, hidden, &router_v);
+        // 3D-packed layout per F.1: rows = num_experts * out_dim.
+        let gate_exps =
+            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
+        let up_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
+        let down_exps =
+            QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
+        let shexp_g = QuantTensor::from_f32_rows(ffn_dim, hidden, &shexp_g_v);
+        let shexp_u = QuantTensor::from_f32_rows(ffn_dim, hidden, &shexp_u_v);
+        let shexp_d = QuantTensor::from_f32_rows(hidden, ffn_dim, &shexp_d_v);
+
+        let x = Array1::from(vec![0.4_f32, -0.2, 0.15]);
+
+        // --- Reference (scalar) ---
+        // Router logits.
+        let mut logits = vec![0.0_f32; num_experts];
+        for e in 0..num_experts {
+            let mut acc = 0.0_f32;
+            for c in 0..hidden {
+                acc += router_v[e * hidden + c] * x[c];
+            }
+            logits[e] = acc;
+        }
+        // Top-K (full sort is fine here).
+        let mut idx: Vec<(usize, f32)> =
+            logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top: Vec<(usize, f32)> = idx.into_iter().take(top_k).collect();
+        // Softmax.
+        let max_l = top.iter().map(|&(_, l)| l).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let w: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        let ref_swiglu = |gate: &[f32], up: &[f32], down: &[f32]| -> Vec<f32> {
+            // gate @ x and up @ x : [ffn_dim]
+            let mut g = vec![0.0_f32; ffn_dim];
+            let mut u = vec![0.0_f32; ffn_dim];
+            for r in 0..ffn_dim {
+                let mut ag = 0.0;
+                let mut au = 0.0;
+                for c in 0..hidden {
+                    ag += gate[r * hidden + c] * x[c];
+                    au += up[r * hidden + c] * x[c];
+                }
+                g[r] = ag;
+                u[r] = au;
+            }
+            // SiLU(g) * u
+            let inter: Vec<f32> = g
+                .iter()
+                .zip(u.iter())
+                .map(|(&gi, &ui)| (gi * sigmoid(gi)) * ui)
+                .collect();
+            // down @ inter : [hidden]
+            let mut y = vec![0.0_f32; hidden];
+            for r in 0..hidden {
+                let mut a = 0.0;
+                for c in 0..ffn_dim {
+                    a += down[r * ffn_dim + c] * inter[c];
+                }
+                y[r] = a;
+            }
+            y
+        };
+
+        let mut expected = vec![0.0_f32; hidden];
+        let bytes_gate_per_expert = ffn_dim * hidden;
+        let bytes_down_per_expert = hidden * ffn_dim;
+        for (i, &(e, _)) in top.iter().enumerate() {
+            let g0 = e * bytes_gate_per_expert;
+            let g1 = g0 + bytes_gate_per_expert;
+            let d0 = e * bytes_down_per_expert;
+            let d1 = d0 + bytes_down_per_expert;
+            let y_i = ref_swiglu(
+                &gate_exps_v[g0..g1],
+                &up_exps_v[g0..g1],
+                &down_exps_v[d0..d1],
+            );
+            for h in 0..hidden {
+                expected[h] += w[i] * y_i[h];
+            }
+        }
+        // Shared expert.
+        let y_sh = ref_swiglu(&shexp_g_v, &shexp_u_v, &shexp_d_v);
+        for h in 0..hidden {
+            expected[h] += y_sh[h];
+        }
+
+        // --- Impl ---
+        let got = swiglu_moe_lazy(
+            &x,
+            &router,
+            &gate_exps,
+            &up_exps,
+            &down_exps,
+            Some(&shexp_g),
+            Some(&shexp_u),
+            Some(&shexp_d),
+            num_experts,
+            top_k,
+            None, // CPU path through QuantTensor::matvec
+        );
+
+        assert_eq!(got.len(), hidden);
+        for h in 0..hidden {
+            assert!(
+                (got[h] - expected[h]).abs() < 1e-5,
+                "moe[{h}] got={} expected={}",
+                got[h],
+                expected[h],
+            );
+        }
+    }
+
+    /// Shared expert is optional — if all three shexp params are
+    /// `None`, the output is just the weighted top-K sum.
+    #[test]
+    fn swiglu_moe_lazy_without_shared_expert() {
+        use larql_models::quant::lazy::QuantTensor;
+        let hidden = 2usize;
+        let ffn_dim = 2usize;
+        let num_experts = 2usize;
+        let top_k = 1usize;
+
+        // Router heavily favours expert 0 for x = [1, 0].
+        let router_v = vec![
+            1.0_f32, 0.0, // expert 0 row
+            -1.0, 0.0, // expert 1 row
+        ];
+        // Expert 0: identity-ish. Expert 1: distinct but should be unused with top_k=1.
+        let gate_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 5.0, 5.0, 5.0, 5.0];
+        let up_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 5.0, 5.0, 5.0, 5.0];
+        let down_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 5.0, 5.0, 5.0, 5.0];
+
+        let router = QuantTensor::from_f32_rows(num_experts, hidden, &router_v);
+        let gate_exps =
+            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
+        let up_exps =
+            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
+        let down_exps =
+            QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
+        let x = Array1::from(vec![1.0_f32, 0.0]);
+
+        let got = swiglu_moe_lazy(
+            &x,
+            &router,
+            &gate_exps,
+            &up_exps,
+            &down_exps,
+            None,
+            None,
+            None,
+            num_experts,
+            top_k,
+            None,
+        );
+
+        // top_k=1 → softmax over one logit = [1.0]. Expert 0 SwiGLU
+        // with identity gate/up/down: y = silu(x) * x.
+        // x = [1, 0] → y = [silu(1)*1, 0].
+        let expected_y0 = sigmoid(1.0); // 1.0 * sigmoid(1.0)
+        assert!((got[0] - expected_y0).abs() < 1e-5, "got={} exp={}", got[0], expected_y0);
+        assert!(got[1].abs() < 1e-5, "got[1]={}", got[1]);
+    }
+
     #[test]
     fn qwen35_forward_step_returns_vocab_shape() {
         // 2-layer model: layer 0 linear, layer 1 attention.
@@ -732,6 +1126,7 @@ mod tests {
                     ffn_gate_quant: None,
                     ffn_up_quant: None,
                     ffn_down_quant: None,
+                    moe: None,
                 },
                 Qwen35FullLayerWeights {
                     block: Qwen35LayerWeights::Attention(attn_weights),
@@ -742,6 +1137,7 @@ mod tests {
                     ffn_gate_quant: None,
                     ffn_up_quant: None,
                     ffn_down_quant: None,
+                    moe: None,
                 },
             ],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
@@ -793,6 +1189,7 @@ mod tests {
                 ffn_gate_quant: None,
                 ffn_up_quant: None,
                 ffn_down_quant: None,
+                moe: None,
             }],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
@@ -848,6 +1245,7 @@ mod tests {
                 ffn_gate: gate,
                 ffn_up: up,
                 ffn_down: down,
+                moe: None,
             }],
             final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
             lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
