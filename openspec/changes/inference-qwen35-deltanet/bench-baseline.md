@@ -172,6 +172,87 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.7: per-class GPU residency + the VRAM/throughput curve
+
+larql's value proposition is *VRAM-minimal* inference: push as much
+of FFN, weights, and incidental compute back to CPU + host RAM,
+keeping only the kernels that demonstrably need device residency
+(attention compute, KV cache, DeltaNet recurrent state). All of
+E.6.{D,B.1,B.2,I} pushed in the opposite direction — toward
+throughput at any VRAM cost — which is the wrong axis to compare
+against llama.cpp on. E.7 adds the per-class dispatch knobs that
+make the *intended* axis measurable.
+
+New env vars (all opt-in; defaults preserve current full-GPU
+behaviour when `LARQL_QWEN35_GPU=1` is set):
+
+```
+LARQL_QWEN35_GPU_NO_FFN=1            # SwiGLU gate/up/down → CPU
+LARQL_QWEN35_GPU_NO_LM_HEAD=1        # final logits matvec → CPU
+LARQL_QWEN35_GPU_NO_DN_PROJ=1        # DeltaNet attn_qkv/attn_gate/ssm_out → CPU
+LARQL_QWEN35_GPU_NO_DN_RECURRENCE=1  # DeltaNet conv1d / L2 / recurrence / rms_norm → CPU
+LARQL_QWEN35_GPU_NO_ATTN_PROJ=1      # Full-attn q/k/v/o matvecs → CPU
+```
+
+Each dispatch site checks the per-class env var (thread-local
+cached, no perf overhead) and uses `gpu_tier::backend_for(class, ..)`
+to elide the backend for that one call site. The CPU fallback path
+that's been present in every kernel hook all along is what runs.
+
+Bench harness now also reports per-process VRAM via
+`nvidia-smi --query-compute-apps`, captured at end of decode.
+
+### The curve (RTX 4090, Qwen3.6-27B-Q4_K_S, prefill 16 / decode 8)
+
+| Tier                          | What's on GPU                                              | VRAM | Decode (t/s) | Prefill (t/s) |
+|---|---|---:|---:|---:|
+| **larql Full** (E.6.I)        | everything                                                  | **18.7 GiB** | 10.63 | 2.75 |
+| larql no_lm_head              | DeltaNet block + FFN + full-attn (LM_head on CPU)           | 13.9 GiB | 5.80 | 4.36 |
+| larql no_ffn                  | DeltaNet block + full-attn + LM_head (FFN on CPU)           | 9.5 GiB | 0.59 | 0.52 |
+| **larql Attn-only**           | DeltaNet recurrence + full-attn block + KV cache only       | **1.45 GiB** | 0.25 | 0.26 |
+| larql All-CPU                 | nothing                                                     | 0 | 0.23 | 0.23 |
+| llama.cpp CUDA (`ngl=99`)     | everything                                                  | 14.76 GiB | 50.60 | 2097 |
+| llama.cpp CPU (`ngl=0`)       | nothing                                                     | 0 | 2.60 | 37.33 |
+
+### What this says about larql vs llama.cpp on the VRAM axis
+
+- **larql can run Qwen3.6-27B at ≤ 1.5 GiB VRAM.** llama.cpp can't —
+  the model doesn't fit in less than ~15 GiB VRAM even at the
+  smallest quant; you have to fall off to its CPU path entirely.
+  larql's Attn-only mode would fit on a 2 GiB consumer GPU (GTX
+  1060 3 GB, RTX 3050 4 GB, integrated GPUs, anything in laptops),
+  while a model this size on llama.cpp at the same VRAM budget
+  needs CPU-only or `--gpu-layers N` with N << total.
+- **Intermediate tiers don't have an llama.cpp equivalent.**
+  llama.cpp's `--gpu-layers N` partial offload is at layer
+  granularity, not at tensor-class granularity. larql's mid-tier
+  (e.g. 9.5 GiB no-FFN) couldn't be replicated by llama.cpp's
+  N-layer partition.
+- **The CPU path is currently the gating cost.** larql at 0 VRAM
+  runs at 0.23 t/s; llama.cpp CPU at the same memory footprint
+  runs at 2.60 t/s. That's an **11× CPU-path gap**: llama.cpp's
+  hand-tuned per-tensor SIMD + thread-pool scheduling does more
+  per cycle than our current `q4k_row_dot` / `q5k_row_dot` rayon
+  path. Closing this gap is the *real* unlock for the value prop —
+  it makes the Attn-only and no-FFN tiers actually competitive.
+- **At full GPU, larql is ~5× behind llama.cpp's GPU path
+  (10.6 vs 50.6 t/s)**. Gap is mostly per-kernel quality: their
+  `mul_mat_vec_q*_K_q8_1_cuda` kernels have years of tuning vs our
+  NVRTC-compiled adaptations.
+
+### Suggested next priorities by axis
+
+| Goal                                  | Lever                                                                |
+|---|---|
+| Make Attn-only tier viable            | Close the 11× CPU q4k/q5k matvec gap with llama.cpp's ggml-cpu       |
+| Make no_ffn tier viable               | Same — FFN on CPU is the bulk of work at that tier                   |
+| Close the full-GPU 5× gap to llama.cpp | Custom Q4_K matvec kernel + CUDA Graphs (E.6.C)                     |
+
+The right next investment for larql's stated value prop is the
+first row: **CPU-side perf**. Once it's not embarrassing, the
+VRAM-constrained tiers become a real differentiator against
+llama.cpp on small-VRAM hardware.
+
 ## 2026-05-12 update — Phase E.6.I: load_gguf_lazy_tensors lm_head dispatch fix (decode 5.19 → 10.61 t/s)
 
 **Hidden bug found while microbenching E.6.F.** Standalone

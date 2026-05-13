@@ -13,6 +13,7 @@ pub mod deltanet_recurrence;
 pub mod deltanet_state;
 pub mod fine_profile;
 pub mod gpu;
+pub mod gpu_tier;
 pub mod gqa;
 pub mod quant_dispatch;
 pub mod qwen35_attn;

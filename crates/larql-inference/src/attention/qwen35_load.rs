@@ -2380,6 +2380,31 @@ mod tests {
                 eprintln!("RSS:     {line}");
             }
         }
+
+        // Phase E.7: VRAM use via nvidia-smi (process-scoped, in MiB).
+        // Needed to make larql's value prop measurable against
+        // llama.cpp on the VRAM axis. Falls through silently when
+        // nvidia-smi isn't on PATH.
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let my_pid = std::process::id();
+            for line in stdout.lines() {
+                let mut parts = line.split(',').map(|s| s.trim());
+                if let (Some(pid_s), Some(mem_s)) = (parts.next(), parts.next()) {
+                    if let Ok(pid) = pid_s.parse::<u32>() {
+                        if pid == my_pid {
+                            eprintln!("VRAM:    {mem_s} MiB (this process, via nvidia-smi)");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

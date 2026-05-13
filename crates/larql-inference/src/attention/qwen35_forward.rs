@@ -368,11 +368,13 @@ pub fn qwen35_forward_step(
     let logits = time_section!(
         LM_HEAD,
         if let Some(qt) = weights.lm_head_quant.as_ref() {
-            crate::attention::quant_dispatch::matvec_with_backend(
-                qt,
-                &x_final,
+            // Phase E.7: per-class GPU residency. `LARQL_QWEN35_GPU_NO_LM_HEAD=1`
+            // forces the final logits matvec onto CPU rayon.
+            let lm_backend = crate::attention::gpu_tier::backend_for(
+                crate::attention::gpu_tier::GpuClass::LmHead,
                 weights.backend.as_deref(),
-            )
+            );
+            crate::attention::quant_dispatch::matvec_with_backend(qt, &x_final, lm_backend)
         } else {
             weights.lm_head.dot(&x_final)
         }
@@ -465,9 +467,15 @@ fn swiglu_ffn_lazy(
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
     use crate::attention::fine_profile::*;
+    use crate::attention::gpu_tier::{self, GpuClass};
     use crate::attention::quant_dispatch::{ggml_type_to_quant_format, matvec_with_backend};
     use crate::time_section;
     use larql_compute::QuantFormat;
+
+    // Phase E.7: per-class GPU residency. When the FFN class is
+    // disabled (`LARQL_QWEN35_GPU_NO_FFN=1`), drop the backend so
+    // every matvec in this block falls back to the CPU rayon path.
+    let backend = gpu_tier::backend_for(GpuClass::Ffn, backend);
 
     // Fastest path: fully device-resident FFN block. Requires all
     // three projections (gate, up, down) to be lazy-quant in a
