@@ -1962,3 +1962,161 @@ LARQL_QWEN35_BENCH_PREFILL=32 LARQL_QWEN35_BENCH_DECODE=8 \
 cargo test -p larql-inference --release --lib real_gguf_qwen35_bench \
   -- --nocapture
 ```
+
+
+## 2026-05-13 update — Production-path gap analysis (post-session honesty pass)
+
+After the F.0–G.2 + E.8 step 2a–2f + Q6_K + Q8_0 × Q8_K AVX2 arc
+shipped, we paused to verify what fraction of the work actually
+reaches the `larql-server` production decode path. The answer turned
+out to be sobering.
+
+### What the production server uses
+
+`larql-server` loads weights through `larql-vindex` (NOT `larql-models`):
+
+- `larql_vindex::load_model_weights_q4k_shard` — vindex shard format
+- `larql_vindex::load_vindex_with_range` — sharded reader
+- `larql_vindex::load_vindex_embeddings` / `load_vindex_tokenizer` /
+  `load_vindex_config`
+
+The CPU FFN hot loop calls `backend.q4_matvec` (Q4_0 weights × Q8
+activations) or `backend.q4k_matvec` (Q4_K weights × f32 activations).
+The CPU Q4_K × Q8_K production kernel **already exists** at
+[`crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs`](../../crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs)
+as `q4k_q8k_matvec_avx2` (line 573) — AVX2 maddubs/madd identical to
+the algorithm this session built in `larql_models::quant::ggml::q4k_q8k`.
+
+Vindex weight formats stored on disk:
+- Q4_K (`write_q4k`) for general FFN
+- Q6_K (LM head)
+- f32 for norms
+
+**Q5_K and Q8_0 are not produced by the vindex extractor.** GGUFs
+that ship Q5_K (FFN_DOWN) or Q8_0 (attention/shared-expert) get
+requantised during vindex extraction.
+
+### What this session built
+
+| Layer | Production server uses                                      | Session built                                          |
+|---|---|---|
+| FFN matvec | `backend.q4_matvec(...)` → `cpu/ops/q4k_q8k_dot::q4k_q8k_matvec_avx2` | `QuantTensor::matvec` → `larql_models::quant::ggml::q4k_q8k::q4k_q8k_row_dot` |
+| LM head | `backend.q4k_matvec(...)` (Q4_K + f32 act) | `QuantTensor::matvec` → `q6k_q8k_row_dot` |
+| Loading | vindex shard format | `QuantTensor::from_mmap_region` (GGUF mmap) |
+| Forward path entry | server routes (`walk_ffn`, attention) | `qwen35_forward_step` (research only) |
+
+**Caller graph (verified by grep):**
+
+- `qwen35_forward_step` callers: only `real_gguf_qwen35_bench`,
+  `real_gguf_qwen35_token_diff_vs_llama_cpp`, the synthetic-weight
+  tests in `qwen35_load.rs`. **Zero callers in `larql-server` or
+  `larql-cli` outside of dev / debug paths.**
+- `QuantTensor::matvec` callers: `qwen35_forward_step` (research),
+  the speculative decode wiring, and `swiglu_moe_lazy`. None reached
+  from `larql-server` routes.
+- `swiglu_moe_lazy`: zero call sites outside `qwen35_forward.rs`
+  itself.
+
+### What ACTUALLY ships to the server
+
+After the audit, the session's production-reachable deliverables are:
+
+1. **TYPE_Q5_0 / TYPE_Q8_0 constant swap** in
+   `larql_models::quant::ggml::mod` — fixes the GGUF wire-format
+   mismatch any caller of `larql-models` would see. Real fix.
+2. **`memmap2`-Arc-backed `QuantTensor::from_mmap_region`** —
+   available to any future `larql-models` consumer that wants
+   zero-copy mmap loading. The vindex path doesn't use it (vindex has
+   its own mmap).
+3. **F.4 / F.6 CUDA Q8_0 matvec** — sits on the `QuantMatVec` trait
+   as `q8_0_matvec`. The server's CUDA path doesn't call this method
+   today; reaching it would require routing some weight class through
+   `quant_matvec(QuantFormat::Q8_0, ...)` from the server side.
+4. **Upstream backfill (PR #96) + post-merge stub reconciliation
+   (PR #97 stubs replaced in main)** — these DO ship and are
+   server-relevant. Not a session-specific deliverable.
+
+### What does NOT ship to the server
+
+- All four `q*k_q8k_row_dot` AVX2 modules in `larql_models::quant::ggml`
+  (q4k_q8k, q5k_q8k, q6k_q8k, q8_0_q8k). These are exact algorithm
+  duplicates of code already in `larql-compute/cpu/ops/q4k_q8k_dot`
+  (for Q4_K) or unused-in-production formats (Q5_K, Q8_0). Q6_K is
+  the one genuinely-missing x86 AVX2 path, but production's Q6_K
+  scalar / NEON reference reads a different ql-byte layout than my
+  AVX2 kernel was written for; porting is non-trivial and the f32
+  dispatch tolerance suggests there may be a latent layout bug in
+  the existing scalar code to investigate first.
+- `q8_0_row_dot` in `larql_models::quant::ggml::legacy` — only
+  called via `QuantTensor::matvec` (research path).
+- `swiglu_moe_lazy` and the whole MoE forward path including F.0–F.3
+  — research path.
+- G.1 mmap-backed `QuantTensor` — research path.
+- G.2 `LARQL_QWEN35_HEAP_LOAD` — research path.
+
+### Why this matters
+
+The session arc reported a clear performance trajectory (1.06 → 2.18
+tok/s all-CPU, 10.50 tok/s GPU Tier 3 on Qwen3.6-35B-A3B-UD-Q4_K_M).
+**Those numbers are accurate for the `real_gguf_qwen35_bench`
+benchmark** — the bench-research path that runs `qwen35_forward_step`
+directly off a GGUF mmap. They do **not** measure or characterise the
+`larql-server` production decode path, which has its own SIMD,
+caching, and weight-loading code.
+
+The user-visible value-prop ("low RSS via mmap-backed weights" /
+"AVX2 maddubs Q*_K × Q8_K") **already exists in the server path
+via different code**, namely `q4k_q8k_dot::q4k_q8k_matvec_avx2`
+(production AVX2 since before this session) and the vindex shard
+format's natural mmap-readiness. The session's parallel implementation
+in `larql-models` is research-grade documentation of the same
+algorithms.
+
+### Next steps (in priority order)
+
+1. **Bench the actual server path.** Profile a vindex-loaded server
+   decode under load to identify production hot spots. The session
+   work was directed by `LARQL_QWEN35_FINE_PROFILE` on the research
+   bench — production has different hot spots.
+
+2. **Port Q6_K × Q8_K AVX2 to `cpu/ops/q4k_q8k_dot.rs`** as the
+   `target_arch = "x86_64"` path mirroring the existing NEON
+   implementation — but FIRST investigate whether the scalar
+   reference in that module has the layout bug suspected during this
+   audit (sequential `ql[i/2]` reads vs llama.cpp-stride writes by
+   `quantize_q6_k`).
+
+3. **Audit `QuantMatVec` trait usage in the server.** If any server
+   path can be retrofitted to dispatch through `quant_matvec(format,
+   ...)` for Q8_0, the F.4/F.6 CUDA kernel becomes reachable for
+   workloads that ship Q8_0 attention projections (e.g. if vindex
+   extraction is taught to preserve Q8_0 instead of requantising
+   to Q4_K).
+
+4. **Treat the bench-research path as research.** Keep `qwen35_forward_step`
+   + `swiglu_moe_lazy` + the F.0–G.2 work as a documentation /
+   exploration sandbox — it's well-tested, well-benched, and useful
+   for prototyping algorithms before porting them into production
+   code. Just don't conflate its numbers with server numbers.
+
+### Honest summary of the session's session
+
+- ✅ **9 PRs landed** (95, 96, 97, 98, 99, 100, G.2 #97).
+- ✅ **Algorithms validated end-to-end** on a real Qwen3.6-35B-A3B MoE
+  GGUF with parity, profiling, and bench data.
+- ✅ **Upstream merge + reconciliation** lands the chrishayuk/larql
+  backfill into our fork.
+- ⚠️ **The CPU SIMD perf wins are on the research path, not server
+  decode.** Server's CPU AVX2 was already complete (Q4_K × Q8_K) before
+  the session started.
+- ⚠️ **The GPU Q8_0 kernel is sitting on the trait but unreachable
+  from server.** Routing it requires server-side dispatch changes.
+- ⚠️ **G.1 mmap, G.2 heap opt-in, G.3 preload-hot** all operate on
+  `QuantTensor` and don't reach the vindex-backed server.
+
+The architectural lesson: **the GGUF→vindex extraction step is the
+boundary between "models we can load and benchmark" and "models the
+server actually serves."** Optimising `larql-models` / `QuantTensor`
+benefits the former; optimising `larql-compute/cpu/ops` and
+`larql-vindex` benefits the latter. Future perf work should pick
+which side it targets before starting.
