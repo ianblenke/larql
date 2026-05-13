@@ -6,7 +6,7 @@
 
 use cudarc::cublas::{
     sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T},
-    Gemm, GemmConfig,
+    Gemm, GemmConfig, Gemv, GemvConfig,
 };
 use cudarc::driver::CudaSlice;
 
@@ -150,23 +150,29 @@ pub(crate) fn gemv_device_w(
 
     let x_dev = drv.device_buf_from(x)?;
     let mut y_dev = drv.device_alloc_uninit(n)?;
-    let cfg = GemmConfig {
-        transa: CUBLAS_OP_T,
-        transb: CUBLAS_OP_N,
-        m: n as i32,
-        n: 1,
-        k: k as i32,
+    // Use direct cublasSgemv instead of gemm-with-n=1. The latter
+    // worked but cuBLAS's gemv path picks better tile dimensions and
+    // memory access patterns for skewed [N=large, K=hidden] matvecs
+    // like the lm_head (vocab=248320, hidden=5120 on Qwen3.6 27B).
+    //
+    // Layout reinterpretation: our `w` is row-major `[N, K]` flat.
+    // cuBLAS is column-major, so the same buffer is a `[K, N]`
+    // column-major matrix `A`. We want `y = W @ x = A^T @ x`, so
+    // pass `op=T`, `m=K (rows of A)`, `n=N (cols of A)`, `lda=K`.
+    let cfg = GemvConfig {
+        trans: CUBLAS_OP_T,
+        m: k as i32,
+        n: n as i32,
         alpha: 1.0_f32,
         lda: k as i32,
-        ldb: k as i32,
+        incx: 1,
         beta: 0.0_f32,
-        ldc: n as i32,
+        incy: 1,
     };
-
     unsafe {
         drv.blas
-            .gemm(cfg, w_dev, &x_dev, &mut y_dev)
-            .map_err(|e| CudaInitError::DriverMissing(format!("cublas gemv_device_w: {e:?}")))?;
+            .gemv(cfg, w_dev, &x_dev, &mut y_dev)
+            .map_err(|e| CudaInitError::DriverMissing(format!("cublas sgemv: {e:?}")))?;
     }
     drv.sync()?;
     drv.to_host(&y_dev)

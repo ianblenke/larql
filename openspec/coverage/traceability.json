@@ -21323,13 +21323,13 @@
     {
       "fqn": "larql_compute::cuda::matmul::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 334,
+      "line": 340,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::matmul::tests::cuda_op_constants_are_distinct",
       "file": "crates/larql-compute/src/cuda/matmul.rs",
-      "line": 334,
+      "line": 340,
       "crate": "larql_compute"
     },
     {
