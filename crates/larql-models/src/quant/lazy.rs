@@ -14,7 +14,8 @@ use std::sync::Arc;
 use ndarray::Array1;
 
 use crate::quant::ggml::{
-    dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_row_dot, q8_0_row_dot,
+    dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_q8k_row_dot, q6k_row_dot,
+    q8_0_row_dot,
     quantize_to_q8_k, tensor_data_size, type_name, Q8_K_BLOCK_BYTES, TYPE_F32, TYPE_Q4_K,
     TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
 };
@@ -304,10 +305,26 @@ impl QuantTensor {
                 use rayon::prelude::*;
                 let rb = self.row_bytes;
                 let data = view_bytes;
-                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                    let row = &data[r * rb..(r + 1) * rb];
-                    *out_r = q6k_row_dot(row, x_slice).expect("q6k_row_dot");
-                });
+                // E.8 step 2e: AVX2 Q6_K × Q8_K fast path (LM_HEAD is
+                // 7 % of all-CPU MoE decode time). Mirrors the Q4_K /
+                // Q5_K patterns. Falls back to the legacy `q6k_row_dot`
+                // scalar (Q4_K_S has an AVX2 dequant pass) when
+                // `x.len() % 256 != 0` or via `LARQL_Q6K_USE_F32_DOT=1`.
+                let use_q8k = x_slice.len().is_multiple_of(256)
+                    && std::env::var("LARQL_Q6K_USE_F32_DOT").ok().as_deref() != Some("1");
+                if use_q8k {
+                    with_q8k_for(x_slice, |q8k_bytes| {
+                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                            let row = &data[r * rb..(r + 1) * rb];
+                            *out_r = q6k_q8k_row_dot(row, q8k_bytes).expect("q6k_q8k_row_dot");
+                        });
+                    });
+                } else {
+                    out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q6k_row_dot(row, x_slice).expect("q6k_row_dot");
+                    });
+                }
             }
             TYPE_Q5_K => {
                 // E.8 step 2d: AVX2 Q5_K × Q8_K fast path. FFN_DOWN is
