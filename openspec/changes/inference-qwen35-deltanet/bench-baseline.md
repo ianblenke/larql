@@ -172,6 +172,38 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.F: LM_HEAD Q6_K — three paths, all ~85 ms/call
+
+Tried three implementations for the dominant LM_HEAD Q6_K matvec
+on Qwen3.6 27B's `[vocab=248320, hidden=5120]` shape, all parity-
+clean, all bench-equivalent:
+
+| Path | Bench decode | LM_HEAD section |
+|---|---:|---:|
+| Default (E.6.D) — f32 cache + `cublasGemm` with n=1 | 5.19 t/s | 87.7 ms |
+| `cublasSgemv` direct (E.6.F.1) | 5.05 t/s | 87.5 ms |
+| Packed Q8_1 × Q6_K mmvq direct kernel | 5.04 t/s | 86.9 ms |
+| f16 weight cache + `cublasGemm<f16>` with m=1 | 4.99 t/s | 85.0 ms |
+
+Memory-bandwidth-limit theoretical: ~5 ms at HBM ~1 TB/s. We're
+~17× slower than that. Three independent kernel/precision paths
+all land at the same 85-87 ms, so the bottleneck is something
+shape-specific that survives precision and algorithm changes —
+likely cuBLAS dispatch/setup overhead at this skewed `m=1` shape
+on this device, or an interaction with the 5 GB f32 weight cache
+in the 24 GB VRAM budget.
+
+Investigation closed without a throughput win. Reverted to the
+simplest default (sgemv direct + f32 cache). The
+`LARQL_CUDA_Q6K_HOST_DEQUANT=1` override remains for
+diagnostic comparisons.
+
+Next levers for LM_HEAD specifically (deferred):
+- Top-K-on-device — skip the 1 MB dtoh for greedy decode.
+- Direct Q6_K matvec without the 5 GB f32 weight cache.
+- A microbench harness to compare cudarc vs raw cuBLAS at this
+  exact shape to attribute the residual cost.
+
 ## 2026-05-12 update — Phase E.6.E diagnostic: Q6_K mmvq vs cuBLAS sgemv — both ~87 ms/call
 
 Investigated whether switching the LM_HEAD Q6_K matvec from the
