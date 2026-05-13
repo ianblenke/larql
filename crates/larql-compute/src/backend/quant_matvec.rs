@@ -58,12 +58,33 @@ pub trait QuantMatVec {
             QuantFormat::Q4_KF => self.q4kf_matvec(weights, x, num_rows, hidden),
             QuantFormat::Q5_K => self.q5k_matvec(weights, x, num_rows, hidden),
             QuantFormat::Q6_K => self.q6k_matvec(weights, x, num_rows, hidden),
-            QuantFormat::Q4_0 | QuantFormat::Q8_0 => {
+            QuantFormat::Q4_0 => {
                 let (q8_x, q8_scales) = crate::cpu::ops::q4_common::quantize_to_q8(x);
                 self.q4_matvec(weights, &q8_x, &q8_scales, num_rows, hidden)
             }
+            QuantFormat::Q8_0 => self.q8_0_matvec(weights, x, num_rows, hidden),
             QuantFormat::BF16 | QuantFormat::F16 | QuantFormat::F32 => None,
         }
+    }
+
+    /// Q8_0 weights × f32 input matvec.
+    ///
+    /// Distinct from `q4_matvec`, which takes pre-quantised Q8 *activations*
+    /// against Q4_0 weights — that path mis-routes Q8_0 weights through
+    /// the Q4_0 dequantiser. F.4 introduces this dedicated entry point so
+    /// the dispatch table can keep weight-format and activation-quant
+    /// flows separate.
+    ///
+    /// Default returns `None` (no Q8_0 support on the backend); the CUDA
+    /// backend overrides with host-dequant + cuBLAS GEMV.
+    fn q8_0_matvec(
+        &self,
+        _q8_0_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        None
     }
 
     /// Format-aware matvec on **pre-quantised** Q8 input.

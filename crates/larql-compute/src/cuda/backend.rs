@@ -44,6 +44,20 @@ pub struct CudaBackend {
     // primitive.
     q4k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     q5k_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    /// F.6: byte-cache for Q8_0 weights — uploads the packed bytes
+    /// once per tensor; the direct kernel reads scale + int8 in place
+    /// (no f32 expansion). Replaces the F.4 f32 cache for the direct
+    /// path; the f32 cache below stays for the cuBLAS fallback.
+    q8_0_byte_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
+    /// F.4: dequantised f32 cache for Q8_0 weights. Qwen3.6-35B-A3B's
+    /// attention/shared-expert projections are Q8_0; without this
+    /// cache each per-token matvec re-dequants 50+ MiB on the host
+    /// and re-uploads to the device — the F.4 first-light measurement
+    /// showed this drops decode from 1.20 → 0.24 t/s. Caching the
+    /// dequantised weight once per tensor recovers the cost. F.6
+    /// replaces the dispatch with the direct kernel (q8_0_byte_device_cache);
+    /// this stays as the fallback when the direct kernel rejects the shape.
+    q8_0_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     q6k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     q6k_packed_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<u8>>>>,
     q4k_f32_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
@@ -114,6 +128,8 @@ impl CudaBackend {
             q4k_device_cache: Mutex::new(HashMap::new()),
             q5k_device_cache: Mutex::new(HashMap::new()),
             q6k_f32_device_cache: Mutex::new(HashMap::new()),
+            q8_0_byte_device_cache: Mutex::new(HashMap::new()),
+            q8_0_f32_device_cache: Mutex::new(HashMap::new()),
             q6k_packed_device_cache: Mutex::new(HashMap::new()),
             q4k_f32_device_cache: Mutex::new(HashMap::new()),
             q4k_f16_device_cache: Mutex::new(HashMap::new()),
@@ -171,6 +187,34 @@ impl CudaBackend {
             .q5k_device_cache
             .lock()
             .map_err(|_| CudaInitError::DriverMissing("q5k device cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc_clone = Arc::clone(entry);
+        drop(cache);
+        f(&arc_clone)
+    }
+
+    /// Same content-keyed byte cache as `with_q5k_device_buf` but for
+    /// Q8_0 weight bytes (34-byte blocks). Used by the F.6 direct
+    /// matvec kernel so each Q8_0 tensor uploads once instead of
+    /// re-dequanting to f32 per call.
+    pub(crate) fn with_q8_0_device_buf<R>(
+        &self,
+        host: &[u8],
+        f: impl FnOnce(&CudaSlice<u8>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self.q8_0_byte_device_cache.lock().map_err(|_| {
+                CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into())
+            })?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let arc = Arc::new(self.drv.device_u8_buf_from(host)?);
+        let mut cache = self.q8_0_byte_device_cache.lock().map_err(|_| {
+            CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into())
+        })?;
         let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
         let arc_clone = Arc::clone(entry);
         drop(cache);
@@ -421,6 +465,37 @@ impl CudaBackend {
             .q6k_f32_device_cache
             .lock()
             .map_err(|_| CudaInitError::DriverMissing("q6k device cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        let arc = Arc::clone(entry);
+        drop(cache);
+        f(&arc)
+    }
+
+    /// Mirror of `with_q6k_f32_device_buf` for Q8_0 weights. See the
+    /// note on `q8_0_f32_device_cache` for why the cache exists.
+    pub(crate) fn with_q8_0_f32_device_buf<R>(
+        &self,
+        host: &[u8],
+        n_elements: usize,
+        f: impl FnOnce(&CudaSlice<f32>) -> Result<R, CudaInitError>,
+    ) -> Result<R, CudaInitError> {
+        let key = DeviceBytesKey::from_slice(host);
+        {
+            let cache = self
+                .q8_0_f32_device_cache
+                .lock()
+                .map_err(|_| CudaInitError::DriverMissing("q8_0 device cache poisoned".into()))?;
+            if let Some(arc) = cache.get(&key) {
+                return f(arc);
+            }
+        }
+        let w = dequant::dequant_q8_0(host, n_elements)
+            .map_err(|e| CudaInitError::DriverMissing(format!("q8_0 dequant: {e:?}")))?;
+        let arc = Arc::new(self.drv.device_buf_from(&w)?);
+        let mut cache = self
+            .q8_0_f32_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("q8_0 device cache poisoned".into()))?;
         let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
         let arc = Arc::clone(entry);
         drop(cache);

@@ -75,3 +75,8 @@ pub(crate) fn dequant_q6_k(data: &[u8], n_elements: usize) -> Result<Vec<f32>, C
     ggml::q6_k::dequantize_q6_k(data, n_elements)
         .map_err(|e| CudaInitError::DriverMissing(format!("dequant_q6_k: {e}")))
 }
+
+pub(crate) fn dequant_q8_0(data: &[u8], n_elements: usize) -> Result<Vec<f32>, CudaInitError> {
+    ggml::legacy::dequantize_q8_0(data, n_elements)
+        .map_err(|e| CudaInitError::DriverMissing(format!("dequant_q8_0: {e}")))
+}

@@ -12,6 +12,7 @@ use super::dequant;
 use super::matmul as kernels;
 use super::q4k_direct;
 use super::q5k_direct;
+use super::q8_0_direct;
 
 impl QuantMatVec for CudaBackend {
     fn q4_matvec(
@@ -95,6 +96,40 @@ impl QuantMatVec for CudaBackend {
             return None;
         }
         q5k_direct::matvec(self, q5k_data, x, num_rows, hidden).ok()
+    }
+
+    /// Q8_0 weights × f32 input matvec. Phase F.4 / F.6.
+    ///
+    /// Qwen3.6-35B-A3B-UD-Q4_K_M ships its attention/shared-expert
+    /// projections as Q8_0. F.4 landed a working but VRAM-expensive
+    /// impl (host-dequant + f32 device cache, 4× expansion). F.6
+    /// replaces the default body with a direct on-device kernel that
+    /// reads the packed bytes in place via `q8_0_byte_device_cache`,
+    /// reclaiming ~4 GiB of device memory on this model. The f32
+    /// fallback stays for shapes the direct kernel rejects (hidden
+    /// not a multiple of 32) — gated by `LARQL_CUDA_Q8_0_HOST_DEQUANT=1`
+    /// to force the legacy path for A/B testing.
+    fn q8_0_matvec(
+        &self,
+        q8_0_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        if x.len() != hidden {
+            return None;
+        }
+        if std::env::var("LARQL_CUDA_Q8_0_HOST_DEQUANT").ok().as_deref() != Some("1") {
+            if let Ok(out) = q8_0_direct::matvec(self, q8_0_data, x, num_rows, hidden) {
+                return Some(out);
+            }
+            // Direct kernel rejects shapes where hidden % 32 != 0 —
+            // fall through to the f32-cached cuBLAS path below.
+        }
+        self.with_q8_0_f32_device_buf(q8_0_data, num_rows * hidden, |w_dev| {
+            kernels::gemv_device_w(self.driver(), w_dev, x, num_rows, hidden)
+        })
+        .ok()
     }
 
     fn q6k_matvec(
