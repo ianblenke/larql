@@ -26,4 +26,5 @@ pub mod routes;
 pub mod session;
 pub mod shard_loader;
 pub mod state;
+pub mod tokenizer_cache;
 pub mod wire;

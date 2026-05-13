@@ -703,6 +703,9 @@ mod tests {
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
+            tokenizer_cache: std::sync::Arc::new(
+                crate::tokenizer_cache::TokenizerCache::new(0, 0),
+            ),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]

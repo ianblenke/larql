@@ -184,28 +184,22 @@ pub fn predict_q4k_metal_with_replaced_head_residual_delta(
         );
     }
 
-    // Flat replacement delta: [seq_len × hidden].
-    let _delta_flat = replacement_delta.as_slice()?.to_vec();
-    // FIXME(merge): upstream-only head-replacement intervention path
-    // (`full_pipeline_q4_with_head_replacement`) was removed in the fork.
-    // Fall back to the standard `full_pipeline_q4`; `target_layer` /
-    // `target_head` no longer participate in the forward pass here.
-    let _ = (target_layer, target_head);
-    let l0 = &layers[0];
-    let result = backend.full_pipeline_q4(
+    // Replacement delta laid out as [seq_len × head_dim] (or [seq_len ×
+    // hidden] if the caller has already projected). The Metal intervention
+    // hook expects `seq_len * head_dim` f32 values.
+    let delta_flat: Vec<f32> = replacement_delta.iter().copied().collect();
+
+    let result = backend.full_pipeline_q4_with_head_replacement(
         &layers,
         &x_all,
         hidden,
         weights.intermediate_size,
-        l0.num_q_heads * l0.head_dim,
-        l0.num_kv_heads * l0.head_dim,
         seq_len,
-        l0.num_q_heads,
-        l0.num_kv_heads,
-        l0.head_dim,
-        l0.rope_base,
         arch.attn_q_norm_key(0).is_some(),
         arch.attn_logit_softcapping().unwrap_or(0.0),
+        target_layer,
+        target_head,
+        &delta_flat,
     )?;
 
     Array2::from_shape_vec((seq_len, hidden), result).ok()
@@ -387,26 +381,20 @@ pub fn predict_q4k_metal_capture_pre_wo(
         );
     }
 
-    // FIXME(merge): upstream-only pre-W_O capture hook
-    // (`full_pipeline_q4_capture_pre_wo`) was removed in the fork. The
-    // baseline forward is the closest available approximation; circuits
-    // research wiring will need to be re-introduced on top of the fork's
-    // pipeline if/when needed.
-    let _ = (target_layer, target_head);
-    let l0 = &layers[0];
-    backend.full_pipeline_q4(
+    // Dispatch the capture hook. The backend stops the forward pass
+    // after capturing the target head's pre-W_O output, so the returned
+    // vec is `[seq_len * head_dim]` rather than the full residual.
+    // Backends without the capture hook return None; the caller falls
+    // back to a CPU oracle path.
+    backend.full_pipeline_q4_capture_pre_wo(
         &layers,
         &x_all,
         hidden,
         weights.intermediate_size,
-        l0.num_q_heads * l0.head_dim,
-        l0.num_kv_heads * l0.head_dim,
         seq_len,
-        l0.num_q_heads,
-        l0.num_kv_heads,
-        l0.head_dim,
-        l0.rope_base,
         arch.attn_q_norm_key(0).is_some(),
         arch.attn_logit_softcapping().unwrap_or(0.0),
+        target_layer,
+        target_head,
     )
 }

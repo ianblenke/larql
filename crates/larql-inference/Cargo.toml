@@ -82,6 +82,11 @@ openblas-src = { version = "0.10", features = ["system"] }
 default = []
 metal = ["larql-compute/metal"]
 cuda = ["larql-compute/cuda"]
+# Expose the synthetic-weights fixtures at `larql_inference::test_utils`
+# for downstream crates' tests (larql-kv, larql-vindex). Pulls in no
+# extra deps — the fixture code uses tokenizers/ndarray which are
+# already always-on.
+test-utils = []
 
 [[example]]
 name = "cpu_gpu_diag"

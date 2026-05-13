@@ -3,7 +3,7 @@
 use super::detok::Detokenizer;
 use super::eos::EosConfig;
 use super::sampling::{Sampler, SamplingConfig};
-use super::types::{GenerateResult, StageTimings};
+use super::types::{GenerateError, GenerateResult, StageTimings};
 use crate::layer_graph::pipeline_layer::{
     attention_geometry_for_arch_layer, kv_cache_shapes_for_arch, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
 };
@@ -274,6 +274,101 @@ pub fn generate(
         SamplingConfig::greedy(),
         &EosConfig::builtin(),
     )
+}
+
+/// Fallible variant of [`generate`].
+///
+/// Runs [`generate`] and converts the result via
+/// [`GenerateResult::into_result`]: on success returns `Ok(result)` with
+/// `error` cleared, on the embedded-error path returns `Err(GenerateError)`.
+/// Pairs with [`try_generate_streaming`] / [`try_generate_constrained`]
+/// for callers (server endpoints, CLI subcommands) that want a typed
+/// failure rather than peeking at `result.error`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+) -> Result<GenerateResult, GenerateError> {
+    generate(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+    )
+    .into_result()
+}
+
+/// Fallible variant of [`generate_with_sampling`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_with_sampling(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> Result<GenerateResult, GenerateError> {
+    generate_with_sampling(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        sampling,
+        eos,
+    )
+    .into_result()
+}
+
+/// Fallible streaming variant — see [`generate_streaming`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_streaming<F>(
+    weights: &mut ModelWeights,
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[u32],
+    max_tokens: usize,
+    index: &larql_vindex::VectorIndex,
+    backend: &dyn ComputeBackend,
+    cached_layers: &CachedLayerGraph,
+    layer_range: std::ops::Range<usize>,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+    on_token: F,
+) -> Result<GenerateResult, GenerateError>
+where
+    F: FnMut(u32, &str, f64),
+{
+    generate_streaming(
+        weights,
+        tokenizer,
+        token_ids,
+        max_tokens,
+        index,
+        backend,
+        cached_layers,
+        layer_range,
+        sampling,
+        eos,
+        on_token,
+    )
+    .into_result()
 }
 
 /// Multi-token generation with explicit sampling and EOS configuration.

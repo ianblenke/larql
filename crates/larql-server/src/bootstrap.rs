@@ -360,6 +360,7 @@ pub fn load_single_vindex(
         expert_filter: opts.expert_filter,
         unit_filter: opts.unit_filter.clone(),
         moe_remote: opts.moe_remote.clone(),
+        tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::from_env()),
         #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
         #[cfg(all(feature = "metal-experts", target_os = "macos"))]
