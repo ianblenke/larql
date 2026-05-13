@@ -640,7 +640,7 @@ mod tests {
         assert!(!arch.is_linear_attention_layer(3));
         assert!(arch.has_post_norms());
         // Tensor key shape for a linear layer.
-        assert_eq!(arch.attn_qkv_key(0).unwrap(), "layers.0.attn_qkv.weight");
+        assert_eq!(arch.attn_qkv_key(0).unwrap(), "layers.0.self_attn.qkv_proj.weight");
     }
 
     #[test]
