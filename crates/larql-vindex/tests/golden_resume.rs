@@ -111,7 +111,7 @@ fn write_synth_model(model_dir: &Path) {
             )
         })
         .collect();
-    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    let serialized = safetensors::tensor::serialize(views, None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     let tok_json =
@@ -261,6 +261,12 @@ fn index_without_timestamp(dir: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
     if let Some(map) = v.as_object_mut() {
         map.remove("extracted_at");
+        if let Some(source) = map
+            .get_mut("source")
+            .and_then(|value| value.as_object_mut())
+        {
+            source.remove("extracted_at");
+        }
     }
     v
 }

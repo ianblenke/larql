@@ -1,17 +1,17 @@
 //! Q4_K pipeline benchmark: compare Q4_K fused QKV vs Q8 fused QKV.
 //!
 //! Exercises the new fused Q4_K QKV shader through the full_pipeline_q4 path.
-//! Usage: cargo run --release --features metal -p larql-compute --example bench_q4k_pipeline
+//! Usage: cargo run --release --features metal -p larql-compute --example compare_pipeline
 
 extern crate blas_src;
 
 fn main() {
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
-        println!("Run with --features metal");
+        println!("Run on macOS with --features metal");
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_q4_k, quantize_to_q8};
         use larql_compute::prelude::*;
@@ -192,45 +192,22 @@ fn main() {
                 ffn_up_bias: None,
                 ffn_down_bias: None,
                 moe: None,
+                ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         // Warmup
-        let _ = metal.full_pipeline_q4(
-            &q4k_layers,
-            &x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            1,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            10000.0,
-            false,
-            0.0,
-        );
+        let _ = metal.full_pipeline_q4(&q4k_layers, &x, hidden, inter, 1, false, 0.0);
 
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.full_pipeline_q4(
-                &q4k_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                1,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-                false,
-                0.0,
-            );
+            let _ = metal.full_pipeline_q4(&q4k_layers, &x, hidden, inter, 1, false, 0.0);
         }
         let q4k_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
@@ -300,45 +277,22 @@ fn main() {
                 ffn_up_bias: None,
                 ffn_down_bias: None,
                 moe: None,
+                ffn_is_remote: false,
                 moe_combined_output_norm: false,
                 moe_outer_post_norm: None,
+                kv_shared_source: None,
+                ple_input_gate: None,
+                ple_projection: None,
+                ple_post_norm: None,
             })
             .collect();
 
         // Warmup
-        let _ = metal.full_pipeline_q4(
-            &q8_layers,
-            &x,
-            hidden,
-            inter,
-            q_dim,
-            kv_dim,
-            1,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            10000.0,
-            false,
-            0.0,
-        );
+        let _ = metal.full_pipeline_q4(&q8_layers, &x, hidden, inter, 1, false, 0.0);
 
         let t0 = Instant::now();
         for _ in 0..n {
-            let _ = metal.full_pipeline_q4(
-                &q8_layers,
-                &x,
-                hidden,
-                inter,
-                q_dim,
-                kv_dim,
-                1,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                10000.0,
-                false,
-                0.0,
-            );
+            let _ = metal.full_pipeline_q4(&q8_layers, &x, hidden, inter, 1, false, 0.0);
         }
         let q8_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
 

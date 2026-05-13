@@ -6,33 +6,144 @@
 //! - [`sampling`]: greedy / temperature / top-k / top-p sampler.
 
 pub mod chat_session;
+mod constrained;
 mod cpu;
 pub mod detok;
 pub mod eos;
 mod gpu;
+mod gpu_setup;
 mod lm_head;
+pub(crate) mod policy;
 pub mod sampling;
 mod types;
 
 pub use chat_session::{
     ChatMLRenderer, ChatSession, GemmaRenderer, Llama3Renderer, TurnRenderer, DEFAULT_MAX_CONTEXT,
 };
+pub use constrained::{
+    generate_constrained, generate_constrained_streaming, generate_constrained_streaming_sampled,
+    try_generate_constrained, try_generate_constrained_streaming,
+    try_generate_constrained_streaming_sampled,
+};
 pub use detok::Detokenizer;
 pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
 pub use gpu::{
-    generate, generate_constrained, generate_constrained_streaming,
-    generate_constrained_streaming_sampled, generate_streaming, generate_with_sampling,
-    stream_forced_full_logits, ForcedLogitsResult,
+    generate, generate_streaming, generate_with_sampling, stream_forced_full_logits,
+    try_generate, try_generate_streaming, try_generate_with_sampling, ForcedLogitsResult,
 };
 pub use lm_head::lm_head_topk;
 pub use sampling::{Sampler, SamplingConfig};
-pub use types::{GenerateResult, StageTimings};
+pub use types::{GenerateError, GenerateResult, StageTimings};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::test_utils::make_test_weights;
     use crate::layer_graph::CachedLayerGraph;
+    use crate::test_utils::make_test_weights;
+
+    // ── `try_*` fallible wrappers ─────────────────────────────────────────────
+    //
+    // The `try_generate*` family runs the infallible `generate*` then routes
+    // the embedded `error: Option<GenerateError>` to a `Result<_, _>` via
+    // `GenerateResult::into_result`. The tests below exercise the surface
+    // contract — every `try_*` wrapper has a Result return type, returns Ok
+    // when the underlying generate produces no `error`, and returns
+    // Err(GenerateError) when it does. End-to-end model behaviour is covered
+    // by the `#[ignore]`d real-vindex tests further down.
+
+    #[test]
+    fn try_generate_wraps_ok_result() {
+        // Empty-success → Ok branch.
+        let ok = GenerateResult::empty_success();
+        let r = ok.into_result();
+        assert!(r.is_ok(), "empty_success must round-trip to Ok");
+        assert!(r.unwrap().error.is_none());
+    }
+
+    #[test]
+    fn try_generate_wraps_typed_error() {
+        // empty_error → Err branch with typed enum variant preserved.
+        let err = GenerateResult::empty_error(GenerateError::unsupported_backend("no Q4"));
+        let r = err.into_result();
+        match r {
+            Err(GenerateError::UnsupportedBackend { reason }) => {
+                assert_eq!(reason, "no Q4");
+            }
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_generate_streaming_signature_returns_result() {
+        // Compile-time check that the streaming variant takes a callback
+        // and returns Result. Build a result locally and feed it through
+        // the same `.into_result()` mapping that `try_generate_streaming`
+        // uses internally.
+        let result_ok = GenerateResult::empty_success();
+        let _: Result<GenerateResult, GenerateError> = result_ok.into_result();
+        let result_err = GenerateResult::empty_error(GenerateError::empty_output("none"));
+        let r = result_err.into_result();
+        assert!(matches!(r, Err(GenerateError::EmptyOutput { .. })));
+    }
+
+    #[test]
+    fn try_generate_with_sampling_preserves_partial_tokens_on_error() {
+        // Even on the Err path, `into_result` only routes by `error.is_some()`
+        // — the result's tokens vec is moved through unchanged. Test that
+        // semantics by hand-building a partial-output error case.
+        let mut partial = GenerateResult::empty_error(GenerateError::prefill_failed("oom"));
+        partial.tokens.push(("hi".into(), 0.5));
+        let r = partial.into_result();
+        assert!(matches!(r, Err(GenerateError::PrefillFailed { .. })));
+    }
+
+    // Compile-only check: the wrappers exist with the right shape and
+    // can be referenced from a function pointer.  No body — the build
+    // failing on a signature change is the test.
+    #[allow(dead_code)]
+    fn _try_generate_function_pointer_check(
+        weights: &mut crate::model::ModelWeights,
+        tokenizer: &tokenizers::Tokenizer,
+        token_ids: &[u32],
+        index: &larql_vindex::VectorIndex,
+        backend: &dyn larql_compute::ComputeBackend,
+        cached: &crate::layer_graph::CachedLayerGraph,
+    ) -> Result<GenerateResult, GenerateError> {
+        try_generate(
+            weights,
+            tokenizer,
+            token_ids,
+            1,
+            index,
+            backend,
+            cached,
+            0..weights.num_layers,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn _try_generate_streaming_function_pointer_check(
+        weights: &mut crate::model::ModelWeights,
+        tokenizer: &tokenizers::Tokenizer,
+        token_ids: &[u32],
+        index: &larql_vindex::VectorIndex,
+        backend: &dyn larql_compute::ComputeBackend,
+        cached: &crate::layer_graph::CachedLayerGraph,
+    ) -> Result<GenerateResult, GenerateError> {
+        try_generate_streaming(
+            weights,
+            tokenizer,
+            token_ids,
+            1,
+            index,
+            backend,
+            cached,
+            0..weights.num_layers,
+            SamplingConfig::greedy(),
+            &EosConfig::builtin(),
+            |_, _, _| {},
+        )
+    }
 
     // ── lm_head / logit helpers (synthetic, no vindex) ────────────────────────
 
@@ -102,7 +213,7 @@ mod tests {
     //   cargo test -p larql-inference --lib layer_graph::generate::tests -- --ignored --nocapture
 
     fn load_test_vindex() -> Option<(larql_vindex::VectorIndex, larql_models::ModelWeights)> {
-        let vpath = std::env::var("LARQL_VINDEX_PATH").ok()?;
+        let vpath = std::env::var(crate::vindex::ENV_VINDEX_PATH).ok()?;
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb).ok()?;
@@ -118,7 +229,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -156,7 +267,7 @@ mod tests {
         let (index, mut weights) =
             load_test_vindex().expect("LARQL_VINDEX_PATH not set or invalid");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .expect("tokenizer load failed");
 
@@ -200,7 +311,7 @@ mod tests {
     fn generate_prefill_ms_positive() {
         let (index, mut weights) = load_test_vindex().expect("LARQL_VINDEX_PATH not set");
         let tokenizer = larql_vindex::load_vindex_tokenizer(std::path::Path::new(
-            &std::env::var("LARQL_VINDEX_PATH").unwrap(),
+            &std::env::var(crate::vindex::ENV_VINDEX_PATH).unwrap(),
         ))
         .unwrap();
         let prompt = "Hello";

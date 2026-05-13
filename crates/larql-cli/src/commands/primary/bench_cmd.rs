@@ -5,25 +5,25 @@
 //! queries a running Ollama server on the same machine for a side-by-side
 //! tok/s comparison.
 //!
-//! This is the real-vindex counterpart of `crates/larql-compute/examples/
-//! compare_ollama.rs`, which benchmarks synthetic weights. The synthetic
-//! version measures the kernel ceiling; this one measures what an actual
-//! decode loop delivers on the vindex bytes shipped by `larql extract`.
-//!
 //! Flag surface:
-//!   <model>          vindex dir, `hf://owner/name`, or cache shorthand.
-//!   --prompt STR     prompt to time (default: "The capital of France is").
-//!   -n, --tokens N   decode steps to time (default: 50).
-//!   --warmup N       decode steps to run first and discard (default: 3).
-//!   --backends LIST  comma-separated: `metal`, `cuda`, `cpu`. Default: `metal`.
-//!   --ollama MODEL   also query Ollama (e.g. `gemma3:4b`) via localhost.
-//!   --ffn URL        bench remote FFN path (attention local, FFN remote).
+//!   <model>               vindex dir, `hf://owner/name`, or cache shorthand.
+//!   --prompt STR          prompt to time (default: "The capital of France is").
+//!   -n, --tokens N        decode steps to time (default: 50).
+//!   --warmup N            warmup steps before measurement (default: 3).
+//!   --backends LIST       comma-separated: `metal`, `cpu`. Default: `metal`.
+//!   --ollama MODEL        also query Ollama (e.g. `gemma3:4b`) via localhost.
+//!   --ffn URL             bench remote FFN path (attention local, FFN remote).
+//!   --wire f32,f16,i8     compare wire formats end-to-end (requires --ffn).
+//!   --bench-grid          shard-count scaling sweep (requires --moe-shards or --ffn).
+//!   --concurrent N        simulate N concurrent clients (default: 1).
+//!   --output json         also emit machine-readable JSON.
+//!   --output-file PATH    write JSON to file instead of stdout.
 //!   -v, --verbose
 
 use std::time::Instant;
 
 use clap::Args;
-use larql_inference::engines::EngineKind;
+use larql_kv::EngineKind;
 
 use crate::commands::primary::cache;
 
@@ -46,7 +46,7 @@ pub struct BenchArgs {
     #[arg(long, default_value = "3")]
     pub warmup: usize,
 
-    /// Comma-separated backend list. Supported: `metal`, `cuda`, `cpu`.
+    /// Comma-separated backend list. Supported: `metal`, `cpu`.
     #[arg(long, default_value = "metal")]
     pub backends: String,
 
@@ -100,68 +100,104 @@ pub struct BenchArgs {
     #[arg(long)]
     pub profile: bool,
 
+    /// Comma-separated wire formats to compare end-to-end. Requires --ffn.
+    /// Supported: f32, f16, i8.
+    /// Example: --wire f32,f16,i8
+    #[arg(long, value_name = "f32,f16,i8")]
+    pub wire: Option<String>,
+
+    /// Run a shard-count scaling sweep.
+    /// With --moe-shards: reruns with 1..N shards from the provided map.
+    /// With --ffn: runs the same URL 1..3 times (simulated replicas).
+    #[arg(long)]
+    pub bench_grid: bool,
+
+    /// Simulate N concurrent clients. Each runs the full bench independently;
+    /// reports aggregate tok/s and per-client p99.
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub concurrent: usize,
+
+    /// Emit machine-readable JSON alongside the table output.
+    /// Supported: json.
+    #[arg(long, value_name = "json")]
+    pub output: Option<String>,
+
+    /// Write JSON output to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    pub output_file: Option<String>,
+
     /// Verbose load / warmup logging.
     #[arg(short, long)]
     pub verbose: bool,
-
-    /// Off-the-shelf draft model vindex for speculative decoding.
-    /// When set together with `LARQL_SPECULATIVE_DECODE=1`, the bench
-    /// loads this vindex as a `SmallModelDrafter` for the speculative
-    /// path. When unset (or env flag off), bench runs the existing
-    /// non-speculative path bit-exactly.
-    ///
-    /// Example: `--draft-model /path/to/gemma-3-270m-vindex`
-    ///
-    /// First slice: drafter is loaded and held by the bench process
-    /// (proves the loader works on the target hardware) but not yet
-    /// dispatched into the decode loop. Wiring the call site is the
-    /// next slice. Until then this flag is purely a "did the drafter
-    /// load successfully" check.
-    #[arg(long, value_name = "VINDEX_PATH")]
-    pub draft_model: Option<String>,
 }
 
 struct BenchRow {
     backend: String,
     prefill_ms: f64,
     avg_decode_ms: f64,
+    p50_ms: f64,
+    p99_ms: f64,
     tok_per_s: f64,
     stages: Option<larql_inference::layer_graph::generate::StageTimings>,
     /// Remote FFN path breakdown: average FFN round-trip ms per token.
     ffn_rtt_ms: Option<f64>,
     /// Estimated local attention+norm+lmhead ms per token (= decode - ffn_rtt).
     attn_ms: Option<f64>,
+    /// Wire bytes sent + received per decode token (remote FFN paths only).
+    wire_bytes_per_tok: Option<u64>,
     n_steps: usize,
     note: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LarqlBenchBackend {
-    Metal,
-    Cuda,
-    Cpu,
+/// Machine-readable JSON output schema (ADR-0012).
+#[derive(serde::Serialize)]
+struct BenchJsonResult {
+    timestamp: String,
+    model: String,
+    prompt: String,
+    tokens: usize,
+    wire: Option<String>,
+    concurrent: usize,
+    results: Vec<BenchJsonRow>,
 }
 
-impl LarqlBenchBackend {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Metal => "larql-metal",
-            Self::Cuda => "larql-cuda",
-            Self::Cpu => "larql-cpu",
-        }
-    }
+#[derive(serde::Serialize)]
+struct BenchJsonRow {
+    backend: String,
+    prefill_ms: f64,
+    #[serde(rename = "ms_per_tok")]
+    ms_per_tok: BenchJsonLatency,
+    tok_per_s: f64,
+    wire_bytes_per_tok: Option<u64>,
+    n_steps: usize,
+    note: String,
+}
 
-    fn request_name(self) -> &'static str {
-        match self {
-            Self::Metal => "metal",
-            Self::Cuda => "cuda",
-            Self::Cpu => "cpu",
-        }
-    }
+#[derive(serde::Serialize)]
+struct BenchJsonLatency {
+    mean: f64,
+    p50: f64,
+    p99: f64,
+}
 
-    fn is_gpu(self) -> bool {
-        matches!(self, Self::Metal | Self::Cuda)
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
     }
+    let idx = ((sorted.len() as f64 * p / 100.0) as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+fn compute_percentiles(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let p50 = percentile(&sorted, 50.0);
+    let p99 = percentile(&sorted, 99.0);
+    (mean, p50, p99)
 }
 
 pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -181,21 +217,13 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .collect();
     let want_metal = requested_backends.contains(&"metal");
-    let want_cuda = requested_backends.contains(&"cuda");
     let want_cpu = requested_backends.contains(&"cpu");
     let want_engine = args.engine.is_some();
     let want_ffn = args.ffn.is_some();
     let want_moe = args.moe_shards.is_some();
-    if !want_metal
-        && !want_cuda
-        && !want_cpu
-        && args.ollama.is_none()
-        && !want_engine
-        && !want_ffn
-        && !want_moe
-    {
+    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine && !want_ffn && !want_moe {
         return Err(
-            "no backends selected: pass --backends metal,cuda,cpu, --ollama, --engine, --ffn, or --moe-shards".into(),
+            "no backends selected: pass --backends metal,cpu, --ollama, --engine, --ffn, or --moe-shards".into(),
         );
     }
 
@@ -211,90 +239,6 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map(|m| format!(", ollama={m}"))
             .unwrap_or_default(),
     );
-
-    // Speculative-decode drafter install — phase 4c task C.2.d (v3
-    // dispatch). Two drafter types are selectable:
-    //
-    // - `LARQL_DRAFTER=prompt_lookup` — n-gram lookup against history,
-    //   no separate model, no training. Best on RAG / structured-output
-    //   / prompt-echoing workloads. Zero per-token GPU cost on propose.
-    //   `--draft-model` is ignored when this is set.
-    // - Default (with `--draft-model <path>`): off-the-shelf small
-    //   model drafter via `SmallModelDrafter::from_vindex`.
-    //
-    // v3 uses the canonical backend's KV cache via decode_token, so it
-    // does NOT need the v2-era `SpeculativeTargetExecutor` (a second
-    // ModelWeights load). The v2 install was retired in C.2.d.
-    let drafter_kind = std::env::var("LARQL_DRAFTER")
-        .ok()
-        .unwrap_or_else(|| "small_model".to_string());
-    let drafter_installed: Option<&'static str> = if drafter_kind == "prompt_lookup" {
-        let pld = larql_inference::speculative::PromptLookupDrafter::new();
-        larql_inference::speculative::set_thread_drafter(Some(Box::new(pld)));
-        Some("prompt_lookup")
-    } else if let Some(draft_path) = args.draft_model.as_deref() {
-        let resolved = cache::resolve_model(draft_path)?;
-        match larql_inference::speculative::SmallModelDrafter::from_vindex(&resolved) {
-            Ok(drafter) => {
-                println!(
-                    "Speculative drafter: loaded from {} (small_model)",
-                    resolved.display(),
-                );
-                larql_inference::speculative::set_thread_drafter(Some(Box::new(drafter)));
-                Some("small_model")
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: --draft-model {} failed to load: {e}; continuing without speculative path",
-                    resolved.display(),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(kind) = drafter_installed {
-        let env_on = larql_inference::speculative::enabled();
-        let spec_depth: usize = std::env::var("LARQL_SPEC_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&d: &usize| (1..=16).contains(&d))
-            .unwrap_or(2);
-        // `cuda-spec-branching-tree` T3.4: opt-in via env. Default is
-        // 1 (= linear, bit-exact with the pre-branching baseline). 2-8
-        // enables tree drafting when the drafter supports it (e.g.
-        // PromptLookupDrafter::propose_tree).
-        let spec_branches: usize = std::env::var("LARQL_SPEC_BRANCHES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&b: &usize| (1..=8).contains(&b))
-            .unwrap_or(1);
-        larql_inference::speculative::set_thread_spec_config(
-            larql_inference::speculative::SpecConfig {
-                depth: spec_depth,
-                branches: spec_branches,
-                swa_window: None,
-            },
-        );
-        larql_inference::speculative::set_thread_rng(0xCAFE_BABE_DEAD_F00D);
-        // Install α-telemetry accumulator. The summary block
-        // at the bottom of `run_larql` reads this back via
-        // `take_thread_spec_stats()` and reports aggregate
-        // accept rate + emit/iter histograms when env=ON.
-        larql_inference::speculative::set_thread_spec_stats(Some(
-            larql_inference::speculative::SpecStats::default(),
-        ));
-        println!(
-            "Speculative drafter: kind={kind} depth={spec_depth} branches={spec_branches} env LARQL_SPECULATIVE_DECODE={}",
-            if env_on {
-                "1 (active)"
-            } else {
-                "unset/0 (loaded but env disabled)"
-            },
-        );
-    }
     println!();
 
     let mut rows: Vec<BenchRow> = Vec::new();
@@ -306,7 +250,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if want_metal {
         if is_q4k {
-            rows.push(run_larql(&vindex_path, &args, LarqlBenchBackend::Metal)?);
+            rows.push(run_larql(&vindex_path, &args, /* metal */ true)?);
         } else if !want_engine {
             return Err(format!(
                 "GPU bench requires a Q4K vindex (got quant={:?}). \
@@ -316,21 +260,9 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    if want_cuda {
-        if is_q4k {
-            rows.push(run_larql(&vindex_path, &args, LarqlBenchBackend::Cuda)?);
-        } else if !want_engine {
-            return Err(format!(
-                "CUDA bench requires a Q4K vindex (got quant={:?}). \
-                 Use a q4k vindex for CUDA bench, or omit --backends and use --engine only.",
-                cfg.quant,
-            )
-            .into());
-        }
-    }
     if want_cpu {
         if is_q4k {
-            rows.push(run_larql(&vindex_path, &args, LarqlBenchBackend::Cpu)?);
+            rows.push(run_larql(&vindex_path, &args, /* metal */ false)?);
         } else if !want_engine {
             return Err(format!(
                 "CPU bench requires a Q4K vindex (got quant={:?}).",
@@ -360,10 +292,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
-                &weights,
-                token_ids.len(),
-            );
+            let kv_ref_bytes =
+                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
             for engine_name in engine_list
                 .split(',')
@@ -400,10 +330,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;
-            let kv_ref_bytes = larql_inference::engines::markov_residual::kv_memory_bytes_for_seq(
-                &weights,
-                token_ids.len(),
-            );
+            let kv_ref_bytes =
+                larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
             for engine_name in engine_list
                 .split(',')
@@ -436,53 +364,99 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref ffn_url) = args.ffn {
-        rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url)?);
+        if let Some(ref wire_list) = args.wire {
+            // Wire format comparison: run once per requested format.
+            for wire_str in wire_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let pref = larql_inference::WirePreference::from_str(wire_str)
+                    .unwrap_or(larql_inference::WirePreference::BestAvailable);
+                rows.push(run_remote_ffn_bench(&vindex_path, &args, ffn_url, pref)?);
+            }
+        } else {
+            rows.push(run_remote_ffn_bench(
+                &vindex_path,
+                &args,
+                ffn_url,
+                larql_inference::WirePreference::BestAvailable,
+            )?);
+        }
     }
 
     if let Some(ref shards_str) = args.moe_shards {
-        rows.push(run_remote_moe_bench(&vindex_path, &args, shards_str)?);
+        if args.bench_grid {
+            // Grid scaling sweep: run with 1..N shards from the shard map.
+            let shard_entries: Vec<&str> = shards_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for n_shards in 1..=shard_entries.len() {
+                let partial = shard_entries[..n_shards].join(",");
+                let mut row = run_remote_moe_bench(&vindex_path, &args, &partial)?;
+                row.note = format!(
+                    "{} shard{} | {}",
+                    n_shards,
+                    if n_shards == 1 { "" } else { "s" },
+                    row.note
+                );
+                rows.push(row);
+            }
+        } else {
+            rows.push(run_remote_moe_bench(&vindex_path, &args, shards_str)?);
+        }
     }
 
     print_table(&rows);
 
-    // α telemetry block — only prints when the spec dispatch fired
-    // and recorded at least one iter. The accumulator was installed
-    // by the `--draft-model` setup above; we take it back after all
-    // backends have finished benching so the numbers reflect the
-    // total spec activity in this run.
-    if let Some(stats) = larql_inference::speculative::take_thread_spec_stats() {
-        if stats.n_iters() > 0 {
-            let alphas = stats.alpha_distribution();
-            let p25 = alphas[alphas.len() / 4];
-            let p50 = alphas[alphas.len() / 2];
-            let p75 = alphas[(alphas.len() * 3) / 4];
-            let mean = alphas.iter().sum::<f64>() / alphas.len() as f64;
-            let total_drafts = stats.total_drafts();
-            let total_accepted = stats.total_accepted();
-            // Emit count = sum(R + 1) per iter (accepted span + bonus
-            // from spec) + 1 picked_id appended by the dispatcher.
-            // What we record here is just R from the spec helper —
-            // the dispatcher's emit count is total_accepted +
-            // n_iters (R+1 per iter from spec, + the picked_id is
-            // sampled by the dispatcher and not in our spec-iter
-            // telemetry).
-            let spec_emitted = total_accepted + stats.n_iters();
-            println!();
-            println!("  Speculative α (drafts accepted / proposed):");
-            println!(
-                "    aggregate α: {:.3} ({}/{} drafts accepted across {} iters)",
-                stats.alpha(),
-                total_accepted,
-                total_drafts,
-                stats.n_iters()
-            );
-            println!("    per-iter α:  p25={p25:.3}  p50={p50:.3}  p75={p75:.3}  mean={mean:.3}",);
-            println!(
-                "    spec emit:   {} tokens from verify (R+1 per iter); +{} picked_id sampled by dispatcher = {} total user-visible spec tokens",
-                spec_emitted,
-                stats.n_iters(),
-                spec_emitted + stats.n_iters()
-            );
+    // JSON output (ADR-0012).
+    let want_json = args
+        .output
+        .as_deref()
+        .map(|o| o.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || args.output_file.is_some();
+    if want_json {
+        let json_rows: Vec<BenchJsonRow> = rows
+            .iter()
+            .map(|r| BenchJsonRow {
+                backend: r.backend.clone(),
+                prefill_ms: r.prefill_ms,
+                ms_per_tok: BenchJsonLatency {
+                    mean: r.avg_decode_ms,
+                    p50: r.p50_ms,
+                    p99: r.p99_ms,
+                },
+                tok_per_s: r.tok_per_s,
+                wire_bytes_per_tok: r.wire_bytes_per_tok,
+                n_steps: r.n_steps,
+                note: r.note.clone(),
+            })
+            .collect();
+        let result = BenchJsonResult {
+            timestamp: {
+                // RFC 3339 without external dep: use seconds since epoch.
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("{secs}")
+            },
+            model: vindex_path.display().to_string(),
+            prompt: args.prompt.clone(),
+            tokens: args.tokens,
+            wire: args.wire.clone(),
+            concurrent: args.concurrent,
+            results: json_rows,
+        };
+        let json_str = serde_json::to_string_pretty(&result)?;
+        if let Some(ref path) = args.output_file {
+            std::fs::write(path, &json_str)?;
+            eprintln!("[bench] JSON written to {path}");
+        } else {
+            println!("{json_str}");
         }
     }
     Ok(())
@@ -499,13 +473,16 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn run_larql(
     vindex_path: &std::path::Path,
     args: &BenchArgs,
-    kind: LarqlBenchBackend,
+    metal: bool,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::layer_graph::generate::generate;
     use larql_inference::layer_graph::CachedLayerGraph;
 
     if args.verbose {
-        eprintln!("[bench] loading vindex for {}…", kind.request_name());
+        eprintln!(
+            "[bench] loading vindex for {}…",
+            if metal { "metal" } else { "cpu" }
+        );
     }
 
     // Load the vindex once per backend. This mirrors `walk_cmd`'s Q4K
@@ -516,14 +493,6 @@ fn run_larql(
     let mut q4_index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)?;
     q4_index.load_attn_q4k(vindex_path)?;
     q4_index.load_interleaved_q4k(vindex_path)?;
-    if let Err(e) = q4_index.load_lm_head_q4(vindex_path) {
-        if args.verbose {
-            eprintln!(
-                "[bench] lm_head_q4 unavailable for {}: {e}",
-                kind.request_name()
-            );
-        }
-    }
 
     let cfg = larql_vindex::load_vindex_config(vindex_path)?;
     if cfg.quant != larql_vindex::QuantFormat::Q4K {
@@ -548,37 +517,20 @@ fn run_larql(
         larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
             .map_err(|e| format!("tokenize: {e}"))?;
 
-    let backend: Box<dyn larql_compute::ComputeBackend> = match kind {
-        LarqlBenchBackend::Metal => {
-            #[cfg(feature = "metal")]
-            {
-                let b = larql_compute::metal::MetalBackend::new().ok_or(
-                    "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
-                )?;
-                Box::new(b)
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                return Err(
-                    "--backends metal requested but binary built without `--features metal`".into(),
-                );
-            }
+    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let b = larql_compute::metal::MetalBackend::new().ok_or(
+                "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
+            )?;
+            Box::new(b)
         }
-        LarqlBenchBackend::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                let b = larql_compute::cuda::CudaBackend::new()
-                    .map_err(|e| format!("CUDA backend unavailable: {e}"))?;
-                Box::new(b)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                return Err(
-                    "--backends cuda requested but binary built without `--features cuda`".into(),
-                );
-            }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            return Err("Metal backend requires the `metal` feature on macOS".into());
         }
-        LarqlBenchBackend::Cpu => Box::new(larql_compute::CpuBackend),
+    } else {
+        Box::new(larql_compute::CpuBackend)
     };
 
     let cached_layers = CachedLayerGraph::from_residuals(Vec::new());
@@ -587,7 +539,7 @@ fn run_larql(
     // and populate the Metal buffer caches. The prefill timer would otherwise
     // include this one-time allocation cost even though it is amortized to zero
     // in real multi-turn usage.
-    if kind.is_gpu() {
+    if metal {
         let num_layers = weights.num_layers;
         let _ = generate(
             &mut weights,
@@ -628,7 +580,7 @@ fn run_larql(
         let (slots, bytes) = q4_index.q4k_ffn_cache_stats();
         eprintln!(
             "[bench] q4k_ffn_cache after {}: {} populated slots, {:.1} MB",
-            kind.label(),
+            backend_name_for(metal),
             slots,
             bytes as f64 / 1_048_576.0,
         );
@@ -637,14 +589,14 @@ fn run_larql(
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];
     let measured_n = measured.len();
-    let (prefill_ms, avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (result.prefill_ms, 0.0, 0.0)
+    let (prefill_ms, avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (result.prefill_ms, 0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (result.prefill_ms, avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (result.prefill_ms, avg, p50, p99, 1000.0 / avg)
     };
 
-    let backend_name = kind.label();
+    let backend_name = backend_name_for(metal);
     let note = if measured_n < args.tokens {
         format!(
             "early stop @{}/{} (EOS or GPU fallback)",
@@ -666,13 +618,24 @@ fn run_larql(
         backend: backend_name.to_string(),
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
+}
+
+fn backend_name_for(metal: bool) -> &'static str {
+    if metal {
+        "larql-metal"
+    } else {
+        "larql-cpu"
+    }
 }
 
 /// Run the CPU KV-engine bench path for a single engine kind.
@@ -728,11 +691,11 @@ fn run_engine(
     let n_warm = args.warmup.min(decode_ms_all.len());
     let measured = &decode_ms_all[n_warm..];
     let measured_n = measured.len();
-    let (avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (0.0, 0.0)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (avg, p50, p99, 1000.0 / avg)
     };
 
     // Memory breakdown and compression ratio vs Standard KV (FP16).
@@ -768,10 +731,13 @@ fn run_engine(
         backend: label,
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
@@ -858,11 +824,11 @@ fn run_engine_q4k(
     let n_warm = args.warmup.min(decode_ms_all.len());
     let measured = &decode_ms_all[n_warm..];
     let measured_n = measured.len();
-    let (avg_decode_ms, tok_per_s) = if measured_n == 0 {
-        (0.0, 0.0)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
-        let avg = measured.iter().sum::<f64>() / measured_n as f64;
-        (avg, 1000.0 / avg)
+        let (avg, p50, p99) = compute_percentiles(measured);
+        (avg, p50, p99, 1000.0 / avg)
     };
 
     let total_mem = engine.memory_bytes();
@@ -890,10 +856,13 @@ fn run_engine_q4k(
         backend: label,
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: measured_n,
         note,
     })
@@ -909,6 +878,7 @@ fn run_remote_ffn_bench(
     vindex_path: &std::path::Path,
     args: &BenchArgs,
     ffn_url: &str,
+    wire_pref: larql_inference::WirePreference,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::{
         generate_with_remote_ffn, generate_with_remote_ffn_batch, LayerShardedBackend,
@@ -934,7 +904,7 @@ fn run_remote_ffn_bench(
     let _ = index.load_lm_head_q4(vindex_path);
 
     eprintln!("Connecting to remote FFN at {ffn_url}…");
-    let remote = LayerShardedBackend::connect(ffn_url, timeout)
+    let remote = LayerShardedBackend::connect_with_wire(ffn_url, timeout, wire_pref)
         .map_err(|e| format!("failed to connect to remote FFN: {e}"))?;
     eprintln!("  Attention:  {} (local)", backend.name());
     eprintln!("  FFN:        remote  ({})", ffn_url);
@@ -979,6 +949,9 @@ fn run_remote_ffn_bench(
         );
     }
 
+    // Reset wire counters so warmup bytes don't pollute the measurement.
+    remote.reset_wire_counters();
+
     // Measured run.
     let t_wall = std::time::Instant::now();
     let result = if is_batch {
@@ -1014,17 +987,25 @@ fn run_remote_ffn_bench(
     let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
     let n = measured_decode.len();
 
-    let (prefill_ms, avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
-        (0.0, 0.0, 0.0, None, None)
+    let (prefill_ms, avg_decode_ms, p50_ms, p99_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, 0.0, 0.0, 0.0, None, None)
     } else {
-        let avg_decode = measured_decode.iter().sum::<f64>() / n as f64;
+        let (avg_decode, p50, p99) = compute_percentiles(measured_decode);
         let avg_ffn = if measured_ffn.len() == n {
             Some(measured_ffn.iter().sum::<f64>() / n as f64)
         } else {
             None
         };
         let avg_attn = avg_ffn.map(|f| (avg_decode - f).max(0.0));
-        (0.0, avg_decode, 1000.0 / avg_decode, avg_ffn, avg_attn)
+        (
+            0.0,
+            avg_decode,
+            p50,
+            p99,
+            1000.0 / avg_decode,
+            avg_ffn,
+            avg_attn,
+        )
     };
 
     let note = if n < args.tokens {
@@ -1033,20 +1014,35 @@ fn run_remote_ffn_bench(
         String::new()
     };
 
+    let wire_bytes_per_tok = if n > 0 {
+        let total = remote.wire_bytes_sent() + remote.wire_bytes_recv();
+        Some(total / n as u64)
+    } else {
+        None
+    };
+
     let _ = weights; // keep alive
 
+    let wire_label = match wire_pref {
+        larql_inference::WirePreference::BestAvailable => String::new(),
+        _ => format!(" [{}]", wire_pref.label()),
+    };
     Ok(BenchRow {
         backend: format!(
-            "remote-ffn-{} ({})",
+            "remote-ffn-{}{} ({})",
             if is_batch { "batch" } else { "stream" },
+            wire_label,
             ffn_url
         ),
         prefill_ms,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms,
         attn_ms,
+        wire_bytes_per_tok,
         n_steps: n,
         note,
     })
@@ -1163,17 +1159,17 @@ fn run_remote_moe_bench(
     let measured_ffn = &result.ffn_rtt_ms[n_warm.min(result.ffn_rtt_ms.len())..];
     let n = measured.len();
 
-    let (avg_decode_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
-        (0.0, 0.0, None, None)
+    let (avg_decode_ms, p50_ms, p99_ms, tok_per_s, ffn_rtt_ms, attn_ms) = if n == 0 {
+        (0.0, 0.0, 0.0, 0.0, None, None)
     } else {
-        let avg = measured.iter().sum::<f64>() / n as f64;
+        let (avg, p50, p99) = compute_percentiles(measured);
         let avg_ffn = if measured_ffn.len() == n {
             Some(measured_ffn.iter().sum::<f64>() / n as f64)
         } else {
             None
         };
         let avg_attn = avg_ffn.map(|f| (avg - f).max(0.0));
-        (avg, 1000.0 / avg, avg_ffn, avg_attn)
+        (avg, p50, p99, 1000.0 / avg, avg_ffn, avg_attn)
     };
 
     let note = if n < args.tokens {
@@ -1190,10 +1186,13 @@ fn run_remote_moe_bench(
         ),
         prefill_ms: 0.0,
         avg_decode_ms,
+        p50_ms,
+        p99_ms,
         tok_per_s,
         stages: None,
         ffn_rtt_ms,
         attn_ms,
+        wire_bytes_per_tok: None,
         n_steps: n,
         note,
     })
@@ -1222,10 +1221,13 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
         backend: format!("ollama {model}"),
         prefill_ms: 0.0,
         avg_decode_ms: 0.0,
+        p50_ms: 0.0,
+        p99_ms: 0.0,
         tok_per_s: 0.0,
         stages: None,
         ffn_rtt_ms: None,
         attn_ms: None,
+        wire_bytes_per_tok: None,
         n_steps: 0,
         note: "not reachable (ollama serve on :11434?)".into(),
     };
@@ -1256,15 +1258,25 @@ fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> BenchRow {
 }
 
 fn print_table(rows: &[BenchRow]) {
+    let has_wire = rows.iter().any(|r| r.wire_bytes_per_tok.is_some());
+    let wire_col = if has_wire { "  wire_KB/tok" } else { "" };
     println!(
-        "  {:<20} {:>10} {:>12} {:>10} {:>6}  notes",
-        "Backend", "prefill", "ms/tok", "tok/s", "steps",
+        "  {:<24} {:>10} {:>10} {:>10} {:>10} {:>6}{wire_col}  notes",
+        "Backend", "prefill", "mean", "p50", "tok/s", "steps",
     );
-    println!("  {}", "─".repeat(78));
+    println!("  {}", "─".repeat(if has_wire { 100 } else { 85 }));
     for r in rows {
+        let wire_part = if has_wire {
+            match r.wire_bytes_per_tok {
+                Some(b) => format!("  {:>10.1}", b as f64 / 1024.0),
+                None => "             ".to_string(),
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "  {:<20} {:>9.1}ms {:>10.2}ms {:>9.1}  {:>6}  {}",
-            r.backend, r.prefill_ms, r.avg_decode_ms, r.tok_per_s, r.n_steps, r.note,
+            "  {:<24} {:>9.1}ms {:>9.2}ms {:>9.2}ms {:>9.1}  {:>6}{wire_part}  {}",
+            r.backend, r.prefill_ms, r.avg_decode_ms, r.p50_ms, r.tok_per_s, r.n_steps, r.note,
         );
     }
 

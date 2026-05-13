@@ -20,9 +20,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::net::TcpListener;
 
+use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::MoeLayerWeights;
 use larql_inference::{
-    cpu_moe_forward, ndarray::ArcArray2, MoeLayerWeights, MoeRouterWeights, RemoteMoeBackend,
-    RemoteMoeError, ShardConfig,
+    ndarray::ArcArray2, MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig,
 };
 use larql_models::weights::ModelWeights;
 use larql_models::{ModelArchitecture, ModelConfig};
@@ -92,13 +93,6 @@ impl TestMoeArch {
                 attention_k_eq_v: false,
                 per_layer_embed_dim: None,
                 num_kv_shared_layers: None,
-                full_attention_interval: None,
-                ssm_state_size: None,
-                ssm_inner_size: None,
-                ssm_dt_rank: None,
-                ssm_group_count: None,
-                ssm_conv_kernel: None,
-                rope_dimension_sections: None,
             },
         }
     }
@@ -228,8 +222,8 @@ fn make_loaded_model(
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
-        ffn_layout: None,
         fp4: None,
+        ffn_layout: None,
     };
 
     // Build ModelWeights with expert data in raw_bytes (no mmap needed).
@@ -247,12 +241,11 @@ fn make_loaded_model(
         vectors,
         raw_bytes,
         packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
-        embed_quant: None,
         lm_head: embed,
-        lm_head_quant: None,
-        quant_tensors: HashMap::new(),
+        position_embed: None,
         arch: Box::new(TestMoeArch::new()),
         num_layers: 1,
         hidden_size: HIDDEN,
@@ -262,7 +255,6 @@ fn make_loaded_model(
         num_q_heads: 2,
         num_kv_heads: 2,
         rope_base: 10000.0,
-        skipped_tensors: Vec::new(),
     };
 
     let lock = OnceLock::new();
@@ -284,12 +276,19 @@ fn make_loaded_model(
         weights: lock,
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: std::sync::Arc::new(
+            larql_server::metrics::LayerLatencyTracker::new(),
+        ),
+        requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
-        tokenizer_cache: std::sync::Arc::new(larql_server::tokenizer_cache::TokenizerCache::new(
-            0, 0,
-        )),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_backend: std::sync::OnceLock::new(),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        moe_scratches: std::sync::Mutex::new(HashMap::new()),
+        #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+        metal_ffn_layer_bufs: std::sync::OnceLock::new(),
     }
 }
 
@@ -303,10 +302,6 @@ async fn spawn_server_with_model(model: LoadedModel) -> String {
         api_key: None,
         sessions: SessionManager::new(3600),
         describe_cache: DescribeCache::new(60),
-        attention_sessions: std::sync::Arc::new(
-            larql_server::attention_session::AttentionSessionMap::new(600, 256),
-        ),
-        default_kv_format: None,
     });
 
     let router = single_model_router(state);
@@ -328,20 +323,17 @@ fn local_output(
     router_proj: &[f32],
     pre_norm: &[f32],
 ) -> Vec<f32> {
-    // Split the BF16 monolith into per-expert byte slices.
-    let bytes_per_gate_up = 2 * INTER * HIDDEN * 2;
-    let bytes_per_down = HIDDEN * INTER * 2;
-    let experts_gate_up: Vec<&[u8]> = (0..NUM_EXPERTS)
-        .map(|e| &gate_up[e * bytes_per_gate_up..(e + 1) * bytes_per_gate_up])
-        .collect();
-    let experts_down: Vec<&[u8]> = (0..NUM_EXPERTS)
-        .map(|e| &down[e * bytes_per_down..(e + 1) * bytes_per_down])
-        .collect();
+    let gate_up_per_expert = gate_up.len() / NUM_EXPERTS;
+    let down_per_expert = down.len() / NUM_EXPERTS;
+    let experts_gate_up: Vec<&[u8]> = gate_up.chunks(gate_up_per_expert).collect();
+    let experts_down: Vec<&[u8]> = down.chunks(down_per_expert).collect();
     cpu_moe_forward(
         h,
         &MoeLayerWeights {
             experts_gate_up,
             experts_down,
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
             expert_data_format: larql_compute::QuantFormat::BF16,
             router_proj,
             router_scale: &[],

@@ -26,6 +26,16 @@ pub struct ExtractIndexArgs {
     #[arg(long, default_value = "10")]
     down_top_k: usize,
 
+    /// Per-expert top-K right singular vectors of `gate_proj` to store
+    /// instead of the full per-expert gate matrix. Default `0` = disabled
+    /// (write full per-expert gate, original behaviour). Set e.g. `64` to
+    /// produce a tractable summary vindex for many-experts MoE models
+    /// (DeepSeek-V4-Pro at 384 experts/layer would otherwise need ~370 GB
+    /// of gate_vectors; with `--summary-features-per-expert 64` it shrinks
+    /// to ~11 GB).
+    #[arg(long, default_value = "0")]
+    summary_features_per_expert: usize,
+
     /// How much of the model to include in the vindex. Each tier is a
     /// strict superset of the previous:
     ///
@@ -300,6 +310,16 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             down_q4k: args.down_q4k,
             feature_major_down: args.feature_major_down,
         };
+
+        // Per-expert SVD-summary tier — opt-in via flag. Threaded as env var
+        // so the streaming gate path can read it without an API break.
+        if args.summary_features_per_expert > 0 {
+            std::env::set_var(
+                "LARQL_SUMMARY_FEATURES_PER_EXPERT",
+                args.summary_features_per_expert.to_string(),
+            );
+        }
+
         larql_vindex::build_vindex_streaming(
             &model_path,
             &tokenizer,

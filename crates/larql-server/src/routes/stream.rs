@@ -29,6 +29,9 @@ const WS_TYPE_INFER_DONE: &str = "infer_done";
 // Inbound message type strings.
 const WS_CMD_DESCRIBE: &str = "describe";
 const WS_CMD_INFER: &str = "infer";
+const WS_CMD_GENERATE: &str = "generate";
+const WS_CMD_CANCEL: &str = "cancel";
+const WS_TYPE_TOKEN: &str = "token";
 
 fn ws_error(message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"type": WS_TYPE_ERROR, "message": message.into()})
@@ -101,6 +104,25 @@ fn ws_infer_done(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/stream",
+    tag = "admin",
+    responses(
+        (status = 101, description = "\
+WebSocket upgrade. After upgrade:\n\n\
+**Client → server** (text frames, JSON):\n\
+- `{\"type\":\"describe\", \"entity\":\"France\", \"band\":\"all\"}` — streams layer-by-layer describe.\n\
+- `{\"type\":\"infer\", \"prompt\":\"The capital of France is\", \"top\":5, \"mode\":\"walk\"}` — \
+streams top-K predictions one at a time.\n\n\
+**Server → client** (text frames, JSON):\n\
+- `{\"type\":\"layer\", \"layer\":N, \"edges\":[...]}` — per-layer describe output.\n\
+- `{\"type\":\"done\", \"entity\":..., \"total_edges\":N, \"latency_ms\":M}` — describe finished.\n\
+- `{\"type\":\"prediction\", \"rank\":I, \"token\":..., \"probability\":P}` — inference result.\n\
+- `{\"type\":\"infer_done\", \"prompt\":..., \"mode\":..., \"predictions\":N, \"latency_ms\":M}` — inference finished.\n\
+- `{\"type\":\"error\", \"message\":...}` — protocol or runtime error.\n"),
+    ),
+)]
 pub async fn handle_stream(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -129,10 +151,20 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             WS_CMD_INFER => {
                 handle_stream_infer(&mut socket, &state, &request).await;
             }
+            WS_CMD_GENERATE => {
+                handle_stream_generate(&mut socket, &state, &request).await;
+            }
+            WS_CMD_CANCEL => {
+                // cancel is handled inside handle_stream_generate via the socket
+                // receiving a cancel frame while generation is running. A
+                // top-level cancel (no active generation) is a no-op.
+            }
             _ => {
                 send_error(
                     &mut socket,
-                    format!("unknown message type: {msg_type}. Supported: describe, infer"),
+                    format!(
+                        "unknown message type: {msg_type}. Supported: describe, infer, generate"
+                    ),
                 )
                 .await;
             }
@@ -171,10 +203,11 @@ async fn stream_describe_messages(
     // Run the describe in a blocking task and stream results layer by layer.
     let start = std::time::Instant::now();
 
-    let token_ids: Vec<u32> = match model.encode_cached_ids(entity.as_str(), false) {
-        Ok(ids) => ids,
-        Err(e) => return vec![ws_error(e)],
+    let encoding = match model.tokenizer.encode(entity.as_str(), false) {
+        Ok(e) => e,
+        Err(e) => return vec![ws_error(e.to_string())],
     };
+    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     if token_ids.is_empty() {
         return vec![ws_empty_done()];
     }
@@ -292,13 +325,14 @@ async fn handle_stream_infer(
         .as_str()
         .unwrap_or(crate::band_utils::INFER_MODE_WALK);
 
-    let token_ids: Vec<u32> = match model.encode_cached_ids(prompt.as_str(), true) {
-        Ok(ids) => ids,
+    let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
+        Ok(e) => e,
         Err(e) => {
-            send_error(socket, e).await;
+            send_error(socket, e.to_string()).await;
             return;
         }
     };
+    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
     if token_ids.is_empty() {
         send_error(socket, "empty prompt after tokenization").await;
         return;
@@ -337,6 +371,165 @@ async fn handle_stream_infer(
 
     let done_msg = ws_infer_done(prompt, mode, predictions.len(), elapsed_ms(start));
     let _ = send_msg(socket, &done_msg).await;
+}
+
+/// WebSocket streaming token generation.
+///
+/// Protocol:
+///   → {"type": "generate", "prompt": "...", "max_tokens": 200}
+///   ← {"type": "token", "text": "Paris", "index": 0}
+///   ← {"type": "token", "text": ",", "index": 1}
+///   ...
+///   ← {"type": "done", "tokens": N, "latency_ms": 210.5}
+///
+/// Client can abort early by sending:
+///   → {"type": "cancel"}
+///
+/// Uses `generate_streaming` — the same engine as SSE /v1/chat/completions.
+/// Requires inference-level weights (same constraints as `infer`).
+async fn handle_stream_generate(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+    request: &serde_json::Value,
+) {
+    let prompt = match request["prompt"].as_str() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            send_error(socket, "missing or empty prompt").await;
+            return;
+        }
+    };
+    let max_tokens = request["max_tokens"].as_u64().unwrap_or(256) as usize;
+
+    let model = match state.model(None) {
+        Some(m) => Arc::clone(m),
+        None => {
+            send_error(socket, "no model loaded").await;
+            return;
+        }
+    };
+    if model.infer_disabled {
+        send_error(socket, "inference disabled (--no-infer)").await;
+        return;
+    }
+    if model.get_or_load_weights().is_err() {
+        send_error(socket, "weights unavailable — server may be starting up").await;
+        return;
+    }
+
+    let encoding = match model.tokenizer.encode(prompt.as_str(), true) {
+        Ok(e) => e,
+        Err(e) => {
+            send_error(socket, e.to_string()).await;
+            return;
+        }
+    };
+    let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if token_ids.is_empty() {
+        send_error(socket, "empty prompt after tokenization").await;
+        return;
+    }
+
+    // Run generation on a blocking thread; stream tokens back via channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    let start = std::time::Instant::now();
+
+    let gen_handle = tokio::task::spawn_blocking(move || {
+        let mut weights_guard = match model.lock_weights_for_gen() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = tx.blocking_send(
+                    serde_json::json!({"type": WS_TYPE_ERROR, "message": e}).to_string(),
+                );
+                return;
+            }
+        };
+        let weights: &mut larql_inference::ModelWeights = &mut weights_guard;
+        let patched = model.patched.blocking_read();
+        let index = patched.base();
+        let backend = larql_compute::default_backend();
+        let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
+        let num_layers = weights.num_layers;
+        let eos = larql_inference::layer_graph::EosConfig::builtin();
+        let sampling = larql_inference::layer_graph::SamplingConfig::greedy();
+
+        let mut idx: usize = 0;
+        let on_token = move |_id: u32, text: &str, _prob: f64| {
+            let msg =
+                serde_json::json!({"type": WS_TYPE_TOKEN, "text": text, "index": idx}).to_string();
+            idx += 1;
+            let _ = tx.blocking_send(msg);
+        };
+
+        larql_inference::layer_graph::generate_streaming(
+            weights,
+            &model.tokenizer,
+            &token_ids,
+            max_tokens,
+            index,
+            &*backend,
+            &cached_layers,
+            0..num_layers,
+            sampling,
+            &eos,
+            on_token,
+        );
+    });
+
+    // Forward tokens to the WebSocket; watch for a cancel frame from client.
+    let mut token_count: usize = 0;
+    loop {
+        tokio::select! {
+            // Token from generation thread.
+            msg = rx.recv() => {
+                match msg {
+                    None => break, // generation finished
+                    Some(json_str) => {
+                        if json_str.contains(WS_TYPE_TOKEN) { token_count += 1; }
+                        if socket.send(Message::Text(json_str.into())).await.is_err() {
+                            gen_handle.abort();
+                            return;
+                        }
+                    }
+                }
+            }
+            // Client message (cancel or close).
+            client_msg = socket.recv() => {
+                match client_msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                            if v["type"].as_str() == Some(WS_CMD_CANCEL) {
+                                gen_handle.abort();
+                                let _ = send_msg(socket, &serde_json::json!({
+                                    "type": WS_TYPE_DONE,
+                                    "tokens": token_count,
+                                    "cancelled": true,
+                                    "latency_ms": elapsed_ms(start),
+                                })).await;
+                                return;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        gen_handle.abort();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let latency = elapsed_ms(start);
+    let _ = send_msg(
+        socket,
+        &serde_json::json!({
+            "type": WS_TYPE_DONE,
+            "tokens": token_count,
+            "latency_ms": latency,
+        }),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -505,14 +698,20 @@ mod tests {
             weights: std::sync::OnceLock::new(),
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
+            layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
+            requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::new(0, 0)),
-            #[cfg(feature = "metal-experts")]
+            tokenizer_cache: std::sync::Arc::new(
+                crate::tokenizer_cache::TokenizerCache::new(0, 0),
+            ),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
-            #[cfg(feature = "metal-experts")]
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(all(feature = "metal-experts", target_os = "macos"))]
+            metal_ffn_layer_bufs: std::sync::OnceLock::new(),
         })
     }
 
@@ -524,9 +723,7 @@ mod tests {
             api_key: None,
             sessions: SessionManager::new(3600),
             describe_cache: DescribeCache::new(0),
-            attention_sessions: std::sync::Arc::new(
-                crate::attention_session::AttentionSessionMap::new(600, 256),
-            ),
+            attention_sessions: crate::attention_session::AttentionSessionMap::new(3600, 16),
             default_kv_format: None,
         })
     }

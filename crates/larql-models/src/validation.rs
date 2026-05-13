@@ -227,14 +227,17 @@ fn validate_fraction(errors: &mut Vec<ConfigValidationError>, field: &'static st
 }
 
 fn validate_hidden_head_dim(_cfg: &ModelConfig, _errors: &mut Vec<ConfigValidationError>) {
-    // Phase 4c spec-decode investigation: Gemma 3 270M has hidden=640
-    // but head_dim=256 (q_dim = 4*256 = 1024, kv_dim = 1*256 = 256).
-    // The Q/K/V projections are sized by `num_q_heads * head_dim` and
-    // `num_kv_heads * head_dim`, NOT by `hidden_size`. The historical
-    // assumption that head_dim divides hidden_size held for Gemma 3 4B
-    // (10*256=2560) but is not architecturally required. Validator
-    // relaxed to accept non-square QKV projections; the actual
-    // dimensional checks happen in the QKV-projection code paths.
+    // Intentionally no-op. Gemma-4 (and any model with separate inner attention
+    // dim) decouples head_dim from hidden_size: Q/K/V projections expand to
+    // num_heads * head_dim, attention runs at that dim, and the output
+    // projection re-projects back to hidden_size. So `hidden_size % head_dim
+    // == 0` is NOT a real invariant of multi-head attention, only an
+    // accidental property of older designs (Gemma-3, Llama, etc.) where
+    // num_heads * head_dim happened to equal hidden_size. Enforcing it here
+    // blocked extraction of e.g. google/gemma-4-26B-A4B-it (hidden 2816,
+    // sliding head_dim 256, global head_dim 512 — neither divides 2816).
+    // Per-layer geometry sanity (head_dim > 0, num_heads > 0, kv|q heads)
+    // is still validated in `validate_layer`.
 }
 
 fn validate_attention_heads(
@@ -403,10 +406,10 @@ fn validate_one_layer<A: ModelArchitecture + ?Sized>(
         ));
         return false;
     }
-    // Same relaxation as `validate_hidden_head_dim` above: head_dim
-    // does not need to divide hidden_size on architectures where the
-    // Q/K/V projections are sized independently of hidden (e.g.
-    // Gemma 3 270M: hidden=640, head_dim=256).
+    // Note: we intentionally do NOT enforce `hidden_size % head_dim == 0`
+    // here — see `validate_hidden_head_dim` above for why. Gemma-4
+    // dual-head_dim layers (sliding 256 / global 512) coexist with
+    // hidden_size 2816 by design.
     if num_q_heads == 0 {
         errors.push(ConfigValidationError::new(
             FIELD_NUM_Q_HEADS_FOR_LAYER,

@@ -37,6 +37,63 @@ pub trait DecodeBackend {
         None
     }
 
+    /// Variant of [`Self::full_pipeline_q4`] that replaces head `target_head`
+    /// at `target_layer` with `replacement_delta` (a `[seq_len * head_dim]`
+    /// f32 slice). The kernel zeros that head's pre-W_O output then adds
+    /// the supplied delta in its place, so the rest of the forward pass
+    /// sees the intervened residual.
+    ///
+    /// Used by the `dev ov_rd` circuit-intervention CLI (eval-program /
+    /// induce-program) to probe head contributions on the GPU.
+    ///
+    /// Default impl returns `None` so backends without the intervention
+    /// hook fall back to the CPU path.
+    #[allow(clippy::too_many_arguments)]
+    fn full_pipeline_q4_with_head_replacement(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        _seq_len: usize,
+        _use_qk_norm: bool,
+        _softcap: f32,
+        _target_layer: usize,
+        _target_head: usize,
+        _replacement_delta: &[f32],
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Variant of [`Self::full_pipeline_q4`] that captures the pre-W_O
+    /// output of head `target_head` at `target_layer` (i.e. the head's
+    /// contribution to the residual stream before the attention output
+    /// projection mixes heads together). After capturing, the dispatcher
+    /// stops short of running the rest of the layers; the returned vec
+    /// is `[seq_len * head_dim]` f32.
+    ///
+    /// Used by the `dev ov_rd` oracle PQ flow to compute residual
+    /// fingerprints from one head's output without paying the cost of
+    /// finishing the forward pass.
+    ///
+    /// Default impl returns `None` so backends without the capture hook
+    /// fall back to the CPU path.
+    #[allow(clippy::too_many_arguments)]
+    fn full_pipeline_q4_capture_pre_wo(
+        &self,
+        _layers: &[crate::FullPipelineLayer<'_>],
+        _x: &[f32],
+        _hidden: usize,
+        _inter: usize,
+        _seq_len: usize,
+        _use_qk_norm: bool,
+        _softcap: f32,
+        _target_layer: usize,
+        _target_head: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Multi-layer Q4 FFN in one submission: gate → up → GEGLU → down.
     fn multi_layer_q4_ffn(
         &self,
@@ -409,5 +466,51 @@ pub trait DecodeBackend {
         _softcap: f32,
     ) -> Option<Vec<f32>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::CpuBackend;
+
+    #[test]
+    fn cpu_full_pipeline_q4_with_head_replacement_returns_none() {
+        // CPU has no GPU intervention hook — default impl returns None,
+        // so callers fall back to a CPU intervention path implemented at
+        // the larql-inference layer.
+        let backend = CpuBackend;
+        let layers: Vec<crate::FullPipelineLayer<'_>> = Vec::new();
+        let out = backend.full_pipeline_q4_with_head_replacement(
+            &layers,
+            &[],
+            16,
+            32,
+            1,
+            false,
+            0.0,
+            0,
+            0,
+            &[],
+        );
+        assert!(out.is_none(), "CPU backend must NOT support head replacement");
+    }
+
+    #[test]
+    fn cpu_full_pipeline_q4_capture_pre_wo_returns_none() {
+        let backend = CpuBackend;
+        let layers: Vec<crate::FullPipelineLayer<'_>> = Vec::new();
+        let out = backend.full_pipeline_q4_capture_pre_wo(
+            &layers,
+            &[],
+            16,
+            32,
+            1,
+            false,
+            0.0,
+            0,
+            0,
+        );
+        assert!(out.is_none(), "CPU backend must NOT support pre-W_O capture");
     }
 }
