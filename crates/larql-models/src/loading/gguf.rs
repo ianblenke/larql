@@ -626,7 +626,16 @@ pub fn load_gguf_lazy_tensors(
     // QuantTensor views can be zero-copy slices into it. RSS only
     // accrues for pages actually touched during forward — the
     // inactive ~95 % of MoE expert weights never enter RSS.
+    //
+    // Phase G.2: `LARQL_QWEN35_HEAP_LOAD=1` opts back into the
+    // pre-G.1 behaviour where each lazy tensor is copied to a
+    // dedicated `Vec<u8>` heap allocation. That puts all 22 GiB of
+    // a model's weights in RSS at load time, but eliminates the
+    // per-token page-fault cost on first-touch of cold MoE experts.
+    // Use on RAM-rich machines where steady-state throughput beats
+    // RSS-minimisation; default (unset) stays mmap-backed.
     let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+    let heap_load = std::env::var("LARQL_QWEN35_HEAP_LOAD").ok().as_deref() == Some("1");
     for info in &gguf.tensor_infos {
         // Accept 2D tensors plus 3D MoE expert tensors. 3D GGUF tensors
         // (e.g. `ffn_gate_exps.weight` with dims `[hidden, ffn_dim,
@@ -664,14 +673,22 @@ pub fn load_gguf_lazy_tensors(
         };
         // Phase G.1: zero-copy view into the mmap. No to_vec() — only
         // pages actually touched during forward accrue RSS.
-        let qt = crate::quant::lazy::QuantTensor::from_mmap_region(
-            std::sync::Arc::clone(&mmap),
-            abs_offset_usize,
-            data_size,
-            info.tensor_type,
-            rows,
-            cols,
-        )?;
+        //
+        // Phase G.2: opt-in to the legacy copy-to-heap mode under
+        // `LARQL_QWEN35_HEAP_LOAD=1` (see top of fn).
+        let qt = if heap_load {
+            let bytes = mmap[abs_offset_usize..abs_offset_usize + data_size].to_vec();
+            crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?
+        } else {
+            crate::quant::lazy::QuantTensor::from_mmap_region(
+                std::sync::Arc::clone(&mmap),
+                abs_offset_usize,
+                data_size,
+                info.tensor_type,
+                rows,
+                cols,
+            )?
+        };
         // Special-case the embed tensor: it has its own dedicated
         // field on `ModelWeights` (a 5 GiB f32 for Qwen3.6 248k vocab)
         // and is consumed via row lookup rather than matvec. Steer it
