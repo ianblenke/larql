@@ -30,6 +30,7 @@ pub mod q4k_q8k;
 pub mod q5_k;
 pub mod q5k_q8k;
 pub mod q6_k;
+pub mod q6k_q8k;
 pub mod quantize;
 
 pub use legacy::{
@@ -40,6 +41,7 @@ pub use q4k_q8k::{q4k_q8k_row_dot, quantize_to_q8_k, Q8_K_BLOCK_BYTES, Q8_K_BLOC
 pub use q5_k::dequantize_q5_k;
 pub use q5k_q8k::q5k_q8k_row_dot;
 pub use q6_k::{dequantize_q6_k, q6k_row_dot, q6k_row_scaled_add};
+pub use q6k_q8k::q6k_q8k_row_dot;
 pub use quantize::{quantize_q4_0, quantize_q8_0};
 
 // ── Tensor-type IDs (match GGML wire format) ────────────────────────────
