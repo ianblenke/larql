@@ -172,6 +172,50 @@ operations onto the same device path; otherwise E.6-style
 device-resident activations/CUDA graphs are required for the expected
 multi-tok/s jump.
 
+## 2026-05-12 update — Phase E.6.B.1: device-resident FFN block (gate+up+silu+down)
+
+First slice of the E.6.B device-resident projection chain: a new
+`ComputeBackend::qwen35_ffn_lazy_block` method runs the full SwiGLU
+FFN on the GPU without host bouncing. CudaBackend's implementation
+chains `gate` Q4_K + `up` Q4_K paired matvec → `silu_gate_up_device`
+→ `down` Q5_K matvec on the same stream and dtohs only the final
+`[hidden]` output. Mixed-format dispatch (Q4_K gate/up + Q5_K down)
+matches the Qwen3.6-27B-Q4_K_S layout.
+
+Saves 2 dtohs (g, u), 1 htod (inter), 1 CPU silu loop, 1 sync per
+FFN layer × 64 layers.
+
+Bench result:
+
+| Config | Prefill (t/s) | Decode (t/s) |
+|---|---:|---:|
+| Phase E.6.F (sgemv revert + investigation) | 3.99 | 5.19 |
+| **Phase E.6.B.1 (device-resident FFN block)** | **4.24** | **5.34** |
+| llama.cpp CUDA GPU | 2097 | 50.6 |
+
+**+6 % prefill, +3 % decode.** Parity preserved. Steady-state
+per-token went 177 → 170 ms.
+
+Profile after E.6.B.1 (steady-state 170 ms / token):
+
+```
+LM_HEAD              89.2 ms  (52 %)    same shape-bottleneck
+FFN_GATE_UP_PAIR     42.0 ms  (25 %)    now full FFN block fused
+DN_RECURRENCE         7.8 ms  ( 5 %)
+ATTN_BLOCK            7.5 ms  ( 4 %)
+DN_SSM_OUT            5.1 ms  ( 3 %)
+DN_SILU_QKV_CONV      4.1 ms  ( 2 %)    still CPU loop in deltanet
+DN_SILU_Z             2.9 ms  ( 2 %)    "
+DN_CONV1D             2.4 ms  ( 1 %)
+…                              <2 %
+```
+
+The DeltaNet block still has CPU silu loops (`silu(qkv_conv)`,
+`silu(z) * o_flat`) and host-bouncing matvecs. Same fused-block
+pattern would apply there — that's the E.6.B.2 scope. The attempt
+in E.6.A is parity-broken (multi-position drift) so the deltanet
+fusion needs a different approach.
+
 ## 2026-05-12 update — Phase E.6.F: LM_HEAD Q6_K — three paths, all ~85 ms/call
 
 Tried three implementations for the dominant LM_HEAD Q6_K matvec

@@ -878,6 +878,61 @@ impl ComputeBackend for CudaBackend {
         super::deltanet::rms_norm_heads(self, x, weight, num_heads, head_dim, eps).ok()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_ffn_lazy_block(
+        &self,
+        x: &[f32],
+        gate_data: &[u8],
+        gate_format: crate::QuantFormat,
+        gate_rows: usize,
+        up_data: &[u8],
+        up_format: crate::QuantFormat,
+        up_rows: usize,
+        down_data: &[u8],
+        down_format: crate::QuantFormat,
+        down_rows: usize,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        use crate::QuantFormat;
+        // Only handle gate/up sharing input dim = hidden and producing
+        // rows=ffn_dim, then down going ffn_dim → hidden. Mismatched
+        // dims fall back to caller.
+        if x.len() != hidden || gate_rows != up_rows {
+            return None;
+        }
+        let ffn_dim = gate_rows;
+        let drv = self.driver();
+
+        // Dispatch per-format matvec to its device-resident variant.
+        // Returns CudaSlice<f32> for downstream chaining.
+        let matvec_dev = |data: &[u8],
+                          format: QuantFormat,
+                          rows: usize,
+                          cols: usize,
+                          x_dev: &cudarc::driver::CudaSlice<f32>|
+         -> Option<cudarc::driver::CudaSlice<f32>> {
+            match format {
+                QuantFormat::Q4_K => {
+                    super::q4k_direct::matvec_device(self, data, x_dev, rows, cols).ok()
+                }
+                QuantFormat::Q5_K => {
+                    super::q5k_direct::matvec_device(self, data, x_dev, rows, cols).ok()
+                }
+                _ => None,
+            }
+        };
+
+        let x_dev = drv.device_buf_from(x).ok()?;
+        let gate_dev = matvec_dev(gate_data, gate_format, ffn_dim, hidden, &x_dev)?;
+        let up_dev = matvec_dev(up_data, up_format, ffn_dim, hidden, &x_dev)?;
+        // silu(gate) * up element-wise on device.
+        let inter_dev =
+            super::elem::silu_gate_up_device(self, &gate_dev, &up_dev, ffn_dim, false).ok()?;
+        let down_dev = matvec_dev(down_data, down_format, down_rows, ffn_dim, &inter_dev)?;
+        drv.sync().ok()?;
+        drv.to_host(&down_dev).ok()
+    }
+
     fn qwen35_paired_q4k_matvec(
         &self,
         a_data: &[u8],

@@ -469,6 +469,45 @@ fn swiglu_ffn_lazy(
     use crate::time_section;
     use larql_compute::QuantFormat;
 
+    // Fastest path: fully device-resident FFN block. Requires all
+    // three projections (gate, up, down) to be lazy-quant in a
+    // GPU-supported format. On Qwen3.6-27B-Q4_K_S `gate`/`up` are
+    // Q4_K and `down` is Q5_K, so the backend must accept a mixed
+    // pair. Saves 2 dtohs (g, u to host), 1 htod (inter back to
+    // device), and 1 CPU silu loop per FFN layer.
+    if let (Some(b), Some(gq), Some(uq), Some(dq)) = (backend, gate_q, up_q, down_q) {
+        let gfmt = ggml_type_to_quant_format(gq.tensor_type());
+        let ufmt = ggml_type_to_quant_format(uq.tensor_type());
+        let dfmt = ggml_type_to_quant_format(dq.tensor_type());
+        let gpu_ok =
+            |f: Option<QuantFormat>| matches!(f, Some(QuantFormat::Q4_K | QuantFormat::Q5_K));
+        if gpu_ok(gfmt) && gpu_ok(ufmt) && gpu_ok(dfmt) {
+            let x_slice = x.as_slice().expect("Array1 contiguous");
+            let g_shape = gq.shape();
+            let u_shape = uq.shape();
+            let d_shape = dq.shape();
+            let block = time_section!(
+                FFN_GATE_UP_PAIR,
+                b.qwen35_ffn_lazy_block(
+                    x_slice,
+                    gq.raw_bytes(),
+                    gfmt.unwrap(),
+                    g_shape[0],
+                    uq.raw_bytes(),
+                    ufmt.unwrap(),
+                    u_shape[0],
+                    dq.raw_bytes(),
+                    dfmt.unwrap(),
+                    d_shape[0],
+                    g_shape[1],
+                )
+            );
+            if let Some(out) = block {
+                return Array1::from(out);
+            }
+        }
+    }
+
     let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
         let paired = match (backend, gate_q, up_q) {
             (Some(b), Some(gq), Some(uq)) => {

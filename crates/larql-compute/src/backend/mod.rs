@@ -127,6 +127,40 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Fused Qwen3.6 SwiGLU FFN block on the GPU. Chains all three
+    /// projection matvecs (`gate`, `up`, `down`) on the same stream
+    /// with `silu(gate) * up` computed device-resident between them,
+    /// so the host only ever sees the final `[hidden]` output.
+    ///
+    /// `gate_data` / `up_data` are the residual stream after the
+    /// post-attn norm; both share the same `x` input. `down_data`
+    /// projects the gated intermediate back to `hidden`. Formats are
+    /// per-tensor (Qwen3.6-27B-Q4_K_S has `gate`/`up` as Q4_K and
+    /// `down` as Q5_K), so the implementation must accept a mix.
+    ///
+    /// Saves the per-call htod x + dtoh intermediate transfers and 2
+    /// stream syncs vs the host-bouncing path through
+    /// `qwen35_paired_q4k_matvec` + CPU silu loop + `quant_matvec`.
+    /// Returns `None` if the backend can't handle the format combo
+    /// (caller falls back to per-call dispatch).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_ffn_lazy_block(
+        &self,
+        _x: &[f32],
+        _gate_data: &[u8],
+        _gate_format: crate::QuantFormat,
+        _gate_rows: usize,
+        _up_data: &[u8],
+        _up_format: crate::QuantFormat,
+        _up_rows: usize,
+        _down_data: &[u8],
+        _down_format: crate::QuantFormat,
+        _down_rows: usize,
+        _hidden: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Paired Q4_K matvec sharing one `x` input. Two weight matrices
     /// (`a_rows × hidden` and `b_rows × hidden`) feed off the same
     /// activation; backend uploads `x` once, runs both kernels on the
