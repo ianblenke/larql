@@ -24,9 +24,22 @@ enum ConvertCommand {
         #[arg(long, default_value = "browse")]
         level: String,
 
-        /// Store in f16 (half precision).
+        /// Store in f16 (half precision). Default if `--quant` not set.
         #[arg(long)]
         f16: bool,
+
+        /// Storage quant format for inference weights. `f16` (default) emits
+        /// the dequantised half-precision weight files (`attn_weights.bin`,
+        /// `up_weights.bin`, `down_weights.bin`, `lm_head.bin`). `q4k` adds
+        /// the Q4_K_M fast-decode artefacts (`interleaved_q4k.bin`,
+        /// `attn_weights_q4k.bin`, `lm_head_q4.bin`) and strips the
+        /// redundant f16 weight files so the production decode path reads
+        /// the Q4_K layer directly. Requires `--level inference` or `--level
+        /// all` so the writer has weights to quantise. Internally still
+        /// roundtrips through f32 — true bitwise passthrough of GGUF Q4_K
+        /// blocks is a follow-up perf win.
+        #[arg(long, default_value = "f16", value_parser = ["f16", "q4k"])]
+        quant: String,
     },
 
     /// Convert a safetensors model to a vindex (alias for extract-index).
@@ -181,7 +194,8 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             output,
             level,
             f16,
-        } => run_gguf_to_vindex(&input, &output, &level, f16),
+            quant,
+        } => run_gguf_to_vindex(&input, &output, &level, f16, &quant),
         ConvertCommand::SafetensorsToVindex {
             input,
             output,
@@ -426,7 +440,12 @@ fn run_gguf_to_vindex(
     output: &std::path::Path,
     level: &str,
     use_f16: bool,
+    quant: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let q4k = matches!(quant, "q4k");
+    if q4k && level == "browse" {
+        return Err("--quant q4k requires --level inference or --level all (the Q4_K writer needs weights)".into());
+    }
     eprintln!("Loading GGUF: {}", input.display());
 
     let gguf = larql_models::loading::gguf::GgufFile::open(input)?;
@@ -483,6 +502,24 @@ fn run_gguf_to_vindex(
         weights.num_layers, weights.hidden_size, weights.intermediate_size, weights.vocab_size
     );
 
+    // --quant q4k currently only handles standard transformer attention.
+    // Hybrid SSM/DeltaNet architectures (e.g. Qwen 3.6 dense + MoE) have
+    // a mix of full-attention layers and DeltaNet layers — the latter
+    // use `ssm_*` / `conv1d` tensors that the existing Q4_K attention
+    // writer doesn't enumerate. Without dedicated handling, those layers'
+    // weights would be silently skipped at write time, producing a
+    // broken vindex. Fail fast instead.
+    if q4k && weights.arch.full_attention_interval() != 0 {
+        return Err(format!(
+            "--quant q4k does not yet support hybrid SSM/DeltaNet architectures \
+             (detected family `{}` with full_attention_interval={}). Use `--f16` \
+             for now; hybrid-aware Q4_K writer is a follow-up.",
+            weights.arch.family(),
+            weights.arch.full_attention_interval(),
+        )
+        .into());
+    }
+
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
         "all" => larql_vindex::ExtractLevel::All,
@@ -529,6 +566,47 @@ fn run_gguf_to_vindex(
         dtype,
         &mut callbacks,
     )?;
+
+    // --quant q4k: overlay the Q4_K fast-decode artefacts and drop the
+    // now-redundant f16 weight files. The Q4_K writer reads from the
+    // same in-memory `ModelWeights` (no separate vindex_to_q4k step)
+    // and patches `index.json` to `quant=Q4K`. Production decode then
+    // reads `interleaved_q4k.bin` / `attn_weights_q4k.bin` / `lm_head_q4.bin`
+    // instead of the f16 forms. Internally this still roundtrips
+    // GGUF Q4_K → f32 → Q4_K; true bitwise passthrough is a follow-up.
+    if q4k {
+        eprintln!("  Writing Q4_K weight artefacts...");
+        let q4k_opts = larql_vindex::Q4kWriteOptions::default();
+        larql_vindex::write_model_weights_q4k_with_opts(
+            &weights,
+            output,
+            &mut callbacks,
+            q4k_opts,
+        )?;
+        // The f16 weight files written by build_vindex are now
+        // strictly redundant — the Q4_K writer's manifest supersedes
+        // them and the decode path no longer reads the f16 names when
+        // `index.json::quant == q4k`. Delete the leftovers so the
+        // vindex on disk reflects only the Q4_K layout.
+        for name in [
+            ATTN_WEIGHTS_BIN,
+            UP_WEIGHTS_BIN,
+            DOWN_WEIGHTS_BIN,
+            LM_HEAD_BIN,
+        ] {
+            let p = output.join(name);
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    eprintln!(
+                        "  warning: could not remove redundant f16 file {}: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+        eprintln!("  Q4_K artefacts written.");
+    }
+
     // GGUF conversion: HF metadata (tokenizer_config.json etc.) is not
     // packed in the GGUF itself, but if the user kept the HF files next
     // to the `.gguf`, snapshot them. Missing-file case is a no-op.
