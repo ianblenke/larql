@@ -659,6 +659,198 @@ unsafe fn hsum_i32x8(v: std::arch::x86_64::__m256i) -> i32 {
     _mm_cvtsi128_si32(v32)
 }
 
+// ── Q4_KF × Q8_K matvec ──────────────────────────────────────────────────────
+//
+// Q4_KF super-block: 160 bytes per 256 values, "pre-baked" Q4_K variant where
+// the per-sub-block scales and mins have already been multiplied by the
+// super-block's d and dmin:
+//
+//   [0..16]   16 bytes: 8 × f16  d*scale[j]
+//   [16..32]  16 bytes: 8 × f16  dmin*min[j]
+//   [32..160] 128 bytes nibbles (identical layout to Q4_K's [16..144])
+//
+// Nibble layout: four groups of 32 bytes, each group covers two sub-blocks
+// 2g (low nibble) and 2g+1 (high nibble). Same as Q4_K, same as `q4k_q8k`
+// inner loop — the only difference vs `q4k_q8k_matvec` is that scales are
+// f32 (decoded from f16, pre-multiplied) rather than i8 scales paired with
+// f16 d/dmin. Math:
+//
+//   acc += d_y * (Σ_g  d*scale[g] · dot_g  -  Σ_g  dmin*min[g] · q8_sum[g])
+//
+// where `dot_g = Σ_{i ∈ 32-elem sub-block g} nibble[i] · q8_qs[i]` (i32) and
+// `q8_sum[g]` is the precomputed sum of q8 lanes for that sub-block.
+
+const Q4KF_BLOCK_BYTES: usize = crate::pipeline::Q4_KF_BLOCK_BYTES;
+
+/// Scalar reference: Q4_KF weights × Q8_K activation matvec. Correctness
+/// oracle for the AVX2 implementation below.
+pub fn q4kf_q8k_matvec_scalar(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * Q4KF_BLOCK_BYTES;
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    if rows == 0 || cols == 0 || w.len() < rows * row_bytes {
+        return;
+    }
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+        for sb in 0..n_blocks {
+            let block = &w[row_base + sb * Q4KF_BLOCK_BYTES..];
+            // Pre-baked scales and mins (8 each, f16 → f32).
+            let mut scales = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            for j in 0..8 {
+                let s_bits = u16::from_le_bytes([block[j * 2], block[j * 2 + 1]]);
+                let m_bits = u16::from_le_bytes([block[16 + j * 2], block[16 + j * 2 + 1]]);
+                scales[j] = f16_to_f32(s_bits);
+                mins[j] = f16_to_f32(m_bits);
+            }
+            let quants = &block[32..Q4KF_BLOCK_BYTES];
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
+            let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
+            let d_y = q8k_x.d[sb];
+
+            for g in 0..4 {
+                let sb_lo = 2 * g;
+                let sb_hi = 2 * g + 1;
+                let chunk = &quants[g * 32..(g + 1) * 32];
+                let y_lo = &q8_qs[sb_lo * SUBBLOCK_SIZE..(sb_lo + 1) * SUBBLOCK_SIZE];
+                let y_hi = &q8_qs[sb_hi * SUBBLOCK_SIZE..(sb_hi + 1) * SUBBLOCK_SIZE];
+
+                let mut dot_lo: i32 = 0;
+                let mut dot_hi: i32 = 0;
+                for l in 0..32 {
+                    let byte = chunk[l];
+                    let q_lo = (byte & 0x0F) as i32;
+                    let q_hi = ((byte >> 4) & 0x0F) as i32;
+                    dot_lo += q_lo * y_lo[l] as i32;
+                    dot_hi += q_hi * y_hi[l] as i32;
+                }
+                acc += d_y
+                    * (scales[sb_lo] * dot_lo as f32
+                        + scales[sb_hi] * dot_hi as f32
+                        - mins[sb_lo] * q8_sums[sb_lo] as f32
+                        - mins[sb_hi] * q8_sums[sb_hi] as f32);
+            }
+        }
+        *out_r = acc;
+    }
+}
+
+/// AVX2 Q4_KF × Q8_K matvec for x86_64. Same `vpmaddubsw` / `vpmaddwd`
+/// inner loop as `q4k_q8k_matvec_avx2`; differs only in scale handling
+/// (f32 pre-baked vs Q4_K's i8 × f16 split). Bit-equivalent to the scalar
+/// reference modulo f32 reduction order (verified in unit tests).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4kf_q8k_matvec_avx2(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    use std::arch::x86_64::*;
+
+    if rows == 0
+        || cols == 0
+        || w.len() < rows * (cols / ELEMS_PER_BLOCK) * Q4KF_BLOCK_BYTES
+    {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * Q4KF_BLOCK_BYTES;
+    let lo_mask = _mm256_set1_epi8(0x0F);
+    let ones_epi16 = _mm256_set1_epi16(1);
+
+    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+
+        for sb in 0..n_blocks {
+            let block =
+                &w[row_base + sb * Q4KF_BLOCK_BYTES..row_base + (sb + 1) * Q4KF_BLOCK_BYTES];
+            // Decode 8 f16 scales + 8 f16 mins (pre-baked d*scale, dmin*min).
+            let mut scales = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            for j in 0..8 {
+                let s_bits = u16::from_le_bytes([block[j * 2], block[j * 2 + 1]]);
+                let m_bits = u16::from_le_bytes([block[16 + j * 2], block[16 + j * 2 + 1]]);
+                scales[j] = f16_to_f32(s_bits);
+                mins[j] = f16_to_f32(m_bits);
+            }
+            let quants = &block[32..Q4KF_BLOCK_BYTES];
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
+            let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
+            let d_y = q8k_x.d[sb];
+
+            for g in 0..4 {
+                let sb_lo = 2 * g;
+                let sb_hi = 2 * g + 1;
+
+                let q4 = _mm256_loadu_si256(quants.as_ptr().add(g * 32) as *const __m256i);
+                let lo_nibbles = _mm256_and_si256(q4, lo_mask);
+                let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(q4, 4), lo_mask);
+
+                let y_lo =
+                    _mm256_loadu_si256(q8_qs.as_ptr().add(sb_lo * SUBBLOCK_SIZE) as *const __m256i);
+                let y_hi =
+                    _mm256_loadu_si256(q8_qs.as_ptr().add(sb_hi * SUBBLOCK_SIZE) as *const __m256i);
+
+                let dot_lo = hsum_i32x8(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(lo_nibbles, y_lo),
+                    ones_epi16,
+                )) as f32;
+                let dot_hi = hsum_i32x8(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(hi_nibbles, y_hi),
+                    ones_epi16,
+                )) as f32;
+
+                acc += d_y
+                    * (scales[sb_lo] * dot_lo
+                        + scales[sb_hi] * dot_hi
+                        - mins[sb_lo] * q8_sums[sb_lo] as f32
+                        - mins[sb_hi] * q8_sums[sb_hi] as f32);
+            }
+        }
+        *out_slot = acc;
+    }
+}
+
+/// Public entry: AVX2 on x86_64 (when available), scalar otherwise. `w` is
+/// a Q4_KF weight matrix of `rows × cols`; `q8k_x` is the pre-quantised
+/// activation. Caller is responsible for `cols % 256 == 0`.
+pub fn q4kf_q8k_matvec_into(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 detected; bounds validated inside.
+        unsafe { q4kf_q8k_matvec_avx2(out, q8k_x, w, rows, cols) };
+        return;
+    }
+    q4kf_q8k_matvec_scalar(out, q8k_x, w, rows, cols);
+}
+
 /// Fused gate+up matvec: produce two output vectors from two weight matrices
 /// against the SAME pre-quantised Q8_K activation in one pass.  Each
 /// super-block of `q8k_x` is loaded once and SDOT'd against both `gate_w`
@@ -1485,6 +1677,79 @@ mod tests {
         let mut out = vec![1.0f32; rows];
         q4k_q8k_matvec_scalar(&mut out, &q, &w, rows, cols);
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    /// Q4_KF AVX2 must match the scalar reference within f32 round-off
+    /// (both fuse the same dot + scale arithmetic but in slightly
+    /// different orders, so bit-exact isn't quite achievable — 1e-5
+    /// rel is the actual envelope).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4kf_q8k_matvec_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::cpu::ops::q4_common::{q4k_to_q4kf, quantize_q4_k};
+        let cols = 1024;
+        let rows = 7;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.0173).sin() * 1.7 + (i as f32 * 0.041).cos() * 0.9) * 1.3)
+            .collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 * 0.013).cos() * 0.4 - (i as f32 * 0.027).sin() * 0.2) * 0.6)
+            .collect();
+        let w_q4k = quantize_q4_k(&w_f32);
+        let w_q4kf = q4k_to_q4kf(&w_q4k, rows, cols);
+        let q8 = quantize_x_to_q8k(&x);
+
+        let mut out_scalar = vec![0.0f32; rows];
+        let mut out_avx2 = vec![0.0f32; rows];
+        q4kf_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q4kf, rows, cols);
+        unsafe { q4kf_q8k_matvec_avx2(&mut out_avx2, &q8, &w_q4kf, rows, cols) };
+
+        for r in 0..rows {
+            let rel = (out_scalar[r] - out_avx2[r]).abs() / out_scalar[r].abs().max(1e-6);
+            assert!(
+                rel < 1e-5,
+                "row {r}: scalar={} avx2={} rel={rel}",
+                out_scalar[r],
+                out_avx2[r],
+            );
+        }
+    }
+
+    /// Canonical oracle: dequant via `dequantize_q4_kf` × x ≈ AVX2 matvec
+    /// within Q8_K activation noise.
+    #[test]
+    fn q4kf_q8k_matvec_matches_canonical_dequant() {
+        use crate::cpu::ops::q4_common::{dequantize_q4_kf, q4k_to_q4kf, quantize_q4_k};
+        let cols = 512;
+        let rows = 5;
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.006).cos() * 0.7)
+            .collect();
+        let w_q4k = quantize_q4_k(&w_f32);
+        let w_q4kf = q4k_to_q4kf(&w_q4k, rows, cols);
+        let w_deq = dequantize_q4_kf(&w_q4kf, rows * cols).expect("dequant q4_kf");
+
+        let mut f32_ref = vec![0.0f32; rows];
+        for (r, slot) in f32_ref.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += w_deq[r * cols + c] * x[c];
+            }
+            *slot = acc;
+        }
+
+        let q8 = quantize_x_to_q8k(&x);
+        let mut got = vec![0.0f32; rows];
+        q4kf_q8k_matvec_into(&mut got, &q8, &w_q4kf, rows, cols);
+
+        for r in 0..rows {
+            let rel = (f32_ref[r] - got[r]).abs() / f32_ref[r].abs().max(1e-6);
+            assert!(rel < 1.5e-2, "row {r}: ref={} got={} rel={rel}", f32_ref[r], got[r]);
+        }
     }
 
     /// AVX2 Q6_K matvec must be bit-equivalent to the scalar reference
