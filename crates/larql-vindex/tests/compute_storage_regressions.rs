@@ -194,6 +194,7 @@ fn moe_model_config() -> VindexModelConfig {
         rope_local_base: None,
         query_pre_attn_scalar: None,
         final_logit_softcapping: None,
+        ..Default::default()
     }
 }
 
