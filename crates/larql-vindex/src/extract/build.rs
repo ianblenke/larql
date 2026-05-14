@@ -239,6 +239,38 @@ impl<'a> BuildContext<'a> {
         let mut all_down_meta: Vec<Option<Vec<Option<crate::FeatureMeta>>>> =
             vec![None; self.num_layers];
 
+        // MoE early-out: down_meta computes per-feature top-k tokens by
+        // matmul'ing the embed table against each expert's down weights.
+        // For MoE the per-layer feature count balloons (e.g. Qwen 3.6-
+        // 35B-A3B: 256 experts × 768 features = 196K features/layer vs
+        // ~10K for dense), making the stage's
+        // O(num_features × vocab × hidden) cost ~20× per layer — for
+        // 35B-A3B that's ~4 × 10¹⁵ ops total, hours wall-clock even on
+        // 34 cores (observed in #129).
+        //
+        // Browse / WALK queries (the downstream consumers of
+        // down_meta.bin) are already partially disabled for MoE — the
+        // gate_top_tokens skip at the dense-only conditional below
+        // prevents relation-cluster collection. Skipping the per-feature
+        // top-k computation entirely for MoE finishes the pattern: MoE
+        // vindexes don't get browse/WALK probing, but `larql convert`
+        // and `larql extract --quant q4k` complete in seconds instead
+        // of hours, and the actual inference path (fast decode via
+        // interleaved_q4k + walk_ffn_q8k) doesn't read down_meta.bin
+        // anyway.
+        //
+        // Filed as #129. This unblocks #128's end-to-end extraction
+        // story for Qwen 3.6 MoE without changing dense behaviour.
+        if self.is_moe && self.n_experts > 0 {
+            crate::format::down_meta::write_binary(
+                self.output_dir,
+                &all_down_meta,
+                self.down_top_k,
+            )?;
+            self.callbacks.on_stage_done(STAGE_DOWN_META, 0.0);
+            return Ok(());
+        }
+
         let cluster_layer_min = 14.min(self.num_layers);
         let cluster_layer_max = 28.min(self.num_layers);
 

@@ -93,8 +93,25 @@ pub trait WeightSource {
 
 impl WeightSource for ModelWeights {
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)> {
-        let t = self.tensors.get(key)?;
-        Some((t.as_slice()?.to_vec(), t.shape()[0], t.shape()[1]))
+        // Dense path (safetensors-loaded): tensors map holds f32 weights.
+        if let Some(t) = self.tensors.get(key) {
+            return Some((t.as_slice()?.to_vec(), t.shape()[0], t.shape()[1]));
+        }
+        // GGUF MoE fallback: 3-D packed expert tensors live in
+        // `quant_tensors` via the per-expert HF aliases registered by
+        // `load_gguf_lazy_tensors` (post #120). Dequantize on demand —
+        // memory cost is ~one expert's worth of f32 (~6 MB at Qwen 3.6-
+        // 35B-A3B's 768×2048 shape) held only for this call. Used by
+        // `write_model_weights_with_opts`'s `up_weights.bin` /
+        // `down_weights.bin` per-expert loop (without this, those
+        // outputs were 0 bytes for MoE GGUFs — same class of bug
+        // #121 fixed for gate_vectors.bin in `build_vindex`).
+        let qt = self.quant_tensors.get(key)?;
+        let shape = qt.shape();
+        let n = shape[0].checked_mul(shape[1])?;
+        let floats =
+            larql_models::quant::ggml::dequantize(qt.raw_bytes(), qt.tensor_type(), n).ok()?;
+        Some((floats, shape[0], shape[1]))
     }
 
     fn get_vector(&self, key: &str) -> Option<Vec<f32>> {
