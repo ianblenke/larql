@@ -53,6 +53,32 @@ pub fn run_attention_block_with_kv_out(
     Some((h_post, attn_proj, attn_w, k, v))
 }
 
+/// Plumbing variant of [`run_attention_block_with_kv_out`] that accepts an
+/// optional mutable [`crate::attention::KvCache`] reference. Currently a thin
+/// wrapper — the cache parameter is accepted but **not yet consumed**, so
+/// behaviour is identical to [`run_attention_block_with_kv_out`]. A follow-up
+/// PR will read cached K/V for previously-seen positions and append only the
+/// new positions' K/V, eliminating the O(N²) per-token full-replay in
+/// `generate_via_cpu_q4k`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn run_attention_block_with_kv_out_with_cache(
+    weights: &crate::model::ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    capture_attention: bool,
+    shared_kv: Option<&SharedKV>,
+    _kv_cache: Option<&mut crate::attention::KvCache>,
+) -> Option<(
+    Array2<f32>,
+    Array2<f32>,
+    Option<AttentionWeights>,
+    Array2<f32>,
+    Array2<f32>,
+)> {
+    run_attention_block_with_kv_out(weights, h, layer, capture_attention, shared_kv)
+}
+
 /// Run attention with optional shared K/V (discards K/V output).
 #[allow(clippy::too_many_arguments)]
 pub fn run_attention_block_shared(

@@ -158,20 +158,50 @@ pub fn run_layer_with_ffn(
     ple_input: Option<&Array2<f32>>,
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<Array2<f32>>, Option<SharedKV>)> {
+    run_layer_with_ffn_with_cache(
+        weights,
+        h,
+        layer,
+        ffn,
+        capture_activation,
+        ple_input,
+        shared_kv,
+        None,
+    )
+}
+
+/// Plumbing variant of [`run_layer_with_ffn`] that accepts an optional mutable
+/// [`crate::attention::KvCache`] reference. The cache is threaded down to the
+/// attention block via
+/// [`crate::attention::run_attention_block_with_kv_out_with_cache`]. Currently
+/// the cache is accepted but **not yet consumed** — behaviour is identical to
+/// [`run_layer_with_ffn`]. A follow-up PR will wire the CPU attention forward
+/// to read cached K/V for prior positions and append only the new positions'
+/// K/V, eliminating the O(N²) per-token full-replay in `generate_via_cpu_q4k`.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_layer_with_ffn_with_cache(
+    weights: &ModelWeights,
+    h: &Array2<f32>,
+    layer: usize,
+    ffn: &dyn FfnBackend,
+    capture_activation: bool,
+    ple_input: Option<&Array2<f32>>,
+    shared_kv: Option<&SharedKV>,
+    kv_cache: Option<&mut crate::attention::KvCache>,
+) -> Option<(Array2<f32>, Option<Array2<f32>>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = if shared_kv.is_some() {
         (
             run_attention_inner(weights, h, layer, false, shared_kv)?.0,
             None,
         )
     } else {
-        let (h_pa, kv) = run_attention_with_kv_cache(weights, h, layer)?;
-        (h_pa, Some(kv))
+        let (h_pa, _, _, k_rope, v_final) =
+            crate::attention::run_attention_block_with_kv_out_with_cache(
+                weights, h, layer, false, None, kv_cache,
+            )?;
+        (h_pa, Some((k_rope, v_final)))
     };
-    // Diagnostic: per-layer `h_post_attn` dump, paired with Metal's
-    // `metal_layer_{LL}_h_post_attn.f32`. Lets the `residual_diff` tool
-    // bisect any layer's drift into attention (compare h_post_attn) vs
-    // FFN+PLE+scalar (compare h_out minus h_post_attn). Gated on the
-    // same env var as the end-of-layer dump; no overhead when unset.
     if let Some(dir) = crate::forward::dump_config::DumpConfig::get().layer_dir() {
         let slice = h_post_attn.as_slice().unwrap_or(&[]);
         let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();

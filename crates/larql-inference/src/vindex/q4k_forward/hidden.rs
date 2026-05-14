@@ -4,8 +4,9 @@ use larql_models::ModelWeights;
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 
-use crate::attention::SharedKV;
+use crate::attention::{KvCache, SharedKV};
 use crate::forward::embed_tokens_pub;
+use crate::forward::layer::run_layer_with_ffn_with_cache;
 use crate::forward::ple::precompute_per_layer_inputs;
 use crate::forward::run_layer_with_ffn;
 
@@ -96,11 +97,36 @@ pub fn predict_q4k_hidden(
     index: &VectorIndex,
     moe_remote: Option<&crate::ffn::RemoteMoeBackend>,
 ) -> Array2<f32> {
+    predict_q4k_hidden_with_cache(weights, token_ids, index, moe_remote, None)
+}
+
+/// Variant of [`predict_q4k_hidden`] that accepts an optional mutable
+/// [`KvCache`] reference. Currently a plumbing pass-through — the cache is
+/// threaded down to the attention block via
+/// [`crate::forward::layer::run_layer_with_ffn_with_cache`] but **not yet
+/// consumed**, so this function is behaviourally identical to
+/// [`predict_q4k_hidden`].
+///
+/// A follow-up PR will wire the CPU attention forward to read cached K/V for
+/// previously-seen positions and append only the new positions' K/V,
+/// eliminating the O(N²) per-token full-replay in
+/// `crate::layer_graph::generate::cpu::generate_via_cpu_q4k`.
+///
+/// MoE-hybrid layers (Gemma 4 26B A4B) currently bypass the cache — only the
+/// non-MoE full-attention path threads it. Hybrid plumbing can follow once the
+/// dense path is consuming the cache.
+pub fn predict_q4k_hidden_with_cache(
+    weights: &mut ModelWeights,
+    token_ids: &[u32],
+    index: &VectorIndex,
+    moe_remote: Option<&crate::ffn::RemoteMoeBackend>,
+    mut kv_cache: Option<&mut KvCache>,
+) -> Array2<f32> {
     let num_layers = weights.num_layers;
     let mut h = embed_tokens_pub(weights, token_ids);
 
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
-    let mut kv_cache: HashMap<usize, SharedKV> = HashMap::new();
+    let mut shared_kv_cache: HashMap<usize, SharedKV> = HashMap::new();
     let dump_dir = crate::forward::dump_config::DumpConfig::get().layer_dir();
     if let Some(dir) = dump_dir {
         let slice = h.as_slice().unwrap_or(&[]);
@@ -115,7 +141,7 @@ pub fn predict_q4k_hidden(
         let shared_kv = weights
             .arch
             .kv_shared_source_layer(layer)
-            .and_then(|src| kv_cache.get(&src));
+            .and_then(|src| shared_kv_cache.get(&src));
         let is_moe_layer = weights.arch.is_hybrid_moe();
         let ffn_backend = crate::ffn::WeightFfn { weights };
         if is_moe_layer {
@@ -130,10 +156,10 @@ pub fn predict_q4k_hidden(
             ) {
                 h = h_new;
                 if let Some(kv) = kv_out {
-                    kv_cache.insert(layer, kv);
+                    shared_kv_cache.insert(layer, kv);
                 }
             }
-        } else if let Some((h_new, _, kv_out)) = run_layer_with_ffn(
+        } else if let Some((h_new, _, kv_out)) = run_layer_with_ffn_with_cache(
             weights,
             &h,
             layer,
@@ -141,10 +167,11 @@ pub fn predict_q4k_hidden(
             false,
             ple_inputs.get(layer),
             shared_kv,
+            kv_cache.as_deref_mut(),
         ) {
             h = h_new;
             if let Some(kv) = kv_out {
-                kv_cache.insert(layer, kv);
+                shared_kv_cache.insert(layer, kv);
             }
         }
 
