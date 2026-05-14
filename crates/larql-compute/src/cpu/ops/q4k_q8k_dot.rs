@@ -684,9 +684,19 @@ pub fn q4k_q8k_gate_up_into(
     }
     #[allow(unreachable_code)]
     {
-        // Scalar fallback: just call the existing single-matvec path twice.
-        q4k_q8k_matvec_scalar(gate_out, q8k_x, gate_w, rows, cols);
-        q4k_q8k_matvec_scalar(up_out, q8k_x, up_w, rows, cols);
+        // Fallback (covers x86_64 with AVX2, and any other target): two
+        // independent matvecs through the AVX2-dispatched entry point.
+        // The aarch64 NEON `q4k_q8k_gate_up_neon` above is preserved as a
+        // bespoke interleaved kernel for completeness, but on x86_64 the
+        // OoO engine extracts enough ILP from two sequential
+        // `q4k_q8k_matvec_into` calls that a manually-interleaved fused
+        // kernel doesn't pay (see `moe/expert.rs:466-471` for the same
+        // empirical observation on M3 Max). The critical fix vs the prior
+        // scalar fallback: this now reaches AVX2 — gate+up dropped from
+        // ~57 ms (2× scalar) to ~3 ms (2× AVX2) at the
+        // `prefill_10240` Q4_K shape.
+        q4k_q8k_matvec_into(gate_out, q8k_x, gate_w, rows, cols);
+        q4k_q8k_matvec_into(up_out, q8k_x, up_w, rows, cols);
     }
 }
 
