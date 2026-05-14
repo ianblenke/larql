@@ -1028,7 +1028,142 @@ pub fn q6k_q8k_matvec_neon(
     }
 }
 
-/// Public entry point: scalar (llama.cpp wire-format) on all targets.
+/// AVX2 Q6_K × Q8_K matvec for x86_64.
+///
+/// Per super-block, per half (128 elements): load 64 ql bytes (two 32-byte
+/// chunks) + 32 qh bytes, derive the four 32-element signed-i8 q6 strides
+/// at positions {0, 32, 64, 96} within the half via nibble + hi-2-bit
+/// extraction + `- 32` lift. Per stride: `_mm256_sign_epi8` flips q8's
+/// sign to match q6's, `_mm256_maddubs_epi16` accumulates 16 i16 pair-
+/// sums, `_mm256_madd_epi16(_, ones)` widens to 8 i32 lanes. The 8 i32
+/// lanes split 4+4 across the two 16-element sub-blocks of the stride,
+/// each scaled by its own int8 `sc` entry. Bit-equivalent to the scalar
+/// reference (verified in tests).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6k_q8k_matvec_avx2(
+    out: &mut [f32],
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * Q6K_BLOCK_BYTES;
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    if rows == 0 || cols == 0 || w.len() < rows * row_bytes {
+        return;
+    }
+
+    let lo4_mask = _mm256_set1_epi8(0x0F);
+    let hi2_mask = _mm256_set1_epi8(0x03);
+    let neg32 = _mm256_set1_epi8(32);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+        let row_base = r * row_bytes;
+        let mut acc = 0.0f32;
+
+        for sb in 0..n_blocks {
+            let block = w.as_ptr().add(row_base + sb * Q6K_BLOCK_BYTES);
+            let ql_ptr = block;
+            let qh_ptr = block.add(128);
+            let sc_ptr = block.add(192) as *const i8;
+            let d_w =
+                f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+            let d_y = q8k_x.d[sb];
+            let q8_base = sb * ELEMS_PER_BLOCK;
+            let q8_ptr = q8k_x.qs.as_ptr().add(q8_base);
+
+            let mut sumi_total: i32 = 0;
+
+            for half in 0..2usize {
+                let ql_off = half * 64;
+                let qh_off = half * 32;
+                let sc_off = half * 8;
+                let x_half = half * 128;
+
+                let ql0 = _mm256_loadu_si256(ql_ptr.add(ql_off) as *const __m256i);
+                let ql32 = _mm256_loadu_si256(ql_ptr.add(ql_off + 32) as *const __m256i);
+                let qh = _mm256_loadu_si256(qh_ptr.add(qh_off) as *const __m256i);
+
+                // Stride 0: ql0 low-nibble + qh bits[0..1] << 4
+                let s0_lo = _mm256_and_si256(ql0, lo4_mask);
+                let s0_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(qh, hi2_mask));
+                let q6_s0 = _mm256_sub_epi8(_mm256_or_si256(s0_lo, s0_hi), neg32);
+
+                // Stride 1: ql32 low-nibble + qh bits[2..3] << 4
+                let s1_lo = _mm256_and_si256(ql32, lo4_mask);
+                let s1_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                    _mm256_srli_epi16::<2>(qh),
+                    hi2_mask,
+                ));
+                let q6_s1 = _mm256_sub_epi8(_mm256_or_si256(s1_lo, s1_hi), neg32);
+
+                // Stride 2: ql0 high-nibble + qh bits[4..5] << 4
+                let s2_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), lo4_mask);
+                let s2_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                    _mm256_srli_epi16::<4>(qh),
+                    hi2_mask,
+                ));
+                let q6_s2 = _mm256_sub_epi8(_mm256_or_si256(s2_lo, s2_hi), neg32);
+
+                // Stride 3: ql32 high-nibble + qh bits[6..7] << 4
+                let s3_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql32), lo4_mask);
+                let s3_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
+                    _mm256_srli_epi16::<6>(qh),
+                    hi2_mask,
+                ));
+                let q6_s3 = _mm256_sub_epi8(_mm256_or_si256(s3_lo, s3_hi), neg32);
+
+                let q6_stride = [q6_s0, q6_s1, q6_s2, q6_s3];
+
+                for g in 0..4usize {
+                    let q8_v = _mm256_loadu_si256(q8_ptr.add(x_half + g * 32) as *const __m256i);
+                    let q8_signed_flipped = _mm256_sign_epi8(q8_v, q6_stride[g]);
+                    let q6_abs = _mm256_abs_epi8(q6_stride[g]);
+                    let prod_i16 = _mm256_maddubs_epi16(q6_abs, q8_signed_flipped);
+                    let sum_i32 = _mm256_madd_epi16(prod_i16, ones_16);
+
+                    // Split the 8 i32 lanes into two halves of 4 each: lower
+                    // 4 lanes correspond to the first sub-block of this
+                    // stride (positions 0..16), upper 4 lanes the second
+                    // (positions 16..32). Each has its own int8 scale.
+                    let lo128 = _mm256_castsi256_si128(sum_i32);
+                    let hi128 = _mm256_extracti128_si256::<1>(sum_i32);
+                    let sumi_lo = horiz_sum_i32_128(lo128);
+                    let sumi_hi = horiz_sum_i32_128(hi128);
+
+                    let sc_lo = *sc_ptr.add(sc_off + 2 * g) as i32;
+                    let sc_hi = *sc_ptr.add(sc_off + 2 * g + 1) as i32;
+
+                    sumi_total += sc_lo * sumi_lo;
+                    sumi_total += sc_hi * sumi_hi;
+                }
+            }
+
+            acc += d_w * d_y * sumi_total as f32;
+        }
+
+        *out_r = acc;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn horiz_sum_i32_128(v: std::arch::x86_64::__m128i) -> i32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_epi32(v, _mm_shuffle_epi32(v, 0b00_00_11_10)); // 4 → 2
+    let s2 = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01)); // 2 → 1
+    _mm_cvtsi128_si32(s2)
+}
+
+/// Public entry point: AVX2 on x86_64 (when available), scalar otherwise.
 /// `w` is a Q6_K weight matrix of `rows` rows × `cols` columns.
 /// `q8k_x` is the pre-quantised activation vector (`cols` elements).
 ///
@@ -1042,6 +1177,12 @@ pub fn q6k_q8k_matvec_into(
     rows: usize,
     cols: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 detected; lengths validated by the AVX2 body.
+        unsafe { q6k_q8k_matvec_avx2(out, q8k_x, w, rows, cols) };
+        return;
+    }
     q6k_q8k_matvec_scalar(out, q8k_x, w, rows, cols);
 }
 
@@ -1334,6 +1475,51 @@ mod tests {
         let mut out = vec![1.0f32; rows];
         q4k_q8k_matvec_scalar(&mut out, &q, &w, rows, cols);
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    /// AVX2 Q6_K matvec must be bit-equivalent to the scalar reference
+    /// modulo i32 reduction-order independence (both produce the same
+    /// `sumi_total` per super-block, then the same `d_w * d_y * sumi` f32
+    /// product — only the order of i32 additions within a super-block
+    /// differs, and both fit comfortably in i32 so there's no overflow).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q6k_q8k_matvec_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let cols = 1024; // 4 super-blocks
+        let rows = 7;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| {
+                let f = i as f32;
+                ((f * 0.0173).sin() * 1.7 + (f * 0.041).cos() * 0.9) * 1.3
+            })
+            .collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let f = i as f32;
+                ((f * 0.013).cos() * 0.4 - (f * 0.027).sin() * 0.2) * 0.6
+            })
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+        let q8 = quantize_x_to_q8k(&x);
+
+        let mut out_scalar = vec![0.0f32; rows];
+        let mut out_avx2 = vec![0.0f32; rows];
+        q6k_q8k_matvec_scalar(&mut out_scalar, &q8, &w_q6, rows, cols);
+        unsafe { q6k_q8k_matvec_avx2(&mut out_avx2, &q8, &w_q6, rows, cols) };
+
+        for r in 0..rows {
+            assert_eq!(
+                out_scalar[r].to_bits(),
+                out_avx2[r].to_bits(),
+                "row {r}: scalar={} avx2={} diff={}",
+                out_scalar[r],
+                out_avx2[r],
+                (out_scalar[r] - out_avx2[r]).abs()
+            );
+        }
     }
 
     /// Canonical oracle: dequantise via `larql_models::quant::ggml::dequantize_q6_k`
