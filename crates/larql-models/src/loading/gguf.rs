@@ -715,6 +715,41 @@ pub fn load_gguf_lazy_tensors(
             weights.lm_head = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
                 .expect("empty array is always valid");
         } else {
+            // MoE: a 3-D `*ffn_{gate,up,down}_exps.weight` tensor is the
+            // packed per-layer expert stack. Register the packed tensor
+            // under its GGUF-style normalized key (as before) AND also
+            // register per-expert HF-style aliases so callers that look
+            // up `layers.{L}.mlp.experts.{E}.{proj}_proj.weight`
+            // (e.g. `build_vindex`'s MoE branch via
+            // `arch.expert_ffn_*_key`) find the slice without each
+            // caller needing to know about the 3-D packing.
+            //
+            // Per-expert slices share the same Arc mmap data via
+            // `QuantTensor::expert_slice`; no copies are made.
+            if info.n_dims == 3 {
+                if let Some((layer_idx, proj_short)) = parse_gguf_moe_expert_key(&key) {
+                    let num_experts = weights.arch.num_experts();
+                    if num_experts > 0 {
+                        for e in 0..num_experts {
+                            match qt.expert_slice(e, num_experts) {
+                                Ok(slice) => {
+                                    let alias = format!(
+                                        "layers.{layer_idx}.mlp.experts.{e}.{proj_short}_proj.weight"
+                                    );
+                                    weights.quant_tensors.insert(alias, slice);
+                                }
+                                Err(err) => {
+                                    return Err(ModelError::Parse(format!(
+                                        "load_gguf_lazy_tensors: failed to slice expert {e}/\
+                                         {num_experts} from {}: {err}",
+                                        key
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             weights.quant_tensors.insert(key.clone(), qt);
         }
         // Drop dense entries that correspond to this lazified tensor.
@@ -722,6 +757,81 @@ pub fn load_gguf_lazy_tensors(
         weights.tensors.remove(&key_raw);
     }
     Ok(weights)
+}
+
+/// Parse a normalized GGUF MoE expert tensor key into `(layer, proj)`.
+///
+/// Accepts `layers.{L}.ffn_{gate,up,down}_exps.weight` (post-
+/// `normalize_gguf_key`, which substitutes `blk.` → `layers.`).
+/// Returns `(L, "gate" | "up" | "down")`. The caller appends `_proj`
+/// when constructing HF-style aliases — Qwen3.6-MoE / Mixtral / Gemma 4
+/// MoE all use the `mlp.experts.{E}.{proj}_proj.weight` form for the
+/// per-expert tensors. Non-MoE-expert keys return `None`.
+fn parse_gguf_moe_expert_key(key: &str) -> Option<(usize, &'static str)> {
+    let rest = key.strip_prefix("layers.")?;
+    // Find the second '.' separating the layer index from the suffix.
+    let dot = rest.find('.')?;
+    let layer_str = &rest[..dot];
+    let layer_idx: usize = layer_str.parse().ok()?;
+    let suffix = &rest[dot + 1..];
+    let proj = if suffix == "ffn_gate_exps.weight" {
+        "gate"
+    } else if suffix == "ffn_up_exps.weight" {
+        "up"
+    } else if suffix == "ffn_down_exps.weight" {
+        "down"
+    } else {
+        return None;
+    };
+    Some((layer_idx, proj))
+}
+
+#[cfg(test)]
+mod parse_moe_tests {
+    use super::parse_gguf_moe_expert_key;
+
+    #[test]
+    fn parses_gate_expert_key() {
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.7.ffn_gate_exps.weight"),
+            Some((7, "gate"))
+        );
+    }
+
+    #[test]
+    fn parses_up_expert_key() {
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.0.ffn_up_exps.weight"),
+            Some((0, "up"))
+        );
+    }
+
+    #[test]
+    fn parses_down_expert_key() {
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.39.ffn_down_exps.weight"),
+            Some((39, "down"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_expert_key() {
+        // Dense FFN tensor (no `_exps` suffix).
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.0.ffn_gate.weight"),
+            None
+        );
+        // Attention tensor.
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.0.self_attn.q_proj.weight"),
+            None
+        );
+        // Missing layer index.
+        assert_eq!(
+            parse_gguf_moe_expert_key("layers.foo.ffn_gate_exps.weight"),
+            None
+        );
+    }
 }
 
 /// Load and validate a GGUF file into ModelWeights (dequantized to f32).
