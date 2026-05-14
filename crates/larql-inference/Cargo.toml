@@ -89,6 +89,10 @@ cuda = ["larql-compute/cuda"]
 test-utils = []
 
 [[example]]
+name = "mech_interp_demo"
+required-features = ["test-utils"]
+
+[[example]]
 name = "cpu_gpu_diag"
 required-features = ["metal"]
 
