@@ -117,7 +117,9 @@ fn cpu_ffn_q4k_composition_matches_dequant_f32_reference() {
     let down_f32: Vec<f32> = (0..hidden * inter)
         .map(|i| (i as f32 * 0.009).sin() * 0.3)
         .collect();
-    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.017).sin() * 1.2).collect();
+    let x: Vec<f32> = (0..hidden)
+        .map(|i| (i as f32 * 0.017).sin() * 1.2)
+        .collect();
 
     // Quantise each weight matrix to Q4_K.
     let gate_q4k = quantize_q4_k(&gate_f32);
@@ -132,8 +134,7 @@ fn cpu_ffn_q4k_composition_matches_dequant_f32_reference() {
     let down_deq = dequantize_q4_k(&down_q4k, hidden * inter);
 
     let ref_out = ffn_reference_f32(&x, &gate_deq, &up_deq, &down_deq, hidden, inter);
-    let got =
-        ffn_production_q4k_q8k(&x, &gate_q4k, &up_q4k, &down_q4k, hidden, inter);
+    let got = ffn_production_q4k_q8k(&x, &gate_q4k, &up_q4k, &down_q4k, hidden, inter);
 
     assert_eq!(ref_out.len(), hidden);
     assert_eq!(got.len(), hidden);
@@ -151,7 +152,6 @@ fn cpu_ffn_q4k_composition_matches_dequant_f32_reference() {
         cos > 0.9995,
         "FFN composition cosine similarity {cos:.6} < 0.9995"
     );
-
 }
 
 /// Mixed Q4_K (gate/up) + Q6_K (down) — the *default* vindex
@@ -176,7 +176,9 @@ fn cpu_ffn_q4k_q6k_down_composition_matches_dequant_f32_reference() {
     let down_f32: Vec<f32> = (0..hidden * inter)
         .map(|i| (i as f32 * 0.009).sin() * 0.3)
         .collect();
-    let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.017).sin() * 1.2).collect();
+    let x: Vec<f32> = (0..hidden)
+        .map(|i| (i as f32 * 0.017).sin() * 1.2)
+        .collect();
 
     let gate_q4k = quantize_q4_k(&gate_f32);
     let up_q4k = quantize_q4_k(&up_f32);

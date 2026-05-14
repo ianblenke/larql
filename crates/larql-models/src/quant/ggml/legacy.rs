@@ -139,8 +139,7 @@ unsafe fn q8_0_row_dot_avx2(data: &[u8], x: &[f32], n_blocks: usize) -> f32 {
     for sb in 0..n_blocks {
         let block_ptr = data.as_ptr().add(sb * 34);
         // Read the scale as f16 (2 bytes), expand to f32 once per block.
-        let scale_u16 =
-            u16::from_le_bytes([*block_ptr, *block_ptr.add(1)]);
+        let scale_u16 = u16::from_le_bytes([*block_ptr, *block_ptr.add(1)]);
         let scale = _mm256_set1_ps(f16_to_f32(scale_u16));
         let q_ptr = block_ptr.add(2);
         let x_ptr = x.as_ptr().add(sb * 32);

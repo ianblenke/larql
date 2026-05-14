@@ -39,8 +39,8 @@
 //! (`sc[is], sc[is+2], sc[is+4], sc[is+6]` for stride 0, 32, 64, 96
 //! respectively).
 
-use crate::quant::ggml::q6_k::q6k_row_dot_scalar;
 use crate::quant::ggml::q4k_q8k::{Q8_K_BLOCK_BYTES, Q8_K_BLOCK_ELEMS};
+use crate::quant::ggml::q6_k::q6k_row_dot_scalar;
 use crate::quant::half::f16_to_f32;
 use crate::ModelError;
 
@@ -144,8 +144,7 @@ unsafe fn q6k_q8k_row_dot_avx2(q6k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -
         let ql_ptr = q6_block;
         let qh_ptr = q6_block.add(128);
         let sc_ptr = q6_block.add(192) as *const i8;
-        let d_q4 =
-            f16_to_f32(u16::from_le_bytes([*q6_block.add(208), *q6_block.add(209)]));
+        let d_q4 = f16_to_f32(u16::from_le_bytes([*q6_block.add(208), *q6_block.add(209)]));
 
         let d_q8 = f32::from_le_bytes([
             *q8_block,
@@ -217,9 +216,7 @@ unsafe fn q6k_q8k_row_dot_avx2(q6k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -
             // sub-block. `sc[sc_off + 2*g]` covers positions 0..16 of
             // stride g; `sc[sc_off + 2*g + 1]` covers 16..32.
             for g in 0..4 {
-                let q8_v = _mm256_loadu_si256(
-                    q8_quants.add(x_half + g * 32) as *const __m256i,
-                );
+                let q8_v = _mm256_loadu_si256(q8_quants.add(x_half + g * 32) as *const __m256i);
                 let q8_signed_flipped = _mm256_sign_epi8(q8_v, q6_signed[g]);
                 let q6_abs = _mm256_abs_epi8(q6_signed[g]);
                 let prod_i16 = _mm256_maddubs_epi16(q6_abs, q8_signed_flipped);

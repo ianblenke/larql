@@ -92,8 +92,8 @@ fn q8_0_q8k_row_dot_scalar(q8_0_data: &[u8], q8k_x: &[u8], n_q8k: usize) -> f32 
 
         // Each Q8_K super-block = 8 Q8_0 blocks (32 elems each).
         for blk in 0..8 {
-            let q80_block = &q8_0_data[(sb * 8 + blk) * Q8_0_BLOCK_BYTES
-                ..(sb * 8 + blk + 1) * Q8_0_BLOCK_BYTES];
+            let q80_block = &q8_0_data
+                [(sb * 8 + blk) * Q8_0_BLOCK_BYTES..(sb * 8 + blk + 1) * Q8_0_BLOCK_BYTES];
             let d_q8w = f16_to_f32(u16::from_le_bytes([q80_block[0], q80_block[1]]));
             let q8_w = &q80_block[2..34];
 

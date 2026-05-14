@@ -610,10 +610,7 @@ mod tests {
             "expected c_fc in {up_key}, got {up_key}"
         );
         let down_key = w.arch.ffn_down_key(0);
-        assert!(
-            down_key.contains("c_proj"),
-            "expected c_proj in {down_key}"
-        );
+        assert!(down_key.contains("c_proj"), "expected c_proj in {down_key}");
         // Attention biases present
         for layer in 0..w.num_layers {
             let qb = w

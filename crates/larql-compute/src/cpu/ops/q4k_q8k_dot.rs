@@ -737,8 +737,7 @@ pub fn q4kf_q8k_matvec_scalar(
                     dot_hi += q_hi * y_hi[l] as i32;
                 }
                 acc += d_y
-                    * (scales[sb_lo] * dot_lo as f32
-                        + scales[sb_hi] * dot_hi as f32
+                    * (scales[sb_lo] * dot_lo as f32 + scales[sb_hi] * dot_hi as f32
                         - mins[sb_lo] * q8_sums[sb_lo] as f32
                         - mins[sb_hi] * q8_sums[sb_hi] as f32);
             }
@@ -762,10 +761,7 @@ unsafe fn q4kf_q8k_matvec_avx2(
 ) {
     use std::arch::x86_64::*;
 
-    if rows == 0
-        || cols == 0
-        || w.len() < rows * (cols / ELEMS_PER_BLOCK) * Q4KF_BLOCK_BYTES
-    {
+    if rows == 0 || cols == 0 || w.len() < rows * (cols / ELEMS_PER_BLOCK) * Q4KF_BLOCK_BYTES {
         for v in out.iter_mut() {
             *v = 0.0;
         }
@@ -822,8 +818,7 @@ unsafe fn q4kf_q8k_matvec_avx2(
                 )) as f32;
 
                 acc += d_y
-                    * (scales[sb_lo] * dot_lo
-                        + scales[sb_hi] * dot_hi
+                    * (scales[sb_lo] * dot_lo + scales[sb_hi] * dot_hi
                         - mins[sb_lo] * q8_sums[sb_lo] as f32
                         - mins[sb_hi] * q8_sums[sb_hi] as f32);
             }
@@ -1276,8 +1271,7 @@ unsafe fn q6k_q8k_matvec_avx2(
             let ql_ptr = block;
             let qh_ptr = block.add(128);
             let sc_ptr = block.add(192) as *const i8;
-            let d_w =
-                f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+            let d_w = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
             let d_y = q8k_x.d[sb];
             let q8_base = sb * ELEMS_PER_BLOCK;
             let q8_ptr = q8k_x.qs.as_ptr().add(q8_base);
@@ -1301,26 +1295,20 @@ unsafe fn q6k_q8k_matvec_avx2(
 
                 // Stride 1: ql32 low-nibble + qh bits[2..3] << 4
                 let s1_lo = _mm256_and_si256(ql32, lo4_mask);
-                let s1_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
-                    _mm256_srli_epi16::<2>(qh),
-                    hi2_mask,
-                ));
+                let s1_hi =
+                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<2>(qh), hi2_mask));
                 let q6_s1 = _mm256_sub_epi8(_mm256_or_si256(s1_lo, s1_hi), neg32);
 
                 // Stride 2: ql0 high-nibble + qh bits[4..5] << 4
                 let s2_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), lo4_mask);
-                let s2_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
-                    _mm256_srli_epi16::<4>(qh),
-                    hi2_mask,
-                ));
+                let s2_hi =
+                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<4>(qh), hi2_mask));
                 let q6_s2 = _mm256_sub_epi8(_mm256_or_si256(s2_lo, s2_hi), neg32);
 
                 // Stride 3: ql32 high-nibble + qh bits[6..7] << 4
                 let s3_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql32), lo4_mask);
-                let s3_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(
-                    _mm256_srli_epi16::<6>(qh),
-                    hi2_mask,
-                ));
+                let s3_hi =
+                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<6>(qh), hi2_mask));
                 let q6_s3 = _mm256_sub_epi8(_mm256_or_si256(s3_lo, s3_hi), neg32);
 
                 let q6_stride = [q6_s0, q6_s1, q6_s2, q6_s3];
@@ -1748,7 +1736,12 @@ mod tests {
 
         for r in 0..rows {
             let rel = (f32_ref[r] - got[r]).abs() / f32_ref[r].abs().max(1e-6);
-            assert!(rel < 1.5e-2, "row {r}: ref={} got={} rel={rel}", f32_ref[r], got[r]);
+            assert!(
+                rel < 1.5e-2,
+                "row {r}: ref={} got={} rel={rel}",
+                f32_ref[r],
+                got[r]
+            );
         }
     }
 
@@ -1812,9 +1805,7 @@ mod tests {
         use larql_models::quant::ggml::dequantize_q4_k as canonical_dequant_q4_k;
         let cols = 512;
         let rows = 5;
-        let x: Vec<f32> = (0..cols)
-            .map(|i| (i as f32 * 0.017).sin() * 1.5)
-            .collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
         let w_f32: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 * 0.006).cos() * 0.7)
             .collect();
@@ -1925,9 +1916,7 @@ mod tests {
     fn q6k_two_production_paths_agree_within_q8k_noise() {
         let cols = 512; // 2 super-blocks per row
         let rows = 5;
-        let x: Vec<f32> = (0..cols)
-            .map(|i| (i as f32 * 0.017).sin() * 1.5)
-            .collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
         let w_f32: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 * 0.006).cos() * 0.7)
             .collect();
@@ -1945,10 +1934,7 @@ mod tests {
             let f = f32_path[r];
             let q = q8k_path[r];
             let rel = (f - q).abs() / f.abs().max(1e-6);
-            assert!(
-                rel < 1.5e-2,
-                "row {r}: f32_path={f} q8k_path={q} rel={rel}"
-            );
+            assert!(rel < 1.5e-2, "row {r}: f32_path={f} q8k_path={q} rel={rel}");
         }
     }
 

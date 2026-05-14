@@ -223,15 +223,7 @@ fn bench_q4_k_gate_up_fused_vs_split(c: &mut Criterion) {
             let mut gate_out = vec![0.0f32; shape.n];
             let mut up_out = vec![0.0f32; shape.n];
             b.iter(|| {
-                q4k_q8k_gate_up_into(
-                    &mut gate_out,
-                    &mut up_out,
-                    q8k,
-                    g,
-                    u,
-                    shape.n,
-                    shape.k,
-                );
+                q4k_q8k_gate_up_into(&mut gate_out, &mut up_out, q8k, g, u, shape.n, shape.k);
             });
         },
     );

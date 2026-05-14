@@ -98,9 +98,7 @@ impl QuantMatVec for CpuBackend {
         if hidden.is_multiple_of(256) && x.len() == hidden && num_rows > 0 {
             let q8k = ops::q4k_q8k_dot::quantize_x_to_q8k(x);
             let mut out = vec![0.0f32; num_rows];
-            ops::q4k_q8k_dot::q4k_q8k_matvec_into(
-                &mut out, &q8k, q4k_data, num_rows, hidden,
-            );
+            ops::q4k_q8k_dot::q4k_q8k_matvec_into(&mut out, &q8k, q4k_data, num_rows, hidden);
             return Some(out);
         }
         Some(ops::q4k_matvec::dispatch(q4k_data, x, num_rows, hidden))
@@ -151,9 +149,7 @@ impl QuantMatVec for CpuBackend {
         if hidden.is_multiple_of(256) && x.len() == hidden && num_rows > 0 {
             let q8k = ops::q4k_q8k_dot::quantize_x_to_q8k(x);
             let mut out = vec![0.0f32; num_rows];
-            ops::q4k_q8k_dot::q6k_q8k_matvec_into(
-                &mut out, &q8k, q6k_data, num_rows, hidden,
-            );
+            ops::q4k_q8k_dot::q6k_q8k_matvec_into(&mut out, &q8k, q6k_data, num_rows, hidden);
             return Some(out);
         }
         Some(ops::q6k_matvec::dispatch(q6k_data, x, num_rows, hidden))
@@ -268,9 +264,7 @@ mod trait_routing_tests {
         use crate::cpu::ops::q4_common::{dequantize_q4_kf, q4k_to_q4kf, quantize_q4_k};
         let cols = 512; // 2 super-blocks
         let rows = 5;
-        let x: Vec<f32> = (0..cols)
-            .map(|i| (i as f32 * 0.017).sin() * 1.5)
-            .collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.017).sin() * 1.5).collect();
         let w_f32: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 * 0.006).cos() * 0.7)
             .collect();

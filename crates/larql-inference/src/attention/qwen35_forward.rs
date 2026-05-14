@@ -579,8 +579,8 @@ fn swiglu_moe_lazy(
     let mut y_moe = Array1::<f32>::zeros(hidden);
     // Cheap empty placeholders for the dense-fallback slots in
     // swiglu_ffn_lazy — we never use them when the lazy form is set.
-    let empty_2d: ArcArray2<f32> = ArcArray2::from_shape_vec((0, 0), vec![])
-        .expect("0x0 array is always valid");
+    let empty_2d: ArcArray2<f32> =
+        ArcArray2::from_shape_vec((0, 0), vec![]).expect("0x0 array is always valid");
 
     // Phase G.1: pre-slice all top-K experts and issue
     // MADV_WILLNEED hints up front. The kernel starts paging in
@@ -912,7 +912,9 @@ mod tests {
         // per-element pattern so the reference and the impl exercise
         // every slot.
         let mk = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * 0.07 + seed).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() * 0.3)
+                .collect()
         };
         let router_v = mk(num_experts * hidden, 0.1);
         let gate_exps_v = mk(num_experts * ffn_dim * hidden, 0.2);
@@ -924,11 +926,9 @@ mod tests {
 
         let router = QuantTensor::from_f32_rows(num_experts, hidden, &router_v);
         // 3D-packed layout per F.1: rows = num_experts * out_dim.
-        let gate_exps =
-            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
+        let gate_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
         let up_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
-        let down_exps =
-            QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
+        let down_exps = QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
         let shexp_g = QuantTensor::from_f32_rows(ffn_dim, hidden, &shexp_g_v);
         let shexp_u = QuantTensor::from_f32_rows(ffn_dim, hidden, &shexp_u_v);
         let shexp_d = QuantTensor::from_f32_rows(hidden, ffn_dim, &shexp_d_v);
@@ -946,12 +946,14 @@ mod tests {
             logits[e] = acc;
         }
         // Top-K (full sort is fine here).
-        let mut idx: Vec<(usize, f32)> =
-            logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        let mut idx: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
         idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let top: Vec<(usize, f32)> = idx.into_iter().take(top_k).collect();
         // Softmax.
-        let max_l = top.iter().map(|&(_, l)| l).fold(f32::NEG_INFINITY, f32::max);
+        let max_l = top
+            .iter()
+            .map(|&(_, l)| l)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
         let w: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
@@ -1058,12 +1060,9 @@ mod tests {
         let down_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 5.0, 5.0, 5.0, 5.0];
 
         let router = QuantTensor::from_f32_rows(num_experts, hidden, &router_v);
-        let gate_exps =
-            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
-        let up_exps =
-            QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
-        let down_exps =
-            QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
+        let gate_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
+        let up_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
+        let down_exps = QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
         let x = Array1::from(vec![1.0_f32, 0.0]);
 
         let got = swiglu_moe_lazy(
@@ -1084,7 +1083,12 @@ mod tests {
         // with identity gate/up/down: y = silu(x) * x.
         // x = [1, 0] → y = [silu(1)*1, 0].
         let expected_y0 = sigmoid(1.0); // 1.0 * sigmoid(1.0)
-        assert!((got[0] - expected_y0).abs() < 1e-5, "got={} exp={}", got[0], expected_y0);
+        assert!(
+            (got[0] - expected_y0).abs() < 1e-5,
+            "got={} exp={}",
+            got[0],
+            expected_y0
+        );
         assert!(got[1].abs() < 1e-5, "got[1]={}", got[1]);
     }
 

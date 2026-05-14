@@ -205,10 +205,8 @@ unsafe fn q4k_q8k_row_dot_avx2(q4k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -
             let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(q4_bytes, 4), lo_mask);
 
             // Q8 quants: 32 int8 each for sub-block 2g (low) and 2g+1 (high).
-            let q8_lo =
-                _mm256_loadu_si256(q8_quants.add((2 * g) * 32) as *const __m256i);
-            let q8_hi =
-                _mm256_loadu_si256(q8_quants.add((2 * g + 1) * 32) as *const __m256i);
+            let q8_lo = _mm256_loadu_si256(q8_quants.add((2 * g) * 32) as *const __m256i);
+            let q8_hi = _mm256_loadu_si256(q8_quants.add((2 * g + 1) * 32) as *const __m256i);
 
             // u8 × i8 → i16 pairwise sum (16 lanes of int16).
             let prod_lo = _mm256_maddubs_epi16(lo_nibbles, q8_lo);
@@ -226,14 +224,10 @@ unsafe fn q4k_q8k_row_dot_avx2(q4k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -
             sumi_total += (scales[2 * g + 1] as i32) * sumi_hi;
 
             // bsum contribution for sub-blocks 2g and 2g+1.
-            let bsum_lo0 =
-                i16::from_le_bytes([*bsums.add(8 * g), *bsums.add(8 * g + 1)]);
-            let bsum_lo1 =
-                i16::from_le_bytes([*bsums.add(8 * g + 2), *bsums.add(8 * g + 3)]);
-            let bsum_hi0 =
-                i16::from_le_bytes([*bsums.add(8 * g + 4), *bsums.add(8 * g + 5)]);
-            let bsum_hi1 =
-                i16::from_le_bytes([*bsums.add(8 * g + 6), *bsums.add(8 * g + 7)]);
+            let bsum_lo0 = i16::from_le_bytes([*bsums.add(8 * g), *bsums.add(8 * g + 1)]);
+            let bsum_lo1 = i16::from_le_bytes([*bsums.add(8 * g + 2), *bsums.add(8 * g + 3)]);
+            let bsum_hi0 = i16::from_le_bytes([*bsums.add(8 * g + 4), *bsums.add(8 * g + 5)]);
+            let bsum_hi1 = i16::from_le_bytes([*bsums.add(8 * g + 6), *bsums.add(8 * g + 7)]);
             bsum_total += (mins[2 * g] as i32) * (bsum_lo0 as i32 + bsum_lo1 as i32);
             bsum_total += (mins[2 * g + 1] as i32) * (bsum_hi0 as i32 + bsum_hi1 as i32);
         }
@@ -297,10 +291,8 @@ fn q4k_q8k_row_dot_scalar(q4k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -> f32
             }
             sumi_total += (scales[i] as i32) * sumi_sub;
 
-            let bsum_lo =
-                i16::from_le_bytes([bsums_bytes[4 * i], bsums_bytes[4 * i + 1]]);
-            let bsum_hi =
-                i16::from_le_bytes([bsums_bytes[4 * i + 2], bsums_bytes[4 * i + 3]]);
+            let bsum_lo = i16::from_le_bytes([bsums_bytes[4 * i], bsums_bytes[4 * i + 1]]);
+            let bsum_hi = i16::from_le_bytes([bsums_bytes[4 * i + 2], bsums_bytes[4 * i + 3]]);
             let bsum_pair = bsum_lo as i32 + bsum_hi as i32;
             bsum_total += (mins[i] as i32) * bsum_pair;
         }
@@ -315,8 +307,8 @@ fn q4k_q8k_row_dot_scalar(q4k_data: &[u8], q8k_x: &[u8], n_blocks: usize) -> f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant::ggml::{dequantize_q4_k, q4k_row_dot};
     use crate::quant::ggml::quantize::quantize_q4_0;
+    use crate::quant::ggml::{dequantize_q4_k, q4k_row_dot};
 
     /// `q4k_q8k_row_dot` agrees with the f32 path `q4k_row_dot` to
     /// within 1e-3 relative on synthetic random-ish weights. The Q8_K

@@ -1133,7 +1133,10 @@ mod tests {
         let na = (x.iter().map(|v| v * v).sum::<f32>()).sqrt();
         let nb = (x_rt.iter().map(|v| v * v).sum::<f32>()).sqrt();
         let cos = dot / (na * nb);
-        assert!(cos > 0.9999, "Q6_K round-trip cosine {cos} should be > 0.9999");
+        assert!(
+            cos > 0.9999,
+            "Q6_K round-trip cosine {cos} should be > 0.9999"
+        );
     }
 
     // ── q4k_to_q4kf / quantize_q4_kf tests ──
