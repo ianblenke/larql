@@ -15,9 +15,8 @@ use ndarray::Array1;
 
 use crate::quant::ggml::{
     dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_q8k_row_dot, q6k_row_dot,
-    q8_0_q8k_row_dot, q8_0_row_dot,
-    quantize_to_q8_k, tensor_data_size, type_name, Q8_K_BLOCK_BYTES, TYPE_F32, TYPE_Q4_K,
-    TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+    q8_0_q8k_row_dot, q8_0_row_dot, quantize_to_q8_k, tensor_data_size, type_name,
+    Q8_K_BLOCK_BYTES, TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
 };
 use crate::ModelError;
 
@@ -128,7 +127,10 @@ impl QuantTensor {
                 type_name(tensor_type),
             )));
         }
-        if byte_offset.checked_add(byte_len).map_or(true, |end| end > mmap.len()) {
+        if byte_offset
+            .checked_add(byte_len)
+            .map_or(true, |end| end > mmap.len())
+        {
             return Err(ModelError::Parse(format!(
                 "QuantTensor::from_mmap_region: range {byte_offset}+{byte_len} out of mmap (len {})",
                 mmap.len()
@@ -185,11 +187,7 @@ impl QuantTensor {
         if let QuantBacking::Mmap(mmap) = &self.data {
             // `advise_range` clips to page boundaries internally on
             // memmap2 0.9+. Ignore errors — prefetch is a hint.
-            let _ = mmap.advise_range(
-                memmap2::Advice::WillNeed,
-                self.byte_offset,
-                self.byte_len,
-            );
+            let _ = mmap.advise_range(memmap2::Advice::WillNeed, self.byte_offset, self.byte_len);
         }
     }
 
@@ -337,10 +335,7 @@ impl QuantTensor {
                 // stays for shapes that aren't a multiple of 256, and
                 // can be forced via `LARQL_Q5K_USE_DEQUANT_DOT=1`.
                 let use_q8k = x_slice.len().is_multiple_of(256)
-                    && std::env::var("LARQL_Q5K_USE_DEQUANT_DOT")
-                        .ok()
-                        .as_deref()
-                        != Some("1");
+                    && std::env::var("LARQL_Q5K_USE_DEQUANT_DOT").ok().as_deref() != Some("1");
                 if use_q8k {
                     use rayon::prelude::*;
                     let rb = self.row_bytes;
@@ -481,8 +476,7 @@ fn with_q8k_for<R>(x: &[f32], f: impl FnOnce(&[u8]) -> R) -> R {
         let mut cell = cell.borrow_mut();
         let ptr = x.as_ptr() as usize;
         let len = x.len();
-        let needs_refresh =
-            !matches!(*cell, Some((p, l, _)) if p == ptr && l == len);
+        let needs_refresh = !matches!(*cell, Some((p, l, _)) if p == ptr && l == len);
         if needs_refresh {
             *cell = Some((ptr, len, quantize_to_q8_k(x)));
         }

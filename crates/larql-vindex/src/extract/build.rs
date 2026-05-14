@@ -95,8 +95,7 @@ fn lookup_expert_weight(weights: &ModelWeights, key: &str) -> Option<WeightArray
     let qt = weights.quant_tensors.get(key)?;
     let shape = qt.shape();
     let n = shape[0].checked_mul(shape[1])?;
-    let floats =
-        larql_models::quant::ggml::dequantize(qt.raw_bytes(), qt.tensor_type(), n).ok()?;
+    let floats = larql_models::quant::ggml::dequantize(qt.raw_bytes(), qt.tensor_type(), n).ok()?;
     let arr = ndarray::Array2::from_shape_vec((shape[0], shape[1]), floats).ok()?;
     Some(arr.into_shared())
 }

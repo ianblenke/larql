@@ -456,9 +456,7 @@ mod loaded_model_tests {
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::new(
-                0, 0,
-            )),
+            tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::new(0, 0)),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]
@@ -513,10 +511,7 @@ mod loaded_model_tests {
     /// Build a WordLevel tokenizer that maps `"hello"`, `"world"`, etc.
     /// to single token ids, so cached encode results have meaningful
     /// `Vec<u32>` shapes for assertions.
-    fn loaded_model_with_real_tokenizer(
-        l0_size: usize,
-        l1_size: usize,
-    ) -> LoadedModel {
+    fn loaded_model_with_real_tokenizer(l0_size: usize, l1_size: usize) -> LoadedModel {
         let vocab = serde_json::json!({
             "hello": 1u64,
             "world": 2u64,
@@ -565,16 +560,14 @@ mod loaded_model_tests {
             weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
-            layer_latency_tracker: std::sync::Arc::new(
-                crate::metrics::LayerLatencyTracker::new(),
-            ),
+            layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
             requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             expert_filter: None,
             unit_filter: None,
             moe_remote: None,
-            tokenizer_cache: std::sync::Arc::new(
-                crate::tokenizer_cache::TokenizerCache::new(l0_size, l1_size),
-            ),
+            tokenizer_cache: std::sync::Arc::new(crate::tokenizer_cache::TokenizerCache::new(
+                l0_size, l1_size,
+            )),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_backend: std::sync::OnceLock::new(),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]

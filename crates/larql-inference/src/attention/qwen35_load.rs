@@ -227,23 +227,22 @@ fn load_qwen35_moe_ffn(
     let shexp_gate = pull_opt("ffn_gate_shexp.weight");
     let shexp_up = pull_opt("ffn_up_shexp.weight");
     let shexp_down = pull_opt("ffn_down_shexp.weight");
-    let (shexp_gate, shexp_up, shexp_down) =
-        match (shexp_gate, shexp_up, shexp_down) {
-            (Some(g), Some(u), Some(d)) => (Some(g), Some(u), Some(d)),
-            (None, None, None) => (None, None, None),
-            // Partial set is almost certainly a bug — fail loudly so
-            // we don't silently drop a shared expert that's in the
-            // GGUF.
-            (g, u, d) => {
-                return Err(Qwen35LoadError::MissingTensor(format!(
-                    "partial shared-expert tensors for layer {layer}: \
+    let (shexp_gate, shexp_up, shexp_down) = match (shexp_gate, shexp_up, shexp_down) {
+        (Some(g), Some(u), Some(d)) => (Some(g), Some(u), Some(d)),
+        (None, None, None) => (None, None, None),
+        // Partial set is almost certainly a bug — fail loudly so
+        // we don't silently drop a shared expert that's in the
+        // GGUF.
+        (g, u, d) => {
+            return Err(Qwen35LoadError::MissingTensor(format!(
+                "partial shared-expert tensors for layer {layer}: \
                      gate={present_g}, up={present_u}, down={present_d}",
-                    present_g = g.is_some(),
-                    present_u = u.is_some(),
-                    present_d = d.is_some(),
-                )));
-            }
-        };
+                present_g = g.is_some(),
+                present_u = u.is_some(),
+                present_d = d.is_some(),
+            )));
+        }
+    };
 
     let num_experts = arch.num_experts();
     let top_k = arch.num_experts_per_token();

@@ -493,24 +493,21 @@ mod tests {
             0,
             &[],
         );
-        assert!(out.is_none(), "CPU backend must NOT support head replacement");
+        assert!(
+            out.is_none(),
+            "CPU backend must NOT support head replacement"
+        );
     }
 
     #[test]
     fn cpu_full_pipeline_q4_capture_pre_wo_returns_none() {
         let backend = CpuBackend;
         let layers: Vec<crate::FullPipelineLayer<'_>> = Vec::new();
-        let out = backend.full_pipeline_q4_capture_pre_wo(
-            &layers,
-            &[],
-            16,
-            32,
-            1,
-            false,
-            0.0,
-            0,
-            0,
+        let out =
+            backend.full_pipeline_q4_capture_pre_wo(&layers, &[], 16, 32, 1, false, 0.0, 0, 0);
+        assert!(
+            out.is_none(),
+            "CPU backend must NOT support pre-W_O capture"
         );
-        assert!(out.is_none(), "CPU backend must NOT support pre-W_O capture");
     }
 }

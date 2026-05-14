@@ -817,10 +817,7 @@ mod parse_moe_tests {
     #[test]
     fn rejects_non_expert_key() {
         // Dense FFN tensor (no `_exps` suffix).
-        assert_eq!(
-            parse_gguf_moe_expert_key("layers.0.ffn_gate.weight"),
-            None
-        );
+        assert_eq!(parse_gguf_moe_expert_key("layers.0.ffn_gate.weight"), None);
         // Attention tensor.
         assert_eq!(
             parse_gguf_moe_expert_key("layers.0.self_attn.q_proj.weight"),

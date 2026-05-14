@@ -28,8 +28,8 @@ pub use constrained::{
 pub use detok::Detokenizer;
 pub use eos::{EosConfig, BUILTIN_STOP_STRINGS, GENERATION_CONFIG_FILENAME};
 pub use gpu::{
-    generate, generate_streaming, generate_with_sampling, stream_forced_full_logits,
-    try_generate, try_generate_streaming, try_generate_with_sampling, ForcedLogitsResult,
+    generate, generate_streaming, generate_with_sampling, stream_forced_full_logits, try_generate,
+    try_generate_streaming, try_generate_with_sampling, ForcedLogitsResult,
 };
 pub use lm_head::lm_head_topk;
 pub use sampling::{Sampler, SamplingConfig};
