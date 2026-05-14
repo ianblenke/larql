@@ -70,6 +70,37 @@ struct BuildContext<'a> {
     cluster_output_tokens: Vec<String>,
 }
 
+/// Look up a MoE expert weight tensor by HF-style key, falling back to
+/// `quant_tensors` with on-demand dequant when `tensors` doesn't have
+/// it. Returns an owned `WeightArray` either way; `tensors` hits are a
+/// cheap Arc clone, `quant_tensors` hits allocate a fresh `Vec<f32>` for
+/// the one expert.
+///
+/// This unblocks GGUF MoE extraction: `load_gguf_lazy_tensors` registers
+/// per-expert HF aliases (post #120) in `quant_tensors` over the 3-D
+/// packed mmap, but `weights.tensors` is empty for MoE experts because
+/// the dense GGUF loader skips 3-D tensors. The fallback lets
+/// `build_vindex`'s legacy per-expert MoE branch find them either way —
+/// safetensors-loaded models still hit `tensors` directly (zero
+/// behaviour change), GGUF-loaded MoE models now resolve via the lazy
+/// quant path.
+///
+/// Memory: one expert's worth of f32 (~6 MB at Qwen 3.6-35B-A3B's
+/// 768×2048 expert shape) held only for the duration of the caller's
+/// borrow. Streams sequentially through the experts loop.
+fn lookup_expert_weight(weights: &ModelWeights, key: &str) -> Option<WeightArray> {
+    if let Some(w) = weights.tensors.get(key) {
+        return Some(w.clone());
+    }
+    let qt = weights.quant_tensors.get(key)?;
+    let shape = qt.shape();
+    let n = shape[0].checked_mul(shape[1])?;
+    let floats =
+        larql_models::quant::ggml::dequantize(qt.raw_bytes(), qt.tensor_type(), n).ok()?;
+    let arr = ndarray::Array2::from_shape_vec((shape[0], shape[1]), floats).ok()?;
+    Some(arr.into_shared())
+}
+
 impl<'a> BuildContext<'a> {
     fn new(
         weights: &'a ModelWeights,
@@ -126,7 +157,7 @@ impl<'a> BuildContext<'a> {
                         Some(k) => k,
                         None => continue,
                     };
-                    let w_gate = match self.weights.tensors.get(&gate_key) {
+                    let w_gate = match lookup_expert_weight(self.weights, &gate_key) {
                         Some(w) => w,
                         None => continue,
                     };
@@ -138,7 +169,7 @@ impl<'a> BuildContext<'a> {
 
                 // Also include shared expert if present
                 if let Some(shared_key) = self.weights.arch.shared_expert_gate_key(layer) {
-                    if let Some(w_gate) = self.weights.tensors.get(&shared_key) {
+                    if let Some(w_gate) = lookup_expert_weight(self.weights, &shared_key) {
                         let n = w_gate.shape()[0];
                         total_features += n;
                         let data = w_gate.as_slice().unwrap();
@@ -224,18 +255,22 @@ impl<'a> BuildContext<'a> {
                 .on_layer_start(COMP_DOWN, layer, self.num_layers);
             let start = std::time::Instant::now();
 
-            // Collect all down matrices for this layer (dense: 1, MoE: num_experts)
-            let down_matrices: Vec<(&WeightArray, usize)> = if self.is_moe && self.n_experts > 0 {
+            // Collect all down matrices for this layer (dense: 1, MoE: num_experts).
+            // MoE branch uses `lookup_expert_weight` so GGUF-loaded MoE
+            // (where experts live in `quant_tensors` under HF aliases via
+            // the post-#120 lazy loader) and safetensors-loaded MoE
+            // (where they live directly in `tensors`) both resolve.
+            let down_matrices: Vec<(WeightArray, usize)> = if self.is_moe && self.n_experts > 0 {
                 let mut mats = Vec::new();
                 for expert in 0..self.n_experts {
                     if let Some(key) = self.weights.arch.expert_ffn_down_key(layer, expert) {
-                        if let Some(w) = self.weights.tensors.get(&key) {
+                        if let Some(w) = lookup_expert_weight(self.weights, &key) {
                             mats.push((w, expert));
                         }
                     }
                 }
                 if let Some(key) = self.weights.arch.shared_expert_down_key(layer) {
-                    if let Some(w) = self.weights.tensors.get(&key) {
+                    if let Some(w) = lookup_expert_weight(self.weights, &key) {
                         mats.push((w, self.n_experts));
                     }
                 }
@@ -243,7 +278,7 @@ impl<'a> BuildContext<'a> {
             } else {
                 let down_key = self.weights.arch.ffn_down_key(layer);
                 match self.weights.tensors.get(&down_key) {
-                    Some(w) => vec![(w, 0)],
+                    Some(w) => vec![(w.clone(), 0)],
                     None => {
                         self.callbacks.on_layer_done(COMP_DOWN, layer, 0.0);
                         continue;

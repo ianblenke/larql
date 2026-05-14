@@ -440,39 +440,48 @@ fn run_gguf_to_vindex(
     }
 
     eprintln!("  Loading and dequantizing tensors...");
-    let weights = larql_models::load_gguf(input)?;
+
+    // For MoE models, pre-scan the GGUF tensor list for 3-D packed
+    // expert tensors (`*ffn_{gate,up,down}_exps.weight`) and route them
+    // through the lazy loader — `load_gguf_lazy_tensors` populates
+    // `weights.quant_tensors` with per-expert HF-style aliases (post
+    // #120) over the same Arc mmap, zero copies. The dense
+    // `load_gguf` would skip 3-D tensors entirely (its
+    // `match info.n_dims` only handles 2-D / 1-D), leaving MoE expert
+    // weight files as 0 bytes — the silent-broken-vindex footgun that
+    // PR #119 guarded against with a fail-fast.
+    //
+    // `build_vindex`'s MoE branch now falls back to `quant_tensors`
+    // with on-demand dequant (see `lookup_expert_weight` in
+    // extract/build.rs), so the lazy aliases get consumed correctly
+    // when writing `gate_vectors.bin` / down meta.
+    let gguf_file = larql_models::loading::gguf::GgufFile::open(input)?;
+    let moe_lazy_keys: std::collections::HashSet<String> = gguf_file
+        .tensor_infos
+        .iter()
+        .filter(|info| {
+            info.dims().len() == 3
+                && (info.name().ends_with("ffn_gate_exps.weight")
+                    || info.name().ends_with("ffn_up_exps.weight")
+                    || info.name().ends_with("ffn_down_exps.weight"))
+        })
+        .map(|info| larql_models::loading::gguf::normalize_gguf_key(info.name()))
+        .collect();
+
+    let weights = if !moe_lazy_keys.is_empty() {
+        eprintln!(
+            "  MoE detected: {} packed expert tensors → lazy loader",
+            moe_lazy_keys.len()
+        );
+        larql_models::loading::gguf::load_gguf_lazy_tensors(input, &moe_lazy_keys)?
+    } else {
+        larql_models::load_gguf(input)?
+    };
 
     eprintln!(
         "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
         weights.num_layers, weights.hidden_size, weights.intermediate_size, weights.vocab_size
     );
-
-    // Fail fast on MoE: `larql_models::load_gguf` reads 3-D packed
-    // expert tensors (`blk.{L}.ffn_{gate,up,down}_exps.weight`) into
-    // `quant_tensors` under GGUF-style keys, but `build_vindex`'s MoE
-    // branch looks them up under HF-style keys
-    // (`model.layers.{L}.mlp.experts.{E}.gate_proj.weight`) via
-    // `arch.expert_ffn_*_key(...)`. The lookup misses silently and
-    // `gate_vectors.bin` / `up_weights.bin` / `down_weights.bin` come
-    // out as 0-byte files — producing a 2.5 GB vindex that mmap-loads
-    // without crashing but cannot serve a single token. Better to
-    // refuse upfront. The safetensors `extract --quant q4k` path DOES
-    // handle MoE (see `larql-vindex/src/format/weights/write_q4k/
-    // moe_layers.rs`); point users there for now. Full GGUF MoE
-    // support is tracked as task #128.
-    if weights.arch.is_moe() {
-        return Err(format!(
-            "convert gguf-to-vindex does not yet support MoE models \
-             (architecture: {}, num_experts: {}). \
-             The lookup path between the GGUF loader (which reads \
-             packed expert tensors under GGUF-style keys) and \
-             build_vindex (which expects per-expert HF-style keys) \
-             is missing. Use `larql extract --quant q4k` against the \
-             safetensors source instead — that path supports MoE via \
-             larql-vindex/src/format/weights/write_q4k/moe_layers.rs. \
-             Tracking fix: task #128."
-        , weights.arch.family(), weights.arch.num_experts()).into());
-    }
 
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
