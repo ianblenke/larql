@@ -139,5 +139,62 @@ fn bench_q6_k(c: &mut Criterion) {
     bench_format(c, QuantFormat::Q6_K, quantize_q6_k, "quant_matvec_q6_k");
 }
 
-criterion_group!(benches, bench_q4_0, bench_q4_k, bench_q4_kf, bench_q6_k);
+/// Head-to-head Q6_K CPU: AVX2 Q8K-input (`q6k_q8k_matvec_into`,
+/// dispatched to AVX2 on x86_64 + avx2 feature) vs scalar f32-input
+/// (`q6k_matvec::dispatch`, the `CpuBackend::q6k_matvec` trait body).
+/// Both reach production callers — the AVX2 path is hot for the
+/// walk-ffn-q8k Q6_K branch (#103) and the f32 path is hot for
+/// attention V-projection and lm-head KNN.
+///
+/// The activation quant cost is amortised across `n` rows in a real
+/// FFN step (the caller quantises `x` once per layer, not per row),
+/// so this bench pre-quantises `x` outside the `iter` closure — same
+/// as the production hot path.
+fn bench_q6_k_avx2_vs_scalar(c: &mut Criterion) {
+    use larql_compute::cpu::ops::q4k_q8k_dot::{q6k_q8k_matvec_into, quantize_x_to_q8k};
+    use larql_compute::cpu::ops::q6k_matvec;
+
+    let mut group = c.benchmark_group("q6k_q8k_vs_q6k_f32");
+    group.sample_size(20);
+
+    for shape in SHAPES {
+        let (w_f32, x) = synth_inputs(shape.n, shape.k);
+        let weights = quantize_q6_k(&w_f32);
+        let q8k_x = quantize_x_to_q8k(&x);
+
+        group.throughput(Throughput::Elements((shape.n * shape.k) as u64));
+
+        // AVX2 Q8K-input — the walk-ffn-q8k hot path.
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("avx2_q8k_input/{}", shape.name)),
+            &(&weights, &q8k_x),
+            |b, (w, q8k)| {
+                let mut out = vec![0.0f32; shape.n];
+                b.iter(|| {
+                    q6k_q8k_matvec_into(&mut out, q8k, w, shape.n, shape.k);
+                });
+            },
+        );
+
+        // f32-input scalar — the trait-dispatched path used by attention
+        // V projection and lm-head KNN.
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("scalar_f32_input/{}", shape.name)),
+            &(&weights, &x),
+            |b, (w, xv)| {
+                b.iter(|| q6k_matvec::dispatch(w, xv, shape.n, shape.k));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_q4_0,
+    bench_q4_k,
+    bench_q4_kf,
+    bench_q6_k,
+    bench_q6_k_avx2_vs_scalar,
+);
 criterion_main!(benches);
