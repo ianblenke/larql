@@ -12,8 +12,15 @@ No code lands under this id — proposal-only, sibling to `cpu-kquant-matvec-cor
 | llama.cpp `-ngl 0` (CPU-only)            | **16.2**      | 0.7 GB idle | ~2.3 GB | ✓ clean |
 | `larql bench --backends cpu` (research path) | **0.1**       | ~0.5 GB (CUDA init) | 10.7 GB | ✓ but off-path |
 | `cargo bench -p larql-compute` AVX2 matvecs (isolated) | 17 Gelem/s | — | — | ✓ kernel-level |
-| **larql `/v1/chat/completions` end-to-end**   | **HUNG** | 1.3 GB | 10.7 GB | ✗ **blocked** |
-| **larql Qwen 3.6 35B-A3B vindex** | n/a | n/a | n/a | ✗ **MoE missing** |
+| **larql `/v1/chat/completions` end-to-end** (Gemma 3 4B Q4_K) | **0.106** (32 tok in 301 s) | — | ~11 GB | ✓ measured after #123 |
+| **larql Qwen 3.6 35B-A3B vindex** (GGUF→f16) | not benched | — | — | ✓ extraction OK after #122; format is f16-only — fast-decode requires #130 |
+
+### End-to-end gap (post-Gaps-1+2-fix)
+
+- Production CPU Q4K decode: **0.106 tok/s** (#127 unblocked the chat handler, so this number is now measurable).
+- llama.cpp CPU-only on the same weights: **16.2 tok/s**.
+- **Gap: ~153×.**
+- Per-matvec AVX2 wins (PRs #102–#119) closed the kernel-level distance; the remaining factor is algorithmic — `generate_via_cpu_q4k` is documented as O(N²) per token (no KV cache on the CPU Q4K path). Closing the gap requires KV cache wiring on the CPU production path, not more matvec micro-optimisation.
 
 ## Gap 1 — `/v1/chat/completions` and `/v1/infer` hang on Gemma 3 4B vindex
 
@@ -100,3 +107,11 @@ In `crates/larql-cli/src/commands/extraction/convert_cmd.rs` (or wherever `gguf-
 - **Affected files**: none directly — this is a status / gap doc.
 - **Affected systems**: documentation of two blockers for end-to-end bench-vs-llama.cpp.
 - **Out of scope**: actually fixing either gap. Each warrants its own change once root cause is established.
+
+## Resolution (2026-05-14)
+
+Both gaps closed, end-to-end bench is now runnable. New gap surfaced.
+
+- **Gap 1** — `/v1/chat/completions` hang: **fixed in PR #123**. Root cause was a `std::sync::RwLock` self-deadlock: both chat paths held the `model.weights` write lock and then called `pick_template`, which tried to take a read lock on the same RwLock (non-reentrant on glibc). The `Down features: not available` hypothesis in this doc was a red herring. Fix: hoist `pick_template` + `render` above `lock_weights_for_gen` in both `run_chat_completion` and `stream_chat_completion`.
+- **Gap 2** — MoE GGUF extraction: **fixed in PRs #119, #120, #121, #122**. End-to-end verified on `unsloth/Qwen3.6-35B-A3B-GGUF` — extraction completes in ~2 min, all expert weight files non-zero. Note the resulting vindex is f16, not interleaved Q4K — production fast-decode for GGUF-sourced vindexes still needs a Q4K-passthrough writer (task #130).
+- **New gap surfaced** — `generate_via_cpu_q4k` is O(N²) per token (no KV cache on the CPU Q4K production path). At Gemma 3 4B that's a ~153× gap vs llama.cpp `-ngl 0`. Closing it requires KV cache wiring on the CPU production path, not more per-matvec AVX2 work. Tracked as a follow-up; not filed under this change.
