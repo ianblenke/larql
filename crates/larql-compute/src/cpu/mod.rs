@@ -113,83 +113,25 @@ impl QuantMatVec for CpuBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
-        // Streaming dequant + dot per super-block. The prior impl
-        // allocated a full `num_rows * hidden` f32 buffer (≈ 2.7 GB at
-        // lm_head_262144 × 2560) and ran a scalar row-by-row dot —
-        // 1.75 s/token at lm-head scale per the #108 bench, with the
-        // allocation as the dominant cost.
+        // Q4_KF trait dispatch: route through the AVX2 Q8K kernel on
+        // x86_64+AVX2 (post-#PRNUM scalar fallback otherwise). Pattern
+        // mirrors `q4k_matvec` and `q6k_matvec` trait routing in #110.
         //
-        // This version processes one super-block (256 elements) at a
-        // time, dequantising into a 256-f32 stack-friendly buffer and
-        // folding into the row accumulator immediately. No
-        // num_rows-sized heap allocation; weight bytes are read once
-        // through the dequant + dot fused loop.
-        //
-        // Q4_KF layout (`pipeline::Q4_KF_BLOCK_BYTES = 160`):
-        //   [0..15]    8 × f16 d*scale[j]
-        //   [16..31]   8 × f16 dmin*min[j]
-        //   [32..159]  128 bytes nibbles (same as Q4_K's
-        //              `[16..144]` region — see `q4k_to_q4kf`).
-        //
-        // Not yet AVX2-vectorised — that's tracked separately. This
-        // pass closes the 1.75 s allocation wall.
-        if x.len() != hidden || !hidden.is_multiple_of(256) {
+        // History:
+        // - Pre-#114: full f32 dequant alloc (≈ 2.7 GB at lm_head_262144)
+        //   then scalar row-dot. 1.75 s/token at lm-head shape.
+        // - #114: streaming per-superblock dequant + dot. 503 ms/token —
+        //   2.7 GB alloc gone, but still scalar f32 math.
+        // - This change: AVX2 `q4kf_q8k_matvec_into` — same integer dot
+        //   inner loop as the Q4_K AVX2 path (#110), pre-baked f16
+        //   scales handled f32-side. Expected ~40 ms at lm-head shape
+        //   per the Q4_K AVX2 baseline.
+        if x.len() != hidden || !hidden.is_multiple_of(256) || num_rows == 0 {
             return None;
         }
-        const BLOCK_ELEMS: usize = 256;
-        const BLOCK_BYTES: usize = crate::pipeline::Q4_KF_BLOCK_BYTES;
-        let superblocks_per_row = hidden / BLOCK_ELEMS;
-        let row_bytes = superblocks_per_row * BLOCK_BYTES;
-        if q4kf_data.len() < num_rows * row_bytes {
-            return None;
-        }
-
+        let q8k = ops::q4k_q8k_dot::quantize_x_to_q8k(x);
         let mut out = vec![0.0f32; num_rows];
-        for row in 0..num_rows {
-            let row_base = row * row_bytes;
-            let mut acc = 0.0f32;
-            for sb in 0..superblocks_per_row {
-                let block = &q4kf_data[row_base + sb * BLOCK_BYTES
-                    ..row_base + (sb + 1) * BLOCK_BYTES];
-
-                // Decode 8 f16 d*scale + 8 f16 dmin*min once per
-                // super-block.
-                let mut scales = [0.0f32; 8];
-                let mut mins = [0.0f32; 8];
-                for j in 0..8 {
-                    let s_bits = u16::from_le_bytes([block[j * 2], block[j * 2 + 1]]);
-                    let m_bits =
-                        u16::from_le_bytes([block[16 + j * 2], block[16 + j * 2 + 1]]);
-                    scales[j] = ops::q4_common::f16_to_f32(s_bits);
-                    mins[j] = ops::q4_common::f16_to_f32(m_bits);
-                }
-
-                let quants = &block[32..160];
-                let x_base = sb * BLOCK_ELEMS;
-                // 4 groups × 32 bytes (= 64 nibbles), each pair of
-                // sub-blocks aligned with `scales[2g]` (low) and
-                // `scales[2g+1]` (high) — same layout as Q4_K.
-                for group in 0..4 {
-                    let sb_lo = 2 * group;
-                    let sb_hi = 2 * group + 1;
-                    let sc_lo = scales[sb_lo];
-                    let sc_hi = scales[sb_hi];
-                    let mn_lo = mins[sb_lo];
-                    let mn_hi = mins[sb_hi];
-                    let chunk = &quants[group * 32..(group + 1) * 32];
-                    let base_lo = x_base + sb_lo * 32;
-                    let base_hi = x_base + sb_hi * 32;
-                    for lane in 0..32 {
-                        let byte = chunk[lane];
-                        let lo = (byte & 0x0F) as f32;
-                        let hi = ((byte >> 4) & 0x0F) as f32;
-                        acc += (sc_lo * lo - mn_lo) * x[base_lo + lane];
-                        acc += (sc_hi * hi - mn_hi) * x[base_hi + lane];
-                    }
-                }
-            }
-            out[row] = acc;
-        }
+        ops::q4k_q8k_dot::q4kf_q8k_matvec_into(&mut out, &q8k, q4kf_data, num_rows, hidden);
         Some(out)
     }
 
@@ -314,13 +256,15 @@ mod trait_routing_tests {
         }
     }
 
-    /// The new streaming `q4kf_matvec` must produce results equivalent
-    /// to the prior allocate-and-dequant-then-dot implementation (which
-    /// the canonical `dequantize_q4_kf + manual dot` exactly mirrors).
-    /// 1e-4 relative tolerance for round-off only — both paths do the
-    /// same f32 arithmetic, just in a different memory access pattern.
+    /// `q4kf_matvec` must produce results within Q8_K activation noise
+    /// of the canonical `dequantize_q4_kf` + scalar dot reference. The
+    /// trait now routes through `q4kf_q8k_matvec_into` (AVX2 on x86_64),
+    /// which pre-quantises `x` to Q8_K — adding ~0.4 % per-element noise
+    /// that averages down to ≪ 1 % in any dot of meaningful width. The
+    /// 1.5 % envelope mirrors `q4k_matvec_trait_routing_*` / `q6k_*` from
+    /// the same trait-routing class introduced in #110.
     #[test]
-    fn q4kf_matvec_streaming_matches_dequant_then_dot_reference() {
+    fn q4kf_matvec_trait_routing_matches_dequant_then_dot_within_q8k_noise() {
         use crate::cpu::ops::q4_common::{dequantize_q4_kf, q4k_to_q4kf, quantize_q4_k};
         let cols = 512; // 2 super-blocks
         let rows = 5;
@@ -348,7 +292,7 @@ mod trait_routing_tests {
         for r in 0..rows {
             let rel = (ref_out[r] - got[r]).abs() / ref_out[r].abs().max(1e-6);
             assert!(
-                rel < 1e-4,
+                rel < 1.5e-2,
                 "row {r}: ref={} got={} rel={rel}",
                 ref_out[r],
                 got[r]
