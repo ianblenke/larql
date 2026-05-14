@@ -791,6 +791,7 @@ fn v2_config_full_round_trip() {
             rope_local_base: None,
             query_pre_attn_scalar: None,
             final_logit_softcapping: None,
+            ..Default::default()
         }),
         fp4: None,
         ffn_layout: None,
@@ -881,6 +882,7 @@ fn v2_config_with_moe() {
             rope_local_base: None,
             query_pre_attn_scalar: None,
             final_logit_softcapping: None,
+            ..Default::default()
         }),
         fp4: None,
         ffn_layout: None,
@@ -1013,6 +1015,7 @@ fn moe_layer_info_round_trip() {
             rope_local_base: None,
             query_pre_attn_scalar: None,
             final_logit_softcapping: None,
+            ..Default::default()
         }),
         fp4: None,
         ffn_layout: None,
@@ -1915,7 +1918,10 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
+        embed_quant: None,
         lm_head,
+        lm_head_quant: None,
+        quant_tensors: std::collections::HashMap::new(),
         position_embed: None,
         num_layers,
         hidden_size: hidden,
