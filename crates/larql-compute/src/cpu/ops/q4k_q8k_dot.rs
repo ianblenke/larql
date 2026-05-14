@@ -1568,6 +1568,47 @@ mod tests {
         }
     }
 
+    /// Cross-path parity: the two production Q6_K matvec entry points
+    /// must agree on identical weights. `q6k_matvec::dispatch` (trait-
+    /// dispatched f32-input scalar; called via `CpuBackend::q6k_matvec`
+    /// from attention V-projection, lm-head KNN, speculative wiring,
+    /// CUDA fallback decode) and `q6k_q8k_matvec_into` (Q8_K-input
+    /// AVX2-on-x86_64; called from `walk_ffn_q8k`'s Q6_K branch added in
+    /// #103) both consume the same llama.cpp Q6_K wire format. They
+    /// differ only in whether the activation `x` is f32 or pre-quantised
+    /// to Q8_K, so they should agree within Q8_K activation noise (~0.5
+    /// % per block — dot product averages this down further).
+    #[test]
+    fn q6k_two_production_paths_agree_within_q8k_noise() {
+        let cols = 512; // 2 super-blocks per row
+        let rows = 5;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| (i as f32 * 0.017).sin() * 1.5)
+            .collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.006).cos() * 0.7)
+            .collect();
+        let w_q6 = quantize_q6_k(&w_f32);
+
+        // f32-input trait path (production attention V proj / lm_head).
+        let f32_path = crate::cpu::ops::q6k_matvec::dispatch(&w_q6, &x, rows, cols);
+
+        // Q8K-input AVX2 path (production FFN_DOWN via walk-ffn-q8k).
+        let q8 = quantize_x_to_q8k(&x);
+        let mut q8k_path = vec![0.0f32; rows];
+        q6k_q8k_matvec_into(&mut q8k_path, &q8, &w_q6, rows, cols);
+
+        for r in 0..rows {
+            let f = f32_path[r];
+            let q = q8k_path[r];
+            let rel = (f - q).abs() / f.abs().max(1e-6);
+            assert!(
+                rel < 1.5e-2,
+                "row {r}: f32_path={f} q8k_path={q} rel={rel}"
+            );
+        }
+    }
+
     #[test]
     fn q6k_q8k_public_entrypoint_matches_scalar() {
         let cols = 256;
