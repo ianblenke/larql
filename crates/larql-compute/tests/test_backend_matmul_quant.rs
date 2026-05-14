@@ -487,11 +487,12 @@ fn decode_defaults_forward_to_specialized_entrypoints() {
     // `None` (intervention hook — callers fall back to a CPU path
     // implemented at the larql-inference layer). It does NOT forward to
     // `full_pipeline_q4`, so the stub's counter stays at 0 here.
-    assert!(be
-        .full_pipeline_q4_with_head_replacement(
+    assert!(
+        be.full_pipeline_q4_with_head_replacement(
             &layers, &x, hidden, inter, 3, false, 0.0, 2, 0, &x,
         )
-        .is_none());
+        .is_none()
+    );
     assert_eq!(be.full_pipeline_calls.get(), 0);
 
     let mut ignored = 0usize;
@@ -544,7 +545,9 @@ fn decode_defaults_forward_to_specialized_entrypoints() {
     assert_eq!((fired, collected), (11, 7));
 
     assert_eq!(
-        be.decode_token_split_profile(&layers, &x, hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope),
+        be.decode_token_split_profile(
+            &layers, &x, hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope
+        ),
         (Some(x.clone()), 0.0, 0.0, 0.0)
     );
     assert_eq!(be.decode_calls.get(), 1);
@@ -646,17 +649,20 @@ fn default_decode_stubs() {
     be.preallocate_kv_cache_per_layer(&[(1, 4)], 16);
     be.truncate_kv_cache(0);
     be.reset_kv_cache(); // default no-op, must not panic
-    // Placeholder geometry — all default-impl methods return None so the
-    // values are never read; only arity matches the current trait.
+                         // Placeholder geometry — all default-impl methods return None so the
+                         // values are never read; only arity matches the current trait.
     let (hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope) = (4, 8, 4, 4, 1, 1, 4, 10000.0);
     assert!(be
         .full_pipeline_q4(
             &layers, &x, hidden, inter, q_dim, kv_dim, 1, nqh, nkvh, hd, rope, false, 0.0,
         )
         .is_none());
-    assert!(be
-        .full_pipeline_q4_with_head_replacement(&layers, &x, hidden, inter, 1, false, 0.0, 0, 0, &x,)
-        .is_none());
+    assert!(
+        be.full_pipeline_q4_with_head_replacement(
+            &layers, &x, hidden, inter, 1, false, 0.0, 0, 0, &x,
+        )
+        .is_none()
+    );
     assert!(be.multi_layer_q4_ffn(&[], &x, inter, hidden).is_none());
     assert!(be
         .decode_token(&layers, &x, hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope)
@@ -705,13 +711,13 @@ fn default_decode_stubs() {
         .is_none());
     assert_eq!((fired, collected), (0, 0));
     assert_eq!(
-        be.decode_token_split_profile(&layers, &x, hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope),
+        be.decode_token_split_profile(
+            &layers, &x, hidden, inter, q_dim, kv_dim, nqh, nkvh, hd, rope
+        ),
         (None, 0.0, 0.0, 0.0)
     );
     assert!(be
-        .prefill_q4(
-            &layers, &x, hidden, inter, q_dim, kv_dim, 1, nqh, nkvh, hd, rope, false, 0.0,
-        )
+        .prefill_q4(&layers, &x, hidden, inter, q_dim, kv_dim, 1, nqh, nkvh, hd, rope, false, 0.0,)
         .is_none());
     assert!(be
         .full_pipeline_q4_capture_pre_wo(&layers, &x, hidden, inter, 1, false, 0.0, 0, 0,)
