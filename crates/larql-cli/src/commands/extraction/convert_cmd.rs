@@ -444,7 +444,10 @@ fn run_gguf_to_vindex(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let q4k = matches!(quant, "q4k");
     if q4k && level == "browse" {
-        return Err("--quant q4k requires --level inference or --level all (the Q4_K writer needs weights)".into());
+        return Err(
+            "--quant q4k requires --level inference or --level all (the Q4_K writer needs weights)"
+                .into(),
+        );
     }
     eprintln!("Loading GGUF: {}", input.display());
 
