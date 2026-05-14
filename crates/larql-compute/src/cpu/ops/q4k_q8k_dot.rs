@@ -1522,6 +1522,74 @@ mod tests {
         }
     }
 
+    /// Canonical oracle for Q4_K × Q8_K: dequantise via
+    /// `larql_models::quant::ggml::dequantize_q4_k` (mirrors llama.cpp
+    /// `dequantize_row_q4_K` wire format) and compute the f32 reference
+    /// dot. Both the scalar and AVX2 paths must match within Q8_K
+    /// activation noise. Defensive against the same class of layout bug
+    /// that #102 found in Q6_K — the existing
+    /// `q8k_matvec_matches_f32_cached_within_q8_noise` test compares
+    /// against `q4k_matvec_into` (an internal reader), which would mask
+    /// a parallel-wrong-the-same-way bug. This oracle uses the
+    /// `larql-models` dequantiser as ground truth.
+    #[test]
+    fn q4k_q8k_matvec_matches_canonical_dequant() {
+        use larql_models::quant::ggml::dequantize_q4_k as canonical_dequant_q4_k;
+        let cols = 512;
+        let rows = 5;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| (i as f32 * 0.017).sin() * 1.5)
+            .collect();
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.006).cos() * 0.7)
+            .collect();
+        let w_q4 = quantize_q4_k(&w_f32);
+        let w_deq = canonical_dequant_q4_k(&w_q4, rows * cols).expect("dequant q4_k");
+
+        // f32 reference: dot(canonical_dequant(w_q4), x) row-wise.
+        let mut f32_ref = vec![0.0f32; rows];
+        for (r, out_r) in f32_ref.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for c in 0..cols {
+                acc += w_deq[r * cols + c] * x[c];
+            }
+            *out_r = acc;
+        }
+
+        let q8 = quantize_x_to_q8k(&x);
+        let mut scalar_path = vec![0.0f32; rows];
+        q4k_q8k_matvec_scalar(&mut scalar_path, &q8, &w_q4, rows, cols);
+
+        // Q8_K activation noise ≤ ~0.5 % per block; relative tolerance of
+        // 1.5 % covers the noise with margin yet flags any layout-mismatch
+        // (which would be O(1) error).
+        for r in 0..rows {
+            let ref_v = f32_ref[r];
+            let got = scalar_path[r];
+            let rel = (ref_v - got).abs() / ref_v.abs().max(1e-6);
+            assert!(
+                rel < 1.5e-2,
+                "scalar row {r}: ref={ref_v} got={got} rel={rel}"
+            );
+        }
+
+        // Dispatched path (AVX2 on x86_64 with the feature, scalar
+        // otherwise) must agree with the scalar bit-exactly. The
+        // dispatched path is what production code reaches via
+        // `q4k_q8k_matvec_into`.
+        let mut into_path = vec![0.0f32; rows];
+        q4k_q8k_matvec_into(&mut into_path, &q8, &w_q4, rows, cols);
+        for r in 0..rows {
+            assert_eq!(
+                scalar_path[r].to_bits(),
+                into_path[r].to_bits(),
+                "dispatched != scalar at row {r}: scalar={} dispatched={}",
+                scalar_path[r],
+                into_path[r],
+            );
+        }
+    }
+
     /// Canonical oracle: dequantise via `larql_models::quant::ggml::dequantize_q6_k`
     /// (mirrors llama.cpp `dequantize_row_q6_K` wire format) and compute the
     /// f32 reference dot. `q6k_q8k_matvec_scalar` must match — anything
