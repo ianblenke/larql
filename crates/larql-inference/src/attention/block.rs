@@ -53,13 +53,29 @@ pub fn run_attention_block_with_kv_out(
     Some((h_post, attn_proj, attn_w, k, v))
 }
 
-/// Plumbing variant of [`run_attention_block_with_kv_out`] that accepts an
-/// optional mutable [`crate::attention::KvCache`] reference. Currently a thin
-/// wrapper — the cache parameter is accepted but **not yet consumed**, so
-/// behaviour is identical to [`run_attention_block_with_kv_out`]. A follow-up
-/// PR will read cached K/V for previously-seen positions and append only the
-/// new positions' K/V, eliminating the O(N²) per-token full-replay in
-/// `generate_via_cpu_q4k`.
+/// Variant of [`run_attention_block_with_kv_out`] that consults a persistent
+/// per-layer K/V cache when one is supplied. Three modes:
+///
+/// 1. `kv_cache = None` → forwards to [`run_attention_block_with_kv_out`].
+///    Identical behaviour, no cache touched.
+/// 2. `kv_cache = Some(cache)` and `cache.cached_len(layer) == 0` → **prefill**.
+///    Runs the standard full-sequence forward and snapshots the resulting K/V
+///    into the cache. Behaviour is identical to mode 1, only with a side
+///    effect on `cache`.
+/// 3. `kv_cache = Some(cache)` and `cache.cached_len(layer) > 0` and
+///    `h.nrows() == 1` → **decode-step**. Delegates to
+///    [`super::decode::run_attention_block_decode_step`], reading the
+///    previously cached `(K, V)` and writing back the concatenated state.
+///    The returned `(k, v)` is the **new** row only (matching mode 1's
+///    convention of returning K/V for this call's input positions).
+///
+/// Bypassed (degrades to mode 1 without touching the cache) when:
+/// - `shared_kv` is `Some(_)` — cross-layer K/V sharing interacts with a
+///   persistent decode cache in ways the caller is responsible for handling
+///   (the caller bypasses this function entirely on cross-layer-share archs).
+/// - `h.nrows() != 1` with a non-empty cache — multi-token append to an
+///   existing cache isn't supported in this PR; correctness is preserved by
+///   running an uncached prefill instead.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn run_attention_block_with_kv_out_with_cache(
@@ -68,7 +84,7 @@ pub fn run_attention_block_with_kv_out_with_cache(
     layer: usize,
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
-    _kv_cache: Option<&mut crate::attention::KvCache>,
+    kv_cache: Option<&mut crate::attention::KvCache>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -76,7 +92,41 @@ pub fn run_attention_block_with_kv_out_with_cache(
     Array2<f32>,
     Array2<f32>,
 )> {
-    run_attention_block_with_kv_out(weights, h, layer, capture_attention, shared_kv)
+    let Some(cache) = kv_cache else {
+        return run_attention_block_with_kv_out(weights, h, layer, capture_attention, shared_kv);
+    };
+    if shared_kv.is_some() {
+        return run_attention_block_with_kv_out(weights, h, layer, capture_attention, shared_kv);
+    }
+    let cached_len = cache.cached_len(layer);
+    let seq = h.nrows();
+    if cached_len == 0 {
+        let (h_post, attn_proj, attn_w, k, v) =
+            run_attention_block_with_kv_out(weights, h, layer, capture_attention, None)?;
+        cache.set_layer(layer, (k.clone(), v.clone()));
+        return Some((h_post, attn_proj, attn_w, k, v));
+    }
+    if seq != 1 {
+        return run_attention_block_with_kv_out(weights, h, layer, capture_attention, None);
+    }
+    let abs_position = cache.next_position;
+    let kv_entry = cache.get_layer(layer).cloned();
+    let (h_post, (k_concat, v_concat)) = super::decode::run_attention_block_decode_step(
+        weights,
+        h,
+        layer,
+        kv_entry.as_ref(),
+        abs_position,
+    )?;
+    let new_k = k_concat.slice(s![cached_len.., ..]).to_owned();
+    let new_v = v_concat.slice(s![cached_len.., ..]).to_owned();
+    cache.set_layer(layer, (k_concat, v_concat));
+    // `attn_projected` is folded into the residual by the decode-step path and
+    // is not exposed separately. None of `_with_cache`'s callers consume it
+    // (they destructure as `_`), so return a placeholder zero of the correct
+    // shape to keep the return-tuple stable.
+    let attn_proj_placeholder = Array2::<f32>::zeros((seq, h.ncols()));
+    Some((h_post, attn_proj_placeholder, None, new_k, new_v))
 }
 
 /// Run attention with optional shared K/V (discards K/V output).
@@ -655,6 +705,81 @@ mod tests {
         assert_eq!(h_out.shape(), &[3, weights.hidden_size]);
         assert_eq!(k_rope.shape()[0], 3);
         assert_eq!(v_final.shape()[0], 3);
+    }
+
+    #[test]
+    fn cached_prefill_then_decode_matches_uncached_full_prefill() {
+        // The headline correctness invariant for the CPU Q4K KV cache arc:
+        // running `_with_cache` as `prefill(N) + decode(1)` MUST produce the
+        // same last-row hidden state as running uncached on the concatenated
+        // `[N+1, hidden]` input. If this drifts, every cached decode-step is
+        // computing the wrong residual and downstream logits are silently
+        // wrong.
+        use super::super::decode::KvCache;
+        let weights = make_test_weights();
+        let h_full = hidden(4, weights.hidden_size);
+        let h_prompt = h_full.slice(s![..3, ..]).to_owned();
+        let h_new = h_full.slice(s![3..4, ..]).to_owned();
+
+        let (h_uncached, _, _, _, _) =
+            run_attention_block_with_kv_out(&weights, &h_full, 0, false, None).unwrap();
+
+        let mut cache = KvCache::with_layers(weights.num_layers);
+        let (h_pref, _, _, _, _) = run_attention_block_with_kv_out_with_cache(
+            &weights,
+            &h_prompt,
+            0,
+            false,
+            None,
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert_eq!(h_pref.shape(), &[3, weights.hidden_size]);
+        assert_eq!(cache.cached_len(0), 3);
+
+        // The driver normally advances `next_position`; do it manually here.
+        cache.next_position = 3;
+
+        let (h_dec, _, _, k_new, v_new) = run_attention_block_with_kv_out_with_cache(
+            &weights,
+            &h_new,
+            0,
+            false,
+            None,
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert_eq!(h_dec.shape(), &[1, weights.hidden_size]);
+        assert_eq!(k_new.shape()[0], 1);
+        assert_eq!(v_new.shape()[0], 1);
+        assert_eq!(cache.cached_len(0), 4);
+
+        let expected = h_uncached.row(3);
+        let actual = h_dec.row(0);
+        for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "decode-step diverges at element {i}: cached={a} uncached={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_none_path_matches_kv_out_byte_for_byte() {
+        // Plumbing-mode invariant: passing `kv_cache=None` to the
+        // `_with_cache` variant must be byte-identical to the existing
+        // `run_attention_block_with_kv_out`. Cheap regression guard for
+        // refactors that touch the cache plumbing.
+        let weights = make_test_weights();
+        let h = hidden(3, weights.hidden_size);
+        let (h_a, _, _, k_a, v_a) =
+            run_attention_block_with_kv_out(&weights, &h, 0, false, None).unwrap();
+        let (h_b, _, _, k_b, v_b) =
+            run_attention_block_with_kv_out_with_cache(&weights, &h, 0, false, None, None)
+                .unwrap();
+        assert_eq!(h_a, h_b);
+        assert_eq!(k_a, k_b);
+        assert_eq!(v_a, v_b);
     }
 
     #[test]

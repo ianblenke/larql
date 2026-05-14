@@ -101,20 +101,24 @@ pub fn predict_q4k_hidden(
 }
 
 /// Variant of [`predict_q4k_hidden`] that accepts an optional mutable
-/// [`KvCache`] reference. Currently a plumbing pass-through — the cache is
-/// threaded down to the attention block via
-/// [`crate::forward::layer::run_layer_with_ffn_with_cache`] but **not yet
-/// consumed**, so this function is behaviourally identical to
-/// [`predict_q4k_hidden`].
+/// [`KvCache`] reference. When provided, the cache is read from and written to
+/// per-layer by the CPU attention forward: an empty cache triggers a prefill
+/// that snapshots K/V into the cache; a populated cache combined with a
+/// single-row input triggers a decode-step that appends one position's K/V.
 ///
-/// A follow-up PR will wire the CPU attention forward to read cached K/V for
-/// previously-seen positions and append only the new positions' K/V,
-/// eliminating the O(N²) per-token full-replay in
-/// `crate::layer_graph::generate::cpu::generate_via_cpu_q4k`.
+/// Two architectures bypass the cache (silently — correctness preserved by
+/// running the uncached forward) because they need follow-up work to integrate
+/// with a persistent per-layer cache:
 ///
-/// MoE-hybrid layers (Gemma 4 26B A4B) currently bypass the cache — only the
-/// non-MoE full-attention path threads it. Hybrid plumbing can follow once the
-/// dense path is consuming the cache.
+/// - **Hybrid MoE** (`arch.is_hybrid_moe()` — Gemma 4 26B A4B): the MoE layer
+///   path doesn't thread the cache parameter yet.
+/// - **Cross-layer K/V sharing** (any layer with
+///   `arch.kv_shared_source_layer(l).is_some()` — Gemma 4 family): the
+///   sharing layer's attention needs to read the donor's full cache rather
+///   than just this-step's K/V, which the current decode helper doesn't
+///   model.
+///
+/// The bench-vs-llama-cpp target (Gemma 3 4B Q4_K) hits neither bypass.
 pub fn predict_q4k_hidden_with_cache(
     weights: &mut ModelWeights,
     token_ids: &[u32],
@@ -123,6 +127,14 @@ pub fn predict_q4k_hidden_with_cache(
     mut kv_cache: Option<&mut KvCache>,
 ) -> Array2<f32> {
     let num_layers = weights.num_layers;
+    if kv_cache.is_some() {
+        let arch = &*weights.arch;
+        let unsupported = arch.is_hybrid_moe()
+            || (0..num_layers).any(|l| arch.kv_shared_source_layer(l).is_some());
+        if unsupported {
+            return predict_q4k_hidden(weights, token_ids, index, moe_remote);
+        }
+    }
     let mut h = embed_tokens_pub(weights, token_ids);
 
     let ple_inputs = precompute_per_layer_inputs(weights, &h, token_ids);
@@ -185,6 +197,10 @@ pub fn predict_q4k_hidden_with_cache(
                 eprintln!("[dump] failed to write {path}: {e}");
             }
         }
+    }
+
+    if let Some(cache) = kv_cache {
+        cache.next_position = cache.next_position.saturating_add(token_ids.len());
     }
 
     h
