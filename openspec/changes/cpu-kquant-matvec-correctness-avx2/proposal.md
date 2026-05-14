@@ -45,6 +45,7 @@ PR sequence below.
 | [#106](https://github.com/ianblenke/larql/pull/106) | test | Cross-path parity: `q6k_matvec::dispatch` (f32 scalar) vs `q6k_q8k_matvec_into` (Q8K AVX2) on identical Q6_K weights within Q8_K activation noise. |
 | [#107](https://github.com/ianblenke/larql/pull/107) | test | `quantize_q6_k` round-trip via canonical `dequantize_q6_k` (defends the vindex extraction input). |
 | [#108](https://github.com/ianblenke/larql/pull/108) | bench | Head-to-head AVX2 Q8K-input vs scalar f32-input Q6_K matvec, three reference shapes. |
+| [#110](https://github.com/ianblenke/larql/pull/110) | perf | `CpuBackend::q4k_matvec` / `q6k_matvec` (trait dispatch) routed through the AVX2 Q8K kernel — lm-head KNN, speculative draft head, attention V CPU fallback now hit the AVX2 fast path. |
 
 ## Bench results (RTX 4090 host, x86_64 + AVX2)
 
@@ -61,6 +62,58 @@ user scenario. When lm_head is forced to CPU (it can't fit in VRAM
 alongside attention + KV-cache for large-context configs), Q6_K matvec
 goes from 738 ms → 40.6 ms per token. The difference between unusable
 and viable for the "models + max context > VRAM" value prop.
+
+## Post-#110 update — trait dispatch numbers
+
+After #110 routed `CpuBackend::q4k_matvec` and `q6k_matvec` (the
+trait-dispatched f32-input entry points) internally through the AVX2
+Q8K kernel, the existing `quant_matvec_q4_k` / `quant_matvec_q6_k`
+Criterion groups (which call `backend.quant_matvec(format, ...)`)
+hit the same fast-path numbers as the direct `q*k_q8k_matvec_into`
+calls:
+
+`cargo bench -p larql-compute --bench quant_matvec -- "quant_matvec_q4_k|quant_matvec_q6_k" --quick`
+
+| Shape           | Q4_K trait | Q6_K trait | Q4_K throughput | Q6_K throughput |
+|-----------------|-----------:|-----------:|----------------:|----------------:|
+| decode_2560     |   **360 µs** |   **406 µs** |   18.2 Gelem/s |   16.1 Gelem/s  |
+| prefill_10240   |  **1.43 ms** |  **1.56 ms** |   18.3 Gelem/s |   16.7 Gelem/s  |
+| lm_head_262144  |  **37.6 ms** |  **42.4 ms** |   17.9 Gelem/s |   15.8 Gelem/s  |
+
+Q4_K is ~10 % faster than Q6_K at the same shape — consistent with
+Q6_K's 50 % larger super-block (210 B vs 144 B per 256 elements).
+
+**lm_head trait dispatch went from 738 ms → 37.6 ms** for Q4_K-stored
+vindexes (e.g. all Qwen 3.6 weight files extracted via the default
+`write_q4k/lm_head.rs:26` path). Speculative decode draft head, lm-head
+KNN scoring under VRAM pressure, and attention V CPU fallback all
+inherit this win automatically because they reach the trait.
+
+### Q4_KF — catastrophically slow, flagged as follow-up
+
+Same bench run also surfaced the `quant_matvec_q4_kf` numbers:
+
+| Shape           | Q4_KF trait | Q4_K trait | Ratio |
+|-----------------|------------:|-----------:|------:|
+| decode_2560     |   **6.58 ms** |   360 µs   | ~18× |
+| prefill_10240   |  **73.1 ms**  |  1.43 ms   | ~51× |
+| lm_head_262144  |  **1.75 s**   | 37.6 ms    | **~46×** |
+
+`CpuBackend::q4kf_matvec` dequantises the entire Q4_KF matrix to
+f32 (`num_rows * hidden` allocation — ≈ 2.7 GB at the lm_head shape)
+then runs a manual scalar dot. The implementation is a no-AVX2,
+maximum-allocation fallback.
+
+Per the production audit, Q4_KF is **not** in vindex storage — see
+`LayerWeightFormat` enum in `larql-vindex/src/format/weights/
+write_layers.rs:28-37` (Q4_K, Q6_K, Q8_0, F32, F16, BF16, Q4_0, FP4;
+no Q4_KF). So the catastrophic numbers do not surface in current
+production decode. But callers exist (`larql_compute/src/cuda/decode.rs:
+410` routes `QuantFormat::Q4_KF` through this trait method) and any
+future code that generates Q4_KF via `q4k_to_q4kf` would hit the
+1.75-second wall.
+
+Filed as follow-up task.
 
 ## Pre-existing bugs found, fixed, and now regression-protected
 
