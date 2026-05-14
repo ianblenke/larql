@@ -49,8 +49,8 @@ pub use block::{
     run_attention_block, run_attention_block_replace_head_residual_delta,
     run_attention_block_replace_pre_o_head, run_attention_block_shared,
     run_attention_block_shared_with_pre_o, run_attention_block_subtract_pre_o_heads,
-    run_attention_block_with_kv_out, run_attention_block_with_pre_o,
-    run_attention_block_with_pre_o_and_all_attention_weights,
+    run_attention_block_with_kv_out, run_attention_block_with_kv_out_with_cache,
+    run_attention_block_with_pre_o, run_attention_block_with_pre_o_and_all_attention_weights,
     run_attention_block_with_pre_o_and_reduced_qk_attention_weights,
     run_attention_block_zero_pre_o_heads,
 };
