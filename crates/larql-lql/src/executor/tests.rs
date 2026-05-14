@@ -489,7 +489,10 @@ fn make_test_weights() -> larql_inference::ModelWeights {
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
         embed,
+        embed_quant: None,
         lm_head,
+        lm_head_quant: None,
+        quant_tensors: std::collections::HashMap::new(),
         position_embed: None,
         num_layers,
         hidden_size: hidden,
@@ -1013,6 +1016,7 @@ fn make_full_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         rope_local_base: None,
         query_pre_attn_scalar: None,
         final_logit_softcapping: None,
+        ..Default::default()
     };
 
     let mut config = VindexConfig {
@@ -1173,7 +1177,10 @@ fn make_large_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
         embed: embed.clone(),
+        embed_quant: None,
         lm_head,
+        lm_head_quant: None,
+        quant_tensors: HashMap::new(),
         position_embed: None,
         arch,
         num_layers: NUM_LAYERS,
@@ -1238,6 +1245,7 @@ fn make_large_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         rope_local_base: None,
         query_pre_attn_scalar: None,
         final_logit_softcapping: None,
+        ..Default::default()
     };
 
     let mut config = VindexConfig {
@@ -1388,6 +1396,7 @@ fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
         rope_local_base: None,
         query_pre_attn_scalar: None,
         final_logit_softcapping: None,
+        ..Default::default()
     };
 
     let mut config = VindexConfig {
