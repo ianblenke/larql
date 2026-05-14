@@ -21,9 +21,12 @@ pub(crate) use generation::generate_q4k_cpu_constrained_streaming_sampled_with_e
 pub use generation::{
     generate_q4k_cpu, generate_q4k_cpu_constrained, generate_q4k_cpu_constrained_streaming,
     generate_q4k_cpu_constrained_streaming_sampled, generate_q4k_cpu_remote, is_end_of_turn,
-    predict_q4k, predict_q4k_full_vocab_probs,
+    predict_q4k, predict_q4k_full_vocab_probs, predict_q4k_with_cache,
 };
-pub use hidden::{predict_q4k_hidden, predict_q4k_hidden_with_cache, prefill_q4k_from_embeddings};
+pub use hidden::{
+    cpu_q4k_cache_supported, predict_q4k_hidden, predict_q4k_hidden_with_cache,
+    prefill_q4k_from_embeddings,
+};
 pub use hooks::predict_q4k_hidden_hooked;
 pub use interventions::{
     predict_q4k_hidden_with_mapped_head_residual_delta, predict_q4k_hidden_with_mapped_pre_o_head,

@@ -88,6 +88,27 @@ pub fn prefill_q4k_from_embeddings(
     (h, kvs)
 }
 
+/// Whether the persistent CPU Q4K KV cache (`KvCache` threaded through
+/// [`predict_q4k_hidden_with_cache`]) supports the architecture of `weights`.
+///
+/// Returns `false` for:
+/// - **Hybrid MoE** (`arch.is_hybrid_moe()` — Gemma 4 26B A4B): MoE layers
+///   don't thread the cache.
+/// - **Cross-layer K/V sharing** (`arch.kv_shared_source_layer(l).is_some()`
+///   for any layer — Gemma 4 family): sharing layers need the donor's full
+///   cache rather than just this-step's K/V.
+///
+/// Callers (e.g., `generate_via_cpu_q4k`) use this to decide whether to
+/// allocate a `KvCache` and route through the decode-step path, or fall
+/// back to the per-token full-replay forward.
+pub fn cpu_q4k_cache_supported(weights: &ModelWeights) -> bool {
+    let arch = &*weights.arch;
+    if arch.is_hybrid_moe() {
+        return false;
+    }
+    !(0..weights.num_layers).any(|l| arch.kv_shared_source_layer(l).is_some())
+}
+
 /// Compute the final hidden state for `token_ids` against a Q4_K/Q6_K
 /// vindex, dequantising attn + FFN one layer at a time. Returns the
 /// `[seq_len, hidden]` array; caller owns the lm_head step.
