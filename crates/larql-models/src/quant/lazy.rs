@@ -129,7 +129,7 @@ impl QuantTensor {
         }
         if byte_offset
             .checked_add(byte_len)
-            .map_or(true, |end| end > mmap.len())
+            .is_none_or(|end| end > mmap.len())
         {
             return Err(ModelError::Parse(format!(
                 "QuantTensor::from_mmap_region: range {byte_offset}+{byte_len} out of mmap (len {})",
