@@ -189,6 +189,83 @@ fn bench_q6_k_avx2_vs_scalar(c: &mut Criterion) {
     group.finish();
 }
 
+/// Validate that `q4k_q8k_gate_up_into` (the fused FFN gate+up entry
+/// point called from `q4k_ffn_forward_layer_q8k::104`) reaches the
+/// AVX2 fast path on x86_64 after #112. Compares against two
+/// sequential `q4k_q8k_matvec_into` calls — the new fallback should
+/// be within noise of the explicit-twice form (both end up running
+/// AVX2 twice on x86_64), and both should be ~18× faster than the
+/// prior `q4k_q8k_matvec_scalar` ×2 path.
+fn bench_q4_k_gate_up_fused_vs_split(c: &mut Criterion) {
+    use larql_compute::cpu::ops::q4k_q8k_dot::{
+        q4k_q8k_gate_up_into, q4k_q8k_matvec_into, q4k_q8k_matvec_scalar, quantize_x_to_q8k,
+    };
+
+    let mut group = c.benchmark_group("q4k_gate_up_fused");
+    group.sample_size(20);
+
+    // Only the FFN gate/up shapes make sense here — `decode_2560` is
+    // a square attention-style shape, and `lm_head_262144` doesn't
+    // have a fused gate/up. Stick to `prefill_10240` (Gemma 3 4B FFN
+    // gate/up: 10240 × 2560) — the shape walk-ffn-q8k actually hits.
+    let shape = &SHAPES[1]; // prefill_10240
+    let (w_f32, x) = synth_inputs(shape.n, shape.k);
+    let gate = quantize_q4_k(&w_f32);
+    let up = quantize_q4_k(&w_f32);
+    let q8k_x = quantize_x_to_q8k(&x);
+
+    group.throughput(Throughput::Elements((2 * shape.n * shape.k) as u64));
+
+    group.bench_with_input(
+        BenchmarkId::from_parameter("fused_into"),
+        &(&gate, &up, &q8k_x),
+        |b, (g, u, q8k)| {
+            let mut gate_out = vec![0.0f32; shape.n];
+            let mut up_out = vec![0.0f32; shape.n];
+            b.iter(|| {
+                q4k_q8k_gate_up_into(
+                    &mut gate_out,
+                    &mut up_out,
+                    q8k,
+                    g,
+                    u,
+                    shape.n,
+                    shape.k,
+                );
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::from_parameter("two_matvec_into"),
+        &(&gate, &up, &q8k_x),
+        |b, (g, u, q8k)| {
+            let mut gate_out = vec![0.0f32; shape.n];
+            let mut up_out = vec![0.0f32; shape.n];
+            b.iter(|| {
+                q4k_q8k_matvec_into(&mut gate_out, q8k, g, shape.n, shape.k);
+                q4k_q8k_matvec_into(&mut up_out, q8k, u, shape.n, shape.k);
+            });
+        },
+    );
+
+    // Document the prior scalar baseline that #112 replaced.
+    group.bench_with_input(
+        BenchmarkId::from_parameter("two_matvec_scalar_pre_pr112"),
+        &(&gate, &up, &q8k_x),
+        |b, (g, u, q8k)| {
+            let mut gate_out = vec![0.0f32; shape.n];
+            let mut up_out = vec![0.0f32; shape.n];
+            b.iter(|| {
+                q4k_q8k_matvec_scalar(&mut gate_out, q8k, g, shape.n, shape.k);
+                q4k_q8k_matvec_scalar(&mut up_out, q8k, u, shape.n, shape.k);
+            });
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_q4_0,
@@ -196,5 +273,6 @@ criterion_group!(
     bench_q4_kf,
     bench_q6_k,
     bench_q6_k_avx2_vs_scalar,
+    bench_q4_k_gate_up_fused_vs_split,
 );
 criterion_main!(benches);
