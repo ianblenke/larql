@@ -5,10 +5,6 @@
 # `--no-default-features` so the CPU-only surface is exercised. macOS
 # runs include defaults so the Metal feature path is checked too.
 #
-# `convert_moe_to_per_layer` example currently doesn't build against
-# the post-refactor `larql-inference` API; CI checks bins + tests
-# instead of `--all-targets` until that example is repaired.
-
 name: larql-cli
 
 on:
@@ -97,13 +93,13 @@ jobs:
       - name: Format check
         run: cargo fmt -p larql-cli -- --check
 
-      - name: Check (CPU only) on Linux/Windows
+      - name: Check all targets (CPU only) on Linux/Windows
         if: runner.os != 'macOS'
-        run: cargo check -p larql-cli --bins --tests --no-default-features
+        run: cargo check -p larql-cli --all-targets --no-default-features
 
-      - name: Check (default features incl. metal) on macOS
+      - name: Check all targets (default features incl. metal) on macOS
         if: runner.os == 'macOS'
-        run: cargo check -p larql-cli --bins --tests
+        run: cargo check -p larql-cli --all-targets
 
       # Clippy is intentionally skipped: as of 2026-05-10 `larql-cli`
       # carries ~82 pre-existing errors under default features and ~112
