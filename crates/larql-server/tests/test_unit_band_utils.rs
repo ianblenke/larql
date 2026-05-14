@@ -171,6 +171,9 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
+        tokenizer_cache: std::sync::Arc::new(
+            larql_server::tokenizer_cache::TokenizerCache::new(64, 64),
+        ),
         #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_backend: std::sync::OnceLock::new(),
         #[cfg(all(feature = "metal-experts", target_os = "macos"))]
