@@ -114,6 +114,8 @@ fn build_loaded_model(weights: ModelWeights) -> LoadedModel {
         weights: lock,
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
+        layer_latency_tracker: Arc::new(larql_server::metrics::LayerLatencyTracker::new()),
+        requests_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         expert_filter: None,
         unit_filter: None,
         moe_remote: None,
@@ -133,7 +135,8 @@ fn build_state_for(weights: ModelWeights) -> Arc<AppState> {
         api_key: None,
         sessions: SessionManager::new(60),
         describe_cache: DescribeCache::new(0),
-        attention_sessions: Arc::new(AttentionSessionMap::new(60, 256)),
+        attention_sessions: AttentionSessionMap::new(60, 256),
+        default_kv_format: None,
     })
 }
 
