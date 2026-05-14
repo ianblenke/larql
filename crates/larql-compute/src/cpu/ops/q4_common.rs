@@ -1086,6 +1086,56 @@ mod tests {
         );
     }
 
+    /// Strong round-trip oracle for `quantize_q6_k`: round through the
+    /// canonical `larql_models::quant::ggml::dequantize_q6_k` (which
+    /// mirrors llama.cpp's `dequantize_row_q6_K` wire format) and verify
+    /// element-wise reconstruction within Q6_K's expected quantisation
+    /// error. Q6_K's worst-case relative reconstruction error is
+    /// `1 / 31 ≈ 3.2 %` per element under the d = amax / (31·127) /
+    /// `sub_scale = sub_max / (31·d)` allocation; for smooth inputs the
+    /// effective error tracks the per-sub-block scale resolution and
+    /// stays well under that bound.
+    ///
+    /// This is the strongest defense against a regression in
+    /// `quantize_q6_k`'s wire-format layout — vindex calls this for
+    /// every Q6_K weight written, so any layout drift would silently
+    /// corrupt every vindex Q6_K matvec downstream.
+    #[test]
+    fn q6_k_quantize_dequantize_roundtrip_within_quant_eps() {
+        use larql_models::quant::ggml::dequantize_q6_k;
+        let n_blocks = 3usize;
+        let n = n_blocks * 256;
+        // Smooth, balanced input — no extreme outliers that would
+        // dominate the absmax allocation.
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 0.6).collect();
+        let q6 = quantize_q6_k(&x);
+        let x_rt = dequantize_q6_k(&q6, n).expect("dequant q6_k");
+        assert_eq!(x_rt.len(), n);
+
+        // Per-element relative tolerance: 5 % (well under Q6_K's
+        // theoretical 3.2 % per-sub-block bound + smooth-input slack).
+        // Absolute floor handles near-zero positions.
+        for i in 0..n {
+            let abs = (x_rt[i] - x[i]).abs();
+            let rel = abs / x[i].abs().max(1e-3);
+            assert!(
+                rel < 5e-2 || abs < 5e-3,
+                "x[{i}]={} round-tripped to {} (abs={abs}, rel={rel})",
+                x[i],
+                x_rt[i],
+            );
+        }
+
+        // Macro-level fidelity: cosine similarity ≥ 0.9999 confirms the
+        // round-tripped vector preserves direction (the property that
+        // matters for downstream dot products).
+        let dot: f32 = x.iter().zip(&x_rt).map(|(a, b)| a * b).sum();
+        let na = (x.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        let nb = (x_rt.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        let cos = dot / (na * nb);
+        assert!(cos > 0.9999, "Q6_K round-trip cosine {cos} should be > 0.9999");
+    }
+
     // ── q4k_to_q4kf / quantize_q4_kf tests ──
 
     #[test]
