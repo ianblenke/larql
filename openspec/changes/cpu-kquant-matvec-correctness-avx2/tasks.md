@@ -14,15 +14,12 @@ All implementation already shipped via PRs #102, #103, #104, #105, #106, #107, #
 - [x] Add `quantize_q6_k` round-trip oracle test (#107)
 - [x] Add head-to-head AVX2 vs scalar Q6_K bench (#108)
 - [x] Route `CpuBackend::q4k_matvec` / `q6k_matvec` (trait dispatch) through AVX2 Q8K kernel (#110)
+- [x] x86_64 fallback for `q4k_q8k_gate_up_into` dispatches to AVX2 `q4k_q8k_matvec_into` (#112)
+- [x] Bench q4k gate+up fused vs split AVX2 (#113)
+- [x] Q4_KF streaming dequant+dot — eliminates 2.7 GB alloc (#114)
+- [x] Q4_KF AVX2 — `q4kf_q8k_matvec_avx2` parallel to Q4_K AVX2 (#115)
 
 ## Open follow-ups
 
 - [ ] Re-vectorise aarch64 NEON `q6k_q8k_matvec_neon` against canonical layout — task #123
 - [ ] Audit Metal `q6k_matvec` shader layout vs vindex Q6_K — task #124
-- [ ] `CpuBackend::q4kf_matvec` perf overhaul — currently 1.75 s at the
-  lm_head_262144 shape due to full f32 dequant + scalar dot. Not on
-  current vindex production path (Q4_KF not in `LayerWeightFormat`),
-  but `cuda::decode.rs:410` routes through it, and `q4k_to_q4kf`
-  exists as a converter. If anything ever calls it at lm-head scale
-  it hits the 1.75 s wall. Either gate the path off until needed or
-  rebuild via AVX2.

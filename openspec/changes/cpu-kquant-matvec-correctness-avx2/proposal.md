@@ -46,6 +46,10 @@ PR sequence below.
 | [#107](https://github.com/ianblenke/larql/pull/107) | test | `quantize_q6_k` round-trip via canonical `dequantize_q6_k` (defends the vindex extraction input). |
 | [#108](https://github.com/ianblenke/larql/pull/108) | bench | Head-to-head AVX2 Q8K-input vs scalar f32-input Q6_K matvec, three reference shapes. |
 | [#110](https://github.com/ianblenke/larql/pull/110) | perf | `CpuBackend::q4k_matvec` / `q6k_matvec` (trait dispatch) routed through the AVX2 Q8K kernel — lm-head KNN, speculative draft head, attention V CPU fallback now hit the AVX2 fast path. |
+| [#112](https://github.com/ianblenke/larql/pull/112) | perf | `q4k_q8k_gate_up_into` x86_64 fallback dispatches to `q4k_q8k_matvec_into` (AVX2) instead of the scalar reference — walk-ffn-q8k FFN gate+up step ~3.8× faster at prefill_10240. |
+| [#113](https://github.com/ianblenke/larql/pull/113) | bench | Head-to-head Q4_K gate+up: fused vs two-matvec, validates #112 empirically. |
+| [#114](https://github.com/ianblenke/larql/pull/114) | perf | Q4_KF trait — streaming dequant+dot, eliminates 2.7 GB allocation, 1.75 s → 503 ms at lm_head shape. |
+| [#115](https://github.com/ianblenke/larql/pull/115) | perf | Q4_KF AVX2 (`q4kf_q8k_matvec_avx2`) — completes the K-quant AVX2 family. Q4_KF lm_head 503 ms → 74.6 ms (~6.7×); cumulative 1.75 s → 74.6 ms (~23×). |
 
 ## Bench results (RTX 4090 host, x86_64 + AVX2)
 
@@ -89,31 +93,38 @@ vindexes (e.g. all Qwen 3.6 weight files extracted via the default
 KNN scoring under VRAM pressure, and attention V CPU fallback all
 inherit this win automatically because they reach the trait.
 
-### Q4_KF — catastrophically slow, flagged as follow-up
+### Q4_KF closure — #114 + #115
 
-Same bench run also surfaced the `quant_matvec_q4_kf` numbers:
+Same bench run surfaced Q4_KF at 1.75 s at the lm_head shape (full f32
+dequant + scalar dot, no AVX2). Closed in two PRs:
 
-| Shape           | Q4_KF trait | Q4_K trait | Ratio |
-|-----------------|------------:|-----------:|------:|
-| decode_2560     |   **6.58 ms** |   360 µs   | ~18× |
-| prefill_10240   |  **73.1 ms**  |  1.43 ms   | ~51× |
-| lm_head_262144  |  **1.75 s**   | 37.6 ms    | **~46×** |
+| Phase           | decode_2560 | prefill_10240 | lm_head_262144 |
+|-----------------|------------:|--------------:|---------------:|
+| Pre-#114 baseline |   6.58 ms |  73.1 ms      | **1.75 s**     |
+| Post-#114 streaming dequant |  4.9 ms |  19.6 ms |  503 ms      |
+| Post-#115 AVX2  |   **720 µs** |  **2.90 ms** |  **74.6 ms**   |
+| Cumulative speedup | ~9× | ~25× | **~23×** |
 
-`CpuBackend::q4kf_matvec` dequantises the entire Q4_KF matrix to
-f32 (`num_rows * hidden` allocation — ≈ 2.7 GB at the lm_head shape)
-then runs a manual scalar dot. The implementation is a no-AVX2,
-maximum-allocation fallback.
+Q4_KF throughput now ~9 Gelem/s (vs Q4_K AVX2's ~18 Gelem/s) — Q4_KF
+uses f32 scale arithmetic per sub-block rather than Q4_K's deferred i32
+sum1/sum2. Closing the remaining gap would require an inverted
+Q4_KF→Q4_K layout conversion or a hybrid kernel; not pursued because
+Q4_KF is not on the vindex production path (see `LayerWeightFormat`
+enum in `larql-vindex/src/format/weights/write_layers.rs:28-37`).
 
-Per the production audit, Q4_KF is **not** in vindex storage — see
-`LayerWeightFormat` enum in `larql-vindex/src/format/weights/
-write_layers.rs:28-37` (Q4_K, Q6_K, Q8_0, F32, F16, BF16, Q4_0, FP4;
-no Q4_KF). So the catastrophic numbers do not surface in current
-production decode. But callers exist (`larql_compute/src/cuda/decode.rs:
-410` routes `QuantFormat::Q4_KF` through this trait method) and any
-future code that generates Q4_KF via `q4k_to_q4kf` would hit the
-1.75-second wall.
+## AVX2 K-quant family — complete
 
-Filed as follow-up task.
+After PR #115, every K-quant CPU matvec entry point on x86_64 has an
+AVX2 fast path through a Q8_K-input kernel:
+
+| Format | Direct entry | Trait entry | Throughput at lm_head_262144 |
+|--------|---|---|---:|
+| Q4_K   | `q4k_q8k_matvec_into` (#110-era) | `CpuBackend::q4k_matvec` (#110) | **17.9 Gelem/s** |
+| Q4_KF  | `q4kf_q8k_matvec_into` (#115)   | `CpuBackend::q4kf_matvec` (#115) | 9.0 Gelem/s |
+| Q6_K   | `q6k_q8k_matvec_into` (#104)    | `CpuBackend::q6k_matvec` (#110) | 15.8 Gelem/s |
+
+Fused gate+up (`q4k_q8k_gate_up_into`, walk-ffn-q8k hot path) also
+reaches AVX2 on x86_64 after #112.
 
 ## Pre-existing bugs found, fixed, and now regression-protected
 
