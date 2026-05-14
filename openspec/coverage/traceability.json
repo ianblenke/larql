@@ -33552,25 +33552,25 @@
     {
       "fqn": "larql_inference::vindex::q4k_forward::generation::is_end_of_turn_recognises_known_terminators",
       "file": "crates/larql-inference/src/vindex/q4k_forward/generation.rs",
-      "line": 270,
+      "line": 306,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::vindex::q4k_forward::generation::is_end_of_turn_rejects_arbitrary_tokens",
       "file": "crates/larql-inference/src/vindex/q4k_forward/generation.rs",
-      "line": 285,
+      "line": 321,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::vindex::q4k_forward::generation::tests::is_end_of_turn_recognises_known_terminators",
       "file": "crates/larql-inference/src/vindex/q4k_forward/generation.rs",
-      "line": 270,
+      "line": 306,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::vindex::q4k_forward::generation::tests::is_end_of_turn_rejects_arbitrary_tokens",
       "file": "crates/larql-inference/src/vindex/q4k_forward/generation.rs",
-      "line": 285,
+      "line": 321,
       "crate": "larql_inference"
     },
     {
