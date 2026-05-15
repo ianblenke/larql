@@ -883,6 +883,26 @@ pub(crate) fn load_gguf_filtered_with_validation(
     // returned by `attn_q_key` / `attn_k_key` / `attn_v_key`.
     split_fused_qkv(&mut normalized_tensors, &mut vectors, &*arch);
 
+    // Gemma 3/4 GGUFs ship 4 layernorms per layer under names that don't
+    // line up with the standard `attn_norm` / `ffn_norm` mapping in
+    // [`GGUF_TO_HF_KEY_REPLACEMENTS`] (which is correct for Llama where
+    // `ffn_norm` is the single between-block norm). For Gemma the GGUF
+    // names are `attn_norm` / `post_attention_norm` / `ffn_norm` /
+    // `post_ffw_norm`, and the layout matches HF's `input_layernorm` /
+    // `post_attention_layernorm` / `pre_feedforward_layernorm` /
+    // `post_feedforward_layernorm`. The naive `ffn_norm ->
+    // post_attention_layernorm` global mapping moves the pre-FFN norm
+    // into the post-attention slot and silently drops the other two
+    // norms — which produced gibberish on Gemma 3 GGUFs (#136 follow-up).
+    //
+    // Additionally, HF stores Gemma RMSNorm weights as `w_eff - 1.0` so
+    // the runtime's `(stored + 1.0)` recovers `w_eff`. GGUF stores
+    // `w_eff` directly, so we subtract 1.0 here to match the HF /
+    // safetensors convention that downstream `apply_norm` expects.
+    if matches!(arch.family(), "gemma3" | "gemma4") {
+        remap_gemma_norms(&mut vectors, &*arch);
+    }
+
     let embed_key = arch.embed_key();
     let embed_raw = normalized_tensors
         .get(embed_key)
@@ -1127,6 +1147,98 @@ fn orient_attention_tensors(
 /// - `q_dim .. q_dim + kv_dim`          → `attn_k_key`
 /// - `q_dim + kv_dim .. q_dim + 2*kv_dim` → `attn_v_key`
 ///
+/// Rename Gemma 3 / Gemma 4 GGUF norm vectors to the HF-canonical layout
+/// `apply_norm` expects, and convert their values from GGUF's `w_eff`
+/// storage to HF's `w_eff - 1.0` so the runtime offset-1 add recovers the
+/// effective scale.
+///
+/// GGUF Gemma names → HF canonical (post `normalize_gguf_key`):
+/// - `attn_norm` → `input_layernorm` (already correct)
+/// - `ffn_norm` → `post_attention_layernorm` via the global table, but
+///   for Gemma this slot is semantically `pre_feedforward_layernorm`.
+///   Move it.
+/// - `post_attention_norm` → unmapped, stays as
+///   `layers.N.post_attention_norm.weight`. Rename to
+///   `post_attention_layernorm.weight`.
+/// - `post_ffw_norm` → unmapped. Rename to
+///   `post_feedforward_layernorm.weight`.
+///
+/// Order matters: free the `post_attention_layernorm` slot before reusing
+/// it for `post_attention_norm`.
+///
+/// Also: HF stores Gemma RMSNorm `weight` as `w - 1.0` so the forward
+/// pass's `(stored + 1.0) * x_norm` recovers the effective scale. GGUF
+/// stores `w_eff` directly. Subtract 1.0 here so the on-disk values match
+/// HF convention, otherwise the effective norm scale doubles the +1
+/// offset and the residual stream blows up (the second part of the long-
+/// standing Gemma 3 CPU gibberish — discovered by side-by-side per-layer
+/// diff against `llama-eval-callback`).
+fn remap_gemma_norms(
+    vectors: &mut HashMap<String, Vec<f32>>,
+    arch: &dyn crate::config::ModelArchitecture,
+) {
+    let n = arch.config().num_layers;
+    for layer in 0..n {
+        let prefix = format!("layers.{layer}.");
+        // Step 1: ffn_norm (mismapped into post_attention_layernorm) → pre_feedforward_layernorm.
+        let pa_key = format!("{prefix}post_attention_layernorm.weight");
+        let pre_ffn_key = format!("{prefix}pre_feedforward_layernorm.weight");
+        if let Some(v) = vectors.remove(&pa_key) {
+            vectors.insert(pre_ffn_key, v);
+        }
+        // Step 2: post_attention_norm → post_attention_layernorm.
+        let pan_key = format!("{prefix}post_attention_norm.weight");
+        if let Some(v) = vectors.remove(&pan_key) {
+            vectors.insert(pa_key, v);
+        }
+        // Step 3: post_ffw_norm → post_feedforward_layernorm.
+        let pf_src = format!("{prefix}post_ffw_norm.weight");
+        let pf_dst = format!("{prefix}post_feedforward_layernorm.weight");
+        if let Some(v) = vectors.remove(&pf_src) {
+            vectors.insert(pf_dst, v);
+        }
+        // Step 4: attn_q_norm → self_attn.q_norm and attn_k_norm →
+        // self_attn.k_norm. The global key map only renames
+        // `attn_q.` / `attn_k.` (the projection weights); the per-head
+        // QK norms get no rename and land here under their GGUF names.
+        let qn_src = format!("{prefix}attn_q_norm.weight");
+        let qn_dst = format!("{prefix}self_attn.q_norm.weight");
+        if let Some(v) = vectors.remove(&qn_src) {
+            vectors.insert(qn_dst, v);
+        }
+        let kn_src = format!("{prefix}attn_k_norm.weight");
+        let kn_dst = format!("{prefix}self_attn.k_norm.weight");
+        if let Some(v) = vectors.remove(&kn_src) {
+            vectors.insert(kn_dst, v);
+        }
+    }
+    // Subtract 1.0 from all Gemma RMSNorm scale vectors so downstream
+    // `apply_norm` (which adds the architecture's `norm_weight_offset =
+    // 1.0`) recovers the effective scale. Only the per-layer + final
+    // RMSNorm vectors get this treatment; QK-norm vectors live under the
+    // QK-norm offset (also 1.0) and need the same fix.
+    let norm_keys: Vec<String> = (0..n)
+        .flat_map(|layer| {
+            [
+                format!("layers.{layer}.input_layernorm.weight"),
+                format!("layers.{layer}.post_attention_layernorm.weight"),
+                format!("layers.{layer}.pre_feedforward_layernorm.weight"),
+                format!("layers.{layer}.post_feedforward_layernorm.weight"),
+                format!("layers.{layer}.self_attn.q_norm.weight"),
+                format!("layers.{layer}.self_attn.k_norm.weight"),
+            ]
+        })
+        .chain(std::iter::once("norm.weight".to_string()))
+        .collect();
+    for key in &norm_keys {
+        if let Some(v) = vectors.get_mut(key) {
+            for x in v.iter_mut() {
+                *x -= 1.0;
+            }
+        }
+    }
+}
+
 /// The fused bias (1D, length `q_dim + 2 * kv_dim`) splits identically into
 /// the per-projection bias keys returned by the trait.
 ///
