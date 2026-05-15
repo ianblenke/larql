@@ -216,11 +216,28 @@ impl<'a> BuildContext<'a> {
     }
 
     /// Stage 2 — write `embeddings.bin`.
+    ///
+    /// Some GGUFs (Gemma 3 4B unsloth Q4_K_M, for one) store `token_embd`
+    /// with more rows than the model's logical vocab — e.g. shape
+    /// `(262208, 2560)` while `gemma3.vocab_size = 262144`. The extra 64
+    /// rows are padding for SIMD-friendly alignment in llama.cpp. Writing
+    /// the full embed buffer leaves the on-disk vocab dimension out of
+    /// sync with `index.json`'s `vocab_size`, which makes
+    /// `load_vindex_embeddings`'s `from_shape_vec((vocab_size, hidden), …)`
+    /// trip a `ShapeError`. Truncate to the logical vocab on write so
+    /// reader and config agree.
     fn write_embeddings(&mut self) -> Result<(), VindexError> {
         self.callbacks.on_stage(STAGE_EMBEDDINGS);
         let embed_path = self.output_dir.join(EMBEDDINGS_BIN);
-        let embed_data = self.weights.embed.as_slice().unwrap();
-        let embed_bytes = crate::config::dtype::encode_floats(embed_data, self.dtype);
+        let stored_vocab = self.weights.embed.shape()[0];
+        let logical_vocab = self.weights.vocab_size;
+        let embed_view = if stored_vocab > logical_vocab {
+            self.weights.embed.slice(ndarray::s![..logical_vocab, ..])
+        } else {
+            self.weights.embed.slice(ndarray::s![.., ..])
+        };
+        let embed_data: Vec<f32> = embed_view.iter().copied().collect();
+        let embed_bytes = crate::config::dtype::encode_floats(&embed_data, self.dtype);
         std::fs::write(&embed_path, &embed_bytes)?;
         self.callbacks.on_stage_done(STAGE_EMBEDDINGS, 0.0);
         Ok(())

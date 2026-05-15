@@ -22,7 +22,20 @@ pub(super) fn write_lm_head_q4k(
     norm_entries: &mut Vec<WeightEntry>,
 ) -> Result<(), VindexError> {
     if let Some((data, rows, cols)) = source.lm_head() {
-        let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
+        // Truncate to logical vocab so the on-disk row count matches
+        // `config.vocab_size` (and therefore matches what the loader
+        // expects). Some GGUFs ship `token_embd` / lm_head with extra
+        // SIMD-alignment rows beyond the logical vocab — see
+        // `build::write_embeddings` for the matching truncation on the
+        // embed side.
+        let logical_vocab = source.arch().config().vocab_size.unwrap_or(rows);
+        let (truncated_data, truncated_rows) = if rows > logical_vocab {
+            let truncated: Vec<f32> = data[..logical_vocab * cols].to_vec();
+            (truncated, logical_vocab)
+        } else {
+            (data, rows)
+        };
+        let (padded, padded_cols) = pad_rows_to_block(&truncated_data, truncated_rows, cols);
         let q_bytes = quantize_q4_k(&padded);
         std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
         // Record in norms manifest so a single weight_manifest.json references
@@ -33,7 +46,7 @@ pub(super) fn write_lm_head_q4k(
         norm_entries.push(WeightEntry {
             key: "lm_head.weight".into(),
             kind: kind::TENSOR_Q4K.into(),
-            shape: vec![rows, padded_cols],
+            shape: vec![truncated_rows, padded_cols],
             offset: 0,
             length: q_bytes.len() as u64,
             file: LM_HEAD_Q4_BIN.into(),
