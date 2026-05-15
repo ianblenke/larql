@@ -1,213 +1,191 @@
 # larql resume prompt — feed this to a fresh session
 
-## Where we are (state at end of session 2026-05-12)
+## Where we are (state at end of session 2026-05-15)
 
-Three lines of work have landed end-to-end. All merged to `main`.
+Two arcs landed end-to-end this session:
 
-### 1. Qwen 3.6 (Qwen3-Next) forward-pass correctness — DONE
+### Arc A — CPU Q4K KV cache (PRs #132 / #134 / #135)
 
-Per-token greedy decode matches `llama-eval-callback` exactly on
-Qwen3.6-27B Q4_K_S for the first 5 generated tokens, GT rank 0 at
-every step. Decoded sequence: `<think>\n\n</think>\n\nHello` (logits
-[28.18, 24.78, 25.47, 30.39, 21.66]).
+Three-step arc that wired a persistent `KvCache` through the CPU Q4K
+forward path. All merged to `main`.
 
-Key bug fixes (newest first):
-- **C.5j** (PR #83): Q6_K dequant layout was sequential; llama.cpp uses
-  interleaved `y[l]/y[l+32]/y[l+64]/y[l+96]` with different scales.
-  Hit `output.weight` (lm_head). Also flipped DeltaNet recurrence from
-  paper-order to **decay-first** matching
-  `ggml_compute_forward_gated_delta_net_one_chunk`.
-- **C.5i** (PR #82): CYCLE GQA (`kh = h % h_k`) is correct. Token-rank
-  hid the bug; the **elementwise binary tensor parity oracle**
-  exposed it (pearson 0.9999 at layer 0 with CYCLE vs 0.77 with BLOCK).
-- Earlier C-phase fixes:
-  `openspec/changes/inference-qwen35-deltanet/C4-investigation-summary.md`.
+- **#132** plumbing — add `predict_q4k_hidden_with_cache`,
+  `run_layer_with_ffn_with_cache`, `run_attention_block_with_kv_out_with_cache`
+  as additive variants. Cache accepted but not consumed.
+- **#134** consume — three operating modes (no cache / prefill+snapshot /
+  decode-step). Headline correctness invariant proven by
+  `cached_prefill_then_decode_matches_uncached_full_prefill` (1e-4 abs
+  match against uncached `[N+1, hidden]` prefill).
+- **#135** driver — `generate_via_cpu_q4k` and
+  `generate_q4k_cpu_constrained_streaming_sampled_with_eos` now allocate
+  a `KvCache` once per request and feed only the newly-sampled token on
+  each decode step. Falls back to full-replay on hybrid MoE / cross-layer
+  K/V share archs.
 
-### 2. Lazy-quantised matmul — Phases 1 → 2d (RAM 105 → 20 GiB)
+### Arc B — Gemma 3 CPU inference correctness (PRs #136 / #137)
 
-Stop dequantising 27 B params to f32 at load time. PRs #86 through
-#91 progressively lazy-load every big tensor. Opt-in via
-`LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1`.
+Diagnosed and fixed six distinct bugs that combined to make Gemma 3 CPU
+inference produce multilingual gibberish on every GGUF-extracted vindex.
+Built llama.cpp's `eval-callback` locally and did a per-layer/per-stage
+side-by-side diff to isolate each issue.
 
-### 3. GPU dispatch — Phase E.1/E.2 (PR #92, just landed)
+**#136** consolidates the first five fixes:
 
-Wires `larql_compute::cuda::CudaBackend` (existing `q4k_direct` /
-`q6k_direct` kernels) into `qwen35_forward_step`'s lm_head and 192
-FFN matvecs/token. Opt-in via `--features cuda` +
-`LARQL_QWEN35_GPU=1`. **The DeltaNet recurrence still runs on CPU**
-and that's now the dominant bottleneck.
+1. **Q4_K dequant row-stride** — writer pads each row to next
+   256-element block; loader was reading `rows*cols` assuming unpadded
+   layout, drifting 72 bytes/row from row 1 onwards. Affected every
+   Q4_K weight whose cols aren't a multiple of 256 (Gemma 3 hidden=1152
+   for 1B, 2560 for 4B is aligned but K/V are 256-wide).
+2. **Gemma 3 GGUF norm key remap** — global `ffn_norm →
+   post_attention_layernorm` mapping is right for Llama but WRONG for
+   Gemma 3, which has 4 layer norms. Added arch-aware `remap_gemma_norms`
+   that places `post_attention_norm` / `ffn_norm` / `post_ffw_norm` /
+   `attn_q_norm` / `attn_k_norm` into the canonical HF slots.
+3. **GGUF norm offset** — HF stores `w - 1.0`; GGUF stores `w` directly.
+   Subtract 1.0 from all Gemma layer + QK + final norms on load so the
+   runtime's `+1.0` recovers `w_eff`.
+4. **Q5_0 dequant layout** — larql interleaved low/high nibbles
+   (`[lo0, hi0, lo1, hi1, …]`); llama.cpp groups them in sequential
+   halves (`[lo0..lo15, hi0..hi15]`). Same bug pattern as the C.5j Q6_K
+   layout fix from PR #83 but for Q5_0. Affects every `attn_q` / `attn_k`
+   / `ffn_gate` / `ffn_up` on Q4_K_M unsloth GGUFs.
+5. **lm_head row-stride padding** — same writer pads lm_head; loader was
+   missing the matching read-side handling.
 
-## Current bench (Qwen3.6-27B Q4_K_S, RTX 4090, prefill 16 / decode 4)
+**#137** adds the sixth:
 
-| Config | Decode (t/s) | RSS / VRAM |
-|---|---:|---:|
-| llama.cpp CUDA GPU | **50.60** | 14.76 GiB VRAM |
-| llama.cpp CPU (-ngl 0) | 2.60 | ~16 GiB |
-| larql baseline (full dequant + BLAS) | 0.49 | 105.25 GiB |
-| larql Phase 2 (lazy FFN, scalar) | 0.06 | 46.65 GiB |
-| larql Phase 3 (+AVX2 +rayon) | 0.20 | 46.65 GiB |
-| larql Phase 2b (+DN projs lazy) | 0.20 | 29.62 GiB |
-| larql Phase 2c (+full-attn lazy) | 0.23 | 24.07 GiB |
-| larql Phase 2d (+embed lazy) | 0.23 | 19.99 GiB |
-| **larql Phase E.1/E.2 (+ GPU FFN & lm_head)** | **0.28** | 21 GiB host |
+6. **Vocab padding truncation** — Gemma 3 4B unsloth GGUF ships
+   `token_embd` shape (262208, 2560) but `gemma3.vocab_size = 262144`
+   (the extra 64 rows are SIMD alignment). The writer passed through
+   the full GGUF shape while `index.json` recorded the logical vocab,
+   so embed.bin and lm_head_q4.bin were sized for vocab=262208 while
+   the config said 262144 → loader `ShapeError`. Truncate to logical
+   vocab on write.
 
-**RAM** : 105 → 20 GiB (−81 %), within ~4 GiB of llama.cpp CPU's
-target.
+## Current bench
 
-**Speed** : still 180× off llama.cpp GPU. The current Phase E.1/E.2
-gain is modest because **DeltaNet recurrence remains on CPU** —
-48 layers × per-head state update per token is now the steady-state
-bottleneck (~3.6 s/token at decode).
+After Arc B fixes, on the same 48-core host (no CUDA available):
 
-Reproduce:
+| Model | Path | Output | Decode tok/s |
+|---|---|---|---:|
+| Gemma 3 1B Q4_K_M | larql CPU `/v1/chat/completions` | coherent ("Cats are fascinating creatures…") | **0.257** |
+| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions` | coherent ("Cats, with their independent spirits…") | **0.117** |
+| Gemma 3 4B Q4_K_M | llama.cpp CPU (`-ngl 0`, full threads) | coherent | **14.1** |
+| Qwen 3.6 27B Q4_K_S | larql `qwen35_forward` (parity oracle) | matches llama-eval-callback gt_rank=0 at every step | n/a |
 
-```bash
-# All-on-GPU lazy bench (current state, ~0.28 t/s)
-LARQL_QWEN35_GGUF=$PWD/output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf \
-LARQL_QWEN35_BENCH_PREFILL=16 LARQL_QWEN35_BENCH_DECODE=4 \
-LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 LARQL_QWEN35_GPU=1 \
-cargo test -p larql-inference --release --features cuda --lib \
-  real_gguf_qwen35_bench -- --nocapture
+**Remaining speed gap on Gemma 3 4B is ~120×.** This is **not a correctness
+issue any more** — both implementations now produce sensible English. The
+gap is the FFN-dequant-per-step bottleneck on larql's CPU path: `insert_q4k_layer_tensors`
+re-dequantises every layer's gate/up/down Q4_K weights to f32 on every
+decode step. Per-step FFN dequant time dominates; the KV cache savings on
+attention compute are a small fraction of total wall clock.
 
-# Parity test (must show GT rank 0 every step)
-LARQL_QWEN35_GGUF=... LARQL_QWEN35_LAZY_FFN=1 LARQL_QWEN35_LAZY_LM_HEAD=1 \
-LARQL_QWEN35_GPU=1 \
-cargo test -p larql-inference --release --features cuda --lib \
-  real_gguf_qwen35_token_diff_vs_llama_cpp -- --nocapture
+The KV cache infra is correct (proven by integration tests against the
+real Gemma 3 4B vindex — `tests/test_kv_cache_real_gemma3.rs`). It just
+isn't where the bottleneck is on this path.
 
-# llama.cpp baseline (for comparison)
-~/3rd-party/llama.cpp/build/bin/llama-bench \
-  -m output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf -p 128 -n 64 -r 2
-```
+## Open levers — pick one
 
-## Open levers — pick one to continue
+### 1. FFN dequant caching across decode steps (highest impact)
 
-User's previous "next?" answer pointed at GPU work. Phase E.1/E.2
-landed but the recurrence bottleneck still caps us at 0.28 t/s.
+The dominant CPU cost on `generate_via_cpu_q4k`. Per token, every layer
+fully dequants gate/up/down Q4_K weights to f32 just to do one matmul.
+At Gemma 3 4B's intermediate=10240 × 34 layers, that's ~3 GB of f32
+materialisation per token.
 
-1. **Phase E.4 — CUDA DeltaNet recurrence + Conv1D kernels.** The
-   real unlock. Per-head state matrix is 128×128 f32 (64 KB), fits
-   in shared memory on Ampere/Ada SM-89. Mirrors llama.cpp's
-   `ggml_compute_forward_gated_delta_net_one_chunk` which we already
-   diffed bit-exact in Phase C.5j (decay-first algorithm). One CUDA
-   block per (batch, head). Conv1D-with-state is straightforward
-   depthwise 4-tap × 10240 channels. Estimated ~600 LoC + cudarc
-   PTX plumbing. Expected: ~10 t/s decode.
-2. **Phase E.3 — Plumb DeltaNet projections + full-attn q/k/v/o
-   through the GPU backend.** Pure plumbing now that E.1/E.2 is in
-   — same `matvec_with_backend` wrapper just at more dispatch sites.
-   Marginal win without E.4 (recurrence still serial CPU).
-3. **Phase E.6 — Device-resident weights + KV cache + CUDA Graphs.**
-   Stops the per-matvec host↔device round-tripping (~1.5 ms/token
-   overhead). Estimated ~30 t/s after this lands (≈ 60 % of
-   llama.cpp GPU). The remaining gap is fused-attention / SwiGLU
-   fusion / Flash-Attention.
-4. **Pivot to paged KV + SSD cache (oMLX-style).** Different axis —
-   multi-turn reuse for OpenAI API serving. Independent of perf.
-   Scope notes in
-   `~/.claude/projects/-home-ianblenke-github-com-ianblenke-larql/memory/reference_omlx_cache.md`.
-5. **Qwen3.6-35B-A3B MoE validation.** Memory wins compound; likely
-   uncovers MoE-specific architecture-handler bugs.
+Two design points:
+- **Layer-resident dequant cache** — keep N most-recent layers' FFN
+  weights as f32 in heap. Trades memory (≈6 GB for full 4B) for the
+  per-step dequant cost. Expected: ~10× decode speedup (the missing
+  speedup the KV cache arc didn't deliver).
+- **Direct Q4_K × Q8_K matmul** — skip f32 materialisation entirely;
+  matmul lands at the FFN output. The `cpu-kquant-matvec-correctness-avx2`
+  arc (PRs #102–#119) already did this for individual tensors at the
+  kernel level; the missing piece is plumbing the Q4_K weights *through*
+  the FFN's gate / up / down without dequant in between. ~17 Gelem/s
+  measured at the kernel level on this host.
 
-## Pointers (where the work lives)
+The Qwen lazy-quant arc (#86–#91) did the moral equivalent for Qwen 3.6.
+Gemma 3 needs the same treatment.
 
-- **GPU openspec change**: `openspec/changes/qwen35-gpu-forward/`
-  (proposal, tasks E.0–E.6, spec delta). E.0/E.1/E.2 complete;
-  E.3–E.6 queued.
-- **Lazy-quant openspec change**:
-  `openspec/changes/qwen35-lazy-quant-matmul/`. Phases 1 / 2 / 2b /
-  2c / 2d shipped.
-- **Bench numbers + protocol**:
-  `openspec/changes/inference-qwen35-deltanet/bench-baseline.md`.
-  Full evolution baseline → Phase E.1/E.2.
-- **Investigation summary**:
-  `openspec/changes/inference-qwen35-deltanet/C4-investigation-summary.md`.
-- **Core impl files**:
-  - `crates/larql-models/src/quant/lazy.rs` — `QuantTensor` + matvec
-    dispatch (rayon row-parallel), `row_to_f32` for embed lookup.
-  - `crates/larql-models/src/quant/ggml/{q4_k,q6_k}.rs` — scalar +
-    NEON + AVX2 row dots. NEON Q6_K forced to scalar after C.5j
-    (TODO to port interleaved layout).
-  - `crates/larql-models/src/loading/gguf.rs` — `load_gguf`,
-    `load_gguf_lazy_lm_head`, `load_gguf_lazy_tensors`. The lazy
-    loader handles the embed special case (own struct field).
-  - `crates/larql-inference/src/attention/quant_dispatch.rs` — GPU
-    bridge between `QuantTensor` and `QuantMatVec`.
-  - `crates/larql-inference/src/attention/{qwen35_forward, qwen35_load,
-    qwen35_block, deltanet_block, deltanet_recurrence}.rs` — Qwen 3.6
-    forward, layer bridge, DeltaNet kernel. The CPU recurrence to
-    port to CUDA in E.4 lives in `deltanet_recurrence.rs::delta_net_step`.
-- **Existing CUDA infrastructure**:
-  - `crates/larql-compute/src/cuda/q4k_mmvq.rs` (893 LoC), `q6k_mmvq.rs`
-    (440 LoC), `q4k_direct.rs` (218 LoC), `matmul.rs`, `attn.rs`,
-    `cache.rs`, `dequant.rs`, `backend.rs`. The `QuantMatVec` trait
-    is the dispatch surface (lives at
-    `crates/larql-compute/src/backend/quant_matvec.rs:40`).
-- **llama.cpp parity oracle** (local clone, NOT this repo):
-  `/home/ianblenke/3rd-party/llama.cpp/`. Modified `common/debug.cpp`
-  to add `LLAMA_DUMP_BIN_DIR` env var that writes full f32 tensors
-  to a directory. This established elementwise parity in C.5i and
-  is the right oracle for any GPU-vs-CPU debugging.
-- **GGUF cache**:
-  `output/gguf-cache/Qwen3.6-27B/Qwen3.6-27B-Q4_K_S.gguf` (14.76 GiB).
-  `output/gguf-cache/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
-  also downloaded for MoE follow-up.
+### 2. Qwen 3.6 hybrid SSM Q4_K writer (option 2 of prior resume)
 
-## Key conventions the next session must respect
+Unblock `larql convert gguf-to-vindex --quant q4k` on Qwen 3.6 35B-A3B
+(currently rejected because the Q4_K attn writer doesn't handle DeltaNet
+layers). Extends PR #125.
 
-- **Spec-first workflow.** Every code change references an OpenSpec
-  capability under `openspec/specs/<capability>/spec.md` or, for
-  in-flight work,
-  `openspec/changes/<id>/specs/<capability>/spec.md`.
-- **`make ci` before push.** Chains fmt, clippy, tests, traceability,
-  openspec validate. The traceability gate will fail if
-  `openspec/coverage/traceability.{md,json}` are stale — run `make
-  traceability` and commit.
-- **Workflow is feature-branch → PR → squash-merge to `main`.** Do
-  not push directly to main. GitHub repo: `ianblenke/larql`. The
-  `upstream` remote points at `chrishayuk/larql` and should NOT be
-  the PR base — `gh repo set-default ianblenke/larql` if PRs
-  auto-target the wrong base.
-- **Token rank is a misleading metric** for parity work. C.5h's
-  reversion of CYCLE GQA was driven by rank and was wrong. **Trust
-  the elementwise binary tensor parity oracle**
-  (`LLAMA_DUMP_BIN_DIR` on llama.cpp side,
-  `LARQL_QWEN35_DUMP_BIN_DIR` on ours).
-- **GPU work is more valuable than CPU work.** The user called this
-  out and was right. CPU AVX2 / rayon plateaus around 2-3 t/s at
-  best (matching llama.cpp CPU); the 4090 is sitting idle until
-  Phase E.4 / E.6 land. Default the planning to GPU.
+### 3. walk_path_audit resurrection (option 3 of prior resume)
 
-## How to ask the fresh session to pick up
+`crates/larql-inference/examples/walk_path_audit.rs` is gated behind
+`#[cfg(any())]` (PR #129). Split `MaskedGateIndex`'s `impl GateIndex`
+block into separate `impl GateLookup` / `impl PatchOverrides` /
+`impl FfnRowAccess` blocks. ~1-2 hour focused session.
 
-Generic resume:
+### 4. Smaller drive-bys
 
-> Read RESUME_PROMPT.md in this repo. Pick one of the open levers
-> and continue. The user's most recent direction was Phase E (GPU
-> forward); E.1/E.2 landed in PR #92 but the headline 0.28 t/s is
-> still 180× off llama.cpp GPU because the DeltaNet recurrence is
-> still CPU.
+- **Compute-crate clippy errors** — `larql-compute` has 4 pre-existing
+  clippy errors (`identity_op`, `needless_range_loop`) that block any
+  workspace-wide `cargo clippy --workspace --tests`. None caused by
+  today's work; would unblock CI's `make lint`.
+- **Q5_0 / Q8_0 round-trip tests** — the Q5_0 layout fix in #136 didn't
+  add a unit test against `gguf` python lib's reference. A focused unit
+  test would catch any regression. Same for Q8_0 (which is currently
+  fine).
+- **`larql-models` GGUF Gemma 4 norm remap** — the `remap_gemma_norms`
+  helper in #136 dispatches on `family() == "gemma3" | "gemma4"` but I
+  only validated against Gemma 3. Gemma 4 has additional features (PLE,
+  layer scalar, cross-layer KV share) that interact differently; might
+  need extra handling.
+- **Bounded-time `/v1/chat/completions` integration test** — `tasks.md`
+  open follow-up that would catch any future server hang of the form #123
+  fixed.
+- **Q4K bitwise passthrough** in convert — the GGUF Q4_K → f32 → vindex
+  Q4_K roundtrip is currently lossy. With the row-stride and layout fixes
+  consolidated, a direct byte-passthrough writer would skip the
+  requantisation noise and double extract speed.
 
-Targeted (recommended):
+## Critical environment notes
 
-> Read RESUME_PROMPT.md. Tackle **Phase E.4 — CUDA DeltaNet
-> recurrence + Conv1D kernels**. The CPU reference is
-> `crates/larql-inference/src/attention/deltanet_recurrence.rs::
-> delta_net_step` (decay-first, verified bit-exact in C.5j against
-> llama.cpp's `ggml_compute_forward_gated_delta_net_one_chunk`).
-> Per-head state matrix is 128×128 f32, fits in shared memory.
-> One CUDA block per (batch, head). Reuse the cudarc PTX plumbing
-> from `crates/larql-compute/src/cuda/q4k_mmvq.rs`. Bench delta
-> goes in `openspec/changes/inference-qwen35-deltanet/bench-baseline.md`.
-> Parity check: `real_gguf_qwen35_token_diff_vs_llama_cpp` under
-> `LARQL_QWEN35_GPU=1 LARQL_QWEN35_LAZY_FFN=1` must still emit
-> `[<think>, \n\n, </think>, \n\n, Hello]` with GT rank 0.
+- **No CUDA / Metal on this host** — only CPU available for benches.
+- **Linux x86_64**, glibc 2.31+ (chat-completion `pick_template`
+  deadlock fix from PR #123 stays applied).
+- **`make ci` blocker**: workspace-wide `cargo clippy --workspace --tests`
+  hits the pre-existing compute clippy errors (drive-by 4 above). Open
+  PRs land via admin merge with all per-crate CI green; ` workspace-wide
+  clippy is currently red on `main` independently of any feature work.
+- **llama.cpp is built** at `/tmp/llama.cpp/build/bin/llama-{cli,gguf,eval-callback}`.
+  Reusable for any future per-layer diff investigation.
+- **Diagnostic tests committed** that you'll want for any further Gemma
+  work:
+  - `tests/test_kv_cache_real_gemma3.rs` — cache infra correctness against real vindex.
+  - `tests/test_gemma3_layer_health.rs` — per-layer hidden-state stats.
+  - `tests/test_gemma3_wv_dump.rs` — W_V tensor inspection.
+  - `tests/test_gemma3_v_proj_source_compare.rs` — GGUF vs vindex diff (parameterised by `LARQL_TARGET_KEY`).
+  - `tests/test_q6k_roundtrip.rs` / `tests/test_v_proj_writer_roundtrip.rs` — quant fidelity checks.
 
-Or for the long arc:
+## Standing rules
 
-> Read RESUME_PROMPT.md. Work through `openspec/changes/qwen35-gpu-forward/tasks.md`
-> sequentially: E.3 (plumb attn projections through GPU backend)
-> first, then E.4 (CUDA recurrence kernel), E.5 (full softmax-attn
-> on GPU via existing cuda/attn.rs), then E.6 (device-resident
-> weights + CUDA Graphs). Each phase its own PR. Parity oracle
-> stays green every step.
+- **Don't self-merge PRs unattended.** User authorises each merge
+  individually via `merge and continue`. Standing auth is per-PR, not
+  session-wide. Admin-merge is acceptable when CI's only failures are
+  pre-existing main-branch issues unrelated to the PR.
+  See `~/.claude/projects/-home-ianblenke-github-com-ianblenke-larql/memory/feedback_unattended_merging.md`.
+- **OpenSpec workflow** — every code change references a capability under
+  `openspec/specs/<name>/spec.md`. Run `make traceability` after any
+  source file's test line numbers shift.
+- **Q4K vindex is the production fast-decode path.** Re-extracting a
+  vindex picks up writer fixes — old vindexes on disk may need to be
+  re-extracted after any writer-side fix lands.
+
+## Quick start prompt for a fresh session
+
+> Read RESUME_PROMPT.md. Pick up lever 1 (FFN dequant caching). The
+> goal is to close the ~120× decode-tok/s gap to llama.cpp CPU on
+> Gemma 3 4B without compromising correctness (we just spent a full
+> session getting Gemma 3 CPU to coherent output — don't regress that).
+> Start with a focused proposal under
+> `openspec/changes/cpu-ffn-dequant-cache/proposal.md` outlining the
+> layer-resident-dequant approach + the direct-Q4K-Q8K alternative,
+> with bench predictions for each. Then implement the simpler one first
+> (layer-resident dequant cache) and re-bench against the 4B baseline of
+> 0.117 tok/s.
