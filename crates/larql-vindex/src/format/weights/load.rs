@@ -688,20 +688,26 @@ pub fn load_model_weights_q4k_shard(
 
     // lm_head_q4.bin (Q4_K of the output projection) — dequant to f32. If
     // absent (tied embeddings), fall back to embed.clone() below.
+    //
+    // The writer pads each row to the next K-quant super-block boundary
+    // when `hidden_size` isn't a multiple of 256 (Gemma 3: 1152 -> 1280).
+    // Match that here so per-row byte offsets line up.
     let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
     if lm_q4_path.exists() {
         let bytes = std::fs::read(&lm_q4_path)?;
-        let num_floats = config.vocab_size * config.hidden_size;
-        let padded = num_floats.div_ceil(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
-            * larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
-        if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, padded) {
-            if floats.len() >= num_floats {
-                if let Ok(arr) = Array2::from_shape_vec(
-                    (config.vocab_size, config.hidden_size),
-                    floats[..num_floats].to_vec(),
-                ) {
-                    lm_head_loaded = Some(arr.into_shared());
-                }
+        let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        let padded_hidden = config.hidden_size.div_ceil(block) * block;
+        let n_padded = config.vocab_size * padded_hidden;
+        if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, n_padded) {
+            if floats.len() == n_padded {
+                let arr_padded = Array2::from_shape_vec((config.vocab_size, padded_hidden), floats)
+                    .expect("padded lm_head shape");
+                let arr = if padded_hidden == config.hidden_size {
+                    arr_padded
+                } else {
+                    arr_padded.slice(ndarray::s![.., ..config.hidden_size]).to_owned()
+                };
+                lm_head_loaded = Some(arr.into_shared());
             }
         }
     }
