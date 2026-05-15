@@ -765,6 +765,55 @@ mod tests {
     }
 
     #[test]
+    fn cached_prefill_then_decode_matches_uncached_full_prefill_gemma3() {
+        // Same invariant as the tinymodel test but on the Gemma 3 fixture,
+        // which exercises post-norms + QK-norm + per-layer rope_base
+        // (sliding-window vs global). If this fails while the tinymodel
+        // test passes, the cache path is mishandling an arch feature the
+        // tiny fixture doesn't have.
+        use super::super::decode::KvCache;
+        let weights = crate::test_utils::make_gemma3_test_weights();
+        let h_full = hidden(4, weights.hidden_size);
+        let h_prompt = h_full.slice(s![..3, ..]).to_owned();
+        let h_new = h_full.slice(s![3..4, ..]).to_owned();
+
+        for layer in 0..weights.num_layers {
+            let (h_uncached, _, _, _, _) =
+                run_attention_block_with_kv_out(&weights, &h_full, layer, false, None).unwrap();
+
+            let mut cache = KvCache::with_layers(weights.num_layers);
+            let _ = run_attention_block_with_kv_out_with_cache(
+                &weights,
+                &h_prompt,
+                layer,
+                false,
+                None,
+                Some(&mut cache),
+            )
+            .unwrap();
+            cache.next_position = 3;
+            let (h_dec, _, _, _, _) = run_attention_block_with_kv_out_with_cache(
+                &weights,
+                &h_new,
+                layer,
+                false,
+                None,
+                Some(&mut cache),
+            )
+            .unwrap();
+
+            let expected = h_uncached.row(3);
+            let actual = h_dec.row(0);
+            for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-3,
+                    "Gemma3 layer {layer} decode-step diverges at element {i}: cached={a} uncached={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cache_none_path_matches_kv_out_byte_for_byte() {
         // Plumbing-mode invariant: passing `kv_cache=None` to the
         // `_with_cache` variant must be byte-identical to the existing
