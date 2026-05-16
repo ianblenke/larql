@@ -186,7 +186,63 @@ small-scalars-per-layer.
 
 This is a **separate small PR** before Step 2b can complete.
 
-## Phase outline (refined, post smoke validation)
+## Scope correction (2026-05-16, post PR #157 investigation)
+
+**The 455 LoC remaining estimate was wrong.** Reading
+`crates/larql-inference/src/attention/qwen35_load.rs:62-374`
+revealed that the existing `load_qwen35_weights(weights, arch)`
+function is **data-source agnostic** — it takes a generic
+`&ModelWeights` reference and walks it via three helpers
+(`get_vec`, `get_tensor`, `weights.quant_tensors.get(key)`). Those
+helpers don't care whether `weights` was populated by
+`larql_models::load_gguf(...)` (GGUF mmap) or by
+`larql_vindex::load_model_weights_q4k_shard(...)` (vindex
+manifest).
+
+So the **real work for 2b** is not per-layer assembly logic
+(already exists, reusable) — it's just **populating
+`weights.quant_tensors` and `weights.tensors` from vindex bytes**
+before calling `load_qwen35_weights`. Three concrete bridges:
+
+1. **DeltaNet matmul bridge** (~50 LoC): for each linear layer L,
+   pull the 5 (data, fmt) tuples from
+   `idx.deltanet_q4k_layer_data(L)`, build a `QuantTensor` per
+   matmul-class tensor (`attn_qkv` / `attn_gate` / `ssm_out`)
+   inserted into `weights.quant_tensors`, and dequant the two
+   smaller matmuls (`ssm_alpha` / `ssm_beta`) into
+   `weights.tensors` (they have no `*_quant` slot in
+   `DeltaNetLayerWeights`).
+
+2. **Standard attn bridge** (~30 LoC): for each full-attn layer,
+   pull Q/K/V/O from `idx.attn_q4k_layer_data(L)` and populate
+   `weights.quant_tensors` by the arch's `attn_{q,k,v,o}_key(L)`.
+
+3. **MoE PerExpert bridge** (~80 LoC): parse each
+   `layers/layer_LL.weights` via
+   `parse_layer_weights_header`, then for each of 256 experts
+   construct the packed `Qwen35MoeFfnWeights::{gate,up,down}_exps`
+   QuantTensors. The expert-byte concatenation order needs to
+   match `quantize_dense_entry`'s layout — gate-rows then up-rows
+   per expert (NOT all-gates then all-ups). Plus the router from
+   `weights.vectors`.
+
+The `load_qwen35_weights_from_vindex` orchestrator in PR #157's
+stub becomes: call the three bridges, then invoke
+`load_qwen35_weights(&weights, &*arch)` and propagate its result.
+
+### Q4_K dequant primitive
+
+For the `ssm_alpha` / `ssm_beta` dense slots, use
+`larql_models::quant::ggml::dequantize(bytes, TYPE_Q4_K, n_elems)`
+(or the appropriate per-type wrapper). The vindex format tag
+string `"Q4_K"` maps to `TYPE_Q4_K = 12` via
+`crates/larql-vindex/src/quant/registry.rs::lookup`.
+
+Total: ~160 LoC across three bridges + orchestrator. One focused
+PR. The previous 2b.2/2b.3/2b.4/2b.5 split is collapsed by this
+finding.
+
+
 
 | Phase | Scope | LoC | Status |
 |---|---|---:|---|
