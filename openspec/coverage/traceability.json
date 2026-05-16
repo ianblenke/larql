@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 53,
-    "requirements": 510,
-    "scenarios": 1524,
-    "scenarios_backed": 1342,
-    "scenarios_unbacked": 182,
-    "test_refs": 3455,
+    "requirements": 512,
+    "scenarios": 1526,
+    "scenarios_backed": 1343,
+    "scenarios_unbacked": 183,
+    "test_refs": 3457,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -1512,6 +1512,34 @@
               "unbacked": false,
               "spec_file": "openspec/changes/backfill-specs/specs/compute-backend-traits/spec.md",
               "line": 159
+            }
+          ]
+        },
+        {
+          "name": "f16-to-f32 subnormal decoding MUST be bit-exact vs the powi reference",
+          "scenarios": [
+            {
+              "name": "All 65,536 f16 inputs decode bit-exact vs the powi reference",
+              "tests_resolved": [
+                "larql_compute::cpu::ops::q4_common::tests::f16_to_f32_bit_exact_for_all_inputs"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/cpu-f16-to-f32-subnormal-fix/specs/compute-backend-traits/spec.md",
+              "line": 18
+            }
+          ]
+        },
+        {
+          "name": "K-quant matvec output MUST match canonical-dequant within Q8_K activation noise on real on-disk bytes",
+          "scenarios": [
+            {
+              "name": "Q6_K matvec on real Gemma 3 4B V bytes matches canonical dequant",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-f16-to-f32-subnormal-fix/specs/compute-backend-traits/spec.md",
+              "line": 41
             }
           ]
         },
