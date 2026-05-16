@@ -108,11 +108,14 @@ pub(super) fn write_norms_and_router(
             }
         }
 
-        // MoE router + norms (hybrid MoE, e.g. Gemma 4 26B A4B).
-        // router.proj.weight is 2D [num_experts, hidden] — flatten and store as "vector".
-        // All other MoE keys are 1D vectors.
-        if arch.is_hybrid_moe() {
-            // 2D router projection — flatten
+        // MoE router (2-D `[num_experts, hidden]` projection — flattened
+        // and stored as a "vector" entry in norms.bin). Covers both the
+        // Gemma 4 26B A4B hybrid-MoE path (`is_hybrid_moe()`) and the
+        // qwen35moe PerExpert path (`is_moe()` without hybrid-MoE — the
+        // attention side is hybrid, FFN is pure MoE). PackedMxfp4 (e.g.
+        // GPT-OSS) is excluded — its router layout differs and the
+        // current writer can't emit it.
+        if arch.is_moe() && arch.expert_format() != larql_models::ExpertFormat::PackedMxfp4 {
             if let Some(key) = arch.moe_router_key(layer) {
                 if let Some((data, _, _)) = source.get_tensor(&key) {
                     let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
@@ -128,7 +131,15 @@ pub(super) fn write_norms_and_router(
                     norms_offset += bytes.len() as u64;
                 }
             }
-            // 1D MoE vectors
+        }
+
+        // 1-D MoE norm vectors (Gemma 4 26B A4B hybrid-MoE specific —
+        // router_scale, per_expert_scale, router_norm, pre/post
+        // experts/ffn norms). qwen35moe doesn't expose these (its arch
+        // accessors return None), so the loop body simply skips on
+        // None. Kept gated on `is_hybrid_moe` to make the Gemma scope
+        // explicit at the call site.
+        if arch.is_hybrid_moe() {
             let moe_vec_keys: Vec<String> = [
                 arch.moe_router_scale_key(layer),
                 arch.moe_router_per_expert_scale_key(layer),
