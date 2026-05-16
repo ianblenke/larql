@@ -337,7 +337,19 @@ impl ModelArchitecture for Qwen35MoeArch {
         if !self.is_moe() {
             return None;
         }
-        Some(format!("{}mlp.gate.weight", self.layer_prefix(layer)))
+        // GGUF ships the MoE router as `blk.{L}.ffn_gate_inp.weight`,
+        // which `normalize_gguf_key` (loading/gguf.rs:1442) maps to
+        // `layers.{L}.ffn_gate_inp.weight` — `ffn_gate_inp.` has no
+        // remap entry in the rewrite table at line 113, so the suffix
+        // passes through unchanged. The earlier HF-style
+        // `mlp.gate.weight` would only match a HuggingFace-loaded
+        // safetensors model, which qwen35moe doesn't expose. Mixtral
+        // applies the same per-arch trick (`block_sparse_moe.gate.weight`)
+        // rather than relying on a global remap.
+        Some(format!(
+            "{}ffn_gate_inp.weight",
+            self.layer_prefix(layer)
+        ))
     }
 
     fn expert_ffn_gate_key(&self, layer: usize, expert_id: usize) -> Option<String> {
@@ -555,7 +567,9 @@ mod tests {
         );
         assert_eq!(
             arch.moe_router_key(0),
-            Some("layers.0.mlp.gate.weight".into())
+            Some("layers.0.ffn_gate_inp.weight".into()),
+            "router key must match `normalize_gguf_key(\"blk.0.ffn_gate_inp.weight\")` so \
+             `source.get_tensor()` finds it on a GGUF-loaded weights map"
         );
     }
 

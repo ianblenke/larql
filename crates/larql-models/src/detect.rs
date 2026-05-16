@@ -676,7 +676,12 @@ mod tests {
         assert_eq!(arch.num_experts_per_token(), 8);
         assert!(arch.is_linear_attention_layer(0));
         assert!(!arch.is_linear_attention_layer(3));
-        assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.mlp.gate.weight");
+        // GGUF-canonical name (post `normalize_gguf_key`); see the
+        // explanatory comment on `Qwen35MoeArch::moe_router_key`.
+        assert_eq!(
+            arch.moe_router_key(0).unwrap(),
+            "layers.0.ffn_gate_inp.weight"
+        );
     }
 
     #[test]
