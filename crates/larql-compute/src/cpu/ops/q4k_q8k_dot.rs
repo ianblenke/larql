@@ -568,6 +568,88 @@ pub fn q4k_q8k_matvec_into(
 /// On AMD EPYC / Intel Haswell+ this is ~12–16× faster than the scalar path.
 ///
 /// Bit-equivalence with the scalar reference is verified in unit tests below.
+/// Per-row Q4_K × Q8_K dot product (AVX2). Computes `out_slot = sum over
+/// super-blocks` for row `r` of the weight matrix. Disjoint per-row state
+/// makes this parallelisable — see [`q4k_q8k_matvec_avx2`] for the rayon
+/// dispatch.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_row_q4k_avx2(
+    out_slot: &mut f32,
+    r: usize,
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    n_blocks: usize,
+    row_bytes: usize,
+) {
+    use std::arch::x86_64::*;
+    let lo_mask = _mm256_set1_epi8(0x0F);
+    let ones_epi16 = _mm256_set1_epi16(1);
+    let row_base = r * row_bytes;
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_blocks {
+        let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
+        let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let (scales, mins) = unpack_scales_mins(&block[4..16]);
+        let quants = &block[16..BLOCK_BYTES];
+        let q8_base = sb * ELEMS_PER_BLOCK;
+        let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
+        let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
+        let d_y = q8k_x.d[sb];
+
+        let mut sum1: i32 = 0;
+        let mut sum2: i32 = 0;
+
+        for g in 0..4 {
+            let sb_lo = 2 * g;
+            let sb_hi = 2 * g + 1;
+
+            let q4 = _mm256_loadu_si256(quants.as_ptr().add(g * 32) as *const __m256i);
+            let lo_nibbles = _mm256_and_si256(q4, lo_mask);
+            let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(q4, 4), lo_mask);
+
+            let y_lo =
+                _mm256_loadu_si256(q8_qs.as_ptr().add(sb_lo * SUBBLOCK_SIZE) as *const __m256i);
+            let y_hi =
+                _mm256_loadu_si256(q8_qs.as_ptr().add(sb_hi * SUBBLOCK_SIZE) as *const __m256i);
+
+            let dot_lo = hsum_i32x8(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(lo_nibbles, y_lo),
+                ones_epi16,
+            ));
+            let dot_hi = hsum_i32x8(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(hi_nibbles, y_hi),
+                ones_epi16,
+            ));
+
+            sum1 += scales[sb_lo] as i32 * dot_lo + scales[sb_hi] as i32 * dot_hi;
+            sum2 += mins[sb_lo] as i32 * q8_sums[sb_lo] as i32
+                + mins[sb_hi] as i32 * q8_sums[sb_hi] as i32;
+        }
+        acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2 as f32;
+    }
+    *out_slot = acc;
+}
+
+/// Rayon-parallel row dispatch for AVX2 Q4_K × Q8_K matvec.
+///
+/// The row loop is embarrassingly parallel — each row reads its own slice of
+/// `w` and writes a single `out` element, with `q8k_x` shared read-only. On a
+/// 48-core host, splitting `rows` across cores converts the previously
+/// single-threaded ~17 Gelem/s bottleneck into a near-linear scale-out at the
+/// matvec sizes used in Gemma 3 4B decode (rows in 1024..10240).
+///
+/// Per-row reduction order is preserved — bit-exactness vs the scalar
+/// reference still holds because the inner accumulators stay row-local.
+///
+/// Small matvecs (rows < `MIN_PAR_ROWS`) skip rayon to avoid the per-task
+/// dispatch overhead. The threshold is picked so small-batch unit tests
+/// (rows in 5..7) run sequentially — they're the existing bit-exact and
+/// canonical-dequant correctness oracles.
+const MIN_PAR_ROWS: usize = 16;
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn q4k_q8k_matvec_avx2(
@@ -577,8 +659,6 @@ unsafe fn q4k_q8k_matvec_avx2(
     rows: usize,
     cols: usize,
 ) {
-    use std::arch::x86_64::*;
-
     if rows == 0 || cols == 0 || w.len() < rows * (cols / ELEMS_PER_BLOCK) * BLOCK_BYTES {
         for v in out.iter_mut() {
             *v = 0.0;
@@ -588,63 +668,30 @@ unsafe fn q4k_q8k_matvec_avx2(
 
     let n_blocks = cols / ELEMS_PER_BLOCK;
     let row_bytes = n_blocks * BLOCK_BYTES;
-    let lo_mask = _mm256_set1_epi8(0x0F);
-    let ones_epi16 = _mm256_set1_epi16(1);
 
-    for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
-        let row_base = r * row_bytes;
-        let mut acc = 0.0f32;
-
-        for sb in 0..n_blocks {
-            let block = &w[row_base + sb * BLOCK_BYTES..row_base + (sb + 1) * BLOCK_BYTES];
-            let d_w = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let dmin_w = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
-            let (scales, mins) = unpack_scales_mins(&block[4..16]);
-            // 16 = 2 (d) + 2 (dmin) + 12 (packed scales/mins).
-            // The remaining BLOCK_BYTES-16 = 128 bytes are nibble-packed quants.
-            let quants = &block[16..BLOCK_BYTES];
-            let q8_base = sb * ELEMS_PER_BLOCK;
-            let q8_qs = &q8k_x.qs[q8_base..q8_base + ELEMS_PER_BLOCK];
-            let q8_sums = &q8k_x.sums[sb * SUBBLOCKS_PER_BLOCK..(sb + 1) * SUBBLOCKS_PER_BLOCK];
-            let d_y = q8k_x.d[sb];
-
-            let mut sum1: i32 = 0;
-            let mut sum2: i32 = 0;
-
-            for g in 0..4 {
-                let sb_lo = 2 * g;
-                let sb_hi = 2 * g + 1;
-
-                // Load 32 Q4 bytes → separate low nibbles (u8 0-15) and high nibbles.
-                let q4 = _mm256_loadu_si256(quants.as_ptr().add(g * 32) as *const __m256i);
-                let lo_nibbles = _mm256_and_si256(q4, lo_mask);
-                let hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(q4, 4), lo_mask);
-
-                // Load 32 Q8 activation bytes for each sub-block half.
-                let y_lo =
-                    _mm256_loadu_si256(q8_qs.as_ptr().add(sb_lo * SUBBLOCK_SIZE) as *const __m256i);
-                let y_hi =
-                    _mm256_loadu_si256(q8_qs.as_ptr().add(sb_hi * SUBBLOCK_SIZE) as *const __m256i);
-
-                // vpmaddubsw: (u8 × i8) → adjacent-pair-summed i16 (32 → 16 values).
-                // vpmaddwd with all-ones: i16 pair-sum → i32 (16 → 8 values).
-                let dot_lo = hsum_i32x8(_mm256_madd_epi16(
-                    _mm256_maddubs_epi16(lo_nibbles, y_lo),
-                    ones_epi16,
-                ));
-                let dot_hi = hsum_i32x8(_mm256_madd_epi16(
-                    _mm256_maddubs_epi16(hi_nibbles, y_hi),
-                    ones_epi16,
-                ));
-
-                sum1 += scales[sb_lo] as i32 * dot_lo + scales[sb_hi] as i32 * dot_hi;
-                sum2 += mins[sb_lo] as i32 * q8_sums[sb_lo] as i32
-                    + mins[sb_hi] as i32 * q8_sums[sb_hi] as i32;
-            }
-            acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2 as f32;
+    if rows < MIN_PAR_ROWS {
+        for (r, out_slot) in out.iter_mut().enumerate().take(rows) {
+            compute_row_q4k_avx2(out_slot, r, q8k_x, w, n_blocks, row_bytes);
         }
-        *out_slot = acc;
+        return;
     }
+
+    use rayon::prelude::*;
+    let chunk_rows = rows.div_ceil(rayon::current_num_threads().max(1)).max(4);
+    out[..rows]
+        .par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let start_row = chunk_idx * chunk_rows;
+            for (i, out_slot) in chunk.iter_mut().enumerate() {
+                let r = start_row + i;
+                // SAFETY: outer fn requires AVX2 (target_feature); caller's
+                // runtime detection precondition holds for every thread.
+                unsafe {
+                    compute_row_q4k_avx2(out_slot, r, q8k_x, w, n_blocks, row_bytes);
+                }
+            }
+        });
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1236,6 +1283,99 @@ pub fn q6k_q8k_matvec_neon(
 /// lanes split 4+4 across the two 16-element sub-blocks of the stride,
 /// each scaled by its own int8 `sc` entry. Bit-equivalent to the scalar
 /// reference (verified in tests).
+/// Per-row Q6_K × Q8_K dot product (AVX2). Row-disjoint state — see
+/// [`q6k_q8k_matvec_avx2`] for rayon dispatch over rows.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_row_q6k_avx2(
+    out_r: &mut f32,
+    r: usize,
+    q8k_x: &Q8KActivation,
+    w: &[u8],
+    n_blocks: usize,
+    row_bytes: usize,
+) {
+    use std::arch::x86_64::*;
+    let lo4_mask = _mm256_set1_epi8(0x0F);
+    let hi2_mask = _mm256_set1_epi8(0x03);
+    let neg32 = _mm256_set1_epi8(32);
+    let ones_16 = _mm256_set1_epi16(1);
+    let row_base = r * row_bytes;
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_blocks {
+        let block = w.as_ptr().add(row_base + sb * Q6K_BLOCK_BYTES);
+        let ql_ptr = block;
+        let qh_ptr = block.add(128);
+        let sc_ptr = block.add(192) as *const i8;
+        let d_w = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+        let d_y = q8k_x.d[sb];
+        let q8_base = sb * ELEMS_PER_BLOCK;
+        let q8_ptr = q8k_x.qs.as_ptr().add(q8_base);
+
+        let mut sumi_total: i32 = 0;
+
+        for half in 0..2usize {
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            let sc_off = half * 8;
+            let x_half = half * 128;
+
+            let ql0 = _mm256_loadu_si256(ql_ptr.add(ql_off) as *const __m256i);
+            let ql32 = _mm256_loadu_si256(ql_ptr.add(ql_off + 32) as *const __m256i);
+            let qh = _mm256_loadu_si256(qh_ptr.add(qh_off) as *const __m256i);
+
+            let s0_lo = _mm256_and_si256(ql0, lo4_mask);
+            let s0_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(qh, hi2_mask));
+            let q6_s0 = _mm256_sub_epi8(_mm256_or_si256(s0_lo, s0_hi), neg32);
+
+            let s1_lo = _mm256_and_si256(ql32, lo4_mask);
+            let s1_hi =
+                _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<2>(qh), hi2_mask));
+            let q6_s1 = _mm256_sub_epi8(_mm256_or_si256(s1_lo, s1_hi), neg32);
+
+            let s2_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), lo4_mask);
+            let s2_hi =
+                _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<4>(qh), hi2_mask));
+            let q6_s2 = _mm256_sub_epi8(_mm256_or_si256(s2_lo, s2_hi), neg32);
+
+            let s3_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql32), lo4_mask);
+            let s3_hi =
+                _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<6>(qh), hi2_mask));
+            let q6_s3 = _mm256_sub_epi8(_mm256_or_si256(s3_lo, s3_hi), neg32);
+
+            let q6_stride = [q6_s0, q6_s1, q6_s2, q6_s3];
+
+            for g in 0..4usize {
+                let q8_v = _mm256_loadu_si256(q8_ptr.add(x_half + g * 32) as *const __m256i);
+                let q8_signed_flipped = _mm256_sign_epi8(q8_v, q6_stride[g]);
+                let q6_abs = _mm256_abs_epi8(q6_stride[g]);
+                let prod_i16 = _mm256_maddubs_epi16(q6_abs, q8_signed_flipped);
+                let sum_i32 = _mm256_madd_epi16(prod_i16, ones_16);
+
+                let lo128 = _mm256_castsi256_si128(sum_i32);
+                let hi128 = _mm256_extracti128_si256::<1>(sum_i32);
+                let sumi_lo = horiz_sum_i32_128(lo128);
+                let sumi_hi = horiz_sum_i32_128(hi128);
+
+                let sc_lo = *sc_ptr.add(sc_off + 2 * g) as i32;
+                let sc_hi = *sc_ptr.add(sc_off + 2 * g + 1) as i32;
+
+                sumi_total += sc_lo * sumi_lo;
+                sumi_total += sc_hi * sumi_hi;
+            }
+        }
+
+        acc += d_w * d_y * sumi_total as f32;
+    }
+    *out_r = acc;
+}
+
+/// Rayon-parallel row dispatch for AVX2 Q6_K × Q8_K matvec. Same pattern as
+/// [`q4k_q8k_matvec_avx2`] — see its doc for rationale. Q6_K's row size is
+/// 210 bytes/256 vs Q4_K's 144 bytes/256, so it's more BW-heavy per row; the
+/// parallel win is correspondingly larger when memory bandwidth scales with
+/// thread count.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn q6k_q8k_matvec_avx2(
@@ -1245,8 +1385,6 @@ unsafe fn q6k_q8k_matvec_avx2(
     rows: usize,
     cols: usize,
 ) {
-    use std::arch::x86_64::*;
-
     debug_assert_eq!(cols % ELEMS_PER_BLOCK, 0);
     let n_blocks = cols / ELEMS_PER_BLOCK;
     let row_bytes = n_blocks * Q6K_BLOCK_BYTES;
@@ -1257,91 +1395,29 @@ unsafe fn q6k_q8k_matvec_avx2(
         return;
     }
 
-    let lo4_mask = _mm256_set1_epi8(0x0F);
-    let hi2_mask = _mm256_set1_epi8(0x03);
-    let neg32 = _mm256_set1_epi8(32);
-    let ones_16 = _mm256_set1_epi16(1);
+    if rows < MIN_PAR_ROWS {
+        for (r, out_r) in out.iter_mut().enumerate().take(rows) {
+            compute_row_q6k_avx2(out_r, r, q8k_x, w, n_blocks, row_bytes);
+        }
+        return;
+    }
 
-    for (r, out_r) in out.iter_mut().enumerate().take(rows) {
-        let row_base = r * row_bytes;
-        let mut acc = 0.0f32;
-
-        for sb in 0..n_blocks {
-            let block = w.as_ptr().add(row_base + sb * Q6K_BLOCK_BYTES);
-            let ql_ptr = block;
-            let qh_ptr = block.add(128);
-            let sc_ptr = block.add(192) as *const i8;
-            let d_w = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
-            let d_y = q8k_x.d[sb];
-            let q8_base = sb * ELEMS_PER_BLOCK;
-            let q8_ptr = q8k_x.qs.as_ptr().add(q8_base);
-
-            let mut sumi_total: i32 = 0;
-
-            for half in 0..2usize {
-                let ql_off = half * 64;
-                let qh_off = half * 32;
-                let sc_off = half * 8;
-                let x_half = half * 128;
-
-                let ql0 = _mm256_loadu_si256(ql_ptr.add(ql_off) as *const __m256i);
-                let ql32 = _mm256_loadu_si256(ql_ptr.add(ql_off + 32) as *const __m256i);
-                let qh = _mm256_loadu_si256(qh_ptr.add(qh_off) as *const __m256i);
-
-                // Stride 0: ql0 low-nibble + qh bits[0..1] << 4
-                let s0_lo = _mm256_and_si256(ql0, lo4_mask);
-                let s0_hi = _mm256_slli_epi16::<4>(_mm256_and_si256(qh, hi2_mask));
-                let q6_s0 = _mm256_sub_epi8(_mm256_or_si256(s0_lo, s0_hi), neg32);
-
-                // Stride 1: ql32 low-nibble + qh bits[2..3] << 4
-                let s1_lo = _mm256_and_si256(ql32, lo4_mask);
-                let s1_hi =
-                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<2>(qh), hi2_mask));
-                let q6_s1 = _mm256_sub_epi8(_mm256_or_si256(s1_lo, s1_hi), neg32);
-
-                // Stride 2: ql0 high-nibble + qh bits[4..5] << 4
-                let s2_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), lo4_mask);
-                let s2_hi =
-                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<4>(qh), hi2_mask));
-                let q6_s2 = _mm256_sub_epi8(_mm256_or_si256(s2_lo, s2_hi), neg32);
-
-                // Stride 3: ql32 high-nibble + qh bits[6..7] << 4
-                let s3_lo = _mm256_and_si256(_mm256_srli_epi16::<4>(ql32), lo4_mask);
-                let s3_hi =
-                    _mm256_slli_epi16::<4>(_mm256_and_si256(_mm256_srli_epi16::<6>(qh), hi2_mask));
-                let q6_s3 = _mm256_sub_epi8(_mm256_or_si256(s3_lo, s3_hi), neg32);
-
-                let q6_stride = [q6_s0, q6_s1, q6_s2, q6_s3];
-
-                for g in 0..4usize {
-                    let q8_v = _mm256_loadu_si256(q8_ptr.add(x_half + g * 32) as *const __m256i);
-                    let q8_signed_flipped = _mm256_sign_epi8(q8_v, q6_stride[g]);
-                    let q6_abs = _mm256_abs_epi8(q6_stride[g]);
-                    let prod_i16 = _mm256_maddubs_epi16(q6_abs, q8_signed_flipped);
-                    let sum_i32 = _mm256_madd_epi16(prod_i16, ones_16);
-
-                    // Split the 8 i32 lanes into two halves of 4 each: lower
-                    // 4 lanes correspond to the first sub-block of this
-                    // stride (positions 0..16), upper 4 lanes the second
-                    // (positions 16..32). Each has its own int8 scale.
-                    let lo128 = _mm256_castsi256_si128(sum_i32);
-                    let hi128 = _mm256_extracti128_si256::<1>(sum_i32);
-                    let sumi_lo = horiz_sum_i32_128(lo128);
-                    let sumi_hi = horiz_sum_i32_128(hi128);
-
-                    let sc_lo = *sc_ptr.add(sc_off + 2 * g) as i32;
-                    let sc_hi = *sc_ptr.add(sc_off + 2 * g + 1) as i32;
-
-                    sumi_total += sc_lo * sumi_lo;
-                    sumi_total += sc_hi * sumi_hi;
+    use rayon::prelude::*;
+    let chunk_rows = rows.div_ceil(rayon::current_num_threads().max(1)).max(4);
+    out[..rows]
+        .par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let start_row = chunk_idx * chunk_rows;
+            for (i, out_r) in chunk.iter_mut().enumerate() {
+                let r = start_row + i;
+                // SAFETY: outer fn requires AVX2; runtime detection happened
+                // in `q6k_q8k_matvec_into` before dispatch.
+                unsafe {
+                    compute_row_q6k_avx2(out_r, r, q8k_x, w, n_blocks, row_bytes);
                 }
             }
-
-            acc += d_w * d_y * sumi_total as f32;
-        }
-
-        *out_r = acc;
-    }
+        });
 }
 
 #[cfg(target_arch = "x86_64")]
