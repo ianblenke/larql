@@ -213,9 +213,34 @@ before calling `load_qwen35_weights`. Three concrete bridges:
    `weights.tensors` (they have no `*_quant` slot in
    `DeltaNetLayerWeights`).
 
-2. **Standard attn bridge** (~30 LoC): for each full-attn layer,
-   pull Q/K/V/O from `idx.attn_q4k_layer_data(L)` and populate
-   `weights.quant_tensors` by the arch's `attn_{q,k,v,o}_key(L)`.
+2. **Standard attn bridge** — **blocked by 2b.3a, then ~30 LoC**.
+   The existing `attn_q4k_layer_data(layer)` accessor at
+   `crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs:484`
+   uses `let base = layer * ATTN_TENSORS_PER_LAYER` index arithmetic.
+   For qwen35moe with `full_attention_interval=4` the manifest is
+   **sparse** — only 10 of 40 layers carry Q/K/V/O entries (layers
+   3, 7, 11, …, 39), so `attn_q4k_layer_data(3)` returns layer 11's
+   bytes (manifest index 12-15) instead of layer 3's (manifest
+   index 0-3).
+   The storage drops keys + shapes when parsing the JSON manifest
+   (only keeps `Vec<(offset, length, format)>`), so a
+   key-prefix lookup like the DeltaNet accessor isn't directly
+   possible without extending the in-memory manifest.
+
+   **Task 2b.3a (~40 LoC)** — extend `attn_q4k_manifest` to also
+   carry `key: String` + `shape: Vec<usize>` per entry (parallel
+   to PR #149's + #160's DeltaNet storage). Add a new
+   `attn_q4k_sparse_layer_data(layer)` accessor that filters
+   manifest entries by `layers.{L}.self_attn.{q,k,v,o}_proj.weight`
+   prefix. Don't break the existing dense-manifest callers
+   (Gemma 3, Gemma 4 dense, …); they continue using
+   `attn_q4k_layer_data` unchanged.
+
+   **Task 2b.3b (~30 LoC)** — bridge body that consumes
+   `attn_q4k_sparse_layer_data` and populates
+   `weights.quant_tensors` under
+   `arch.attn_{q,k,v,o}_key(L)`. Same pattern as PR #161's
+   DeltaNet bridge.
 
 3. **MoE PerExpert bridge** (~80 LoC): parse each
    `layers/layer_LL.weights` via
