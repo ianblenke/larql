@@ -152,6 +152,64 @@ The KV cache infra is correct (proven by integration tests against the
 real Gemma 3 4B vindex — `tests/test_kv_cache_real_gemma3.rs`). It just
 isn't where the bottleneck is on this path.
 
+## Active arc — Qwen 3.6 35B-A3B vindex bridge (2026-05-16)
+
+User picked Qwen3.6-35B-A3B as the new showcase model (replaces
+Gemma 3 4B as the primary demo target). Memory:
+[showcase MoE models](~/.claude/projects/-home-ianblenke-github-com-ianblenke-larql/memory/project_showcase_moe_models.md),
+[model storage](~/.claude/projects/-home-ianblenke-github-com-ianblenke-larql/memory/reference_model_storage.md).
+
+### Step 1 — Writer ✅ MERGED (PR #147, commit a7aed4f)
+
+`vindex-qwen35moe-extraction` shipped:
+- New `write_q4k/deltanet.rs` — Q4_K matmul tensors per linear layer
+  (attn_qkv, attn_gate, ssm_alpha, ssm_beta, ssm_out).
+- `write_q4k/moe_layers.rs` — extended for `ExpertFormat::PerExpert`
+  (256 experts × 3 projections × 40 layers).
+- `write_q4k/attn.rs` — skips linear layers; standard Q/K/V/O only
+  fires on the 10 full-attention layers.
+- `write_q4k/norms.rs` — DeltaNet small tensors (ssm_norm/dt/a/conv1d)
+  per linear layer.
+- `convert_cmd.rs:515` guard removed.
+
+Live smoke conversion on `/tank/ai/Qwen/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
+(21 GB) → `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex/` (60 GB structurally
+complete, 542 MB deltanet bytes, 148 MB attn bytes, 40 × 256-expert
+layer files, ssm_*small tensors in norms.bin, index.json reflects
+`qwen35moe` + `full_attention_interval=4`).
+
+### Step 2 — Reader (NEXT, specced)
+
+`openspec/changes/vindex-qwen35moe-reader/` covers:
+1. `vindex/index/storage/deltanet.rs` (NEW) — mmap
+   `deltanet_weights_q4k.bin` + manifest, expose
+   `VectorIndex::deltanet_q4k_layer_data(layer)`.
+2. `inference/attention/qwen35_load_vindex.rs` (NEW) —
+   `load_qwen35_weights_from_vindex(dir) -> Qwen35Weights`. Dequants
+   into the same struct the GGUF loader produces.
+3. `larql-server` dispatch: when arch_family ∈ {qwen35, qwen35moe},
+   route `/v1/chat/completions` through `qwen35_forward_step` instead
+   of `predict_q4k_hidden_with_cache`.
+4. Smoke gate: server responds 200 to a chat completion on the
+   vindex from Step 1; full parity vs llama.cpp deferred to a
+   separate change.
+
+Estimated ~650 LoC. See proposal + tasks.md in
+`openspec/changes/vindex-qwen35moe-reader/`.
+
+### Out of scope on this arc
+
+- DeepSeek V4 Flash MLA path — still parked.
+- 40 GB `gate_vectors.bin` size optimisation — separate writer
+  emitting MoE router weights in f32; structural correctness is
+  achieved either way.
+- Arc #1 (batched multi-row Q4_K × Q8_K matmul kernel) — still
+  open as a general perf lever on top of either Gemma 3 4B or the
+  new qwen35moe path once it reaches the server.
+- Arc #2 (mmap-backed embed) — same.
+
+---
+
 ## Open levers — pick one
 
 After PRs #138 (dequant cache) + #139 (Q4kDirectFfn), the next ~10×
