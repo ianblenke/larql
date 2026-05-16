@@ -175,6 +175,63 @@ pub fn populate_deltanet_quant_tensors(
     Ok(())
 }
 
+/// **Task 2b.3b** — bridge full-attn Q/K/V/O vindex bytes into a
+/// `ModelWeights`. All 4 projections have `*_quant` slots in
+/// `Qwen35AttentionLayerWeights`, so every tensor lands in
+/// `weights.quant_tensors` — no dequant fallback needed (unlike
+/// the DeltaNet bridge's `ssm_alpha`/`ssm_beta` dense-only case).
+///
+/// Walks every layer L where `arch.is_linear_attention_layer(L) ==
+/// false` and pulls 4 (bytes, fmt, shape) tuples via the sparse-
+/// aware accessor from PR #163 (`attn_q4k_sparse_layer_data`). The
+/// existing dense accessor's `layer * 4` arithmetic would read
+/// wrong bytes for hybrid arches whose manifest only carries
+/// entries for the 10 full-attention layers.
+///
+/// V is typically Q6_K (writer's higher-precision choice for the
+/// value projection); Q/K/O are Q4_K. The fmt tag string per
+/// tensor determines the `tensor_type` constant passed to
+/// `QuantTensor::from_raw`.
+pub fn populate_attn_quant_tensors(
+    idx: &VectorIndex,
+    arch: &dyn ModelArchitecture,
+    weights: &mut ModelWeights,
+) -> Result<(), VindexLoadError> {
+    let n_layers = weights.num_layers;
+    for layer in 0..n_layers {
+        if arch.is_linear_attention_layer(layer) {
+            continue;
+        }
+        let Some(slots) = idx.attn_q4k_sparse_layer_data(layer) else {
+            continue;
+        };
+
+        // Fixed-order keys mirror the writer's tensor enumeration
+        // in `write_q4k::attn::write_attn_weights_q4k`.
+        let keys: [String; 4] = [
+            arch.attn_q_key(layer),
+            arch.attn_k_key(layer),
+            arch.attn_v_key(layer),
+            arch.attn_o_key(layer),
+        ];
+
+        for (i, (bytes, fmt, shape)) in slots.iter().enumerate() {
+            if shape.len() != 2 {
+                continue;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            let tensor_type = match *fmt {
+                "Q4_K" => TYPE_Q4_K,
+                "Q6_K" => TYPE_Q6_K,
+                _ => continue,
+            };
+            let qt = QuantTensor::from_raw(bytes.to_vec(), tensor_type, rows, cols)?;
+            weights.quant_tensors.insert(keys[i].clone(), qt);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
