@@ -83,6 +83,16 @@ pub const ATTN_WEIGHTS_Q4K_MANIFEST_JSON: &str = "attn_weights_q4k_manifest.json
 pub const ATTN_WEIGHTS_Q8_BIN: &str = "attn_weights_q8.bin";
 pub const ATTN_WEIGHTS_Q8_MANIFEST_JSON: &str = "attn_weights_q8_manifest.json";
 
+// ── DeltaNet (Qwen 3.6 linear-attention layers) ────────────────────────
+// Per-layer Q4_K matmul tensors for the linear-attention layers of
+// hybrid SSM/DeltaNet architectures (Qwen 3.6 27B dense + 35B-A3B MoE).
+// Tensors per layer: attn_qkv, attn_gate, ssm_alpha, ssm_beta, ssm_out
+// when each tensor's column dimension is 256-aligned. Layers where
+// `arch.is_linear_attention_layer(layer)` is false do NOT emit here —
+// they go through `attn_weights_q4k.bin` (Q/K/V/O).
+pub const DELTANET_WEIGHTS_Q4K_BIN: &str = "deltanet_weights_q4k.bin";
+pub const DELTANET_WEIGHTS_Q4K_MANIFEST_JSON: &str = "deltanet_weights_q4k_manifest.json";
+
 // ── Per-layer FFN weights (§5.12) ──────────────────────────────────────
 //
 // Unified format for both dense and MoE FFN weights. One file per layer.
@@ -124,6 +134,8 @@ pub const HF_UPLOAD_FILES: &[&str] = &[
     ATTN_WEIGHTS_BIN,
     ATTN_WEIGHTS_Q4K_BIN,
     ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+    DELTANET_WEIGHTS_Q4K_BIN,
+    DELTANET_WEIGHTS_Q4K_MANIFEST_JSON,
     DOWN_FEATURES_BIN,
     UP_FEATURES_BIN,
     LM_HEAD_Q4_BIN,
@@ -174,6 +186,8 @@ mod tests {
             ATTN_WEIGHTS_Q4_MANIFEST_JSON,
             ATTN_WEIGHTS_Q4K_BIN,
             ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+            DELTANET_WEIGHTS_Q4K_BIN,
+            DELTANET_WEIGHTS_Q4K_MANIFEST_JSON,
             ATTN_WEIGHTS_Q8_BIN,
             ATTN_WEIGHTS_Q8_MANIFEST_JSON,
             LM_HEAD_BIN,

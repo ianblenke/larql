@@ -28,7 +28,7 @@ pub(super) fn write_norms_and_router(
     let mut norm_entries: Vec<WeightEntry> = Vec::new();
 
     for layer in 0..num_layers {
-        let keys: Vec<String> = [
+        let mut keys: Vec<String> = [
             Some(arch.input_layernorm_key(layer)),
             Some(arch.post_attention_layernorm_key(layer)),
             arch.pre_feedforward_layernorm_key(layer),
@@ -51,6 +51,24 @@ pub(super) fn write_norms_and_router(
         .flatten()
         .collect();
 
+        // DeltaNet linear-attention layers (Qwen 3.6) carry several small
+        // tensors that aren't Q4_K candidates — RMSNorm weights and
+        // per-head bias / decay vectors. They land here so the matmul-
+        // class projections in [`super::deltanet`] stay single-purpose.
+        // `ssm_conv1d` is 2-D and is handled separately below alongside
+        // the moe_router 2-D case.
+        if arch.is_linear_attention_layer(layer) {
+            keys.extend(
+                [
+                    arch.ssm_norm_key(layer),
+                    arch.ssm_dt_key(layer),
+                    arch.ssm_a_key(layer),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+
         for key in keys {
             if let Some(data) = source.get_vector(&key) {
                 let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
@@ -64,6 +82,29 @@ pub(super) fn write_norms_and_router(
                     file: NORMS_BIN.into(),
                 });
                 norms_offset += bytes.len() as u64;
+            }
+        }
+
+        // DeltaNet 2-D `ssm_conv1d` kernel — depthwise Conv1D weight
+        // [d_conv, conv_dim]. Flattened and stored as f32 since the
+        // depthwise stride is too small (4) for Q4_K super-blocks to
+        // be worthwhile. Shape recorded as a flat vector; the reader
+        // reshapes back at load time using the per-arch `d_conv`.
+        if arch.is_linear_attention_layer(layer) {
+            if let Some(key) = arch.ssm_conv1d_key(layer) {
+                if let Some((data, _, _)) = source.get_tensor(&key) {
+                    let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
+                    norms_file.write_all(&bytes)?;
+                    norm_entries.push(WeightEntry {
+                        key: key.clone(),
+                        kind: kind::VECTOR.into(),
+                        shape: vec![data.len()],
+                        offset: norms_offset,
+                        length: bytes.len() as u64,
+                        file: NORMS_BIN.into(),
+                    });
+                    norms_offset += bytes.len() as u64;
+                }
             }
         }
 
