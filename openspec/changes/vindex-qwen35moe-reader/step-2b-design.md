@@ -186,20 +186,39 @@ small-scalars-per-layer.
 
 This is a **separate small PR** before Step 2b can complete.
 
-## Phase outline (refined)
+## Phase outline (refined, post PR #152)
 
-| Phase | Scope | LoC |
-|---|---|---:|
-| 2b.0 | Fix router write for `qwen35moe` PerExpert in `write_q4k/norms.rs` | ~10 |
-| 2b.1 | Norms reader: extract DeltaNet small tensors from `norms.bin` per layer | ~80 |
-| 2b.2 | Per-layer assembly: `DeltaNetLayerWeights` from vindex bytes | ~120 |
-| 2b.3 | Per-layer assembly: `Qwen35AttentionLayerWeights` for full-attn layers | ~80 |
-| 2b.4 | MoE per-layer: parse `layer_LL.weights` → pack 256 experts into `Qwen35MoeFfnWeights` | ~150 |
-| 2b.5 | Top-level: `load_qwen35_weights_from_vindex` orchestrator | ~50 |
-| 2b.6 | Unit test: load `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex`, dimension-check the produced struct | ~50 |
+| Phase | Scope | LoC | Status |
+|---|---|---:|---|
+| 2b.0 | Router write fix in `write_q4k/norms.rs` | ~10 | ✅ Shipped in PR #152 |
+| 2b.1 | Norms reader: extract DeltaNet small tensors from `norms.bin` per layer | ~0 | ✅ **No-op** — see note below |
+| 2b.2 | Per-layer assembly: `DeltaNetLayerWeights` from vindex bytes | ~120 | pending |
+| 2b.3 | Per-layer assembly: `Qwen35AttentionLayerWeights` for full-attn layers | ~80 | pending |
+| 2b.4 | MoE per-layer: parse `layer_LL.weights` → pack 256 experts into `Qwen35MoeFfnWeights` | ~150 | pending |
+| 2b.5 | Top-level: `load_qwen35_weights_from_vindex` orchestrator | ~50 | pending |
+| 2b.6 | Unit test: load `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex`, dimension-check the produced struct | ~50 | pending |
 
-Total ~540 LoC. (Previous ~300 estimate was wishful.) Single
-focused PR target.
+Total remaining ~450 LoC (was ~540).
+
+### 2b.1 simplification — existing reader already does it
+
+`crates/larql-vindex/src/format/weights/load.rs:534` already loads every
+`kind::VECTOR` entry from `norms.bin` (via `weight_manifest.json`) into
+a `HashMap<String, Vec<f32>>` keyed by the full tensor name. The
+DeltaNet small tensors emitted by `write_q4k/norms.rs` —
+`layers.{L}.ssm_norm.weight`, `layers.{L}.ssm_dt.weight`,
+`layers.{L}.ssm_a.weight`, `layers.{L}.ssm_conv1d.weight` — are all
+emitted with `kind: kind::VECTOR`, so they land in that map for free.
+
+The MoE router (PR #152) follows the same pattern — emitted as a
+flattened `VECTOR` entry with key `layers.{L}.mlp.gate.weight`, length
+`num_experts * hidden`. The reader pulls it the same way; the consumer
+just reshapes back to `[num_experts, hidden]`.
+
+**Implication for Step 2b.2/2b.4:** the consumer reads
+`vectors.get("layers.{L}.ssm_norm.weight")` and friends directly. No
+new reader code is needed. The remaining work is purely structural
+assembly into the `Qwen35Weights` field shapes.
 
 ## Out of scope (still)
 
