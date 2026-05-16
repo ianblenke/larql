@@ -2,7 +2,7 @@
 
 ## Where we are (state at end of session 2026-05-16)
 
-Five PRs landed end-to-end during 2026-05-16:
+Six PRs landed end-to-end during 2026-05-16:
 
 - **PR #139** (Q4kDirectFfn) — direct Q4_K × Q8_K matvec FFN for decode.
 - **PR #140** (f16 subnormal fix) — pre-existing latent bug in
@@ -20,8 +20,15 @@ Five PRs landed end-to-end during 2026-05-16:
   `weights.lm_head_quant` from `lm_head_q4.bin` and dispatch the final
   vocab projection through `QuantTensor::matvec` (rayon-parallel AVX2
   Q4_K × Q8_K) instead of f32 BLAS GEMV.
+- **PR #145** (Q8K cache hazard + BLAS thread pin) — two coupled fixes:
+  (a) `with_q8k_for` cache used `(ptr, len)` as key; #144's per-step
+  lm_head `to_owned()` allocator reuse hit the cache and returned stale
+  Q8K bytes → silent gibberish at long decode lengths. (b) OpenBLAS
+  default thread count was contending with rayon on small per-head
+  attention dots, adding ~160ms/step at 150-token cache. Cache key now
+  fingerprints `x[0]`+`x[len-1]`; main pins `OPENBLAS_NUM_THREADS=1`.
 
-### Arcs C-G — CPU decode-step direct matvec + parallel + lm_head
+### Arcs C-H — CPU decode-step direct matvec + parallel + lm_head + threading
 
 `predict_q4k_hidden_with_cache` now dispatches direct-matvec backends
 for both FFN (`Q4kDirectFfn`) and attention
@@ -41,13 +48,18 @@ Q8_K-aligned. Gemma 3 4B (`hidden=2560`) engages every direct path.
 | Model | Path | Before | After | Speedup |
 |---|---|---:|---:|---:|
 | Gemma 3 4B Q4_K_M | `predict_q4k_hidden_with_cache` (pure decode, no lm_head) | 193 ms/step | **89 ms/step** | **2.16×** |
-| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 150 tok | 0.117 tok/s | **3.96 tok/s** | **33.9×** |
+| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 150 tok | 0.117 tok/s | **9.81 tok/s** | **83.9×** |
 
-llama.cpp CPU 14.1 tok/s reference unchanged. Remaining gap is ~3.6×
-on 4B end-to-end. Top remaining costs are now sampling (top-k +
-detokenisation per step) and per-step memory bandwidth on the attn
-matvecs; FFN, attention, and lm_head are all on the same Q4_K×Q8_K
-rayon-parallel AVX2 path.
+llama.cpp CPU 14.1 tok/s reference unchanged. Remaining gap is **~1.44×**
+on 4B end-to-end (70% of llama.cpp performance). FFN, attention, and
+lm_head are all on the same rayon-parallel AVX2 Q4_K × Q8_K path with
+BLAS pinned to 1 thread for the residual gqa per-head dots.
+
+⚠ The bench number reported in PR #144 (3.96 tok/s) was actually
+subtle-gibberish output due to the cache hazard fixed in #145 —
+throughput-only benchmark missed the correctness regression. PR #145
+both fixed correctness and brought the corrected post-#144 baseline
+(4.18 tok/s coherent) up to 9.81 tok/s.
 
 ## Where we were (state at end of session 2026-05-15)
 
@@ -235,12 +247,13 @@ block into separate `impl GateLookup` / `impl PatchOverrides` /
 
 ## Quick start prompt for a fresh session
 
-> Read RESUME_PROMPT.md. We're sitting at 3.96 tok/s on Gemma 3 4B
-> Q4_K_M after #139 / #140 / #142 / #143 / #144 (Q4kDirectFfn + f16
-> subnormal fix + Q4kDirectAttention + rayon-parallel AVX2 matvec +
-> direct Q4_K lm_head) — 33.9× the 0.117 baseline, ~3.6× from
-> llama.cpp's 14.1 tok/s. FFN, attention, and lm_head all flow
-> through the same Q4_K × Q8_K rayon-parallel AVX2 path. Next lever
-> is sampling/detokenization overlap (lever 1). Don't regress 1B
+> Read RESUME_PROMPT.md. We're sitting at 9.81 tok/s on Gemma 3 4B
+> Q4_K_M after #139 / #140 / #142 / #143 / #144 / #145 — 83.9× the
+> 0.117 baseline, ~1.44× from llama.cpp's 14.1 tok/s (70% of llama.cpp).
+> FFN, attention, and lm_head all flow through the same Q4_K × Q8_K
+> rayon-parallel AVX2 path; BLAS pinned to 1 thread. Don't regress 1B
 > coherence (hidden=1152, not Q8_K aligned, must keep falling back to
-> WeightFfn / WeightAttention / f32 BLAS lm_head).
+> WeightFfn / WeightAttention / f32 BLAS lm_head). Watch for the
+> `with_q8k_for` allocator-reuse hazard fixed in #145 — any new caller
+> that drops `x` and reallocates needs the content-fingerprint cache
+> key to stay correct.
