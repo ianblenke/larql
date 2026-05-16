@@ -1907,7 +1907,7 @@ _Source: `openspec/changes/backfill-specs/specs/vindex-quantization-storage/spec
 
 ## Orphan tests (not referenced by any scenario)
 
-Total: **5278**
+Total: **5273**
 
 | FQN | File:Line |
 |---|---|
@@ -2112,4 +2112,4 @@ Total: **5278**
 | `larql_cli::commands::primary::publish_cmd::short_model_name_handles_hf_cache_layout` | `crates/larql-cli/src/commands/primary/publish_cmd.rs:790` |
 | `larql_cli::commands::primary::publish_cmd::slice_repo_template_custom_separator` | `crates/larql-cli/src/commands/primary/publish_cmd.rs:720` |
 
-_(truncated; 5078 more in `traceability.json`)_
+_(truncated; 5073 more in `traceability.json`)_

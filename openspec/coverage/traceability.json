@@ -32622,27 +32622,9 @@
       "crate": "larql_inference"
     },
     {
-      "fqn": "larql_inference::test_gemma3_layer_health::dump_per_layer_hidden_stats",
-      "file": "crates/larql-inference/tests/test_gemma3_layer_health.rs",
-      "line": 14,
-      "crate": "larql_inference"
-    },
-    {
       "fqn": "larql_inference::test_gemma3_smoke::first_token_matches_expected_surface",
       "file": "crates/larql-inference/tests/test_gemma3_smoke.rs",
       "line": 42,
-      "crate": "larql_inference"
-    },
-    {
-      "fqn": "larql_inference::test_gemma3_v_proj_source_compare::compare_v_proj_gguf_vs_vindex",
-      "file": "crates/larql-inference/tests/test_gemma3_v_proj_source_compare.rs",
-      "line": 11,
-      "crate": "larql_inference"
-    },
-    {
-      "fqn": "larql_inference::test_gemma3_wv_dump::dump_layer0_w_v_first_row",
-      "file": "crates/larql-inference/tests/test_gemma3_wv_dump.rs",
-      "line": 8,
       "crate": "larql_inference"
     },
     {
@@ -32700,12 +32682,6 @@
       "crate": "larql_inference"
     },
     {
-      "fqn": "larql_inference::test_q6k_roundtrip::q6k_roundtrip_on_gemma3_v_proj_row0",
-      "file": "crates/larql-inference/tests/test_q6k_roundtrip.rs",
-      "line": 10,
-      "crate": "larql_inference"
-    },
-    {
       "fqn": "larql_inference::test_speculative_parity::parity_at_scale_256_prompts",
       "file": "crates/larql-inference/tests/test_speculative_parity.rs",
       "line": 281,
@@ -32715,12 +32691,6 @@
       "fqn": "larql_inference::test_target_forward_parity::target_forward_via_speculative_decode_matches_naive_64_seeds",
       "file": "crates/larql-inference/tests/test_target_forward_parity.rs",
       "line": 150,
-      "crate": "larql_inference"
-    },
-    {
-      "fqn": "larql_inference::test_v_proj_writer_roundtrip::v_proj_writer_roundtrip_vs_vindex",
-      "file": "crates/larql-inference/tests/test_v_proj_writer_roundtrip.rs",
-      "line": 12,
       "crate": "larql_inference"
     },
     {
