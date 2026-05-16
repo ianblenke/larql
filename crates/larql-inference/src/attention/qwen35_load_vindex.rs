@@ -19,6 +19,12 @@
 
 use std::path::Path;
 
+use larql_models::quant::ggml::{dequantize, TYPE_Q4_K, TYPE_Q6_K};
+use larql_models::quant::lazy::QuantTensor;
+use larql_models::{ModelArchitecture, ModelWeights};
+use larql_vindex::VectorIndex;
+use ndarray::Array2;
+
 use crate::attention::qwen35_forward::Qwen35Weights;
 
 /// Errors surfaced by [`load_qwen35_weights_from_vindex`].
@@ -74,11 +80,99 @@ pub fn load_qwen35_weights_from_vindex(
     }
 
     todo!(
-        "2b.2..2b.5 — assemble per-layer Qwen35FullLayerWeights from \
-         `idx.deltanet_q4k_layer_data(l)` / `idx.attn_q4k_layer_data(l)` / \
-         `layers/layer_LL.weights`. See \
+        "2b.3 (full-attn) + 2b.4 (MoE) bridges, then delegate to \
+         `qwen35_load::load_qwen35_weights(&weights, &*arch)`. \
+         The 2b.2 DeltaNet bridge below is ready; the standard \
+         attn / Q-K-V-O bridge and MoE-256-expert packed bridge are \
+         the remaining concrete blockers. See \
          openspec/changes/vindex-qwen35moe-reader/step-2b-design.md."
     )
+}
+
+/// **Task 2b.2** — bridge DeltaNet Q4_K bytes into a `ModelWeights`.
+///
+/// Inserts the three lazy-quant matmul tensors (`attn_qkv`,
+/// `attn_gate`, `ssm_out`) into `weights.quant_tensors` so the
+/// existing GGUF-side `load_qwen35_weights` (which is data-source
+/// agnostic) finds them via `weights.quant_tensors.get(&key)`. The
+/// two smaller matmuls without a `*_quant` slot in
+/// `DeltaNetLayerWeights` (`ssm_alpha`, `ssm_beta`) get dequantised
+/// to f32 and inserted into `weights.tensors`.
+///
+/// No-op when the vindex carries no DeltaNet bytes
+/// (`idx.has_deltanet_q4k() == false`) — every non-hybrid arch
+/// falls through cleanly.
+///
+/// Looks up arch keys via `attn_qkv_key` / `attn_gate_key` /
+/// `ssm_alpha_key` / `ssm_beta_key` / `ssm_out_key`. The Qwen35 arch
+/// handler returns the **HF-normalised** form
+/// (`layers.{L}.self_attn.qkv_proj.weight` etc) which matches the
+/// writer-side keys recorded by PR #147's manifest. The historical
+/// router-key mismatch (PR #155 / task 2b.0b) does NOT affect
+/// DeltaNet matmuls — the GGUF→HF remap table covers `attn_qkv.` →
+/// `self_attn.qkv_proj.`, so there's no naming-skew gotcha here.
+pub fn populate_deltanet_quant_tensors(
+    idx: &VectorIndex,
+    arch: &dyn ModelArchitecture,
+    weights: &mut ModelWeights,
+) -> Result<(), VindexLoadError> {
+    if !idx.has_deltanet_q4k() {
+        return Ok(());
+    }
+    let n_layers = weights.num_layers;
+    for layer in 0..n_layers {
+        if !arch.is_linear_attention_layer(layer) {
+            continue;
+        }
+        let Some(slots) = idx.deltanet_q4k_layer_data(layer) else {
+            continue;
+        };
+
+        // Fixed-order keys mirror the writer's tensor enumeration
+        // in `write_q4k::deltanet::write_deltanet_weights_q4k`.
+        let keys: [Option<String>; 5] = [
+            arch.attn_qkv_key(layer),
+            arch.attn_gate_key(layer),
+            arch.ssm_alpha_key(layer),
+            arch.ssm_beta_key(layer),
+            arch.ssm_out_key(layer),
+        ];
+
+        for (i, (bytes, fmt, shape)) in slots.iter().enumerate() {
+            let Some(key) = keys[i].as_ref() else {
+                continue;
+            };
+            if shape.len() != 2 {
+                continue;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            let tensor_type = match *fmt {
+                "Q4_K" => TYPE_Q4_K,
+                "Q6_K" => TYPE_Q6_K,
+                _ => continue,
+            };
+
+            // Three tensors have a `*_quant` slot in
+            // `DeltaNetLayerWeights` (attn_qkv / attn_gate / ssm_out
+            // — indices 0, 1, 4). The other two (ssm_alpha, ssm_beta
+            // — indices 2, 3) are dense-only on the consumer side,
+            // so dequantise to f32 and feed `weights.tensors`. The
+            // existing `load_qwen35_weights` looks them up via
+            // `get_tensor` which only reads `weights.tensors`.
+            let is_dense_only = matches!(i, 2 | 3);
+            if is_dense_only {
+                let floats = dequantize(bytes, tensor_type, rows * cols)?;
+                let arr = Array2::from_shape_vec((rows, cols), floats).map_err(|e| {
+                    VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string()))
+                })?;
+                weights.tensors.insert(key.clone(), arr.into_shared());
+            } else {
+                let qt = QuantTensor::from_raw(bytes.to_vec(), tensor_type, rows, cols)?;
+                weights.quant_tensors.insert(key.clone(), qt);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
