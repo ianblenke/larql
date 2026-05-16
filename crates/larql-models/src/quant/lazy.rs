@@ -488,7 +488,7 @@ fn with_q8k_for<R>(x: &[f32], f: impl FnOnce(&[u8]) -> R) -> R {
         let last = x.last().copied().unwrap_or(0.0).to_bits();
         let needs_refresh = !matches!(
             *cell,
-            Some((p, l, f0, fL, _)) if p == ptr && l == len && f0 == first && fL == last
+            Some((p, l, f0, f_n, _)) if p == ptr && l == len && f0 == first && f_n == last
         );
         if needs_refresh {
             *cell = Some((ptr, len, first, last, quantize_to_q8_k(x)));

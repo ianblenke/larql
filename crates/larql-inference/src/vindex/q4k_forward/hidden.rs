@@ -170,9 +170,32 @@ pub fn predict_q4k_hidden_with_cache(
         let _ = std::fs::write(format!("{dir}/cpu_h_embed.f32"), &bytes);
     }
 
+    // Per-layer dispatch: when the layer can fully run through the direct
+    // Q4_K × Q8_K paths (Q4kDirectFfn for FFN, Q4kDirectAttention for the
+    // attention prefill + decode), the f32 dequant cache from
+    // `insert_q4k_layer_tensors` is dead weight — skipping the insert
+    // saves ~10 GB resident on Gemma 3 4B (PR after #145).
+    //
+    // The cache is still needed for:
+    // - non-Q8K-aligned hidden_size (Gemma 3 1B at hidden=1152): direct
+    //   path's `quantize_x_to_q8k` requires `hidden % 256 == 0`;
+    // - hybrid-MoE layers: the MoE expert path doesn't yet have a direct
+    //   Q4_K variant;
+    // - cross-layer K/V share donors (Gemma 4 family): attention pulls
+    //   the donor's full K/V via `shared_kv`, not the direct path.
+    let arch_pre = &*weights.arch;
+    let q_dim_pre = arch_pre.num_q_heads_for_layer(0) * arch_pre.head_dim_for_layer(0);
+    let direct_all_layers = !arch_pre.is_hybrid_moe()
+        && h.shape()[1].is_multiple_of(256)
+        && q_dim_pre.is_multiple_of(256)
+        && !(0..num_layers).any(|l| arch_pre.kv_shared_source_layer(l).is_some());
+
     for layer in 0..num_layers {
-        let inserted =
-            insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"));
+        let inserted = if direct_all_layers {
+            Vec::new()
+        } else {
+            insert_q4k_layer_tensors(weights, index, layer).unwrap_or_else(|err| panic!("{err}"))
+        };
 
         let shared_kv = weights
             .arch
@@ -180,26 +203,25 @@ pub fn predict_q4k_hidden_with_cache(
             .and_then(|src| shared_kv_cache.get(&src));
         let is_moe_layer = weights.arch.is_hybrid_moe();
         // Decode-step FFN (seq == 1) uses the direct Q4_K × Q8_K matvec
-        // path — skips f32 dequant entirely, dispatches to AVX2 kernels in
-        // `larql_compute::cpu::ops::q4k_q8k_dot`. Prefill (seq > 1) stays on
-        // WeightFfn so it benefits from BLAS GEMM over the dequant cache.
-        //
-        // Q8_K activation alignment: `quantize_x_to_q8k` panics in debug and
-        // truncates silently in release if `hidden % 256 != 0`. Gemma 3 4B
-        // (hidden=2560) and 12B/27B are aligned; Gemma 3 1B (hidden=1152) is
-        // not. Models with non-aligned hidden_size fall back to `WeightFfn`.
+        // path — skips f32 dequant entirely. Prefill (seq > 1) also uses
+        // Q4kDirectFfn when the alignment guards hold; the function's
+        // per-row matvec loop is slower than a BLAS GEMM on the dequant
+        // cache but doesn't need that cache. RAM win > prefill speed loss
+        // on the bench target (Gemma 3 4B end-to-end). Models with
+        // non-Q8K-aligned hidden_size or hybrid-MoE fall back to WeightFfn
+        // (which still requires the cache — handled by the
+        // `direct_all_layers` gate above).
         let weight_ffn = crate::ffn::WeightFfn { weights };
         let direct_ffn = crate::ffn::Q4kDirectFfn {
             arch: &*weights.arch,
             index,
         };
         let hidden_q8k_aligned = h.shape()[1].is_multiple_of(256);
-        let ffn_backend: &dyn crate::ffn::FfnBackend =
-            if h.shape()[0] == 1 && !is_moe_layer && hidden_q8k_aligned {
-                &direct_ffn
-            } else {
-                &weight_ffn
-            };
+        let ffn_backend: &dyn crate::ffn::FfnBackend = if !is_moe_layer && hidden_q8k_aligned {
+            &direct_ffn
+        } else {
+            &weight_ffn
+        };
         if is_moe_layer {
             if let Some((h_new, kv_out)) = run_moe_layer_cpu(
                 weights,

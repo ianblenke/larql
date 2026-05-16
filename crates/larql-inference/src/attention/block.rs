@@ -102,6 +102,27 @@ pub fn run_attention_block_with_kv_out_with_cache(
     let cached_len = cache.cached_len(layer);
     let seq = h.nrows();
     if cached_len == 0 {
+        // Prefill. Prefer the direct Q4_K × Q8_K multi-row matvec path
+        // when a vindex is provided and the per-layer alignment guards
+        // hold (mirrors the decode-step direct path's gate). This is
+        // what lets us skip `insert_q4k_layer_tensors`'s ~10 GB f32
+        // dequant cache on Gemma 3 4B prefill — see PR scope.
+        let arch_for_align = &*weights.arch;
+        let q_dim_pre =
+            arch_for_align.num_q_heads_for_layer(layer) * arch_for_align.head_dim_for_layer(layer);
+        let prefill_direct_supported = vindex.is_some()
+            && !capture_attention
+            && !arch_for_align.is_hybrid_moe()
+            && h.ncols().is_multiple_of(256)
+            && q_dim_pre.is_multiple_of(256);
+        if prefill_direct_supported {
+            let idx = vindex.expect("prefill_direct_supported guarantees vindex");
+            let (h_post, (k, v)) =
+                super::q4k_prefill::run_attention_block_prefill_q4k_direct(weights, idx, h, layer)?;
+            cache.set_layer(layer, (k.clone(), v.clone()));
+            let attn_proj_placeholder = Array2::<f32>::zeros((seq, h.ncols()));
+            return Some((h_post, attn_proj_placeholder, None, k, v));
+        }
         let (h_post, attn_proj, attn_w, k, v) =
             run_attention_block_with_kv_out(weights, h, layer, capture_attention, None)?;
         cache.set_layer(layer, (k.clone(), v.clone()));

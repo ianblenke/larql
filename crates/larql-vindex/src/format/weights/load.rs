@@ -698,39 +698,24 @@ pub fn load_model_weights_q4k_shard(
         let bytes = std::fs::read(&lm_q4_path)?;
         let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
         let padded_hidden = config.hidden_size.div_ceil(block) * block;
-        let n_padded = config.vocab_size * padded_hidden;
-        if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, n_padded) {
-            if floats.len() == n_padded {
-                let arr_padded = Array2::from_shape_vec((config.vocab_size, padded_hidden), floats)
-                    .expect("padded lm_head shape");
-                let arr = if padded_hidden == config.hidden_size {
-                    arr_padded
-                } else {
-                    arr_padded
-                        .slice(ndarray::s![.., ..config.hidden_size])
-                        .to_owned()
-                };
-                lm_head_loaded = Some(arr.into_shared());
-            }
-        }
-        // Also populate `lm_head_quant` for the direct Q4_K × Q8_K matvec
-        // path. Only when `hidden_size` is already 256-aligned — for
-        // padded layouts (Gemma 3 1B at hidden=1152→1280) the QuantTensor
-        // would need padded-cols semantics that downstream callers don't
-        // model yet. Non-aligned models keep using the dequantised f32
-        // `lm_head` field; this is the same alignment guard as
-        // `Q4kDirectFfn`.
+
+        // When `hidden_size` is 256-aligned, dispatch lm_head through the
+        // direct Q4_K × Q8_K matvec via `QuantTensor` (PR #144's hot path).
+        // Skip the f32 dequant entirely in this case — `weights.lm_head`
+        // gets a tiny zero-sized placeholder array, so callers that
+        // reference it but never fall through actually see a non-None
+        // field. ~2.6 GB saved on Gemma 3 4B at vocab=262144 hidden=2560.
+        //
+        // Non-aligned models (Gemma 3 1B at hidden=1152→padded 1280) keep
+        // the dequantised f32 path because `QuantTensor::matvec` doesn't
+        // yet model padded-col semantics. Same alignment guard as
+        // `Q4kDirectFfn` / `Q4kDirectAttention`.
         if padded_hidden == config.hidden_size {
             // The on-disk `lm_head_q4.bin` may include trailing rows
             // beyond `vocab_size` for GGUFs that pad vocab to a 64-row
             // alignment (Gemma 3 4B unsloth: 262208 stored, 262144
             // logical). PR #137 added logical-vocab truncation on the
-            // f32 dequant path; mirror it here by trimming `bytes` to
-            // exactly the bytes for the first `vocab_size` rows before
-            // handing them to `QuantTensor::from_raw`. Models whose
-            // `hidden_size` isn't 256-aligned (Gemma 3 1B at 1152) keep
-            // using the dequantised f32 `lm_head` field — the
-            // QuantTensor path can't yet model padded-col semantics.
+            // f32 dequant path; mirror it here.
             let row_bytes = (config.hidden_size / 256) * 144;
             let expected_bytes = config.vocab_size * row_bytes;
             let trimmed = if bytes.len() >= expected_bytes {
@@ -747,6 +732,26 @@ pub fn load_model_weights_q4k_shard(
                 config.hidden_size,
             ) {
                 lm_head_quant_loaded = Some(qt);
+            }
+            // Leave `lm_head_loaded = None` so the dense `lm_head` falls
+            // back to the embed clone below. With `lm_head_quant` populated
+            // every production lm_head call routes through QuantTensor::matvec
+            // (PR #144), so the f32 lm_head is never actually read on this
+            // path.
+        } else {
+            // Non-aligned: must keep the f32 dense form for the BLAS GEMV
+            // fallback in `project_lm_head_last_row`.
+            let n_padded = config.vocab_size * padded_hidden;
+            if let Ok(floats) = larql_models::quant::ggml::dequantize_q4_k(&bytes, n_padded) {
+                if floats.len() == n_padded {
+                    let arr_padded =
+                        Array2::from_shape_vec((config.vocab_size, padded_hidden), floats)
+                            .expect("padded lm_head shape");
+                    let arr = arr_padded
+                        .slice(ndarray::s![.., ..config.hidden_size])
+                        .to_owned();
+                    lm_head_loaded = Some(arr.into_shared());
+                }
             }
         }
     }
