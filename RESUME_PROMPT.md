@@ -157,23 +157,53 @@ isn't where the bottleneck is on this path.
 After PRs #138 (dequant cache) + #139 (Q4kDirectFfn), the next ~10×
 gap to llama.cpp is no longer FFN. Likely candidates:
 
-### 1. Sampling / detokenization overlap (probable next biggest)
+### 1. Batched multi-row Q4_K × Q8_K kernel for prefill (largest remaining CPU lever)
 
-After #144, decode-step matvecs (FFN, attention, lm_head) are all on
-the rayon-parallel AVX2 Q4_K × Q8_K path. Top-k sampling and
-detokenization (`Sampler::sample_with_history`, `tokenizer.decode`)
-now run sequentially after the logits land — overlapping them with
-the next step's prefill could close more of the remaining 3.56× gap
-to llama.cpp.
+After #146, prefill on long prompts (~189 tokens) still runs at 18
+tok/s vs llama.cpp's 274 tok/s — the per-row direct-matvec loop pays a
+rayon dispatch per row, which doesn't amortise. A batched kernel
+(`q4k_q8k_matmul_into` over [N, hidden] × [out, hidden]^T) processing
+all N rows in one rayon dispatch would close most of this 15× gap and
+make larql competitive with llama.cpp CPU on long-context prefill.
+Short-prompt chat (≤50 tokens) is already fast post-#146, so this is
+specifically a long-context lever.
 
-### 2. Padded-col QuantTensor variant (unblocks 1B direct lm_head)
+### 2. mmap-backed embed (~2.5 GB RAM win)
+
+`load_model_weights_q4k` reads `embeddings.bin` and calls `to_vec()`
+on the mmap → 2.5 GB heap allocation on top of the mmap'd pages.
+Keeping the f32 embed as a memory-mapped view (via an
+`ArcArray`-compatible wrapper that holds the mmap) would eliminate
+the Vec copy. Lookup semantics unchanged. Closes most of the
+remaining RAM gap to llama.cpp's 3.85 GB.
+
+### 3. Heterogeneous deploy showcase (FFN on CPU, attention on GPU)
+
+The original design point. Infrastructure exists (`--ffn-only`
+service mode, `RemoteWalkBackend`, `/v1/walk-ffn` HTTP, gRPC walk_ffn,
+`--join` grid coordination) but isn't proven end-to-end on a model
+that doesn't fit in 24 GB VRAM. Qwen 3.5 122B-A10B Q4_K_M (~68 GB on
+disk) is in `/tank/ai/qwen3.5-122b/gguf/Q4_K_M/` and would be the
+right showcase — llama.cpp on -ngl 99 can't load it, and -ngl partial
+is bottlenecked on PCIe. larql's per-component split should win here.
+
+### 4. Wire CUDA into single-binary chat path
+
+`larql_compute::default_backend()` doesn't return CUDA even with
+`--features cuda` built. After #146 most matvecs went off f32 BLAS,
+so the leverage of CUDA dispatch in the single-binary chat completion
+is smaller than it would have been pre-#146, but it'd still help
+prefill (still BLAS-bound) and unlock testing CUDA paths locally
+without a multi-process deploy.
+
+### 5. Padded-col QuantTensor variant (unblocks 1B direct lm_head)
 
 Gemma 3 1B (`hidden=1152`) keeps using the f32 BLAS path because
 `QuantTensor::from_raw` doesn't model padded-col layout. Adding a
 `from_raw_padded(rows, cols, padded_cols)` constructor + matching
 matvec semantics would extend every "direct Q4_K" arc to 1B too.
 
-### 3. Profile-first (always-useful sanity check)
+### 6. Profile-first (always-useful sanity check)
 
 The ~10× gap to llama.cpp is now small enough that intuition isn't
 reliable. Run a flamegraph / perf-annotate on 4B decode and identify
@@ -183,20 +213,20 @@ small matrices, missing thread parallelism (`q4k_q8k_matvec_into` may
 be single-threaded — checking would inform a rayon arc that's
 potentially bigger than #1).
 
-### 4. Qwen 3.6 hybrid SSM Q4_K writer (option 2 of prior resume)
+### 7. Qwen 3.6 hybrid SSM Q4_K writer (option 2 of prior resume)
 
 Unblock `larql convert gguf-to-vindex --quant q4k` on Qwen 3.6 35B-A3B
 (currently rejected because the Q4_K attn writer doesn't handle DeltaNet
 layers). Extends PR #125.
 
-### 5. walk_path_audit resurrection (option 3 of prior resume)
+### 8. walk_path_audit resurrection (option 3 of prior resume)
 
 `crates/larql-inference/examples/walk_path_audit.rs` is gated behind
 `#[cfg(any())]` (PR #129). Split `MaskedGateIndex`'s `impl GateIndex`
 block into separate `impl GateLookup` / `impl PatchOverrides` /
 `impl FfnRowAccess` blocks. ~1-2 hour focused session.
 
-### 6. Smaller drive-bys
+### 9. Smaller drive-bys
 
 - **Compute-crate clippy errors** — `larql-compute` has 4 pre-existing
   clippy errors (`identity_op`, `needless_range_loop`) that block any
