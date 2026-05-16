@@ -693,6 +693,7 @@ pub fn load_model_weights_q4k_shard(
     // when `hidden_size` isn't a multiple of 256 (Gemma 3: 1152 -> 1280).
     // Match that here so per-row byte offsets line up.
     let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
+    let mut lm_head_quant_loaded: Option<larql_models::quant::lazy::QuantTensor> = None;
     if lm_q4_path.exists() {
         let bytes = std::fs::read(&lm_q4_path)?;
         let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
@@ -705,9 +706,47 @@ pub fn load_model_weights_q4k_shard(
                 let arr = if padded_hidden == config.hidden_size {
                     arr_padded
                 } else {
-                    arr_padded.slice(ndarray::s![.., ..config.hidden_size]).to_owned()
+                    arr_padded
+                        .slice(ndarray::s![.., ..config.hidden_size])
+                        .to_owned()
                 };
                 lm_head_loaded = Some(arr.into_shared());
+            }
+        }
+        // Also populate `lm_head_quant` for the direct Q4_K × Q8_K matvec
+        // path. Only when `hidden_size` is already 256-aligned — for
+        // padded layouts (Gemma 3 1B at hidden=1152→1280) the QuantTensor
+        // would need padded-cols semantics that downstream callers don't
+        // model yet. Non-aligned models keep using the dequantised f32
+        // `lm_head` field; this is the same alignment guard as
+        // `Q4kDirectFfn`.
+        if padded_hidden == config.hidden_size {
+            // The on-disk `lm_head_q4.bin` may include trailing rows
+            // beyond `vocab_size` for GGUFs that pad vocab to a 64-row
+            // alignment (Gemma 3 4B unsloth: 262208 stored, 262144
+            // logical). PR #137 added logical-vocab truncation on the
+            // f32 dequant path; mirror it here by trimming `bytes` to
+            // exactly the bytes for the first `vocab_size` rows before
+            // handing them to `QuantTensor::from_raw`. Models whose
+            // `hidden_size` isn't 256-aligned (Gemma 3 1B at 1152) keep
+            // using the dequantised f32 `lm_head` field — the
+            // QuantTensor path can't yet model padded-col semantics.
+            let row_bytes = (config.hidden_size / 256) * 144;
+            let expected_bytes = config.vocab_size * row_bytes;
+            let trimmed = if bytes.len() >= expected_bytes {
+                let mut v = bytes;
+                v.truncate(expected_bytes);
+                v
+            } else {
+                bytes
+            };
+            if let Ok(qt) = larql_models::quant::lazy::QuantTensor::from_raw(
+                trimmed,
+                larql_models::quant::ggml::TYPE_Q4_K,
+                config.vocab_size,
+                config.hidden_size,
+            ) {
+                lm_head_quant_loaded = Some(qt);
             }
         }
     }
@@ -726,7 +765,7 @@ pub fn load_model_weights_q4k_shard(
         embed,
         embed_quant: None,
         lm_head,
-        lm_head_quant: None,
+        lm_head_quant: lm_head_quant_loaded,
         quant_tensors: std::collections::HashMap::new(),
         position_embed: None,
         num_layers: cfg.num_layers,

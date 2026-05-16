@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 53,
-    "requirements": 516,
-    "scenarios": 1533,
+    "requirements": 517,
+    "scenarios": 1536,
     "scenarios_backed": 1345,
-    "scenarios_unbacked": 188,
-    "test_refs": 3464,
+    "scenarios_unbacked": 191,
+    "test_refs": 3467,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -8007,6 +8007,35 @@
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
               "line": 66
+            }
+          ]
+        },
+        {
+          "name": "lm_head projection MUST prefer the direct Q4_K \u00d7 Q8_K matvec path when `lm_head_quant` is populated",
+          "scenarios": [
+            {
+              "name": "Vindex-loaded Gemma 3 4B uses direct lm_head matvec",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q4k-direct-lm-head/specs/inference-residual-engine/spec.md",
+              "line": 7
+            },
+            {
+              "name": "Non-Q8_K-aligned hidden_size falls back to f32 BLAS",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q4k-direct-lm-head/specs/inference-residual-engine/spec.md",
+              "line": 19
+            },
+            {
+              "name": "Vindex loader trims trailing vocab-padding rows",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q4k-direct-lm-head/specs/inference-residual-engine/spec.md",
+              "line": 29
             }
           ]
         },
@@ -29300,109 +29329,109 @@
     {
       "fqn": "larql_inference::forward::predict::dense::cmp_desc_nan_last_orders_descending_with_nan_last",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 291,
+      "line": 313,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::logit_lens_top1_returns_none_for_wrong_shape",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 332,
+      "line": 354,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::logit_lens_top1_returns_some_for_correct_shape",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 324,
+      "line": 346,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::logits_to_predictions_pub_matches_internal",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 374,
+      "line": 396,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::predict_from_hidden_resumes_at_start_layer",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 339,
+      "line": 361,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::predict_from_hidden_with_ffn_handles_empty_token_ids",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 347,
+      "line": 369,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::predict_returns_top_k_predictions",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 300,
+      "line": 322,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::predict_with_ffn_trace_returns_per_layer_residuals",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 359,
+      "line": 381,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::predict_with_temperature_high_temp_smooths_distribution",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 307,
+      "line": 329,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::cmp_desc_nan_last_orders_descending_with_nan_last",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 291,
+      "line": 313,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::logit_lens_top1_returns_none_for_wrong_shape",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 332,
+      "line": 354,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::logit_lens_top1_returns_some_for_correct_shape",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 324,
+      "line": 346,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::logits_to_predictions_pub_matches_internal",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 374,
+      "line": 396,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::predict_from_hidden_resumes_at_start_layer",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 339,
+      "line": 361,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::predict_from_hidden_with_ffn_handles_empty_token_ids",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 347,
+      "line": 369,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::predict_returns_top_k_predictions",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 300,
+      "line": 322,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::predict_with_ffn_trace_returns_per_layer_residuals",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 359,
+      "line": 381,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::forward::predict::dense::tests::predict_with_temperature_high_temp_smooths_distribution",
       "file": "crates/larql-inference/src/forward/predict/dense.rs",
-      "line": 307,
+      "line": 329,
       "crate": "larql_inference"
     },
     {

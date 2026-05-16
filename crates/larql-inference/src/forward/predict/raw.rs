@@ -42,6 +42,15 @@ fn apply_logits_transform(weights: &ModelWeights, raw_row: &[f32]) -> ndarray::A
 ///
 /// Used by constrained generation: the caller masks the returned vector (e.g. sets
 /// disallowed token positions to `f32::NEG_INFINITY`) before applying argmax.
+///
+/// **Direct-Q4_K lm_head path.** When the vindex loader populated
+/// `weights.lm_head_quant` (Gemma 3 4B and any other model whose
+/// `hidden_size` is 256-aligned), the matvec dispatches through
+/// `QuantTensor::matvec` — rayon-parallel AVX2 Q4_K × Q8_K row dot —
+/// instead of the f32 BLAS GEMV over the dequantised `weights.lm_head`.
+/// At Gemma 3 4B's vocab=262144 × hidden=2560 shape (~671 M MACs/step),
+/// this is a meaningful fraction of decode wall-clock after the
+/// FFN / attention direct-matvec arcs.
 pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> Vec<f32> {
     let norm_offset = weights.arch.norm_weight_offset();
     let h_final = apply_norm(
@@ -50,8 +59,8 @@ pub fn hidden_to_raw_logits(weights: &ModelWeights, h_single: &Array2<f32>) -> V
         weights.arch.final_norm_key(),
         norm_offset,
     );
-    let logits_raw = dot_proj(&h_final.slice(ndarray::s![0..1, ..]), &weights.lm_head);
-    apply_logits_transform(weights, logits_raw.row(0).as_slice().unwrap()).to_vec()
+    let raw = super::dense::project_lm_head_last_row(weights, &h_final, 1);
+    apply_logits_transform(weights, &raw).to_vec()
 }
 
 /// Raw-logits forward pass used by target-delta optimisation.
