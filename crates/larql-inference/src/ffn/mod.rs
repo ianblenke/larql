@@ -54,6 +54,7 @@ pub trait FfnBackend {
 // ── Re-exports ──
 
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
+pub use q4k_direct::Q4kDirectFfn;
 pub use remote::{
     LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
     WirePreference,
@@ -63,7 +64,6 @@ pub use sparse_compute::{
     sparse_ffn_forward, sparse_ffn_forward_with_full_overrides, sparse_ffn_forward_with_overrides,
     FeatureSlotOverride,
 };
-pub use q4k_direct::Q4kDirectFfn;
 pub use weight::{dense_ffn_forward_backend, BackendFfn, WeightFfn};
 
 // ── Per-layer backend selection ──

@@ -32,13 +32,12 @@ fn cache_prefill_matches_uncached_prefill() {
     let path = std::path::Path::new(&vindex_path);
     let index = open_inference_vindex(path).expect("open vindex");
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights =
-        larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
+    let mut weights = larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer");
 
     let prompt = "Hello";
-    let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, prompt)
-        .expect("tokenize");
+    let token_ids =
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, prompt).expect("tokenize");
     eprintln!("prompt {} tokens: {:?}", token_ids.len(), token_ids);
 
     let h_uncached = predict_q4k_hidden(&mut weights, &token_ids, &index, None);
@@ -72,23 +71,17 @@ fn cache_prefill_predict_matches_uncached_predict() {
     let path = std::path::Path::new(&vindex_path);
     let index = open_inference_vindex(path).expect("open vindex");
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights =
-        larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
+    let mut weights = larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer");
 
     let prompt = std::env::var("LARQL_SMOKE_PROMPT")
         .unwrap_or_else(|_| "The capital of France is".to_string());
-    let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &prompt)
-        .expect("tokenize");
+    let token_ids =
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &prompt).expect("tokenize");
     eprintln!("prompt {} tokens", token_ids.len());
 
-    let uncached = larql_inference::vindex::predict_q4k(
-        &mut weights,
-        &tokenizer,
-        &token_ids,
-        5,
-        &index,
-    );
+    let uncached =
+        larql_inference::vindex::predict_q4k(&mut weights, &tokenizer, &token_ids, 5, &index);
 
     let mut cache = KvCache::with_layers(weights.num_layers);
     let cached = larql_inference::vindex::predict_q4k_with_cache(
@@ -123,14 +116,13 @@ fn cache_decode_step_matches_uncached_full_replay() {
     let path = std::path::Path::new(&vindex_path);
     let index = open_inference_vindex(path).expect("open vindex");
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut weights =
-        larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
+    let mut weights = larql_vindex::load_model_weights_q4k(path, &mut cb).expect("load weights");
     let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer");
 
     let prompt = std::env::var("LARQL_SMOKE_PROMPT")
         .unwrap_or_else(|_| "The capital of France is".to_string());
-    let token_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &prompt)
-        .expect("tokenize");
+    let token_ids =
+        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &prompt).expect("tokenize");
     assert!(token_ids.len() >= 2, "need at least 2 prompt tokens");
     let n = token_ids.len();
     let prompt_first = &token_ids[..n - 1];
