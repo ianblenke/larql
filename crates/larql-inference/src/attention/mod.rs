@@ -15,6 +15,7 @@ pub mod fine_profile;
 pub mod gpu;
 pub mod gpu_tier;
 pub mod gqa;
+pub mod q4k_direct;
 pub mod quant_dispatch;
 pub mod qwen35_attn;
 pub mod qwen35_block;
