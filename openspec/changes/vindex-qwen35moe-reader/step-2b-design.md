@@ -186,20 +186,83 @@ small-scalars-per-layer.
 
 This is a **separate small PR** before Step 2b can complete.
 
-## Phase outline (refined)
+## Phase outline (refined, post smoke validation)
 
-| Phase | Scope | LoC |
-|---|---|---:|
-| 2b.0 | Fix router write for `qwen35moe` PerExpert in `write_q4k/norms.rs` | ~10 |
-| 2b.1 | Norms reader: extract DeltaNet small tensors from `norms.bin` per layer | ~80 |
-| 2b.2 | Per-layer assembly: `DeltaNetLayerWeights` from vindex bytes | ~120 |
-| 2b.3 | Per-layer assembly: `Qwen35AttentionLayerWeights` for full-attn layers | ~80 |
-| 2b.4 | MoE per-layer: parse `layer_LL.weights` → pack 256 experts into `Qwen35MoeFfnWeights` | ~150 |
-| 2b.5 | Top-level: `load_qwen35_weights_from_vindex` orchestrator | ~50 |
-| 2b.6 | Unit test: load `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex`, dimension-check the produced struct | ~50 |
+| Phase | Scope | LoC | Status |
+|---|---|---:|---|
+| 2b.0a | Router write **gate** fix in `write_q4k/norms.rs` | ~10 | ✅ Shipped in PR #152 |
+| 2b.0b | Router **key** fix in `qwen35.rs::moe_router_key` | ~5 | ❌ See note below |
+| 2b.1 | Norms reader: extract DeltaNet small tensors from `norms.bin` per layer | ~0 | ✅ No-op — existing reader works |
+| 2b.2 | Per-layer assembly: `DeltaNetLayerWeights` from vindex bytes | ~120 | pending |
+| 2b.3 | Per-layer assembly: `Qwen35AttentionLayerWeights` for full-attn layers | ~80 | pending |
+| 2b.4 | MoE per-layer: parse `layer_LL.weights` → pack 256 experts into `Qwen35MoeFfnWeights` | ~150 | pending |
+| 2b.5 | Top-level: `load_qwen35_weights_from_vindex` orchestrator | ~50 | pending |
+| 2b.6 | Unit test: load `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex`, dimension-check the produced struct | ~50 | pending |
 
-Total ~540 LoC. (Previous ~300 estimate was wishful.) Single
-focused PR target.
+Total remaining ~455 LoC (was ~540).
+
+### 2b.0b — router key still doesn't reach the writer (smoke result)
+
+PR #152's gate change is correct — the `if arch.is_moe() &&
+expert_format() != PackedMxfp4` block at `write_q4k/norms.rs:114`
+now fires for qwen35moe. But the smoke conversion on the live
+21 GB Qwen3.6-35B-A3B GGUF (output at
+`/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v2/`) still produces a
+`weight_manifest.json` with **zero** entries matching
+`mlp.gate.weight` or `gate.weight`.
+
+Root cause: a key naming mismatch between the arch handler and the
+GGUF loader.
+- `crates/larql-models/src/architectures/qwen35.rs:340`:
+  `moe_router_key(layer) → "layers.{L}.mlp.gate.weight"` (HF style).
+- The GGUF tensor is `blk.{L}.ffn_gate_inp.weight`.
+- `crates/larql-models/src/loading/gguf.rs:113` (the
+  `normalize_gguf_key` remap table) has `("ffn_gate.",
+  "mlp.gate_proj.")` but **no entry for `ffn_gate_inp.`**. So
+  `normalize_gguf_key("blk.0.ffn_gate_inp.weight")` returns
+  `"layers.0.ffn_gate_inp.weight"`, not the
+  `"layers.0.mlp.gate.weight"` the arch returns.
+
+`source.get_tensor(arch.moe_router_key(layer))` therefore returns
+`None` and the write is silently skipped.
+
+Two clean fixes:
+
+1. **Update qwen35.rs** to return the loader-canonical key
+   `"layers.{L}.ffn_gate_inp.weight"` from `moe_router_key`.
+   Smallest delta. Mixtral already does the per-arch trick
+   (returns `block_sparse_moe.gate.weight` directly). No global
+   remap change.
+
+2. **Add a remap entry** `("ffn_gate_inp.", "mlp.gate.")` to
+   `gguf.rs:113`. Affects all MoE arches whose GGUFs ship
+   `ffn_gate_inp` — Mixtral, qwen35moe, future MoE variants.
+   Cleaner long-term but risks per-arch regressions; needs an
+   audit before landing.
+
+**Recommend option 1** for the next PR — minimum blast radius.
+
+Verification: after the fix, re-run the smoke conversion and
+check that
+`grep -c 'ffn_gate_inp.weight' weight_manifest.json` (or
+`'mlp.gate.weight'` if option 2 chosen) returns 40 (one per MoE
+layer).
+
+### 2b.1 simplification — existing reader already does it
+
+`crates/larql-vindex/src/format/weights/load.rs:534` already loads
+every `kind::VECTOR` entry from `norms.bin` (via
+`weight_manifest.json`) into a `HashMap<String, Vec<f32>>` keyed by
+the full tensor name. The DeltaNet small tensors emitted by
+`write_q4k/norms.rs` — `layers.{L}.ssm_norm.weight`,
+`layers.{L}.ssm_dt.weight`, `layers.{L}.ssm_a.weight`,
+`layers.{L}.ssm_conv1d.weight` — are all VECTOR-kind, so they land
+in the map for free.
+
+Once task 2b.0b lands, the router will also be a VECTOR entry the
+existing reader picks up automatically. **Implication for Step
+2b.2/2b.4:** consume those vectors via `vectors.get(key)`. No new
+reader code is needed.
 
 ## Out of scope (still)
 
