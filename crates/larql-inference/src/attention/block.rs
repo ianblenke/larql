@@ -85,6 +85,7 @@ pub fn run_attention_block_with_kv_out_with_cache(
     capture_attention: bool,
     shared_kv: Option<&SharedKV>,
     kv_cache: Option<&mut crate::attention::KvCache>,
+    vindex: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(
     Array2<f32>,
     Array2<f32>,
@@ -111,13 +112,33 @@ pub fn run_attention_block_with_kv_out_with_cache(
     }
     let abs_position = cache.next_position;
     let kv_entry = cache.get_layer(layer).cloned();
-    let (h_post, (k_concat, v_concat)) = super::decode::run_attention_block_decode_step(
-        weights,
-        h,
-        layer,
-        kv_entry.as_ref(),
-        abs_position,
-    )?;
+    // Direct Q4_K × Q8_K matvec for Q/K/V/O when a vindex is present and
+    // the per-layer alignment requirements hold (`hidden % 256 == 0` for
+    // Q/K/V activation, `num_q * head_dim % 256 == 0` for O activation).
+    // Falls back to the weights-tensors-based decode step otherwise (e.g.,
+    // Gemma 3 1B at hidden=1152).
+    let arch = &*weights.arch;
+    let q_dim = arch.num_q_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
+    let direct_supported =
+        vindex.is_some() && h.ncols().is_multiple_of(256) && q_dim.is_multiple_of(256);
+    let (h_post, (k_concat, v_concat)) = if direct_supported {
+        super::q4k_direct::run_attention_block_decode_step_q4k_direct(
+            weights,
+            vindex.expect("direct_supported guarantees vindex is Some"),
+            h,
+            layer,
+            kv_entry.as_ref(),
+            abs_position,
+        )?
+    } else {
+        super::decode::run_attention_block_decode_step(
+            weights,
+            h,
+            layer,
+            kv_entry.as_ref(),
+            abs_position,
+        )?
+    };
     let new_k = k_concat.slice(s![cached_len.., ..]).to_owned();
     let new_v = v_concat.slice(s![cached_len.., ..]).to_owned();
     cache.set_layer(layer, (k_concat, v_concat));
@@ -732,6 +753,7 @@ mod tests {
             false,
             None,
             Some(&mut cache),
+            None,
         )
         .unwrap();
         assert_eq!(h_pref.shape(), &[3, weights.hidden_size]);
@@ -747,6 +769,7 @@ mod tests {
             false,
             None,
             Some(&mut cache),
+            None,
         )
         .unwrap();
         assert_eq!(h_dec.shape(), &[1, weights.hidden_size]);
@@ -789,6 +812,7 @@ mod tests {
                 false,
                 None,
                 Some(&mut cache),
+                None,
             )
             .unwrap();
             cache.next_position = 3;
@@ -799,6 +823,7 @@ mod tests {
                 false,
                 None,
                 Some(&mut cache),
+                None,
             )
             .unwrap();
 
@@ -824,7 +849,8 @@ mod tests {
         let (h_a, _, _, k_a, v_a) =
             run_attention_block_with_kv_out(&weights, &h, 0, false, None).unwrap();
         let (h_b, _, _, k_b, v_b) =
-            run_attention_block_with_kv_out_with_cache(&weights, &h, 0, false, None, None).unwrap();
+            run_attention_block_with_kv_out_with_cache(&weights, &h, 0, false, None, None, None)
+                .unwrap();
         assert_eq!(h_a, h_b);
         assert_eq!(k_a, k_b);
         assert_eq!(v_a, v_b);

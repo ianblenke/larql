@@ -224,6 +224,7 @@ pub fn predict_q4k_hidden_with_cache(
             ple_inputs.get(layer),
             shared_kv,
             kv_cache.as_deref_mut(),
+            Some(index),
         ) {
             h = h_new;
             if let Some(kv) = kv_out {
