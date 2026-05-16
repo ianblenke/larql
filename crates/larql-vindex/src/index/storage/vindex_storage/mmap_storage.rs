@@ -25,6 +25,25 @@ use crate::index::types::{GateLayerSlice, GateQ4Slice};
 use super::sealed::Sealed;
 use super::{BytesView, GateLayerView, VindexStorage, DELTANET_TENSORS_PER_LAYER};
 
+/// Per-entry view of the `attn_weights_q4k_manifest.json` payload.
+/// Carries `key` + `shape` alongside the byte-range fields so a sparse
+/// manifest (qwen35moe ships only Q/K/V/O for the 10 full-attention
+/// layers, indices 3/7/11/…/39) can be queried by key prefix instead
+/// of via the position-arithmetic `attn_q4k_layer_data` accessor
+/// (which assumes 4 entries per layer for every layer).
+///
+/// Dense-manifest callers (Gemma 3, Gemma 4 dense, llama) continue
+/// using `attn_q4k_layer_data` — their manifest has 4 entries per
+/// layer in order, so `layer * 4` indexes correctly.
+#[derive(Clone, Debug)]
+pub struct AttnManifestEntry {
+    pub key: String,
+    pub shape: Vec<usize>,
+    pub offset: usize,
+    pub length: usize,
+    pub format: String,
+}
+
 /// Per-entry view of the `deltanet_weights_q4k_manifest.json` payload.
 /// Keys are kept so the layer accessor can resolve a global layer
 /// index → 5 entries by prefix match, sidestepping the position-based
@@ -71,7 +90,7 @@ pub struct MmapStorage {
 
     // ── Attention ────────────────────────────────────────────────────
     pub(crate) attn_q4k: Option<Bytes>,
-    pub(crate) attn_q4k_manifest: Option<Vec<(usize, usize, String)>>,
+    pub(crate) attn_q4k_manifest: Option<Vec<AttnManifestEntry>>,
     pub(crate) attn_q4: Option<Bytes>,
     pub(crate) attn_q4_manifest: Option<Vec<(usize, usize)>>,
     pub(crate) attn_q8: Option<Bytes>,
@@ -179,7 +198,7 @@ impl MmapStorage {
     pub fn set_attn_q4k(
         &mut self,
         mmap: Arc<memmap2::Mmap>,
-        manifest: Option<Vec<(usize, usize, String)>>,
+        manifest: Option<Vec<AttnManifestEntry>>,
     ) {
         self.attn_q4k = Some(arc_mmap_to_bytes(&mmap));
         self.attn_q4k_manifest = manifest;
@@ -531,13 +550,67 @@ impl VindexStorage for MmapStorage {
             return None;
         }
         for i in 0..ATTN_TENSORS_PER_LAYER {
-            let (offset, length, _) = &manifest[base + i];
-            checked_view(bytes, *offset, *length)?;
+            let e = &manifest[base + i];
+            checked_view(bytes, e.offset, e.length)?;
         }
         let out: [(BytesView<'_>, &str); ATTN_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
-            let (offset, length, format) = &manifest[base + i];
-            (BytesView::new(bytes, *offset, *length), format.as_str())
+            let e = &manifest[base + i];
+            (BytesView::new(bytes, e.offset, e.length), e.format.as_str())
         });
+        Some(out)
+    }
+
+    fn attn_q4k_sparse_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(BytesView<'_>, &str, &[usize]); ATTN_TENSORS_PER_LAYER]> {
+        let bytes = self.attn_q4k.as_ref()?;
+        let manifest = self.attn_q4k_manifest.as_ref()?;
+
+        // Match by suffix so the layer-number prefix
+        // (`layers.{layer}.`) is the only structural assumption — the
+        // hybrid-attention manifest (qwen35moe) only carries entries
+        // for the 10 full-attention layers, so `layer * 4` arithmetic
+        // doesn't work.
+        const SUFFIXES: [&str; ATTN_TENSORS_PER_LAYER] = [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ];
+        let prefix = format!("layers.{layer}.");
+
+        let mut found: [Option<&AttnManifestEntry>; ATTN_TENSORS_PER_LAYER] =
+            [None; ATTN_TENSORS_PER_LAYER];
+        for entry in manifest {
+            let Some(rest) = entry.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            for (i, suf) in SUFFIXES.iter().enumerate() {
+                if rest == *suf {
+                    found[i] = Some(entry);
+                    break;
+                }
+            }
+        }
+        for entry in found.iter().flatten() {
+            let end = entry.offset.checked_add(entry.length)?;
+            if end > bytes.len() {
+                return None;
+            }
+        }
+        if found.iter().any(|e| e.is_none()) {
+            return None;
+        }
+        let out: [(BytesView<'_>, &str, &[usize]); ATTN_TENSORS_PER_LAYER] =
+            std::array::from_fn(|i| {
+                let e = found[i].expect("checked above");
+                (
+                    BytesView::new(bytes, e.offset, e.length),
+                    e.format.as_str(),
+                    e.shape.as_slice(),
+                )
+            });
         Some(out)
     }
 
@@ -887,13 +960,20 @@ mod tests {
         let payload = vec![0u8; 256];
         let mut s = MmapStorage::empty(8);
 
+        let attn_entry = |key: &str, offset, length| AttnManifestEntry {
+            key: key.into(),
+            shape: vec![16, 16],
+            offset,
+            length,
+            format: "Q4_K".into(),
+        };
         s.set_attn_q4k(
             arc_mmap_from(&payload),
             Some(vec![
-                (0, 16, "Q4_K".to_string()),
-                (16, 16, "Q4_K".to_string()),
-                (32, 16, "Q4_K".to_string()),
-                (48, 16, "Q4_K".to_string()),
+                attn_entry("layers.0.self_attn.q_proj.weight", 0, 16),
+                attn_entry("layers.0.self_attn.k_proj.weight", 16, 16),
+                attn_entry("layers.0.self_attn.v_proj.weight", 32, 16),
+                attn_entry("layers.0.self_attn.o_proj.weight", 48, 16),
             ]),
         );
         assert!(s.has_attn_q4k());
@@ -1026,13 +1106,20 @@ mod tests {
                 num_features: 4,
             }],
         );
+        let attn_entry = |key: &str, offset, length| AttnManifestEntry {
+            key: key.into(),
+            shape: vec![16, 16],
+            offset,
+            length,
+            format: "Q4_K".into(),
+        };
         s.set_attn_q4k(
             arc_mmap_from(&payload),
             Some(vec![
-                (0, 16, "Q4_K".into()),
-                (16, 16, "Q4_K".into()),
-                (32, 16, "Q4_K".into()),
-                (48, 16, "Q4_K".into()),
+                attn_entry("layers.0.self_attn.q_proj.weight", 0, 16),
+                attn_entry("layers.0.self_attn.k_proj.weight", 16, 16),
+                attn_entry("layers.0.self_attn.v_proj.weight", 32, 16),
+                attn_entry("layers.0.self_attn.o_proj.weight", 48, 16),
             ]),
         );
         s.set_attn_q4(

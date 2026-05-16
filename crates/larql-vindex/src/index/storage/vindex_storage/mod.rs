@@ -82,7 +82,7 @@ use crate::index::types::GateLayerSlice;
 pub const DELTANET_TENSORS_PER_LAYER: usize = 5;
 
 mod mmap_storage;
-pub use mmap_storage::{DeltanetManifestEntry, MmapStorage};
+pub use mmap_storage::{AttnManifestEntry, DeltanetManifestEntry, MmapStorage};
 
 /// Borrowed view into a substore's whole-file `Bytes`. Carries the
 /// (offset, length) cut without paying the refcount bump that
@@ -211,6 +211,17 @@ pub trait VindexStorage: sealed::Sealed + Send + Sync {
         &self,
         layer: usize,
     ) -> Option<[(BytesView<'_>, &str); ATTN_TENSORS_PER_LAYER]>;
+
+    /// Like [`attn_q4k_layer_data`] but resolves the layer via key-prefix
+    /// match instead of `layer * 4` index arithmetic. Required for
+    /// sparse manifests where only some global layers (e.g. the 10
+    /// full-attention layers on qwen35moe) carry Q/K/V/O entries.
+    /// Returns `(bytes, fmt, shape)` per tensor so consumers can build
+    /// `QuantTensor::from_raw` without re-parsing the manifest.
+    fn attn_q4k_sparse_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(BytesView<'_>, &str, &[usize]); ATTN_TENSORS_PER_LAYER]>;
 
     /// Whole-file Q4_0 attention buffer.
     fn attn_q4_whole_buffer(&self) -> Option<Bytes>;
