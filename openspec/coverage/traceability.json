@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 53,
-    "requirements": 514,
-    "scenarios": 1530,
-    "scenarios_backed": 1343,
-    "scenarios_unbacked": 187,
-    "test_refs": 3461,
+    "requirements": 516,
+    "scenarios": 1533,
+    "scenarios_backed": 1345,
+    "scenarios_unbacked": 188,
+    "test_refs": 3464,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -1641,6 +1641,44 @@
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-kquant-matvec-correctness-avx2/specs/compute-backend-traits/spec.md",
               "line": 128
+            }
+          ]
+        },
+        {
+          "name": "AVX2 Q4_K / Q6_K \u00d7 Q8_K matvec MUST scale across CPU threads",
+          "scenarios": [
+            {
+              "name": "Production decode-step matvecs use the parallel path",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q4k-q8k-matvec-rayon/specs/compute-backend-traits/spec.md",
+              "line": 16
+            }
+          ]
+        },
+        {
+          "name": "Parallel matvec output MUST be bit-exact vs the scalar reference",
+          "scenarios": [
+            {
+              "name": "AVX2 parallel output matches scalar bit-exactly",
+              "tests_resolved": [
+                "larql_compute::cpu::ops::q4k_q8k_dot::tests::q8k_matvec_avx2_matches_scalar"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/cpu-q4k-q8k-matvec-rayon/specs/compute-backend-traits/spec.md",
+              "line": 32
+            },
+            {
+              "name": "Q6_K AVX2 parallel output matches scalar bit-exactly",
+              "tests_resolved": [
+                "larql_compute::cpu::ops::q4k_q8k_dot::tests::q6k_q8k_matvec_avx2_matches_scalar"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/cpu-q4k-q8k-matvec-rayon/specs/compute-backend-traits/spec.md",
+              "line": 41
             }
           ]
         },
@@ -21906,139 +21944,139 @@
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q4k_q8k_matvec_matches_canonical_dequant",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1804,
+      "line": 1880,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q4kf_q8k_matvec_avx2_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1676,
+      "line": 1752,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q4kf_q8k_matvec_matches_canonical_dequant",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1712,
+      "line": 1788,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q6k_q8k_matvec_avx2_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1755,
+      "line": 1831,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q6k_q8k_matvec_matches_canonical_dequant",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1865,
+      "line": 1941,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q6k_q8k_public_entrypoint_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1942,
+      "line": 2018,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q6k_q8k_zero_dims_and_short_weights_zero_output",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1963,
+      "line": 2039,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q6k_two_production_paths_agree_within_q8k_noise",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1916,
+      "line": 1992,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_gate_up_fused_matches_separate_matvecs",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1600,
+      "line": 1676,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_in_place_matches_alloc_version",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1537,
+      "line": 1613,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_2row_matches_single_row_bit_exact",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1566,
+      "line": 1642,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_avx2_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1979,
+      "line": 2055,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_matches_f32_cached_within_q8_noise",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1427,
+      "line": 1503,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_multi_block_within_noise",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1463,
+      "line": 1539,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_neon_matches_scalar_bit_exact",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1496,
+      "line": 1572,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_short_weight_buffer_returns_zero",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1659,
+      "line": 1735,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_matvec_zero_dims_returns_zero",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1645,
+      "line": 1721,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_quantize_round_trip_within_quant_step",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1388,
+      "line": 1464,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::q8k_zero_input_clean",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1413,
+      "line": 1489,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::tests::q4kf_q8k_matvec_avx2_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1676,
+      "line": 1752,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::tests::q4kf_q8k_matvec_matches_canonical_dequant",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1712,
+      "line": 1788,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::tests::q6k_q8k_public_entrypoint_matches_scalar",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1942,
+      "line": 2018,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cpu::ops::q4k_q8k_dot::tests::q6k_q8k_zero_dims_and_short_weights_zero_output",
       "file": "crates/larql-compute/src/cpu/ops/q4k_q8k_dot.rs",
-      "line": 1963,
+      "line": 2039,
       "crate": "larql_compute"
     },
     {
