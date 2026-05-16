@@ -22,6 +22,7 @@ pub mod qwen35_attn;
 pub mod qwen35_block;
 pub mod qwen35_forward;
 pub mod qwen35_load;
+pub mod qwen35_load_vindex;
 pub mod rope;
 
 use ndarray::Array2;

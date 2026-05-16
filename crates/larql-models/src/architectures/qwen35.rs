@@ -346,10 +346,7 @@ impl ModelArchitecture for Qwen35MoeArch {
         // safetensors model, which qwen35moe doesn't expose. Mixtral
         // applies the same per-arch trick (`block_sparse_moe.gate.weight`)
         // rather than relying on a global remap.
-        Some(format!(
-            "{}ffn_gate_inp.weight",
-            self.layer_prefix(layer)
-        ))
+        Some(format!("{}ffn_gate_inp.weight", self.layer_prefix(layer)))
     }
 
     fn expert_ffn_gate_key(&self, layer: usize, expert_id: usize) -> Option<String> {
