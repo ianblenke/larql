@@ -824,8 +824,7 @@ mod tests {
         let (h_a, _, _, k_a, v_a) =
             run_attention_block_with_kv_out(&weights, &h, 0, false, None).unwrap();
         let (h_b, _, _, k_b, v_b) =
-            run_attention_block_with_kv_out_with_cache(&weights, &h, 0, false, None, None)
-                .unwrap();
+            run_attention_block_with_kv_out_with_cache(&weights, &h, 0, false, None, None).unwrap();
         assert_eq!(h_a, h_b);
         assert_eq!(k_a, k_b);
         assert_eq!(v_a, v_b);
