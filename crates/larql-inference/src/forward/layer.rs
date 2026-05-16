@@ -167,6 +167,7 @@ pub fn run_layer_with_ffn(
         ple_input,
         shared_kv,
         None,
+        None,
     )
 }
 
@@ -189,6 +190,7 @@ pub fn run_layer_with_ffn_with_cache(
     ple_input: Option<&Array2<f32>>,
     shared_kv: Option<&SharedKV>,
     kv_cache: Option<&mut crate::attention::KvCache>,
+    vindex: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, Option<Array2<f32>>, Option<SharedKV>)> {
     let (h_post_attn, kv_out) = if shared_kv.is_some() {
         (
@@ -198,7 +200,7 @@ pub fn run_layer_with_ffn_with_cache(
     } else {
         let (h_pa, _, _, k_rope, v_final) =
             crate::attention::run_attention_block_with_kv_out_with_cache(
-                weights, h, layer, false, None, kv_cache,
+                weights, h, layer, false, None, kv_cache, vindex,
             )?;
         (h_pa, Some((k_rope, v_final)))
     };
