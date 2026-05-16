@@ -211,9 +211,11 @@ field:
   tensor matches because `normalize_gguf_key` has no remap rule
   for `ffn_gate_inp.`). Mixtral uses the same per-arch convention.
 
-Smoke validation after #155: live conversion of the 21 GB GGUF
-should now land 40 `layers.{L}.ffn_gate_inp.weight` entries in
-`weight_manifest.json` (one per MoE layer).
+Smoke validated after #155: live conversion of the 21 GB GGUF
+produced a vindex at `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v3/` whose
+`weight_manifest.json` carries exactly **40
+`layers.{L}.ffn_gate_inp.weight` entries** (one per MoE layer).
+Writer arc structurally complete.
 
 ### Step 2b.1 — Norms reader ✅ NO-OP (confirmed via #154)
 
@@ -224,13 +226,22 @@ the full tensor name. DeltaNet small tensors + the post-#155
 router land there automatically. No new reader code needed for
 Step 2b's consumers — they read by key.
 
-### Step 2b.2..2b.6 — `Qwen35Weights` vindex adapter (NEXT)
+### Step 2b — adapter stub ✅ MERGED (PR #157)
+
+`crates/larql-inference/src/attention/qwen35_load_vindex.rs` (NEW)
+lands the module skeleton + `VindexLoadError` enum + public
+signature `pub fn load_qwen35_weights_from_vindex(vindex_dir) ->
+Result<Qwen35Weights, VindexLoadError>`. Arch sanity-check in the
+body refuses non-qwen35 vindexes cleanly. Per-layer assembly is
+`todo!()` until 2b.2..2b.4 land.
+
+### Step 2b.2..2b.6 — adapter body (NEXT)
 
 The hard part. Phase 2 of `vindex-qwen35moe-reader`.
 
-`crates/larql-inference/src/attention/qwen35_load_vindex.rs` (NEW)
-must produce a `Qwen35Weights` from a vindex directory. Per
-`qwen35_forward.rs:98`, the struct has:
+The stub from PR #157 has the right module wiring + error type +
+signature. The remaining work fills in the `todo!()` body with
+per-layer assembly. Per `qwen35_forward.rs:98`, the struct has:
 - `embed`: `ArcArray2<f32>` + `embed_quant: Option<QuantTensor>`
 - `layers: Vec<Qwen35FullLayerWeights>` — each carries
   `block: Qwen35LayerWeights` (`Linear(DeltaNetLayerWeights)` or
