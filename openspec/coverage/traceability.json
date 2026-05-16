@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 53,
-    "requirements": 517,
-    "scenarios": 1536,
+    "requirements": 519,
+    "scenarios": 1541,
     "scenarios_backed": 1345,
-    "scenarios_unbacked": 191,
-    "test_refs": 3467,
+    "scenarios_unbacked": 196,
+    "test_refs": 3472,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -1679,6 +1679,27 @@
               "unbacked": false,
               "spec_file": "openspec/changes/cpu-q4k-q8k-matvec-rayon/specs/compute-backend-traits/spec.md",
               "line": 41
+            }
+          ]
+        },
+        {
+          "name": "with_q8k_for cache key MUST be content-aware",
+          "scenarios": [
+            {
+              "name": "per-step lm_head matvec sees fresh quantisation each call",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q8k-cache-and-blas-thread-fix/specs/compute-backend-traits/spec.md",
+              "line": 19
+            },
+            {
+              "name": "MoE-style cache reuse still hits the cache",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q8k-cache-and-blas-thread-fix/specs/compute-backend-traits/spec.md",
+              "line": 32
             }
           ]
         },
@@ -17216,6 +17237,35 @@
               "unbacked": false,
               "spec_file": "openspec/changes/backfill-specs/specs/server-vindex-loading/spec.md",
               "line": 149
+            }
+          ]
+        },
+        {
+          "name": "larql-server MUST pin BLAS thread count to 1 at startup",
+          "scenarios": [
+            {
+              "name": "Default startup yields BLAS_NUM_THREADS=1",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q8k-cache-and-blas-thread-fix/specs/server-vindex-loading/spec.md",
+              "line": 17
+            },
+            {
+              "name": "Caller-supplied OPENBLAS_NUM_THREADS overrides the default",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q8k-cache-and-blas-thread-fix/specs/server-vindex-loading/spec.md",
+              "line": 26
+            },
+            {
+              "name": "End-to-end decode runs at the post-rayon target",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q8k-cache-and-blas-thread-fix/specs/server-vindex-loading/spec.md",
+              "line": 35
             }
           ]
         },
@@ -39343,109 +39393,109 @@
     {
       "fqn": "larql_models::quant::lazy::expert_slice_matvec_matches_standalone",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 620,
+      "line": 633,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::expert_slice_rejects_mismatched_num_experts",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 603,
+      "line": 616,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::expert_slice_rejects_oob_expert_id",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 610,
+      "line": 623,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::expert_slice_returns_per_expert_subview_f32",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 551,
+      "line": 564,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::expert_slice_shares_arc_with_parent",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 586,
+      "line": 599,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 493,
+      "line": 506,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 518,
+      "line": 531,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::row_to_f32_oob_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 540,
+      "line": 553,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::row_to_f32_returns_each_row_in_order",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 525,
+      "line": 538,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::expert_slice_matvec_matches_standalone",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 620,
+      "line": 633,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::expert_slice_rejects_mismatched_num_experts",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 603,
+      "line": 616,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::expert_slice_rejects_oob_expert_id",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 610,
+      "line": 623,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::expert_slice_returns_per_expert_subview_f32",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 551,
+      "line": 564,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::expert_slice_shares_arc_with_parent",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 586,
+      "line": 599,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::f32_roundtrip_matvec_matches_scalar_dot",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 493,
+      "line": 506,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::matvec_wrong_x_len_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 518,
+      "line": 531,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::row_to_f32_oob_errors",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 540,
+      "line": 553,
       "crate": "larql_models"
     },
     {
       "fqn": "larql_models::quant::lazy::tests::row_to_f32_returns_each_row_in_order",
       "file": "crates/larql-models/src/quant/lazy.rs",
-      "line": 525,
+      "line": 538,
       "crate": "larql_models"
     },
     {
