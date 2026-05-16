@@ -10,6 +10,30 @@ use crate::ffn::WeightFfn;
 use crate::model::ModelWeights;
 use ndarray::Array2;
 
+/// Project the LAST row of `h_final` ([seq_len-1..seq_len, ..]) to raw
+/// pre-temperature logits.
+///
+/// Prefers the direct Q4_K × Q8_K matvec path via
+/// `weights.lm_head_quant` when available (rayon-parallel AVX2 row
+/// dot, no f32 materialisation of the vocab × hidden matrix). Falls
+/// back to f32 BLAS GEMV against `weights.lm_head` otherwise (Gemma 3 1B
+/// at hidden=1152 — not Q8_K-aligned, so `lm_head_quant` is None).
+pub(super) fn project_lm_head_last_row(
+    weights: &ModelWeights,
+    h_final: &Array2<f32>,
+    seq_len: usize,
+) -> Vec<f32> {
+    let last_2d = h_final.slice(ndarray::s![seq_len - 1..seq_len, ..]);
+    if let Some(lm_q) = weights.lm_head_quant.as_ref() {
+        let x = last_2d.row(0).to_owned();
+        if let Ok(v) = lm_q.matvec(&x) {
+            return v.to_vec();
+        }
+    }
+    let logits_raw = dot_proj(&last_2d, &weights.lm_head);
+    logits_raw.row(0).to_vec()
+}
+
 /// Descending order on the probability field of `(index, prob)` pairs,
 /// with NaN probabilities treated as the smallest value so they never
 /// displace a real top-k hit. Used by every top-k selector in this file
@@ -51,11 +75,9 @@ pub fn full_vocab_probs(weights: &ModelWeights, h: &Array2<f32>, temperature: f3
     let logits_scale = weights.arch.logits_scaling();
     let final_softcap = weights.arch.final_logit_softcapping();
 
-    let last_2d = h_final.slice(ndarray::s![seq_len - 1..seq_len, ..]);
-    let logits_raw = dot_proj(&last_2d, &weights.lm_head);
+    let logits_raw_vec = project_lm_head_last_row(weights, &h_final, seq_len);
     let inv_scale = 1.0 / logits_scale;
-    let logits: Vec<f32> = logits_raw
-        .row(0)
+    let logits: Vec<f32> = logits_raw_vec
         .iter()
         .map(|&v| {
             let mut logit = v * inv_scale;
