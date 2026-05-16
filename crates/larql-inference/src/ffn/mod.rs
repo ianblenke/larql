@@ -9,6 +9,7 @@
 
 pub mod graph_backend;
 pub mod moe_remote;
+pub mod q4k_direct;
 pub mod remote;
 pub mod sparse;
 pub mod sparse_compute;
@@ -53,6 +54,7 @@ pub trait FfnBackend {
 // ── Re-exports ──
 
 pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
+pub use q4k_direct::Q4kDirectFfn;
 pub use remote::{
     LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
     WirePreference,
