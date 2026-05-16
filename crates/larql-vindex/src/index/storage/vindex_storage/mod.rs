@@ -75,8 +75,14 @@ use crate::index::storage::attn::ATTN_TENSORS_PER_LAYER;
 use crate::index::storage::ffn_store::FFN_COMPONENTS_PER_LAYER;
 use crate::index::types::GateLayerSlice;
 
+/// Number of Q4_K matmul tensors emitted per linear-attention
+/// (DeltaNet) layer: attn_qkv, attn_gate, ssm_alpha, ssm_beta, ssm_out
+/// in that fixed order. Mirrors [`ATTN_TENSORS_PER_LAYER`] for the
+/// full-attention path.
+pub const DELTANET_TENSORS_PER_LAYER: usize = 5;
+
 mod mmap_storage;
-pub use mmap_storage::MmapStorage;
+pub use mmap_storage::{DeltanetManifestEntry, MmapStorage};
 
 /// Borrowed view into a substore's whole-file `Bytes`. Carries the
 /// (offset, length) cut without paying the refcount bump that
@@ -223,6 +229,29 @@ pub trait VindexStorage: sealed::Sealed + Send + Sync {
         &self,
         layer: usize,
     ) -> Option<[(BytesView<'_>, BytesView<'_>); ATTN_TENSORS_PER_LAYER]>;
+
+    // ── DeltaNet (Qwen 3.6 linear-attention) ────────────────────────────
+
+    /// Q4_K matmul tensors for one DeltaNet linear-attention layer:
+    /// `[(attn_qkv, fmt), (attn_gate, fmt), (ssm_alpha, fmt),
+    ///   (ssm_beta, fmt), (ssm_out, fmt)]`.
+    ///
+    /// `layer` is the **global** layer index. The accessor looks up
+    /// manifest entries by `layers.{layer}.` key prefix rather than by
+    /// `layer * 5` arithmetic, so it tolerates sparse manifests where
+    /// only the linear-attention layers carry entries (3 out of every
+    /// 4 layers on Qwen 3.6 at `full_attention_interval=4`).
+    ///
+    /// Returns `None` when:
+    /// - no `deltanet_weights_q4k.bin` was loaded
+    /// - the requested layer is a full-attention layer (its weights
+    ///   live in the `attn_weights_q4k.bin` store instead)
+    /// - any of the 5 expected tensors is missing from the manifest
+    ///   (a partial layer would mislead callers)
+    fn deltanet_q4k_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER]>;
 
     // ── lm_head ─────────────────────────────────────────────────────────
 

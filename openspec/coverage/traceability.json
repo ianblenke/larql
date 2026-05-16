@@ -1,11 +1,11 @@
 {
   "summary": {
     "capabilities": 54,
-    "requirements": 525,
-    "scenarios": 1548,
+    "requirements": 528,
+    "scenarios": 1551,
     "scenarios_backed": 1345,
-    "scenarios_unbacked": 203,
-    "test_refs": 3479,
+    "scenarios_unbacked": 206,
+    "test_refs": 3482,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -18212,6 +18212,45 @@
               "unbacked": true,
               "spec_file": "openspec/changes/vindex-qwen35moe-extraction/specs/vindex-extraction/spec.md",
               "line": 75
+            }
+          ]
+        },
+        {
+          "name": "Vindex SHALL expose DeltaNet weights to consumers",
+          "scenarios": [
+            {
+              "name": "Qwen 3.6 35B-A3B linear layer 0 returns 5 DeltaNet tuples",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-reader/specs/vindex-extraction/spec.md",
+              "line": 18
+            }
+          ]
+        },
+        {
+          "name": "Vindex-loaded Qwen35Weights SHALL be functionally equivalent to GGUF-loaded",
+          "scenarios": [
+            {
+              "name": "vindex-loaded forward produces non-degenerate logits",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-reader/specs/vindex-extraction/spec.md",
+              "line": 40
+            }
+          ]
+        },
+        {
+          "name": "larql-server SHALL dispatch qwen35-family arches through the hybrid forward",
+          "scenarios": [
+            {
+              "name": "server dispatches qwen35moe to the qwen35 forward",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-reader/specs/vindex-extraction/spec.md",
+              "line": 63
             }
           ]
         }
@@ -47253,6 +47292,42 @@
       "crate": "larql_vindex"
     },
     {
+      "fqn": "larql_vindex::index::storage::deltanet::deltanet_q4k_layer_data_returns_5_entries_for_complete_layer",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 145,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::index::storage::deltanet::load_deltanet_q4k_is_noop_when_file_absent",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 130,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::index::storage::deltanet::load_deltanet_q4k_rejects_manifest_without_format",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 218,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::index::storage::deltanet::tests::deltanet_q4k_layer_data_returns_5_entries_for_complete_layer",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 145,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::index::storage::deltanet::tests::load_deltanet_q4k_is_noop_when_file_absent",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 130,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::index::storage::deltanet::tests::load_deltanet_q4k_rejects_manifest_without_format",
+      "file": "crates/larql-vindex/src/index/storage/deltanet.rs",
+      "line": 218,
+      "crate": "larql_vindex"
+    },
+    {
       "fqn": "larql_vindex::index::storage::ffn_store::down::down_feature_vector_none_for_oob_feature",
       "file": "crates/larql-vindex/src/index/storage/ffn_store/down.rs",
       "line": 174,
@@ -48743,361 +48818,361 @@
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::bytes_view_as_slice_and_owned",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 298,
+      "line": 327,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::gate_layer_view_is_borrowed_and_copy",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 280,
+      "line": 309,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::attn_q4_layer_slices_rejects_out_of_bounds",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1005,
+      "line": 1094,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::attn_q8_layer_data_validates_combined_span",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 649,
+      "line": 738,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::bytes_view_is_empty",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1178,
+      "line": 1267,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::down_features_q4k_layer_data_rejects_out_of_bounds",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1017,
+      "line": 1106,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::empty_storage_returns_none_everywhere",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 587,
+      "line": 676,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::ffn_q4k_layer_data_matches_manifest",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 608,
+      "line": 697,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::ffn_q4k_layer_data_rejects_out_of_bounds_manifest",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 633,
+      "line": 722,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::full_sweep_through_trait_and_helpers",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 897,
+      "line": 986,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::gate_helpers_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1080,
+      "line": 1169,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::gate_layer_view_none_when_layer_unowned",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 691,
+      "line": 780,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::gate_layer_view_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 666,
+      "line": 755,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::gate_q4_helpers_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1104,
+      "line": 1193,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::gate_q4_layer_data_rejects_zero_or_overflow",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1035,
+      "line": 1124,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::mmap_storage_clones_via_refcount",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 705,
+      "line": 794,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::register_mmap_only_tracks_file_backed_handles",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1161,
+      "line": 1250,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::release_pages_does_not_destroy_storage",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1125,
+      "line": 1214,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::release_pages_empty_is_noop",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1151,
+      "line": 1240,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_attn_q4k_q4_q8_round_trips",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 784,
+      "line": 873,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_down_features_q4k_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 764,
+      "line": 853,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_gate_q4_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 877,
+      "line": 966,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_gate_vectors_then_layer_view",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 853,
+      "line": 942,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_interleaved_q4_whole_buffer_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 752,
+      "line": 841,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_interleaved_q4k_is_zero_copy_from_arc_mmap",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1065,
+      "line": 1154,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_interleaved_q4k_with_manifest_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 730,
+      "line": 819,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_lm_head_q4_synth_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 843,
+      "line": 932,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::set_lm_head_variants_and_views",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 822,
+      "line": 911,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::attn_q4_layer_slices_rejects_out_of_bounds",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1005,
+      "line": 1094,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::attn_q8_layer_data_validates_combined_span",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 649,
+      "line": 738,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::bytes_view_is_empty",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1178,
+      "line": 1267,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::down_features_q4k_layer_data_rejects_out_of_bounds",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1017,
+      "line": 1106,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::empty_storage_returns_none_everywhere",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 587,
+      "line": 676,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::ffn_q4k_layer_data_matches_manifest",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 608,
+      "line": 697,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::ffn_q4k_layer_data_rejects_out_of_bounds_manifest",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 633,
+      "line": 722,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::full_sweep_through_trait_and_helpers",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 897,
+      "line": 986,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::gate_helpers_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1080,
+      "line": 1169,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::gate_layer_view_none_when_layer_unowned",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 691,
+      "line": 780,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::gate_layer_view_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 666,
+      "line": 755,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::gate_q4_helpers_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1104,
+      "line": 1193,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::gate_q4_layer_data_rejects_zero_or_overflow",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1035,
+      "line": 1124,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::mmap_storage_clones_via_refcount",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 705,
+      "line": 794,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::register_mmap_only_tracks_file_backed_handles",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1161,
+      "line": 1250,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::release_pages_does_not_destroy_storage",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1125,
+      "line": 1214,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::release_pages_empty_is_noop",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1151,
+      "line": 1240,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_attn_q4k_q4_q8_round_trips",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 784,
+      "line": 873,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_down_features_q4k_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 764,
+      "line": 853,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_gate_q4_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 877,
+      "line": 966,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_gate_vectors_then_layer_view",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 853,
+      "line": 942,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_interleaved_q4_whole_buffer_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 752,
+      "line": 841,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_interleaved_q4k_is_zero_copy_from_arc_mmap",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 1065,
+      "line": 1154,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_interleaved_q4k_with_manifest_then_layer_data",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 730,
+      "line": 819,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_lm_head_q4_synth_round_trip",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 843,
+      "line": 932,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::mmap_storage::tests::set_lm_head_variants_and_views",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mmap_storage.rs",
-      "line": 822,
+      "line": 911,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::tests::bytes_view_as_slice_and_owned",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 298,
+      "line": 327,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::tests::gate_layer_view_is_borrowed_and_copy",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 280,
+      "line": 309,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::tests::trait_is_object_safe",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 260,
+      "line": 289,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::tests::trait_object_is_send_sync",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 271,
+      "line": 300,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::trait_is_object_safe",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 260,
+      "line": 289,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::index::storage::vindex_storage::trait_object_is_send_sync",
       "file": "crates/larql-vindex/src/index/storage/vindex_storage/mod.rs",
-      "line": 271,
+      "line": 300,
       "crate": "larql_vindex"
     },
     {

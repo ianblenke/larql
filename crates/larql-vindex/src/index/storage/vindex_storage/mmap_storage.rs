@@ -23,7 +23,20 @@ use crate::index::storage::ffn_store::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_
 use crate::index::types::{GateLayerSlice, GateQ4Slice};
 
 use super::sealed::Sealed;
-use super::{BytesView, GateLayerView, VindexStorage};
+use super::{BytesView, GateLayerView, VindexStorage, DELTANET_TENSORS_PER_LAYER};
+
+/// Per-entry view of the `deltanet_weights_q4k_manifest.json` payload.
+/// Keys are kept so the layer accessor can resolve a global layer
+/// index → 5 entries by prefix match, sidestepping the position-based
+/// indexing the standard Q/K/V/O accessor uses (the DeltaNet manifest
+/// is sparse — only linear-attention layers carry entries).
+#[derive(Clone, Debug)]
+pub struct DeltanetManifestEntry {
+    pub key: String,
+    pub offset: usize,
+    pub length: usize,
+    pub format: String,
+}
 
 /// Parity wrapper over today's substore mmaps. Implements
 /// `VindexStorage` by cloning each substore's `Arc<Mmap>` (or
@@ -55,6 +68,16 @@ pub struct MmapStorage {
     pub(crate) attn_q4_manifest: Option<Vec<(usize, usize)>>,
     pub(crate) attn_q8: Option<Bytes>,
     pub(crate) attn_q8_manifest: Option<Vec<(usize, usize, usize)>>,
+
+    // ── DeltaNet (Qwen 3.6 linear-attention) ─────────────────────────
+    //
+    // Manifest entries carry the key so the accessor can resolve a
+    // global layer index → 5 entries by prefix match, sidestepping
+    // the `layer * 5` index arithmetic that would break on sparse
+    // manifests (Qwen 3.6 emits entries for only the linear layers,
+    // i.e. 30 of 40 at `full_attention_interval=4`).
+    pub(crate) deltanet_q4k: Option<Bytes>,
+    pub(crate) deltanet_q4k_manifest: Option<Vec<DeltanetManifestEntry>>,
 
     // ── lm_head ──────────────────────────────────────────────────────
     pub(crate) lm_head_f32: Option<Bytes>,
@@ -173,6 +196,17 @@ impl MmapStorage {
         self.register_mmap(&mmap);
     }
 
+    /// Set the DeltaNet Q4_K mmap + manifest.
+    pub fn set_deltanet_q4k(
+        &mut self,
+        mmap: Arc<memmap2::Mmap>,
+        manifest: Option<Vec<DeltanetManifestEntry>>,
+    ) {
+        self.deltanet_q4k = Some(arc_mmap_to_bytes(&mmap));
+        self.deltanet_q4k_manifest = manifest;
+        self.register_mmap(&mmap);
+    }
+
     /// Set the lm_head f32 mmap.
     pub fn set_lm_head_f32(&mut self, mmap: Arc<memmap2::Mmap>) {
         self.lm_head_f32 = Some(arc_mmap_to_bytes(&mmap));
@@ -274,6 +308,9 @@ impl MmapStorage {
     pub fn has_attn_q8(&self) -> bool {
         self.attn_q8.is_some()
     }
+    pub fn has_deltanet_q4k(&self) -> bool {
+        self.deltanet_q4k.is_some()
+    }
     pub fn has_lm_head_q4(&self) -> bool {
         self.lm_head_q4.is_some()
     }
@@ -352,6 +389,8 @@ impl MmapStorage {
             attn_q4_manifest: None,
             attn_q8: None,
             attn_q8_manifest: None,
+            deltanet_q4k: None,
+            deltanet_q4k_manifest: None,
             lm_head_f32: None,
             lm_head_f16: None,
             lm_head_q4: None,
@@ -544,6 +583,56 @@ impl VindexStorage for MmapStorage {
                 let scales = BytesView::new(bytes, offset + vals_len, scales_len);
                 (vals, scales)
             });
+        Some(out)
+    }
+
+    fn deltanet_q4k_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER]> {
+        let bytes = self.deltanet_q4k.as_ref()?;
+        let manifest = self.deltanet_q4k_manifest.as_ref()?;
+
+        // Names emitted by `write_q4k::deltanet` per linear layer, in
+        // fixed order. Match by suffix so the layer-number prefix
+        // (`layers.{layer}.`) is the only structural assumption.
+        const SUFFIXES: [&str; DELTANET_TENSORS_PER_LAYER] = [
+            "self_attn.qkv_proj.weight",
+            "attn_gate.weight",
+            "ssm_alpha.weight",
+            "ssm_beta.weight",
+            "ssm_out.weight",
+        ];
+        let prefix = format!("layers.{layer}.");
+
+        let mut found: [Option<&DeltanetManifestEntry>; DELTANET_TENSORS_PER_LAYER] =
+            [None; DELTANET_TENSORS_PER_LAYER];
+        for entry in manifest {
+            let Some(rest) = entry.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            for (i, suf) in SUFFIXES.iter().enumerate() {
+                if rest == *suf {
+                    found[i] = Some(entry);
+                    break;
+                }
+            }
+        }
+        // Every slot must be present — a partial layer is a writer bug
+        // we want to surface, not paper over with empty bytes.
+        for entry in found.iter().flatten() {
+            let end = entry.offset.checked_add(entry.length)?;
+            if end > bytes.len() {
+                return None;
+            }
+        }
+        if found.iter().any(|e| e.is_none()) {
+            return None;
+        }
+        let out: [(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
+            let e = found[i].expect("checked above");
+            (BytesView::new(bytes, e.offset, e.length), e.format.as_str())
+        });
         Some(out)
     }
 
