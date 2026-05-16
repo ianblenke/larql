@@ -178,24 +178,78 @@ complete, 542 MB deltanet bytes, 148 MB attn bytes, 40 × 256-expert
 layer files, ssm_*small tensors in norms.bin, index.json reflects
 `qwen35moe` + `full_attention_interval=4`).
 
-### Step 2 — Reader (NEXT, specced)
+### Step 2a — Storage reader ✅ MERGED (PR #149, commit 3e83070)
 
-`openspec/changes/vindex-qwen35moe-reader/` covers:
-1. `vindex/index/storage/deltanet.rs` (NEW) — mmap
-   `deltanet_weights_q4k.bin` + manifest, expose
-   `VectorIndex::deltanet_q4k_layer_data(layer)`.
-2. `inference/attention/qwen35_load_vindex.rs` (NEW) —
-   `load_qwen35_weights_from_vindex(dir) -> Qwen35Weights`. Dequants
-   into the same struct the GGUF loader produces.
-3. `larql-server` dispatch: when arch_family ∈ {qwen35, qwen35moe},
-   route `/v1/chat/completions` through `qwen35_forward_step` instead
-   of `predict_q4k_hidden_with_cache`.
-4. Smoke gate: server responds 200 to a chat completion on the
-   vindex from Step 1; full parity vs llama.cpp deferred to a
-   separate change.
+`vindex-qwen35moe-reader` **Phase 1** shipped:
+- `crates/larql-vindex/src/index/storage/deltanet.rs` (NEW) —
+  `VectorIndex::load_deltanet_q4k(dir)` + `deltanet_q4k_layer_data(layer)`
+  + `has_deltanet_q4k()`.
+- `MmapStorage`: `deltanet_q4k` + `deltanet_q4k_manifest` fields,
+  `set_deltanet_q4k`, `has_deltanet_q4k` inherent methods.
+- `VindexStorage` trait: `deltanet_q4k_layer_data` method,
+  `DELTANET_TENSORS_PER_LAYER = 5` constant.
+- `DeltanetManifestEntry { key, offset, length, format }` struct.
+- Sparse-manifest awareness: accessor resolves by
+  `layers.{layer}.` prefix + tensor-name suffix (not `layer * 5`
+  arithmetic), so it tolerates the 10-of-40 attn / 30-of-40
+  deltanet split.
+- 3 new unit tests (load no-op when absent; 5-entry layer +
+  partial-layer None; missing-format rejection).
+- 925/925 unit tests pass.
 
-Estimated ~650 LoC. See proposal + tasks.md in
-`openspec/changes/vindex-qwen35moe-reader/`.
+### Step 2b — `Qwen35Weights` vindex adapter (NEXT)
+
+The hard part. Phase 2 of `vindex-qwen35moe-reader`.
+
+`crates/larql-inference/src/attention/qwen35_load_vindex.rs` (NEW)
+must produce a `Qwen35Weights` from a vindex directory. Per
+`qwen35_forward.rs:98`, the struct has:
+- `embed`: `ArcArray2<f32>` + `embed_quant: Option<QuantTensor>`
+- `layers: Vec<Qwen35FullLayerWeights>` — each carries
+  `block: Qwen35LayerWeights` (`Linear(DeltaNetLayerWeights)` or
+  `Attention(Qwen35AttentionLayerWeights)`), `attn_post_norm`,
+  dense + lazy SwiGLU FFN slots, and `moe: Option<Qwen35MoeFfnWeights>`.
+- `final_norm`, `lm_head` + `lm_head_quant`, `ffn_dim`.
+
+The forward dispatches based on which slot is populated (`*_quant`
+takes precedence). Cleanest path: populate the `*_quant` slots from
+vindex bytes by constructing `QuantTensor` instances over the
+vindex shape + format tags. RAM-cheap; matches the GGUF lazy path.
+
+Key dependency: `QuantTensor` constructor from raw bytes + shape +
+tensor type. Need to verify that path exists in `larql-models` —
+the GGUF mmap loader uses it; the vindex bytes should fit the same
+contract (Q4_K block layout is identical between GGUF and vindex
+after PR #137 / PR #136 stride fixes).
+
+For DeltaNet small tensors (ssm_norm, ssm_dt, ssm_a, ssm_conv1d):
+read from `norms.bin` via the existing `load_vindex_norms` path,
+then plug into the matching `DeltaNetLayerWeights` fields.
+
+For 256-expert MoE: parse `layers/layer_{LL}.weights` headers via
+`larql_vindex::format::weights::write_layers::parse_layer_weights_header`,
+then construct per-expert `QuantTensor` slices over the byte
+ranges.
+
+Estimated ~300 LoC.
+
+### Step 2c — server dispatch
+
+Phase 3 of `vindex-qwen35moe-reader`. ~100 LoC.
+
+When the server loads a vindex with `arch_family ∈ {qwen35,
+qwen35moe}`, route `/v1/chat/completions` decoding through a
+`qwen35_forward_step`-based helper instead of
+`predict_q4k_hidden_with_cache`.
+
+### Smoke gate
+
+Live `/v1/chat/completions` against
+`/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex` returns 200 with
+non-degenerate text. Full parity vs llama.cpp is a separate change.
+
+See `openspec/changes/vindex-qwen35moe-reader/tasks.md` for the
+full breakdown.
 
 ### Out of scope on this arc
 
