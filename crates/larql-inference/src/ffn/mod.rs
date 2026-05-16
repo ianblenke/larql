@@ -9,6 +9,7 @@
 
 pub mod graph_backend;
 pub mod moe_remote;
+pub mod q4k_direct;
 pub mod remote;
 pub mod sparse;
 pub mod sparse_compute;
@@ -62,6 +63,7 @@ pub use sparse_compute::{
     sparse_ffn_forward, sparse_ffn_forward_with_full_overrides, sparse_ffn_forward_with_overrides,
     FeatureSlotOverride,
 };
+pub use q4k_direct::Q4kDirectFfn;
 pub use weight::{dense_ffn_forward_backend, BackendFfn, WeightFfn};
 
 // ── Per-layer backend selection ──

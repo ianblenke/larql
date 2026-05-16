@@ -179,13 +179,33 @@ pub fn predict_q4k_hidden_with_cache(
             .kv_shared_source_layer(layer)
             .and_then(|src| shared_kv_cache.get(&src));
         let is_moe_layer = weights.arch.is_hybrid_moe();
-        let ffn_backend = crate::ffn::WeightFfn { weights };
+        // Decode-step FFN (seq == 1) uses the direct Q4_K × Q8_K matvec
+        // path — skips f32 dequant entirely, dispatches to AVX2 kernels in
+        // `larql_compute::cpu::ops::q4k_q8k_dot`. Prefill (seq > 1) stays on
+        // WeightFfn so it benefits from BLAS GEMM over the dequant cache.
+        //
+        // Q8_K activation alignment: `quantize_x_to_q8k` panics in debug and
+        // truncates silently in release if `hidden % 256 != 0`. Gemma 3 4B
+        // (hidden=2560) and 12B/27B are aligned; Gemma 3 1B (hidden=1152) is
+        // not. Models with non-aligned hidden_size fall back to `WeightFfn`.
+        let weight_ffn = crate::ffn::WeightFfn { weights };
+        let direct_ffn = crate::ffn::Q4kDirectFfn {
+            arch: &*weights.arch,
+            index,
+        };
+        let hidden_q8k_aligned = h.shape()[1].is_multiple_of(256);
+        let ffn_backend: &dyn crate::ffn::FfnBackend =
+            if h.shape()[0] == 1 && !is_moe_layer && hidden_q8k_aligned {
+                &direct_ffn
+            } else {
+                &weight_ffn
+            };
         if is_moe_layer {
             if let Some((h_new, kv_out)) = run_moe_layer_cpu(
                 weights,
                 &h,
                 layer,
-                &ffn_backend,
+                ffn_backend,
                 ple_inputs.get(layer),
                 shared_kv,
                 moe_remote,
@@ -199,7 +219,7 @@ pub fn predict_q4k_hidden_with_cache(
             weights,
             &h,
             layer,
-            &ffn_backend,
+            ffn_backend,
             false,
             ple_inputs.get(layer),
             shared_kv,
