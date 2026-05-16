@@ -505,23 +505,11 @@ fn run_gguf_to_vindex(
         weights.num_layers, weights.hidden_size, weights.intermediate_size, weights.vocab_size
     );
 
-    // --quant q4k currently only handles standard transformer attention.
-    // Hybrid SSM/DeltaNet architectures (e.g. Qwen 3.6 dense + MoE) have
-    // a mix of full-attention layers and DeltaNet layers — the latter
-    // use `ssm_*` / `conv1d` tensors that the existing Q4_K attention
-    // writer doesn't enumerate. Without dedicated handling, those layers'
-    // weights would be silently skipped at write time, producing a
-    // broken vindex. Fail fast instead.
-    if q4k && weights.arch.full_attention_interval() != 0 {
-        return Err(format!(
-            "--quant q4k does not yet support hybrid SSM/DeltaNet architectures \
-             (detected family `{}` with full_attention_interval={}). Use `--f16` \
-             for now; hybrid-aware Q4_K writer is a follow-up.",
-            weights.arch.family(),
-            weights.arch.full_attention_interval(),
-        )
-        .into());
-    }
+    // Hybrid SSM/DeltaNet arches (Qwen 3.6 dense + MoE) now flow through
+    // `write_q4k::deltanet` (matmul tensors), `write_q4k::norms`
+    // (ssm_norm/dt/a/conv1d), and `write_q4k::moe_layers` (PerExpert MoE
+    // layout). The earlier fast-fail guard at this point was removed in
+    // change `vindex-qwen35moe-extraction`.
 
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,

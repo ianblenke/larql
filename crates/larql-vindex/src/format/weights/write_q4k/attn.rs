@@ -33,6 +33,15 @@ pub(super) fn write_attn_weights_q4k(
     let mut attn_manifest: Vec<Q4kManifestEntry> = Vec::with_capacity(num_layers * 4);
 
     for layer in 0..num_layers {
+        // Hybrid SSM/DeltaNet arches (Qwen 3.6) interleave linear-
+        // attention layers between full-attention ones. The linear
+        // layers don't expose Q/K/V/O — their weights live in
+        // `deltanet_weights_q4k.bin` ([`super::deltanet`]). Skip here
+        // so the manifest reflects only the full-attention layers
+        // (e.g. 10 of 40 on Qwen 3.6 at `full_attention_interval=4`).
+        if arch.is_linear_attention_layer(layer) {
+            continue;
+        }
         callbacks.on_layer_start(COMP_ATTN_Q4K, layer, num_layers);
 
         // Resolve each tensor. For V, fall back to K when v_shares_k=true or

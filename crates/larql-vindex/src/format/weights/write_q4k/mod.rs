@@ -31,6 +31,7 @@ use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGH
 use super::write_f32::WeightSource;
 
 mod attn;
+mod deltanet;
 mod ffn;
 mod lm_head;
 mod moe_layers;
@@ -180,6 +181,7 @@ pub fn write_model_weights_q4k_with_opts(
     let num_layers = source.num_layers();
 
     attn::write_attn_weights_q4k(source, dir, num_layers, callbacks)?;
+    deltanet::write_deltanet_weights_q4k(source, dir, num_layers, callbacks)?;
     ffn::write_interleaved_ffn_q4k(source, dir, num_layers, opts, callbacks)?;
     moe_layers::write_per_layer_moe_q4k(source, dir, num_layers)?;
     let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;
