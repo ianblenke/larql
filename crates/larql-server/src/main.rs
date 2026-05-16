@@ -10,9 +10,10 @@ use clap::Parser;
 
 use larql_server::bootstrap::{self, normalize_serve_alias, BoxError, Cli};
 
-// OpenBLAS thread-control entry point (present in all OpenBLAS builds for
-// the last decade). Setting to 1 at runtime disables BLAS multi-threading
-// regardless of any earlier initialisation.
+// OpenBLAS thread-control entry point. Only declared on Linux/Windows
+// where `openblas-src` provides the symbol. macOS links Accelerate.framework
+// (no `openblas_set_num_threads`); we rely on env vars there.
+#[cfg(not(target_os = "macos"))]
 extern "C" {
     fn openblas_set_num_threads(num_threads: std::os::raw::c_int);
 }
@@ -43,8 +44,20 @@ fn configure_blas_threads_for_rayon() {
     }
     // Belt-and-suspenders: the env var catches OpenBLAS's lazy-init path
     // AND any OpenMP variant. The FFI call catches the eager-init path
-    // where the env var was already read at process load. Idempotent —
-    // safe to call when the env var was already 1.
+    // where the env var was already read at process load. macOS uses
+    // Accelerate which honours `VECLIB_MAXIMUM_THREADS` instead (set
+    // below for completeness).
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VECLIB_MAXIMUM_THREADS").is_none() {
+        // SAFETY: single-threaded at this point.
+        unsafe {
+            std::env::set_var("VECLIB_MAXIMUM_THREADS", "1");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: link-time guarantee on Linux/Windows where openblas-src
+    // provides the symbol. Idempotent — safe to call when the env var
+    // was already 1.
     unsafe {
         openblas_set_num_threads(1);
     }
