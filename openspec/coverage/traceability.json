@@ -1,11 +1,11 @@
 {
   "summary": {
-    "capabilities": 53,
-    "requirements": 522,
-    "scenarios": 1545,
+    "capabilities": 54,
+    "requirements": 525,
+    "scenarios": 1548,
     "scenarios_backed": 1345,
-    "scenarios_unbacked": 200,
-    "test_refs": 3476,
+    "scenarios_unbacked": 203,
+    "test_refs": 3479,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -18173,6 +18173,51 @@
       ]
     },
     {
+      "name": "vindex-extraction",
+      "spec_file": "openspec/changes/vindex-qwen35moe-extraction/specs/vindex-extraction/spec.md",
+      "requirements": [
+        {
+          "name": "GGUF to vindex Q4_K conversion SHALL support hybrid SSM/DeltaNet architectures",
+          "scenarios": [
+            {
+              "name": "Qwen 3.6 35B-A3B Q4_K_M converts to a structurally complete vindex",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-extraction/specs/vindex-extraction/spec.md",
+              "line": 26
+            }
+          ]
+        },
+        {
+          "name": "PerExpert MoE layout SHALL be supported by the per-layer Q4_K writer",
+          "scenarios": [
+            {
+              "name": "PerExpert MoE writes 256 entries per layer",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-extraction/specs/vindex-extraction/spec.md",
+              "line": 54
+            }
+          ]
+        },
+        {
+          "name": "Linear-attention layers SHALL be skipped by the standard Q/K/V/O writer",
+          "scenarios": [
+            {
+              "name": "40-layer hybrid arch emits 10 full-attn manifests",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/vindex-qwen35moe-extraction/specs/vindex-extraction/spec.md",
+              "line": 75
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "vindex-format",
       "spec_file": "openspec/changes/backfill-specs/specs/vindex-format/spec.md",
       "requirements": [
@@ -31644,6 +31689,12 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::profile_4b_decode::profile_decode_step",
+      "file": "crates/larql-inference/tests/profile_4b_decode.rs",
+      "line": 18,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::prompt::chatml_wrap_includes_im_tags",
       "file": "crates/larql-inference/src/prompt.rs",
       "line": 418,
@@ -32856,9 +32907,27 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::test_gemma3_layer_health::dump_per_layer_hidden_stats",
+      "file": "crates/larql-inference/tests/test_gemma3_layer_health.rs",
+      "line": 14,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::test_gemma3_smoke::first_token_matches_expected_surface",
       "file": "crates/larql-inference/tests/test_gemma3_smoke.rs",
       "line": 42,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_gemma3_v_proj_source_compare::compare_v_proj_gguf_vs_vindex",
+      "file": "crates/larql-inference/tests/test_gemma3_v_proj_source_compare.rs",
+      "line": 11,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_gemma3_wv_dump::dump_layer0_w_v_first_row",
+      "file": "crates/larql-inference/tests/test_gemma3_wv_dump.rs",
+      "line": 8,
       "crate": "larql_inference"
     },
     {
@@ -32916,6 +32985,12 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::test_q6k_roundtrip::q6k_roundtrip_on_gemma3_v_proj_row0",
+      "file": "crates/larql-inference/tests/test_q6k_roundtrip.rs",
+      "line": 10,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::test_speculative_parity::parity_at_scale_256_prompts",
       "file": "crates/larql-inference/tests/test_speculative_parity.rs",
       "line": 281,
@@ -32925,6 +33000,12 @@
       "fqn": "larql_inference::test_target_forward_parity::target_forward_via_speculative_decode_matches_naive_64_seeds",
       "file": "crates/larql-inference/tests/test_target_forward_parity.rs",
       "line": 150,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_v_proj_writer_roundtrip::v_proj_writer_roundtrip_vs_vindex",
+      "file": "crates/larql-inference/tests/test_v_proj_writer_roundtrip.rs",
+      "line": 12,
       "crate": "larql_inference"
     },
     {
@@ -44120,13 +44201,13 @@
     {
       "fqn": "larql_vindex::format::filenames::all_filenames_unique",
       "file": "crates/larql-vindex/src/format/filenames.rs",
-      "line": 139,
+      "line": 151,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::filenames::hf_upload_files_subset_of_all",
       "file": "crates/larql-vindex/src/format/filenames.rs",
-      "line": 187,
+      "line": 201,
       "crate": "larql_vindex"
     },
     {
