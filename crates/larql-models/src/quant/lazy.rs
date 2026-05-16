@@ -463,24 +463,37 @@ impl QuantTensor {
 /// inside one thread.
 ///
 /// Caveat: `x.as_ptr()` can ABA-collide if a `Vec<f32>` is dropped
-/// and a new one lands at the same address. In the larql forward path
-/// `x` is kept alive across all sibling matvec calls in one MoE FFN,
-/// so this doesn't fire in practice.
+/// and a new one lands at the same address. The lm_head path
+/// (post-#144) hits exactly this: `x = last_2d.row(0).to_owned()` is
+/// freshly allocated per decode step and dropped immediately, and the
+/// allocator routinely reuses the same heap slot for the next step's
+/// `Vec<f32>`. To stay correct in BOTH the MoE-reuse case (where the
+/// cache pays off) and the per-step lm_head case (where it would return
+/// stale bytes), the cache key also fingerprints the first and last f32
+/// of `x`. A change to either invalidates the cache. The MoE pattern
+/// keeps `x` alive across sibling matvecs so the fingerprint matches
+/// trivially — no perf loss. The lm_head pattern always produces a
+/// new fingerprint per step — no stale-byte hit.
 #[inline]
 fn with_q8k_for<R>(x: &[f32], f: impl FnOnce(&[u8]) -> R) -> R {
     thread_local! {
-        static CACHE: std::cell::RefCell<Option<(usize, usize, Vec<u8>)>> =
+        static CACHE: std::cell::RefCell<Option<(usize, usize, u32, u32, Vec<u8>)>> =
             const { std::cell::RefCell::new(None) };
     }
     CACHE.with(|cell| {
         let mut cell = cell.borrow_mut();
         let ptr = x.as_ptr() as usize;
         let len = x.len();
-        let needs_refresh = !matches!(*cell, Some((p, l, _)) if p == ptr && l == len);
+        let first = x.first().copied().unwrap_or(0.0).to_bits();
+        let last = x.last().copied().unwrap_or(0.0).to_bits();
+        let needs_refresh = !matches!(
+            *cell,
+            Some((p, l, f0, fL, _)) if p == ptr && l == len && f0 == first && fL == last
+        );
         if needs_refresh {
-            *cell = Some((ptr, len, quantize_to_q8_k(x)));
+            *cell = Some((ptr, len, first, last, quantize_to_q8_k(x)));
         }
-        let bytes = cell.as_ref().expect("just initialised").2.as_slice();
+        let bytes = cell.as_ref().expect("just initialised").4.as_slice();
         f(bytes)
     })
 }
