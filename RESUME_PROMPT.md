@@ -197,7 +197,34 @@ layer files, ssm_*small tensors in norms.bin, index.json reflects
   partial-layer None; missing-format rejection).
 - 925/925 unit tests pass.
 
-### Step 2b — `Qwen35Weights` vindex adapter (NEXT)
+### Step 2b.0 — Router write fixes ✅ MERGED (PRs #152 + #155)
+
+Two coupled prerequisites for the reader's `Qwen35MoeFfnWeights::router`
+field:
+- **2b.0a (PR #152)**: widened the router-write gate in
+  `write_q4k/norms.rs:114` from `is_hybrid_moe()` to
+  `is_moe() && expert_format() != PackedMxfp4` so qwen35moe
+  PerExpert also writes the router.
+- **2b.0b (PR #155)**: fixed `Qwen35MoeArch::moe_router_key` to
+  return the loader-canonical name `layers.{L}.ffn_gate_inp.weight`
+  (was returning HF-style `layers.{L}.mlp.gate.weight` that no GGUF
+  tensor matches because `normalize_gguf_key` has no remap rule
+  for `ffn_gate_inp.`). Mixtral uses the same per-arch convention.
+
+Smoke validation after #155: live conversion of the 21 GB GGUF
+should now land 40 `layers.{L}.ffn_gate_inp.weight` entries in
+`weight_manifest.json` (one per MoE layer).
+
+### Step 2b.1 — Norms reader ✅ NO-OP (confirmed via #154)
+
+`crates/larql-vindex/src/format/weights/load.rs:534` already loads
+every `kind::VECTOR` entry from `norms.bin` (via
+`weight_manifest.json`) into a `HashMap<String, Vec<f32>>` keyed by
+the full tensor name. DeltaNet small tensors + the post-#155
+router land there automatically. No new reader code needed for
+Step 2b's consumers — they read by key.
+
+### Step 2b.2..2b.6 — `Qwen35Weights` vindex adapter (NEXT)
 
 The hard part. Phase 2 of `vindex-qwen35moe-reader`.
 
@@ -231,7 +258,14 @@ For 256-expert MoE: parse `layers/layer_{LL}.weights` headers via
 then construct per-expert `QuantTensor` slices over the byte
 ranges.
 
-Estimated ~300 LoC.
+Estimated ~455 LoC across:
+- 2b.2 DeltaNet layer assembly (~120)
+- 2b.3 Full-attn layer assembly (~80)
+- 2b.4 MoE 256-expert packed assembly (~150)
+- 2b.5 Top-level orchestrator (~50)
+- 2b.6 Smoke test against `/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex` (~50)
+
+Detailed design in `openspec/changes/vindex-qwen35moe-reader/step-2b-design.md`.
 
 ### Step 2c — server dispatch
 
