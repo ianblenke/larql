@@ -58,8 +58,24 @@ impl VectorIndex {
                             )
                         })?
                         .to_string();
+                    // Writer records `shape = [rows, padded_cols]`. The
+                    // consumer bridge needs both dims to call
+                    // `QuantTensor::from_raw(bytes, type, rows, cols)`;
+                    // arch-derivation would be fragile across future
+                    // tensor-shape revisions.
+                    let shape: Vec<usize> = e["shape"]
+                        .as_array()
+                        .ok_or_else(|| {
+                            VindexError::Parse(
+                                "deltanet_weights_q4k_manifest entry missing `shape` field".into(),
+                            )
+                        })?
+                        .iter()
+                        .map(|v| v.as_u64().unwrap_or(0) as usize)
+                        .collect();
                     Ok::<_, VindexError>(DeltanetManifestEntry {
                         key,
+                        shape,
                         offset,
                         length,
                         format,
@@ -82,8 +98,13 @@ impl VectorIndex {
     }
 
     /// Get the 5 DeltaNet matmul tensors for one linear-attention layer:
-    /// `[(attn_qkv, fmt), (attn_gate, fmt), (ssm_alpha, fmt),
-    ///   (ssm_beta, fmt), (ssm_out, fmt)]`.
+    /// `[(attn_qkv, fmt, shape), (attn_gate, fmt, shape),
+    ///   (ssm_alpha, fmt, shape), (ssm_beta, fmt, shape),
+    ///   (ssm_out, fmt, shape)]`.
+    ///
+    /// `shape` is the writer-recorded `[rows, padded_cols]` slice. The
+    /// consumer reader bridge uses `shape[0]` and `shape[1]` to call
+    /// `QuantTensor::from_raw(bytes.to_vec(), TYPE_Q4_K, rows, cols)`.
     ///
     /// `layer` is the **global** layer index. Returns `None` when no
     /// `deltanet_weights_q4k.bin` was loaded, when the layer is a
@@ -92,13 +113,13 @@ impl VectorIndex {
     pub fn deltanet_q4k_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(&[u8], &str); DELTANET_TENSORS_PER_LAYER]> {
+    ) -> Option<[(&[u8], &str, &[usize]); DELTANET_TENSORS_PER_LAYER]> {
         let arr = self.storage.deltanet_q4k_layer_data(layer)?;
-        let mut out: [(&[u8], &str); DELTANET_TENSORS_PER_LAYER] =
-            [(&[], ""); DELTANET_TENSORS_PER_LAYER];
+        let mut out: [(&[u8], &str, &[usize]); DELTANET_TENSORS_PER_LAYER] =
+            [(&[], "", &[]); DELTANET_TENSORS_PER_LAYER];
         for i in 0..DELTANET_TENSORS_PER_LAYER {
-            let (view, fmt) = arr[i];
-            out[i] = (view.as_slice(), fmt);
+            let (view, fmt, shape) = arr[i];
+            out[i] = (view.as_slice(), fmt, shape);
         }
         Some(out)
     }
@@ -199,7 +220,14 @@ mod tests {
         assert!(idx.has_deltanet_q4k());
         let layer0 = idx.deltanet_q4k_layer_data(0).expect("layer 0 complete");
         assert_eq!(layer0.len(), DELTANET_TENSORS_PER_LAYER);
-        assert!(layer0.iter().all(|(_, fmt)| *fmt == "Q4_K"));
+        assert!(layer0.iter().all(|(_, fmt, _)| *fmt == "Q4_K"));
+        // Every slot SHALL surface its writer-recorded `[rows, cols]`
+        // tuple — the bridge into `weights.quant_tensors` needs both.
+        assert_eq!(layer0[0].2, &[8192, 2048][..], "attn_qkv shape");
+        assert_eq!(layer0[1].2, &[4096, 2048][..], "attn_gate shape");
+        assert_eq!(layer0[2].2, &[32, 2048][..], "ssm_alpha shape");
+        assert_eq!(layer0[3].2, &[32, 2048][..], "ssm_beta shape");
+        assert_eq!(layer0[4].2, &[2048, 4096][..], "ssm_out shape");
 
         assert!(
             idx.deltanet_q4k_layer_data(1).is_none(),

@@ -233,14 +233,21 @@ pub trait VindexStorage: sealed::Sealed + Send + Sync {
     // ── DeltaNet (Qwen 3.6 linear-attention) ────────────────────────────
 
     /// Q4_K matmul tensors for one DeltaNet linear-attention layer:
-    /// `[(attn_qkv, fmt), (attn_gate, fmt), (ssm_alpha, fmt),
-    ///   (ssm_beta, fmt), (ssm_out, fmt)]`.
+    /// `[(attn_qkv, fmt, shape), (attn_gate, fmt, shape),
+    ///   (ssm_alpha, fmt, shape), (ssm_beta, fmt, shape),
+    ///   (ssm_out, fmt, shape)]`.
     ///
     /// `layer` is the **global** layer index. The accessor looks up
     /// manifest entries by `layers.{layer}.` key prefix rather than by
     /// `layer * 5` arithmetic, so it tolerates sparse manifests where
     /// only the linear-attention layers carry entries (3 out of every
     /// 4 layers on Qwen 3.6 at `full_attention_interval=4`).
+    ///
+    /// `shape` is the writer-recorded `[rows, padded_cols]` slice —
+    /// what the reader bridge needs to call
+    /// `QuantTensor::from_raw(bytes, type, rows, cols)`. Borrowed from
+    /// the underlying manifest so callers don't pay an allocation per
+    /// lookup.
     ///
     /// Returns `None` when:
     /// - no `deltanet_weights_q4k.bin` was loaded
@@ -251,7 +258,7 @@ pub trait VindexStorage: sealed::Sealed + Send + Sync {
     fn deltanet_q4k_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER]>;
+    ) -> Option<[(BytesView<'_>, &str, &[usize]); DELTANET_TENSORS_PER_LAYER]>;
 
     // ── lm_head ─────────────────────────────────────────────────────────
 
