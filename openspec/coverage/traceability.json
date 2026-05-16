@@ -2,10 +2,10 @@
   "summary": {
     "capabilities": 53,
     "requirements": 510,
-    "scenarios": 1523,
+    "scenarios": 1524,
     "scenarios_backed": 1342,
-    "scenarios_unbacked": 181,
-    "test_refs": 3454,
+    "scenarios_unbacked": 182,
+    "test_refs": 3455,
     "test_refs_unresolved": 96
   },
   "capabilities": [
@@ -7861,7 +7861,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
-              "line": 19
+              "line": 21
             },
             {
               "name": "Prefill on dense Q4_K layer routes to WeightFfn",
@@ -7869,7 +7869,15 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
-              "line": 27
+              "line": 29
+            },
+            {
+              "name": "Non-Q8_K-aligned hidden_size routes to WeightFfn even on decode step",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
+              "line": 38
             },
             {
               "name": "Hybrid-MoE layers route to WeightFfn even on decode step",
@@ -7877,7 +7885,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
-              "line": 36
+              "line": 48
             }
           ]
         },
@@ -7890,7 +7898,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/cpu-q4k-direct-ffn/specs/inference-residual-engine/spec.md",
-              "line": 54
+              "line": 66
             }
           ]
         },
@@ -23088,7 +23096,7 @@
     {
       "fqn": "larql_inference::attention::block::attention_block_capture_returns_per_head_weights",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 835,
+      "line": 834,
       "crate": "larql_inference"
     },
     {
@@ -23106,13 +23114,13 @@
     {
       "fqn": "larql_inference::attention::block::attention_block_post_norms_arch_runs_through_post_norm_branch",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1006,
+      "line": 1005,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::attention_block_shared_with_pre_o_works_under_kv_share",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 854,
+      "line": 853,
       "crate": "larql_inference"
     },
     {
@@ -23124,13 +23132,13 @@
     {
       "fqn": "larql_inference::attention::block::attention_block_starcoder_with_kv_out_returns_finite_kv",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1030,
+      "line": 1029,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::attention_block_with_all_attention_weights_returns_per_position_dist",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 868,
+      "line": 867,
       "crate": "larql_inference"
     },
     {
@@ -23142,25 +23150,25 @@
     {
       "fqn": "larql_inference::attention::block::attention_block_with_pre_o_returns_per_head_pre_projection",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 844,
+      "line": 843,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::attention_block_with_q_k_v_o_biases_runs_add_bias_branches",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1019,
+      "line": 1018,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::attention_block_with_qk_norm_keys_routes_through_qk_norm_branch",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 994,
+      "line": 993,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::attention_block_with_reduced_qk_attention_weights_clamps_rank",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 881,
+      "line": 880,
       "crate": "larql_inference"
     },
     {
@@ -23184,79 +23192,79 @@
     {
       "fqn": "larql_inference::attention::block::intervention_paths_return_none_for_missing_layer",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 978,
+      "line": 977,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::replace_head_residual_delta_zero_replacement_matches_zero_head",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 958,
+      "line": 957,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::replace_pre_o_head_substitutes_one_head",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 924,
+      "line": 923,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::subtract_pre_o_heads_matches_zero_pre_o_heads_numerically",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 941,
+      "line": 940,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_capture_returns_per_head_weights",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 835,
+      "line": 834,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_post_norms_arch_runs_through_post_norm_branch",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1006,
+      "line": 1005,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_shared_with_pre_o_works_under_kv_share",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 854,
+      "line": 853,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_starcoder_with_kv_out_returns_finite_kv",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1030,
+      "line": 1029,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_with_all_attention_weights_returns_per_position_dist",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 868,
+      "line": 867,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_with_pre_o_returns_per_head_pre_projection",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 844,
+      "line": 843,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_with_q_k_v_o_biases_runs_add_bias_branches",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 1019,
+      "line": 1018,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_with_qk_norm_keys_routes_through_qk_norm_branch",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 994,
+      "line": 993,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::attention_block_with_reduced_qk_attention_weights_clamps_rank",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 881,
+      "line": 880,
       "crate": "larql_inference"
     },
     {
@@ -23280,49 +23288,49 @@
     {
       "fqn": "larql_inference::attention::block::tests::intervention_paths_return_none_for_missing_layer",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 978,
+      "line": 977,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::replace_head_residual_delta_zero_replacement_matches_zero_head",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 958,
+      "line": 957,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::replace_pre_o_head_substitutes_one_head",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 924,
+      "line": 923,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::subtract_pre_o_heads_matches_zero_pre_o_heads_numerically",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 941,
+      "line": 940,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::zero_pre_o_heads_changes_output_when_head_active",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 894,
+      "line": 893,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::tests::zero_pre_o_heads_under_shared_kv_omits_kv_output",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 911,
+      "line": 910,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::zero_pre_o_heads_changes_output_when_head_active",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 894,
+      "line": 893,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::block::zero_pre_o_heads_under_shared_kv_omits_kv_output",
       "file": "crates/larql-inference/src/attention/block.rs",
-      "line": 911,
+      "line": 910,
       "crate": "larql_inference"
     },
     {
@@ -32640,7 +32648,7 @@
     {
       "fqn": "larql_inference::test_kv_cache_real_gemma3::cache_decode_step_matches_uncached_full_replay",
       "file": "crates/larql-inference/tests/test_kv_cache_real_gemma3.rs",
-      "line": 116,
+      "line": 109,
       "crate": "larql_inference"
     },
     {
@@ -32652,7 +32660,7 @@
     {
       "fqn": "larql_inference::test_kv_cache_real_gemma3::cache_prefill_predict_matches_uncached_predict",
       "file": "crates/larql-inference/tests/test_kv_cache_real_gemma3.rs",
-      "line": 62,
+      "line": 61,
       "crate": "larql_inference"
     },
     {
