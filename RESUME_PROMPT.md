@@ -2,7 +2,7 @@
 
 ## Where we are (state at end of session 2026-05-16)
 
-Six PRs landed end-to-end during 2026-05-16:
+Seven PRs landed end-to-end during 2026-05-16:
 
 - **PR #139** (Q4kDirectFfn) — direct Q4_K × Q8_K matvec FFN for decode.
 - **PR #140** (f16 subnormal fix) — pre-existing latent bug in
@@ -20,6 +20,13 @@ Six PRs landed end-to-end during 2026-05-16:
   `weights.lm_head_quant` from `lm_head_q4.bin` and dispatch the final
   vocab projection through `QuantTensor::matvec` (rayon-parallel AVX2
   Q4_K × Q8_K) instead of f32 BLAS GEMV.
+- **PR #146** (drop f32 dequant cache) — `insert_q4k_layer_tensors`'s
+  10 GB FFN+attn dequant cache and the 2.6 GB f32 lm_head form are no
+  longer populated when every layer can run direct. New
+  `run_attention_block_prefill_q4k_direct` provides the multi-row
+  prefill direct path that closed the dependency on `weights.tensors`.
+  RSS 24.6 → 10.3 GB; prefill 14-tok 2.7 → 1.0 s; decode flat at 9.7
+  tok/s. Closes the bulk of larql's RAM gap vs llama.cpp.
 - **PR #145** (Q8K cache hazard + BLAS thread pin) — two coupled fixes:
   (a) `with_q8k_for` cache used `(ptr, len)` as key; #144's per-step
   lm_head `to_owned()` allocator reuse hit the cache and returned stale
@@ -28,7 +35,7 @@ Six PRs landed end-to-end during 2026-05-16:
   attention dots, adding ~160ms/step at 150-token cache. Cache key now
   fingerprints `x[0]`+`x[len-1]`; main pins `OPENBLAS_NUM_THREADS=1`.
 
-### Arcs C-H — CPU decode-step direct matvec + parallel + lm_head + threading
+### Arcs C-I — CPU decode-step direct matvec + parallel + lm_head + threading + RAM
 
 `predict_q4k_hidden_with_cache` now dispatches direct-matvec backends
 for both FFN (`Q4kDirectFfn`) and attention
