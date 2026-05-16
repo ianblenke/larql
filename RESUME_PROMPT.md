@@ -2,26 +2,39 @@
 
 ## Where we are (state at end of session 2026-05-16)
 
-PR #139 (Q4kDirectFfn — direct Q4_K × Q8_K matvec FFN for CPU decode)
-lands the next-biggest CPU speedup after the dequant cache (PR #138).
+Three PRs landed end-to-end during 2026-05-16:
 
-### Arc C — CPU decode-step direct Q4_K × Q8_K FFN (PR #139)
+- **PR #139** (Q4kDirectFfn) — direct Q4_K × Q8_K matvec FFN for decode.
+- **PR #140** (f16 subnormal fix) — pre-existing latent bug in
+  `larql_compute::f16_to_f32` decoded every subnormal 2× too large. Found
+  while testing Q6_K matvec on Gemma 3 4B V/FFN_DOWN (small weights →
+  subnormal `d`). Masked by a shadow `fn f16_to_f32` in the test module
+  that decoded subnormals correctly while the production fn was buggy.
+- **PR #142** (Q4kDirectAttention) — direct Q4_K × Q8_K matvec for the
+  decode-step Q/K/V/O projections. Same pattern as Q4kDirectFfn.
 
-`predict_q4k_hidden_with_cache` now dispatches a new `Q4kDirectFfn`
-backend on single-row, non-MoE, Q8_K-hidden-aligned layers. Skips f32
-materialisation of FFN weights on the decode path; routes gate+up
-through `q4k_q8k_gate_up_into` and down through `q4k_q8k_matvec_into` /
-`q6k_q8k_matvec_into` (kernels from PRs #102–#119).
+### Arcs C / D / E — CPU decode-step direct matvec (PRs #139 / #140 / #142)
 
-Gemma 3 1B (hidden=1152) falls back to WeightFfn — not Q8_K-aligned.
-Gemma 3 4B (hidden=2560) engages the direct path.
+`predict_q4k_hidden_with_cache` now dispatches direct-matvec backends
+for both FFN (`Q4kDirectFfn`) and attention
+(`run_attention_block_decode_step_q4k_direct`) on single-row, non-MoE,
+Q8_K-aligned layers. Skips f32 materialisation of weights entirely on
+the decode path; routes through `q4k_q8k_*` / `q6k_q8k_*` kernels from
+PRs #102–#119. The f16 fix (#140) was a prerequisite for Q6_K V/O to
+match the dequant reference within Q8_K activation noise.
+
+Gemma 3 1B (`hidden=1152`) falls back to the f32 BLAS path — not
+Q8_K-aligned. Gemma 3 4B (`hidden=2560`) engages the direct path.
 
 | Model | Path | Before | After | Speedup |
 |---|---|---:|---:|---:|
 | Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 50 tok | 0.117 tok/s | **1.45 tok/s** | **12.4×** |
-| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 150 tok | 0.117 tok/s | **1.36 tok/s** | **11.6×** |
+| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 150 tok | 0.117 tok/s | **1.63 tok/s** | **13.9×** |
 
-llama.cpp CPU 14.1 tok/s reference unchanged.
+llama.cpp CPU 14.1 tok/s reference unchanged. Remaining gap is ~8.6×
+on 4B; the next-biggest CPU lever is single-threaded `q*k_q8k_matvec_*`
+kernels — rayon-parallelising them across rows would unlock more of
+the 48-core host.
 
 ## Where we were (state at end of session 2026-05-15)
 
@@ -112,22 +125,15 @@ isn't where the bottleneck is on this path.
 After PRs #138 (dequant cache) + #139 (Q4kDirectFfn), the next ~10×
 gap to llama.cpp is no longer FFN. Likely candidates:
 
-### 1. Direct Q4_K × Q8_K attention Q/K/V/O (probably moderate)
+### 1. Rayon-parallel Q*K × Q8_K matvec (highest expected impact)
 
-The decode-step attention Q/K/V/O projections still read f32 from the
-dequant cache via BLAS GEMV. Direct path mirrors the Q4kDirectFfn arc:
-new `Q4kDirectAttention` adapter that calls `q4k_q8k_matvec_into` on
-the vindex's Q4_K Q/K/V/O bytes. Expected ~25% additional speedup —
-the projection BW is ~1/5 of FFN BW.
+`q4k_q8k_matvec_into` / `q6k_q8k_matvec_into` iterate rows serially in
+the outer loop, even on a 48-core host. Per-row work (1 row × cols
+bytes) is independent — `rayon::par_iter` over rows could give 10×+
+on this host. Verify with a flamegraph first; one of the matvec calls
+likely dominates the decode-step wall clock.
 
-Implementation surface: `crates/larql-inference/src/attention/decode.rs`
-`run_attention_block_decode_step_backend` reads `weights.tensors` for
-W_Q/K/V/O. Either thread `index: &VectorIndex` through
-`run_attention_block_with_kv_out_with_cache` (~8 call sites) or add an
-`AttentionBackend` trait. Q8_K hidden alignment guard same as FFN
-(gates Gemma 3 1B back to WeightAttention).
-
-### 2. Profile-first (recommended before more arcs)
+### 2. Profile-first (recommended before #1 to confirm)
 
 The ~10× gap to llama.cpp is now small enough that intuition isn't
 reliable. Run a flamegraph / perf-annotate on 4B decode and identify
@@ -208,11 +214,12 @@ block into separate `impl GateLookup` / `impl PatchOverrides` /
 
 ## Quick start prompt for a fresh session
 
-> Read RESUME_PROMPT.md. We're sitting at 1.36 tok/s on Gemma 3 4B
-> Q4_K_M after #138 (dequant cache) + #139 (Q4kDirectFfn) — ~12×
-> better than the 0.117 baseline, and ~10× from llama.cpp's 14.1
-> tok/s. The bottleneck has moved off FFN. Run lever 2 (profile-first)
-> on a 50-token Gemma 3 4B completion to identify where wall-clock
-> time actually goes before picking lever 1 (Q4kDirectAttention) or a
-> threading arc. Don't regress 1B coherence (hidden=1152, not Q8_K
-> aligned, must keep falling back to WeightFfn).
+> Read RESUME_PROMPT.md. We're sitting at 1.63 tok/s on Gemma 3 4B
+> Q4_K_M after #139 / #140 / #142 (Q4kDirectFfn + f16 subnormal fix +
+> Q4kDirectAttention) — 13.9× the 0.117 baseline, ~8.6× from llama.cpp's
+> 14.1 tok/s. FFN and attention Q/K/V/O are both off the f32 BLAS path
+> on decode. Run lever 2 (profile-first) on a 50-token Gemma 3 4B
+> completion to confirm whether `q*k_q8k_matvec_*` row-loop dominates,
+> then lever 1 (rayon-parallel matvec). Don't regress 1B coherence
+> (hidden=1152, not Q8_K aligned, must keep falling back to
+> WeightFfn / WeightAttention).
