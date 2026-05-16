@@ -1,6 +1,29 @@
 # larql resume prompt — feed this to a fresh session
 
-## Where we are (state at end of session 2026-05-15)
+## Where we are (state at end of session 2026-05-16)
+
+PR #139 (Q4kDirectFfn — direct Q4_K × Q8_K matvec FFN for CPU decode)
+lands the next-biggest CPU speedup after the dequant cache (PR #138).
+
+### Arc C — CPU decode-step direct Q4_K × Q8_K FFN (PR #139)
+
+`predict_q4k_hidden_with_cache` now dispatches a new `Q4kDirectFfn`
+backend on single-row, non-MoE, Q8_K-hidden-aligned layers. Skips f32
+materialisation of FFN weights on the decode path; routes gate+up
+through `q4k_q8k_gate_up_into` and down through `q4k_q8k_matvec_into` /
+`q6k_q8k_matvec_into` (kernels from PRs #102–#119).
+
+Gemma 3 1B (hidden=1152) falls back to WeightFfn — not Q8_K-aligned.
+Gemma 3 4B (hidden=2560) engages the direct path.
+
+| Model | Path | Before | After | Speedup |
+|---|---|---:|---:|---:|
+| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 50 tok | 0.117 tok/s | **1.45 tok/s** | **12.4×** |
+| Gemma 3 4B Q4_K_M | larql CPU `/v1/chat/completions`, 150 tok | 0.117 tok/s | **1.36 tok/s** | **11.6×** |
+
+llama.cpp CPU 14.1 tok/s reference unchanged.
+
+## Where we were (state at end of session 2026-05-15)
 
 Two arcs landed end-to-end this session:
 
@@ -86,42 +109,48 @@ isn't where the bottleneck is on this path.
 
 ## Open levers — pick one
 
-### 1. FFN dequant caching across decode steps (highest impact)
+After PRs #138 (dequant cache) + #139 (Q4kDirectFfn), the next ~10×
+gap to llama.cpp is no longer FFN. Likely candidates:
 
-The dominant CPU cost on `generate_via_cpu_q4k`. Per token, every layer
-fully dequants gate/up/down Q4_K weights to f32 just to do one matmul.
-At Gemma 3 4B's intermediate=10240 × 34 layers, that's ~3 GB of f32
-materialisation per token.
+### 1. Direct Q4_K × Q8_K attention Q/K/V/O (probably moderate)
 
-Two design points:
-- **Layer-resident dequant cache** — keep N most-recent layers' FFN
-  weights as f32 in heap. Trades memory (≈6 GB for full 4B) for the
-  per-step dequant cost. Expected: ~10× decode speedup (the missing
-  speedup the KV cache arc didn't deliver).
-- **Direct Q4_K × Q8_K matmul** — skip f32 materialisation entirely;
-  matmul lands at the FFN output. The `cpu-kquant-matvec-correctness-avx2`
-  arc (PRs #102–#119) already did this for individual tensors at the
-  kernel level; the missing piece is plumbing the Q4_K weights *through*
-  the FFN's gate / up / down without dequant in between. ~17 Gelem/s
-  measured at the kernel level on this host.
+The decode-step attention Q/K/V/O projections still read f32 from the
+dequant cache via BLAS GEMV. Direct path mirrors the Q4kDirectFfn arc:
+new `Q4kDirectAttention` adapter that calls `q4k_q8k_matvec_into` on
+the vindex's Q4_K Q/K/V/O bytes. Expected ~25% additional speedup —
+the projection BW is ~1/5 of FFN BW.
 
-The Qwen lazy-quant arc (#86–#91) did the moral equivalent for Qwen 3.6.
-Gemma 3 needs the same treatment.
+Implementation surface: `crates/larql-inference/src/attention/decode.rs`
+`run_attention_block_decode_step_backend` reads `weights.tensors` for
+W_Q/K/V/O. Either thread `index: &VectorIndex` through
+`run_attention_block_with_kv_out_with_cache` (~8 call sites) or add an
+`AttentionBackend` trait. Q8_K hidden alignment guard same as FFN
+(gates Gemma 3 1B back to WeightAttention).
 
-### 2. Qwen 3.6 hybrid SSM Q4_K writer (option 2 of prior resume)
+### 2. Profile-first (recommended before more arcs)
+
+The ~10× gap to llama.cpp is now small enough that intuition isn't
+reliable. Run a flamegraph / perf-annotate on 4B decode and identify
+where the time actually goes. Likely suspects: K/V concat memcpy,
+softmax in `gqa_attention_decode_step`, per-head `ndarray.dot` for
+small matrices, missing thread parallelism (`q4k_q8k_matvec_into` may
+be single-threaded — checking would inform a rayon arc that's
+potentially bigger than #1).
+
+### 3. Qwen 3.6 hybrid SSM Q4_K writer (option 2 of prior resume)
 
 Unblock `larql convert gguf-to-vindex --quant q4k` on Qwen 3.6 35B-A3B
 (currently rejected because the Q4_K attn writer doesn't handle DeltaNet
 layers). Extends PR #125.
 
-### 3. walk_path_audit resurrection (option 3 of prior resume)
+### 4. walk_path_audit resurrection (option 3 of prior resume)
 
 `crates/larql-inference/examples/walk_path_audit.rs` is gated behind
 `#[cfg(any())]` (PR #129). Split `MaskedGateIndex`'s `impl GateIndex`
 block into separate `impl GateLookup` / `impl PatchOverrides` /
 `impl FfnRowAccess` blocks. ~1-2 hour focused session.
 
-### 4. Smaller drive-bys
+### 5. Smaller drive-bys
 
 - **Compute-crate clippy errors** — `larql-compute` has 4 pre-existing
   clippy errors (`identity_op`, `needless_range_loop`) that block any
@@ -179,13 +208,11 @@ block into separate `impl GateLookup` / `impl PatchOverrides` /
 
 ## Quick start prompt for a fresh session
 
-> Read RESUME_PROMPT.md. Pick up lever 1 (FFN dequant caching). The
-> goal is to close the ~120× decode-tok/s gap to llama.cpp CPU on
-> Gemma 3 4B without compromising correctness (we just spent a full
-> session getting Gemma 3 CPU to coherent output — don't regress that).
-> Start with a focused proposal under
-> `openspec/changes/cpu-ffn-dequant-cache/proposal.md` outlining the
-> layer-resident-dequant approach + the direct-Q4K-Q8K alternative,
-> with bench predictions for each. Then implement the simpler one first
-> (layer-resident dequant cache) and re-bench against the 4B baseline of
-> 0.117 tok/s.
+> Read RESUME_PROMPT.md. We're sitting at 1.36 tok/s on Gemma 3 4B
+> Q4_K_M after #138 (dequant cache) + #139 (Q4kDirectFfn) — ~12×
+> better than the 0.117 baseline, and ~10× from llama.cpp's 14.1
+> tok/s. The bottleneck has moved off FFN. Run lever 2 (profile-first)
+> on a 50-token Gemma 3 4B completion to identify where wall-clock
+> time actually goes before picking lever 1 (Q4kDirectAttention) or a
+> threading arc. Don't regress 1B coherence (hidden=1152, not Q8_K
+> aligned, must keep falling back to WeightFfn).
