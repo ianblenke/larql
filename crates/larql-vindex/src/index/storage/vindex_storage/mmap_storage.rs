@@ -30,9 +30,17 @@ use super::{BytesView, GateLayerView, VindexStorage, DELTANET_TENSORS_PER_LAYER}
 /// index → 5 entries by prefix match, sidestepping the position-based
 /// indexing the standard Q/K/V/O accessor uses (the DeltaNet manifest
 /// is sparse — only linear-attention layers carry entries).
+///
+/// `shape` is the writer-side `[rows, padded_cols]` tuple — the
+/// reader bridge into `weights.quant_tensors` needs both dimensions
+/// to call `QuantTensor::from_raw(bytes, type, rows, cols)`. Without
+/// `shape` here, the consumer would have to either derive shape from
+/// arch parameters (fragile across arch revisions) or re-parse the
+/// manifest from disk on every lookup.
 #[derive(Clone, Debug)]
 pub struct DeltanetManifestEntry {
     pub key: String,
+    pub shape: Vec<usize>,
     pub offset: usize,
     pub length: usize,
     pub format: String,
@@ -589,7 +597,7 @@ impl VindexStorage for MmapStorage {
     fn deltanet_q4k_layer_data(
         &self,
         layer: usize,
-    ) -> Option<[(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER]> {
+    ) -> Option<[(BytesView<'_>, &str, &[usize]); DELTANET_TENSORS_PER_LAYER]> {
         let bytes = self.deltanet_q4k.as_ref()?;
         let manifest = self.deltanet_q4k_manifest.as_ref()?;
 
@@ -629,10 +637,15 @@ impl VindexStorage for MmapStorage {
         if found.iter().any(|e| e.is_none()) {
             return None;
         }
-        let out: [(BytesView<'_>, &str); DELTANET_TENSORS_PER_LAYER] = std::array::from_fn(|i| {
-            let e = found[i].expect("checked above");
-            (BytesView::new(bytes, e.offset, e.length), e.format.as_str())
-        });
+        let out: [(BytesView<'_>, &str, &[usize]); DELTANET_TENSORS_PER_LAYER] =
+            std::array::from_fn(|i| {
+                let e = found[i].expect("checked above");
+                (
+                    BytesView::new(bytes, e.offset, e.length),
+                    e.format.as_str(),
+                    e.shape.as_slice(),
+                )
+            });
         Some(out)
     }
 
