@@ -10,7 +10,7 @@ use crate::forward::layer::run_layer_with_ffn_with_cache;
 use crate::forward::ple::precompute_per_layer_inputs;
 use crate::forward::run_layer_with_ffn;
 
-use super::tensors::{insert_q4k_layer_tensors, remove_layer_tensors};
+use super::tensors::insert_q4k_layer_tensors;
 
 /// Like [`predict_q4k_hidden`] but takes pre-embedded inputs and
 /// returns the per-layer K/V cache alongside the final hidden state.
@@ -82,7 +82,10 @@ pub fn prefill_q4k_from_embeddings(
             }
         }
 
-        remove_layer_tensors(weights, inserted);
+        // Keep `inserted` resident in `weights.tensors` across calls:
+        // `insert_q4k_layer_tensors` is idempotent, so the next call's
+        // dequant is skipped. ~10 GB resident for Gemma 3 4B, ~3 GB for 1B.
+        let _ = inserted;
     }
 
     (h, kvs)
@@ -208,7 +211,10 @@ pub fn predict_q4k_hidden_with_cache(
             }
         }
 
-        remove_layer_tensors(weights, inserted);
+        // Keep `inserted` resident across decode steps so subsequent
+        // tokens skip the per-layer Q4_K dequant. See
+        // `insert_q4k_layer_tensors` doc for memory budget.
+        let _ = inserted;
 
         if let Some(dir) = dump_dir {
             let slice = h.as_slice().unwrap_or(&[]);
