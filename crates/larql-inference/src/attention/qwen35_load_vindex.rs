@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use larql_models::quant::ggml::{dequantize, TYPE_Q4_K, TYPE_Q6_K};
+use larql_models::quant::ggml::{dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q6_K};
 use larql_models::quant::lazy::QuantTensor;
 use larql_models::{ModelArchitecture, ModelWeights};
 use larql_vindex::VectorIndex;
@@ -228,6 +228,163 @@ pub fn populate_attn_quant_tensors(
             let qt = QuantTensor::from_raw(bytes.to_vec(), tensor_type, rows, cols)?;
             weights.quant_tensors.insert(keys[i].clone(), qt);
         }
+    }
+    Ok(())
+}
+
+/// **Task 2b.4** — bridge MoE per-layer expert files into a
+/// `ModelWeights`. Reads each `layers/layer_LL.weights` file
+/// produced by PR #147's writer, parses the LYRW header to learn
+/// `(num_experts, inter, hidden)` + per-expert offsets, then
+/// **concatenates** all 256 experts' bytes into three packed
+/// QuantTensors matching the shape `Qwen35MoeFfnWeights` expects:
+///
+/// - `ffn_gate_exps`: `[num_experts * inter, hidden]`
+/// - `ffn_up_exps`:   `[num_experts * inter, hidden]`
+/// - `ffn_down_exps`: `[num_experts * hidden, padded_inter]`
+///
+/// The writer's `quantize_dense_entry` interleaves each expert's
+/// gate + up rows into one `[2*inter, hidden]` tensor (gate rows
+/// first, then up rows). The bridge splits at the row-midpoint
+/// (always safe for block-quantised tensors — row boundaries
+/// align to super-block boundaries by construction).
+///
+/// The MoE router (`ffn_gate_inp.weight`) lives in
+/// `weights.vectors` (PR #155 fix), but the consumer
+/// `load_qwen35_moe_ffn` looks it up in `weights.quant_tensors`.
+/// The bridge therefore wraps the f32 router buffer in a
+/// `QuantTensor` of `TYPE_F32` and inserts it under the arch's
+/// router key.
+///
+/// Shared-expert tensors (`ffn_*_shexp.weight`) are not in scope
+/// for this PR — `load_qwen35_moe_ffn` will return `None` for
+/// them, and the qwen35moe forward currently treats `shexp` as
+/// optional. A follow-up PR adds them once the writer side starts
+/// emitting them.
+pub fn populate_moe_quant_tensors(
+    vindex_dir: &Path,
+    arch: &dyn ModelArchitecture,
+    weights: &mut ModelWeights,
+) -> Result<(), VindexLoadError> {
+    if !arch.is_moe() {
+        return Ok(());
+    }
+    let num_experts = arch.num_experts();
+    let moe_inter = arch.moe_intermediate_size();
+    let hidden = arch.config().hidden_size;
+    if num_experts == 0 || moe_inter == 0 || hidden == 0 {
+        return Ok(());
+    }
+
+    for layer in 0..weights.num_layers {
+        // ── Router: f32 in `vectors`, wrap as TYPE_F32 QuantTensor ──
+        if let Some(router_key) = arch.moe_router_key(layer) {
+            if let Some(router_floats) = weights.vectors.get(&router_key) {
+                if router_floats.len() == num_experts * hidden {
+                    let bytes: Vec<u8> =
+                        router_floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let qt = QuantTensor::from_raw(bytes, TYPE_F32, num_experts, hidden)?;
+                    weights.quant_tensors.insert(router_key.clone(), qt);
+                }
+            }
+        }
+
+        // ── Per-layer expert file ──
+        let path = vindex_dir.join(format!("layers/layer_{layer:02}.weights"));
+        let Ok(file) = std::fs::File::open(&path) else {
+            // qwen35moe vindexes from PR #147 always have these; skip
+            // gracefully if absent (test fixtures, partial vindexes).
+            continue;
+        };
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        let (fmt, n_entries, inter, _h, offsets) =
+            larql_vindex::format::weights::write_layers::parse_layer_weights_header(&mmap)
+                .ok_or_else(|| {
+                    VindexLoadError::Vindex(larql_vindex::VindexError::Parse(format!(
+                        "layers/layer_{layer:02}.weights: malformed LYRW header"
+                    )))
+                })?;
+        if n_entries != num_experts || inter != moe_inter {
+            return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                format!(
+                    "layers/layer_{layer:02}.weights: header says \
+                     num_entries={n_entries}, inter={inter}; arch expects \
+                     num_experts={num_experts}, moe_intermediate={moe_inter}"
+                ),
+            )));
+        }
+        let tensor_type = match fmt {
+            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q4_K => TYPE_Q4_K,
+            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q6_K => TYPE_Q6_K,
+            other => {
+                return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    format!("layers/layer_{layer:02}.weights: format {other:?} unsupported"),
+                )));
+            }
+        };
+
+        // Concat all 256 experts' bytes. The writer guarantees
+        // `gate_up_bytes` is `[2 * inter, hidden]` row-major
+        // (gate rows then up rows), so a midpoint byte cut is
+        // safe — row boundaries align to super-block boundaries
+        // for any block-quantised format.
+        let mut packed_gate: Vec<u8> = Vec::new();
+        let mut packed_up: Vec<u8> = Vec::new();
+        let mut packed_down: Vec<u8> = Vec::new();
+        let mut down_len_per_expert: usize = 0;
+        for (gu_off, gu_len, dn_off, dn_len) in &offsets {
+            let gu_end = gu_off.checked_add(*gu_len).ok_or_else(|| {
+                VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    "expert gate_up byte range overflows usize".into(),
+                ))
+            })?;
+            let dn_end = dn_off.checked_add(*dn_len).ok_or_else(|| {
+                VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    "expert down byte range overflows usize".into(),
+                ))
+            })?;
+            if gu_end > mmap.len() || dn_end > mmap.len() {
+                return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    format!("layers/layer_{layer:02}.weights: expert byte range past EOF"),
+                )));
+            }
+            let half = gu_len / 2;
+            packed_gate.extend_from_slice(&mmap[*gu_off..*gu_off + half]);
+            packed_up.extend_from_slice(&mmap[*gu_off + half..gu_end]);
+            packed_down.extend_from_slice(&mmap[*dn_off..dn_end]);
+            down_len_per_expert = *dn_len;
+        }
+
+        // `down` per expert is `[hidden, padded_inter]`. Derive
+        // padded_inter from byte count: bytes_per_block × blocks_per_row × hidden.
+        let block_elems = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        let bytes_per_block = match fmt {
+            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q4_K => {
+                larql_models::quant::ggml::Q4_K_BLOCK_BYTES
+            }
+            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q6_K => {
+                larql_models::quant::ggml::Q6_K_BLOCK_BYTES
+            }
+            _ => unreachable!("format checked above"),
+        };
+        let blocks_per_row = down_len_per_expert / hidden / bytes_per_block;
+        let padded_inter = blocks_per_row * block_elems;
+
+        let prefix = format!("layers.{layer}.");
+        let gate_qt = QuantTensor::from_raw(packed_gate, tensor_type, num_experts * inter, hidden)?;
+        let up_qt = QuantTensor::from_raw(packed_up, tensor_type, num_experts * inter, hidden)?;
+        let down_qt =
+            QuantTensor::from_raw(packed_down, tensor_type, num_experts * hidden, padded_inter)?;
+        weights
+            .quant_tensors
+            .insert(format!("{prefix}ffn_gate_exps.weight"), gate_qt);
+        weights
+            .quant_tensors
+            .insert(format!("{prefix}ffn_up_exps.weight"), up_qt);
+        weights
+            .quant_tensors
+            .insert(format!("{prefix}ffn_down_exps.weight"), down_qt);
     }
     Ok(())
 }
