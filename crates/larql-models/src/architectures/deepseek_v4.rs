@@ -172,20 +172,33 @@ impl ModelArchitecture for DeepSeekV4Arch {
         Some(format!("{}ffn_gate_inp.weight", self.layer_prefix(layer)))
     }
 
-    fn expert_ffn_gate_key(&self, layer: usize, _expert_id: usize) -> Option<String> {
-        // V4 packs all 256 experts into a single 3-D tensor
-        // (`[hidden, intermediate, num_experts]`); per-expert keys
-        // aren't separate tensors. Return the fused-tensor key so
-        // writers that index into the third dim can find it.
-        Some(format!("{}ffn_gate_exps.weight", self.layer_prefix(layer)))
+    fn expert_ffn_gate_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        // V4 packs all 256 experts into a 3-D `ffn_gate_exps.weight`
+        // tensor (`[hidden, intermediate, num_experts]`). The GGUF
+        // loader (`loading/gguf.rs:753-776`) detects the 3-D shape and
+        // emits per-expert HF-style aliases at
+        // `layers.{L}.mlp.experts.{E}.{proj}_proj.weight` that share
+        // the same Arc mmap data via `QuantTensor::expert_slice`.
+        // Returning the alias here keeps consumers (vindex writer,
+        // forward) ignorant of the 3-D packing.
+        Some(format!(
+            "{}mlp.experts.{expert_id}.gate_proj.weight",
+            self.layer_prefix(layer)
+        ))
     }
 
-    fn expert_ffn_up_key(&self, layer: usize, _expert_id: usize) -> Option<String> {
-        Some(format!("{}ffn_up_exps.weight", self.layer_prefix(layer)))
+    fn expert_ffn_up_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        Some(format!(
+            "{}mlp.experts.{expert_id}.up_proj.weight",
+            self.layer_prefix(layer)
+        ))
     }
 
-    fn expert_ffn_down_key(&self, layer: usize, _expert_id: usize) -> Option<String> {
-        Some(format!("{}ffn_down_exps.weight", self.layer_prefix(layer)))
+    fn expert_ffn_down_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        Some(format!(
+            "{}mlp.experts.{expert_id}.down_proj.weight",
+            self.layer_prefix(layer)
+        ))
     }
 
     fn shared_expert_gate_key(&self, layer: usize) -> Option<String> {
@@ -346,17 +359,21 @@ mod tests {
             arch.moe_router_key(3),
             Some("layers.3.ffn_gate_inp.weight".to_string())
         );
-        // V4 packs all 256 experts into a single 3-D tensor — every
-        // expert_id returns the same fused-tensor key. The actual
-        // expert slicing happens at the writer / reader level using
-        // the third dimension of the tensor.
+        // V4 packs all 256 experts into a 3-D fused tensor; the GGUF
+        // loader unpacks it into per-expert HF-style aliases that the
+        // arch surfaces here, so the vindex writer can iterate
+        // experts without knowing about the packing.
         assert_eq!(
             arch.expert_ffn_gate_key(3, 0),
-            Some("layers.3.ffn_gate_exps.weight".to_string())
+            Some("layers.3.mlp.experts.0.gate_proj.weight".to_string())
         );
         assert_eq!(
             arch.expert_ffn_gate_key(3, 255),
-            Some("layers.3.ffn_gate_exps.weight".to_string())
+            Some("layers.3.mlp.experts.255.gate_proj.weight".to_string())
+        );
+        assert_eq!(
+            arch.expert_ffn_down_key(3, 42),
+            Some("layers.3.mlp.experts.42.down_proj.weight".to_string())
         );
         assert_eq!(
             arch.shared_expert_gate_key(3),

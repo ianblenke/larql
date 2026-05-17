@@ -356,6 +356,17 @@ impl GgufFile {
             }
 
             let raw = &mmap[abs_offset_usize..end];
+            // Integer-index tensors (DeepSeek V4 `ffn_gate_tid2eid` is
+            // I32 `[6, 129280]` for the first 3 layers; LLMs occasionally
+            // ship I8/I64 metadata side-channels too) have no meaningful
+            // f32 representation. Skip them in the dense loader — the
+            // forward (when it exists) reads the raw int bytes via the
+            // lazy / mmap path. Browse-tier extraction doesn't need
+            // them at all.
+            if crate::quant::ggml::is_integer_type(info.tensor_type) {
+                let _ = raw;
+                continue;
+            }
             let floats = dequantize(raw, info.tensor_type, n_elements as usize)?;
 
             match info.n_dims {
