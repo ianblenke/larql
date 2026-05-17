@@ -561,6 +561,97 @@ pub fn q4k_q8k_matvec_into(
     q4k_q8k_matvec_scalar(out, q8k_x, w, rows, cols);
 }
 
+/// Batched multi-row Q4_K × Q8_K matmul. Computes
+/// `out[n * rows + r] = dot(q8k_xs[n], W_row[r])` for every
+/// `n in 0..q8k_xs.len()` and `r in 0..rows`.
+///
+/// Equivalent to looping [`q4k_q8k_matvec_into`] once per input
+/// row, but rayon parallelism moves to the **outer N axis** so the
+/// per-row matvec dispatch overhead amortises across the whole
+/// matmul. Critical for prefill: a 14-token prompt currently fans
+/// out 14 separate rayon dispatches per attention projection; this
+/// kernel collapses that to one dispatch with N=14 tasks.
+///
+/// `out.len()` must equal `q8k_xs.len() * rows`. Row-major output
+/// (`out[n * rows + r]`).
+///
+/// Task 2c of `vindex-qwen35moe-reader` — wait, no, **Arc 1** from
+/// RESUME_PROMPT's open-levers list. Closes the prefill speed gap
+/// to llama.cpp by eliminating per-row rayon dispatch overhead.
+pub fn q4k_q8k_matmul_into(
+    out: &mut [f32],
+    q8k_xs: &[Q8KActivation],
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    let n = q8k_xs.len();
+    if n == 0 || rows == 0 || cols == 0 {
+        out.fill(0.0);
+        return;
+    }
+    assert_eq!(
+        out.len(),
+        n * rows,
+        "q4k_q8k_matmul_into: out.len() ({}) must equal n_inputs ({n}) * rows ({rows})",
+        out.len()
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime check guarantees AVX2 availability for
+        // every rayon worker.
+        unsafe { q4k_q8k_matmul_avx2(out, q8k_xs, w, rows, cols) };
+        return;
+    }
+
+    // Portable fallback: serial outer loop, per-row matvec
+    // (which itself may go parallel on the inner row axis).
+    for (n_idx, q8k) in q8k_xs.iter().enumerate() {
+        let out_row = &mut out[n_idx * rows..(n_idx + 1) * rows];
+        q4k_q8k_matvec_into(out_row, q8k, w, rows, cols);
+    }
+}
+
+/// Outer-N parallel matmul on x86_64 AVX2. Each rayon task handles
+/// one input row against the full weight matrix, using the
+/// **serial** per-row AVX2 path (no nested rayon dispatch). N
+/// (input rows) is the parallelism level — typically prefill seq
+/// length, 14-200 tokens.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_q8k_matmul_avx2(
+    out: &mut [f32],
+    q8k_xs: &[Q8KActivation],
+    w: &[u8],
+    rows: usize,
+    cols: usize,
+) {
+    let n_blocks = cols / ELEMS_PER_BLOCK;
+    let row_bytes = n_blocks * BLOCK_BYTES;
+    let expected_w = rows * row_bytes;
+    if w.len() < expected_w {
+        out.fill(0.0);
+        return;
+    }
+
+    use rayon::prelude::*;
+    out.par_chunks_mut(rows)
+        .enumerate()
+        .for_each(|(n_idx, out_row)| {
+            let q8k = &q8k_xs[n_idx];
+            for (r, out_slot) in out_row.iter_mut().enumerate().take(rows) {
+                // SAFETY: outer fn is `target_feature(avx2)`; rayon
+                // workers inherit the same target features at
+                // compile time; runtime check at the public entry
+                // guarantees AVX2 availability.
+                unsafe {
+                    compute_row_q4k_avx2(out_slot, r, q8k, w, n_blocks, row_bytes);
+                }
+            }
+        });
+}
+
 /// AVX2 Q4_K × Q8_K matvec for x86_64.
 ///
 /// `vpmaddubsw` (unsigned×signed 8-bit → adjacent-pair-summed 16-bit) replaces
@@ -2088,5 +2179,75 @@ mod tests {
                 (out_scalar[r] - out_avx2[r]).abs()
             );
         }
+    }
+
+    /// `q4k_q8k_matmul_into` must produce **bit-exact** output to a loop
+    /// of `q4k_q8k_matvec_into` calls. This is the load-bearing
+    /// correctness guarantee — prefill calls swap from the per-row loop
+    /// to the batched kernel; any divergence would silently break
+    /// every chat completion that goes through prefill.
+    #[test]
+    fn q4k_q8k_matmul_into_matches_per_row_matvec_loop_bit_exact() {
+        // Realistic prefill dims: hidden=2048 (= 8 super-blocks),
+        // rows=8192 (qwen3.6 attn_qkv), n=14 (typical chat prompt seq).
+        // Trim to a tractable test size while keeping multi-block + N>1.
+        let cols = 512; // 2 super-blocks
+        let rows = 64; // > MIN_PAR_ROWS to exercise the parallel branch
+        let n_inputs = 5usize;
+
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.0017).sin() * 0.4)
+            .collect();
+        let w_q4 = quantize_q4_k(&w_f32);
+
+        let q8k_xs: Vec<Q8KActivation> = (0..n_inputs)
+            .map(|n| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((n as f32) * 0.31 + (i as f32) * 0.011).cos() * 1.5)
+                    .collect();
+                quantize_x_to_q8k(&x)
+            })
+            .collect();
+
+        // Reference: per-row loop.
+        let mut out_loop = vec![0.0f32; n_inputs * rows];
+        for (n_idx, q8k) in q8k_xs.iter().enumerate() {
+            let slot = &mut out_loop[n_idx * rows..(n_idx + 1) * rows];
+            q4k_q8k_matvec_into(slot, q8k, &w_q4, rows, cols);
+        }
+
+        // Batched kernel.
+        let mut out_batched = vec![0.0f32; n_inputs * rows];
+        q4k_q8k_matmul_into(&mut out_batched, &q8k_xs, &w_q4, rows, cols);
+
+        for n in 0..n_inputs {
+            for r in 0..rows {
+                let i = n * rows + r;
+                assert_eq!(
+                    out_loop[i].to_bits(),
+                    out_batched[i].to_bits(),
+                    "[n={n} r={r}]: loop={} batched={} diff={}",
+                    out_loop[i],
+                    out_batched[i],
+                    (out_loop[i] - out_batched[i]).abs()
+                );
+            }
+        }
+    }
+
+    /// Zero inputs / zero rows / zero cols must produce a zero-filled
+    /// output without panicking — the fast-path guard at the top of
+    /// the matmul.
+    #[test]
+    fn q4k_q8k_matmul_into_zero_inputs_zeroes_output() {
+        let mut out = vec![1.0f32; 0]; // n=0 => out is empty
+        q4k_q8k_matmul_into(&mut out, &[], &[], 64, 256);
+        assert!(out.is_empty());
+
+        // n=2 but rows=0 should still zero-fill the (zero-sized) output.
+        let q8: Vec<Q8KActivation> = (0..2).map(|_| quantize_x_to_q8k(&vec![0.0; 256])).collect();
+        let mut out = vec![1.0f32; 0];
+        q4k_q8k_matmul_into(&mut out, &q8, &[], 0, 256);
+        assert!(out.is_empty());
     }
 }

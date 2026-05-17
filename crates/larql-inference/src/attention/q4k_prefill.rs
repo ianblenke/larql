@@ -20,7 +20,7 @@
 //! the next-arc to close the prefill speed gap.
 
 use larql_compute::cpu::ops::q4k_q8k_dot::{
-    q4k_q8k_matvec_into, q6k_q8k_matvec_into, quantize_x_to_q8k,
+    q4k_q8k_matmul_into, q4k_q8k_matvec_into, q6k_q8k_matvec_into, quantize_x_to_q8k,
 };
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
@@ -47,10 +47,17 @@ fn matvec_row(
     }
 }
 
-/// Multi-row matmul `[N, cols] × [rows, cols]^T = [N, rows]` via per-row
-/// Q4_K × Q8_K matvec on quantised weight bytes. `x_normed` is the
-/// pre-normalised activation in f32 (its rows are Q8_K-quantised once each
-/// before being fed to the matvec kernel).
+/// Multi-row matmul `[N, cols] × [rows, cols]^T = [N, rows]`.
+///
+/// Q4_K weights take the batched [`q4k_q8k_matmul_into`] path — one
+/// rayon dispatch parallelising over the N input rows. Q6_K weights
+/// still go through per-row [`q6k_q8k_matvec_into`] (no batched Q6_K
+/// kernel yet — typically only the V projection on full-attention
+/// layers; a separate arc).
+///
+/// Bit-exact against the per-row loop for Q4_K — see
+/// `q4k_q8k_matmul_into_matches_per_row_matvec_loop_bit_exact` in
+/// `larql-compute/src/cpu/ops/q4k_q8k_dot.rs`.
 fn matmul_per_row(
     x_normed: &Array2<f32>,
     w_bytes: &[u8],
@@ -60,19 +67,44 @@ fn matmul_per_row(
 ) -> Array2<f32> {
     let n = x_normed.nrows();
     let mut out = Array2::<f32>::zeros((n, rows));
-    for r in 0..n {
-        let row_in = x_normed
-            .row(r)
-            .as_slice()
-            .map(<[f32]>::to_vec)
-            .unwrap_or_else(|| x_normed.row(r).iter().copied().collect());
-        let q8k = quantize_x_to_q8k(&row_in);
-        let mut out_flat = vec![0.0f32; rows];
-        matvec_row(&mut out_flat, &q8k, w_bytes, w_fmt, rows, cols);
-        out.row_mut(r)
-            .iter_mut()
-            .zip(out_flat.iter())
-            .for_each(|(o, v)| *o = *v);
+
+    // Quantise every input row to Q8K once. Same work either path —
+    // the batched kernel needs them as a slice, the per-row path
+    // discards them after each iteration.
+    let q8ks: Vec<_> = (0..n)
+        .map(|r| {
+            let row_in = x_normed
+                .row(r)
+                .as_slice()
+                .map(<[f32]>::to_vec)
+                .unwrap_or_else(|| x_normed.row(r).iter().copied().collect());
+            quantize_x_to_q8k(&row_in)
+        })
+        .collect();
+
+    match w_fmt {
+        "Q4_K" => {
+            // Batched: one rayon dispatch over the N input rows.
+            // The output is already laid out `[n * rows + r]` —
+            // matches the `Array2<f32>` row-major layout for shape
+            // `(n, rows)`, so we can pass `out.as_slice_mut()` straight
+            // through.
+            let out_slice = out
+                .as_slice_mut()
+                .expect("freshly-allocated row-major Array2 has contiguous slice");
+            q4k_q8k_matmul_into(out_slice, &q8ks, w_bytes, rows, cols);
+        }
+        "Q6_K" => {
+            for (r, q8k) in q8ks.iter().enumerate() {
+                let mut out_flat = vec![0.0f32; rows];
+                q6k_q8k_matvec_into(&mut out_flat, q8k, w_bytes, rows, cols);
+                out.row_mut(r)
+                    .iter_mut()
+                    .zip(out_flat.iter())
+                    .for_each(|(o, v)| *o = *v);
+            }
+        }
+        other => panic!("unsupported attn weight format for q4k-direct prefill: {other}"),
     }
     out
 }
