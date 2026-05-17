@@ -31,9 +31,7 @@ use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGH
 use super::write_f32::WeightSource;
 
 mod attn;
-mod attn_mla;
 mod deltanet;
-mod dsv4_aux;
 mod ffn;
 mod lm_head;
 mod moe_layers;
@@ -41,8 +39,6 @@ mod norms;
 mod ple;
 
 pub mod feature_major_down;
-
-pub use dsv4_aux::Dsv4AuxEntry;
 
 /// Per-block quantisation format for a single tensor in the Q4_K pipeline.
 /// Serde writes / reads the literal strings `"Q4_K"` and `"Q6_K"` to match
@@ -184,17 +180,7 @@ pub fn write_model_weights_q4k_with_opts(
     ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
 
-    // MLA-aware split: DSv4 (and any future MLA family with a writer
-    // wired up) emits 5 tensors per layer through `attn_mla`; the
-    // standard Q/K/V/O writer is skipped because those keys don't
-    // exist in the source. `ensure_standard_attention_supported` is
-    // permissive for known-MLA writers (see `capabilities.rs`).
-    if arch.uses_mla() {
-        attn_mla::write_mla_weights_q4k(source, dir, num_layers, callbacks)?;
-        dsv4_aux::write_dsv4_aux(source, dir, num_layers)?;
-    } else {
-        attn::write_attn_weights_q4k(source, dir, num_layers, callbacks)?;
-    }
+    attn::write_attn_weights_q4k(source, dir, num_layers, callbacks)?;
     deltanet::write_deltanet_weights_q4k(source, dir, num_layers, callbacks)?;
     ffn::write_interleaved_ffn_q4k(source, dir, num_layers, opts, callbacks)?;
     moe_layers::write_per_layer_moe_q4k(source, dir, num_layers)?;

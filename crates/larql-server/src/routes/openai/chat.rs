@@ -751,43 +751,14 @@ fn run_chat_completion(
     // chat goes through the dedicated path below.
     let arch_family = weights.arch.family();
     let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe");
-    let is_dsv4 = arch_family == "deepseek4";
-    if (is_qwen35 || is_dsv4) && constrained_schema.is_some() {
+    if is_qwen35 && constrained_schema.is_some() {
         return Err(ServerError::Internal(format!(
             "/v1/chat/completions with response_format/tools is not yet wired \
-             through the dedicated generate driver (arch `{arch_family}`). \
-             Drop response_format/tools or use a different model."
+             through the qwen35 generate driver (arch `{arch_family}`). \
+             Drop response_format/tools or use a non-qwen35 model."
         )));
     }
-    let result = if is_dsv4 {
-        // Lazy-cache the heavy `Dsv4Weights` reconstruction. The Q4_K
-        // vindex loader mmaps ~500 GB of files but only touches pages
-        // on demand; first-request latency is dominated by the
-        // manifest parses + per-layer expert file opens.
-        let dsv4_w =
-            match model.dsv4_weights.get() {
-                Some(w) => std::sync::Arc::clone(w),
-                None => {
-                    let loaded = larql_inference::attention::dsv4_load_vindex
-                    ::load_dsv4_weights_from_vindex(&model.path)
-                    .map_err(|e| ServerError::Internal(format!(
-                        "deepseek4 vindex load failed: {e}"
-                    )))?;
-                    let arc = std::sync::Arc::new(loaded);
-                    let _ = model.dsv4_weights.set(std::sync::Arc::clone(&arc));
-                    model.dsv4_weights.get().cloned().unwrap_or(arc)
-                }
-            };
-        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
-        larql_inference::attention::dsv4_load_vindex::dsv4_generate_with_sampling(
-            &dsv4_w,
-            &model.tokenizer,
-            &prompt_ids,
-            max_tokens,
-            sampling,
-            &eos,
-        )
-    } else if is_qwen35 {
+    let result = if is_qwen35 {
         // Lazy-cache the heavy `Qwen35Weights` reconstruction (~30-40s
         // for a 60 GB vindex) for the model's lifetime.
         let qwen35_w = match model.qwen35_weights.get() {

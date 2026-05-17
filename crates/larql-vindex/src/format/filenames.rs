@@ -93,34 +93,6 @@ pub const ATTN_WEIGHTS_Q8_MANIFEST_JSON: &str = "attn_weights_q8_manifest.json";
 pub const DELTANET_WEIGHTS_Q4K_BIN: &str = "deltanet_weights_q4k.bin";
 pub const DELTANET_WEIGHTS_Q4K_MANIFEST_JSON: &str = "deltanet_weights_q4k_manifest.json";
 
-// ── MLA (DeepSeek V4 Flash) ────────────────────────────────────────────
-// Per-layer Q4_K matmul tensors for MLA attention. DSv4 emits 5 tensors
-// per layer (vs Q/K/V/O for standard attention):
-//   attn_q_a   (4096, 1024) — Q down-projection
-//   attn_q_b   (1024, 32768) — Q up-projection (64 heads × 512 dim)
-//   attn_kv    (4096, 512) — joint KV down-projection
-//   attn_output_a (4096, 8192) — output low-rank A
-//   attn_output_b (8192, 4096) — output low-rank B
-// Sidecar manifest records each tensor's (offset, length, format, shape).
-pub const MLA_WEIGHTS_Q4K_BIN: &str = "mla_weights_q4k.bin";
-pub const MLA_WEIGHTS_Q4K_MANIFEST_JSON: &str = "mla_weights_q4k_manifest.json";
-
-// ── DeepSeek V4 auxiliary tensors ──────────────────────────────────────
-// V4-specific tensors that have no analogue in other architectures:
-// hyper-connection (`hc_{attn,ffn,output}_{base,fn,scale}`), per-layer
-// attention sinks (`attn_sinks`), router bias (`exp_probs_b`),
-// sparse-attention compressor + indexer blocks
-// (`attn_compressor_*`, `indexer_*`), and hash-routing tables for the
-// first 3 layers (`ffn_gate_tid2eid`).
-//
-// Most are small F16/F32 vectors or matrices that don't benefit from
-// Q4_K (the matmul cost is dwarfed by the experts), and the
-// hash-routing tables are I32. Stored byte-for-byte as they appeared
-// in the GGUF; the sidecar manifest records (key, offset, length,
-// gguf_type, shape) so the scope-4 reader can mmap and interpret them.
-pub const DSV4_AUX_BIN: &str = "dsv4_aux.bin";
-pub const DSV4_AUX_MANIFEST_JSON: &str = "dsv4_aux_manifest.json";
-
 // ── Per-layer FFN weights (§5.12) ──────────────────────────────────────
 //
 // Unified format for both dense and MoE FFN weights. One file per layer.
