@@ -73,3 +73,52 @@ fn dsv4_gguf_header_parses_and_routes_to_v4_arch() {
     );
     assert_eq!(arch.mla_kv_b_key(0), None);
 }
+
+/// Browse-tier vindex extraction smoke — Scope 2.
+///
+/// Validates that a vindex produced by
+/// `larql convert gguf-to-vindex --level browse` on the real DSv4
+/// GGUF has the expected structural shape: 43 layers, 256 experts
+/// per layer, hidden=4096, vocab=129280, embedding f32 file sized
+/// `vocab × hidden × 4`. The conversion itself is invoked manually
+/// (it takes ~40 minutes and writes ~350 GB) — this test only opens
+/// the result. Skipped automatically when the vindex directory
+/// doesn't exist.
+#[test]
+#[ignore = "requires browse-tier vindex at /tank/ai/deepseek-ai/DeepSeek-V4-Flash-vindex-v1/"]
+fn dsv4_browse_vindex_structure_matches_gguf_metadata() {
+    let dir = Path::new("/tank/ai/deepseek-ai/DeepSeek-V4-Flash-vindex-v1");
+    if !dir.exists() {
+        panic!(
+            "browse-tier vindex not present at {dir:?} — re-run the conversion:\n  \
+             larql convert gguf-to-vindex --level browse --output {dir:?} \
+             /tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/*.gguf"
+        );
+    }
+
+    let cfg_path = dir.join("index.json");
+    let cfg_bytes = std::fs::read(&cfg_path).expect("read index.json");
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&cfg_bytes).expect("parse index.json as JSON");
+
+    assert_eq!(cfg["family"], "deepseek4");
+    assert_eq!(cfg["num_layers"], 43);
+    assert_eq!(cfg["hidden_size"], 4096);
+    assert_eq!(cfg["vocab_size"], 129280);
+    assert_eq!(cfg["extract_level"], "browse");
+
+    // 43 layers × 256 experts + 1 shared = 257 expert groups; the
+    // per-layer record holds num_experts=256 (routed) with
+    // num_features_per_expert=2048 (V4 expert intermediate width).
+    let layer0 = &cfg["layers"][0];
+    assert_eq!(layer0["num_experts"], 256);
+    assert_eq!(layer0["num_features_per_expert"], 2048);
+    // 256 routed × 2048 + 1 shared × 2048 = 526336 total features.
+    assert_eq!(layer0["num_features"], 526336);
+
+    // embeddings.bin shape: vocab × hidden × sizeof(f32).
+    let embed_path = dir.join("embeddings.bin");
+    let embed_meta = std::fs::metadata(&embed_path).expect("stat embeddings.bin");
+    let expected_embed_size: u64 = 129280 * 4096 * 4;
+    assert_eq!(embed_meta.len(), expected_embed_size);
+}

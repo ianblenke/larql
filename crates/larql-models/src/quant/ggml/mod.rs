@@ -86,6 +86,23 @@ pub const TYPE_Q5_K: u32 = 13;
 pub const TYPE_Q6_K: u32 = 14;
 pub const TYPE_BF16: u32 = 30;
 
+// Integer index types — used by hash-routing tables (DeepSeek V4
+// `ffn_gate_tid2eid` is I32 `[6, 129280]`, first 3 layers only) and
+// occasional metadata side-channels. The dequantise path returns
+// these unchanged as raw byte slices; no float conversion is
+// meaningful.
+pub const TYPE_I8: u32 = 24;
+pub const TYPE_I16: u32 = 25;
+pub const TYPE_I32: u32 = 26;
+pub const TYPE_I64: u32 = 27;
+
+/// True if `tensor_type` is one of the integer-index types
+/// (`I8`/`I16`/`I32`/`I64`). Callers that want to skip non-weight
+/// tensors during load can branch on this.
+pub fn is_integer_type(tensor_type: u32) -> bool {
+    matches!(tensor_type, TYPE_I8 | TYPE_I16 | TYPE_I32 | TYPE_I64)
+}
+
 // ── Block geometry (canonical GGML wire format) ─────────────────────────
 //
 // Legacy quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) pack 32 elements per block.
@@ -190,6 +207,10 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
         TYPE_Q4_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q4_K_BLOCK_BYTES),
         TYPE_Q5_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q5_K_BLOCK_BYTES),
         TYPE_Q6_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q6_K_BLOCK_BYTES),
+        TYPE_I8 => Ok(n_elements),
+        TYPE_I16 => Ok(n_elements * 2),
+        TYPE_I32 => Ok(n_elements * 4),
+        TYPE_I64 => Ok(n_elements * 8),
         _ => Err(ModelError::Parse(format!(
             "tensor_data_size: unsupported type id {tensor_type}"
         ))),
@@ -213,6 +234,10 @@ pub fn type_name(tensor_type: u32) -> &'static str {
         TYPE_Q5_K => "Q5_K",
         TYPE_Q6_K => "Q6_K",
         TYPE_BF16 => "BF16",
+        TYPE_I8 => "I8",
+        TYPE_I16 => "I16",
+        TYPE_I32 => "I32",
+        TYPE_I64 => "I64",
         _ => "unknown",
     }
 }
