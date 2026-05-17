@@ -327,10 +327,51 @@ full breakdown.
 - 40 GB `gate_vectors.bin` size optimisation — separate writer
   emitting MoE router weights in f32; structural correctness is
   achieved either way.
-- Arc #1 (batched multi-row Q4_K × Q8_K matmul kernel) — still
-  open as a general perf lever on top of either Gemma 3 4B or the
-  new qwen35moe path once it reaches the server.
-- Arc #2 (mmap-backed embed) — same.
+- Arc #1 (batched multi-row Q4_K × Q8_K matmul kernel) —
+  ✅ SHIPPED in PR #173. `q4k_q8k_matmul_into` moves rayon
+  parallelism to the outer N axis (input rows), eliminating
+  per-row dispatch overhead. Bit-exact against the per-row loop.
+  Wired into `q4k_prefill::matmul_per_row` for Q4_K attn
+  projections.
+- Arc #2 (mmap-backed embed) — **BLOCKED on architecture
+  decision.** The to_vec copy in `load_vindex_embeddings`
+  (`format/load.rs:382`) allocates a 2 GB Vec<f32> from the
+  mmap'd `embeddings.bin`. Eliminating it requires changing the
+  storage type of `embed` (currently `WeightArray =
+  ArcArray2<f32>`, owned Vec). Three paths, each with risk too
+  high for unattended work:
+  1. **Cross-crate refactor** of `WeightArray` to a new enum
+     `EmbedMatrix::{Heap(Array2<f32>), Mmap(MmappedEmbed)}` —
+     touches 6+ consumers (`walker/{weight,vector,attention}_walker.rs`,
+     `capture.rs`, `forward/ple.rs`, `attention/qwen35_forward.rs`,
+     server load path). Walker uses `.dot()` which only exists on
+     owned Array2 — needs a per-call-site row-iteration replacement.
+  2. **Additive `embed_mmap: Option<MmappedEmbed>` field** —
+     keep `embed` field as today, populate `embed_mmap` in the
+     vindex loader and have the f32 case skip the Vec allocation
+     by setting `embed = Array2::zeros((0,0))` placeholder.
+     Every consumer that today reads `weights.embed.row(tok)` has
+     to first check `embed_mmap` and fall through. Same call-site
+     count as path 1 with less type churn.
+  3. **Custom `ndarray::RawData` storage type** wrapping
+     `Arc<Mmap>` — gives `Array2<f32>` semantics with no Vec
+     allocation. ~50-100 LoC of unsafe ndarray internals with
+     subtle invariants around drop order + 'static-lifetime
+     extension via Arc. Most elegant if it works; safety review
+     beyond what's tractable unattended.
+
+  The minimum viable Arc 2 LITE that ships zero RAM win but
+  reduces decode CPU work: replace `decode_floats(&mmap, F32)`
+  with `bytemuck::cast_slice(&mmap).to_vec()` in the three call
+  sites (`format/load.rs:212`, `:382`, `:557`). Saves the
+  per-element `f32::from_le_bytes` decode loop; still allocates
+  the 2 GB Vec. ~10 LoC. Worth shipping; not what the design doc
+  asks for.
+
+  **Recommendation for the next session**: discuss with the user
+  which of paths 1/2/3 to take before implementing. The
+  cross-crate refactor (path 1) is the cleanest long-term but the
+  blast radius is real.
 
 ---
 
