@@ -123,10 +123,18 @@ impl ModelArchitecture for DeepSeekV4Arch {
     }
 
     fn input_layernorm_key(&self, layer: usize) -> String {
-        format!("{}attn_norm.weight", self.layer_prefix(layer))
+        // The GGUF→HF normalizer rewrites `attn_norm.` →
+        // `input_layernorm.` (see `loading/gguf.rs::GGUF_TO_HF_KEY_REPLACEMENTS`).
+        // Return the post-normalize key so the norms writer's
+        // `source.get_vector(&key)` actually finds it.
+        format!("{}input_layernorm.weight", self.layer_prefix(layer))
     }
     fn post_attention_layernorm_key(&self, layer: usize) -> String {
-        format!("{}ffn_norm.weight", self.layer_prefix(layer))
+        // GGUF→HF: `ffn_norm.` → `post_attention_layernorm.`
+        format!(
+            "{}post_attention_layernorm.weight",
+            self.layer_prefix(layer)
+        )
     }
     fn pre_feedforward_layernorm_key(&self, _layer: usize) -> Option<String> {
         None
@@ -330,12 +338,15 @@ mod tests {
     #[test]
     fn dsv4_per_layer_keys_match_gguf_post_normalisation() {
         let arch = DeepSeekV4Arch::from_config(dsv4_config());
-        // GGUF→HF rewrites `blk.7.` → `layers.7.`; V4-specific
-        // suffixes pass through unchanged.
-        assert_eq!(arch.input_layernorm_key(7), "layers.7.attn_norm.weight");
+        // GGUF→HF rewrites `blk.7.` → `layers.7.` and the legacy
+        // `attn_norm.`/`ffn_norm.` keys to HF spellings.
+        assert_eq!(
+            arch.input_layernorm_key(7),
+            "layers.7.input_layernorm.weight"
+        );
         assert_eq!(
             arch.post_attention_layernorm_key(7),
-            "layers.7.ffn_norm.weight"
+            "layers.7.post_attention_layernorm.weight"
         );
         assert_eq!(
             arch.mla_q_a_key(7),
