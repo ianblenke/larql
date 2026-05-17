@@ -736,6 +736,33 @@ fn run_chat_completion(
     let cached_layers = larql_inference::CachedLayerGraph::from_residuals(Vec::new());
     let num_layers = weights.num_layers;
 
+    // qwen35 / qwen35moe (Qwen 3.6 dense + 35B-A3B MoE) needs a
+    // separate generate driver because the per-token forward goes
+    // through `qwen35_forward_step` + `DeltaNetHybridCache`, not the
+    // generic `predict_q4k_hidden_with_cache` + `KvCache` path that
+    // `generate_with_sampling` drives. Refusing here with a clear
+    // error beats silently mis-routing the qwen35 vindex through the
+    // standard transformer path — that would compute on the wrong
+    // weight shapes (DeltaNet linear-attn layers have no Q/K/V/O
+    // tensors at all) and produce garbage logits.
+    //
+    // The driver itself (~150-200 LoC: `qwen35_generate_with_sampling`)
+    // is task 2c per
+    // `openspec/changes/vindex-qwen35moe-reader/step-2b-design.md`.
+    // Step 2b (PRs #161-#167) shipped the reader half — Qwen35Weights
+    // can be loaded from a vindex; the driver glue is what's left.
+    let arch_family = weights.arch.family();
+    if matches!(arch_family, "qwen35" | "qwen35moe") {
+        return Err(ServerError::Internal(format!(
+            "/v1/chat/completions for arch `{arch_family}` requires the qwen35 \
+             generate driver (task 2c of vindex-qwen35moe-reader); \
+             not yet implemented. The vindex weights load correctly via \
+             `load_qwen35_weights_from_vindex` (smoke-validated in PR #167), \
+             but the per-token forward needs `qwen35_forward_step` + \
+             `DeltaNetHybridCache`, not the standard transformer path."
+        )));
+    }
+
     let result = if let Some(schema) = constrained_schema {
         // Sampling under mask via the new `_sampled` variant — drives
         // selection through the user's SamplingConfig over the masked
