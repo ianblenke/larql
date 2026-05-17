@@ -92,6 +92,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -184,6 +185,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

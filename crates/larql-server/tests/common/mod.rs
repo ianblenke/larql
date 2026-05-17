@@ -137,6 +137,7 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -181,6 +182,7 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -235,7 +237,7 @@ pub fn model_with_loaded_weights(id: &str) -> Arc<LoadedModel> {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: small.clone(),
+        embed: larql_models::embed::EmbedMatrix::from_array(small.clone()),
         embed_quant: None,
         lm_head: small.clone(),
         lm_head_quant: None,
@@ -274,6 +276,7 @@ pub fn model_with_loaded_weights(id: &str) -> Arc<LoadedModel> {
         embed_store: None,
         release_mmap_after_request: false,
         weights: weights_cell,
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: std::collections::HashMap::new(),
         ffn_l2_cache: larql_server::ffn_l2_cache::FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
@@ -357,6 +360,7 @@ impl ModelBuilder {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
+            qwen35_weights: std::sync::OnceLock::new(),
             probe_labels: self.probe_labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(

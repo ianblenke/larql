@@ -740,30 +740,54 @@ fn run_chat_completion(
     // separate generate driver because the per-token forward goes
     // through `qwen35_forward_step` + `DeltaNetHybridCache`, not the
     // generic `predict_q4k_hidden_with_cache` + `KvCache` path that
-    // `generate_with_sampling` drives. Refusing here with a clear
-    // error beats silently mis-routing the qwen35 vindex through the
-    // standard transformer path — that would compute on the wrong
-    // weight shapes (DeltaNet linear-attn layers have no Q/K/V/O
-    // tensors at all) and produce garbage logits.
+    // `generate_with_sampling` drives. Forwarding through
+    // `generate_with_sampling` would compute on the wrong weight
+    // shapes (DeltaNet linear-attn layers have no Q/K/V/O tensors
+    // at all) and produce garbage logits.
     //
-    // The driver itself (~150-200 LoC: `qwen35_generate_with_sampling`)
-    // is task 2c per
-    // `openspec/changes/vindex-qwen35moe-reader/step-2b-design.md`.
-    // Step 2b (PRs #161-#167) shipped the reader half — Qwen35Weights
-    // can be loaded from a vindex; the driver glue is what's left.
+    // Constrained masking (response_format) and the qwen35 driver
+    // are not yet plumbed together — refuse with a clear error so
+    // schema-bound qwen35 callers know to wait. Free-form qwen35
+    // chat goes through the dedicated path below.
     let arch_family = weights.arch.family();
-    if matches!(arch_family, "qwen35" | "qwen35moe") {
+    let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe");
+    if is_qwen35 && constrained_schema.is_some() {
         return Err(ServerError::Internal(format!(
-            "/v1/chat/completions for arch `{arch_family}` requires the qwen35 \
-             generate driver (task 2c of vindex-qwen35moe-reader); \
-             not yet implemented. The vindex weights load correctly via \
-             `load_qwen35_weights_from_vindex` (smoke-validated in PR #167), \
-             but the per-token forward needs `qwen35_forward_step` + \
-             `DeltaNetHybridCache`, not the standard transformer path."
+            "/v1/chat/completions with response_format/tools is not yet wired \
+             through the qwen35 generate driver (arch `{arch_family}`). \
+             Drop response_format/tools or use a non-qwen35 model."
         )));
     }
-
-    let result = if let Some(schema) = constrained_schema {
+    let result = if is_qwen35 {
+        // Lazy-cache the heavy `Qwen35Weights` reconstruction (~30-40s
+        // for a 60 GB vindex) for the model's lifetime.
+        let qwen35_w = match model.qwen35_weights.get() {
+            Some(w) => std::sync::Arc::clone(w),
+            None => {
+                let loaded = larql_inference::attention::qwen35_load_vindex
+                    ::load_qwen35_weights_from_vindex(&model.path)
+                    .map_err(|e| ServerError::Internal(format!(
+                        "qwen35 vindex load failed: {e}"
+                    )))?;
+                let arc = std::sync::Arc::new(loaded);
+                // OnceLock semantics: first writer wins; if a parallel
+                // request already initialised, drop ours and use theirs.
+                let _ = model.qwen35_weights.set(std::sync::Arc::clone(&arc));
+                model.qwen35_weights.get().cloned().unwrap_or(arc)
+            }
+        };
+        let arch_ref: &dyn larql_models::ModelArchitecture = &*weights.arch;
+        let (sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
+        larql_inference::attention::qwen35_load_vindex::qwen35_generate_with_sampling(
+            &qwen35_w,
+            arch_ref,
+            &model.tokenizer,
+            &prompt_ids,
+            max_tokens,
+            sampling,
+            &eos,
+        )
+    } else if let Some(schema) = constrained_schema {
         // Sampling under mask via the new `_sampled` variant — drives
         // selection through the user's SamplingConfig over the masked
         // logits. Greedy when no sampling fields are set.
