@@ -173,10 +173,11 @@ fn derive_dims(cfg: &larql_vindex::VindexConfig) -> Dsv4Dims {
     let top_k = moe.map(|m| m.top_k).unwrap_or(6);
     let shared = moe.map(|m| m.shared_expert as usize).unwrap_or(1);
     let ffn_dim = moe.and_then(|m| m.moe_intermediate_size).unwrap_or(2048);
-    // q_lora_rank / kv_lora_rank aren't surfaced through
-    // `VindexModelConfig` yet — DSv4 publishes them in GGUF metadata
-    // but the writer doesn't propagate. Default to the published
-    // model's values; a follow-up should add explicit fields.
+    // q_lora_rank / kv_lora_rank / rope_dim / rope_base aren't
+    // surfaced through `VindexModelConfig` yet — DSv4 publishes them
+    // in GGUF metadata but the writer doesn't propagate. Default to
+    // the published model's values; a follow-up should add explicit
+    // fields.
     Dsv4Dims {
         hidden,
         q_lora_rank: 1024,
@@ -191,6 +192,8 @@ fn derive_dims(cfg: &larql_vindex::VindexConfig) -> Dsv4Dims {
         vocab: cfg.vocab_size,
         norm_eps: 1e-6,
         expert_weights_scale: 1.5,
+        rope_dim: 64,
+        rope_base: mc.map(|c| c.rope_base).unwrap_or(10_000.0),
     }
 }
 
@@ -642,6 +645,8 @@ pub fn dsv4_dims_from_weights(weights: &Dsv4Weights) -> Dsv4Dims {
         vocab,
         norm_eps: 1e-6,
         expert_weights_scale: 1.5,
+        rope_dim: 64,
+        rope_base: 10_000.0,
     }
 }
 

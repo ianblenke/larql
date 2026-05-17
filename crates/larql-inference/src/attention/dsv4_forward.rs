@@ -67,6 +67,12 @@ pub struct Dsv4Dims {
     pub norm_eps: f32,
     /// Expert weight scale (`deepseek4.expert_weights_scale`) — 1.5.
     pub expert_weights_scale: f32,
+    /// RoPE rotary dimension (`deepseek4.rope.dimension_count`) — 64.
+    /// Only this many dims (per Q head; trailing slice of KV latent)
+    /// get rotary encoding; the rest pass through.
+    pub rope_dim: usize,
+    /// RoPE base frequency (`deepseek4.rope.freq_base`) — 10000.0.
+    pub rope_base: f64,
 }
 
 /// Per-layer weights for the MLA attention block.
@@ -255,11 +261,50 @@ fn mla_attention_step(
         .matvec(&q_latent)
         .expect("q_b matvec at q_lora_rank width");
     debug_assert_eq!(q_full.len(), dims.n_heads * dims.head_dim);
+    // RoPE on the rotary portion of each head's Q. V4 reports
+    // `rope.dimension_count = 64` of the 512 head_dim (fraction
+    // 64/512 = 0.125). The rotary section is the FIRST `rope_dim`
+    // dims of each head (HF convention). Position is the current
+    // token's position in the sequence (== cache.next_position
+    // before we append the new KV-latent below).
+    let q_full = if dims.rope_dim > 0 && dims.rope_dim <= dims.head_dim {
+        let row =
+            Array2::from_shape_vec((1, q_full.len()), q_full.to_vec()).expect("q reshape for rope");
+        let rotated = super::rope::apply_rope_partial_at(
+            &row,
+            dims.n_heads,
+            dims.head_dim,
+            dims.rope_base,
+            dims.rope_dim as f64 / dims.head_dim as f64,
+            cache.next_position,
+        );
+        rotated.row(0).to_owned()
+    } else {
+        q_full
+    };
 
     // KV path: x → kv (down) → kv_a_norm → cache.
     let kv_latent = w.attn.kv.matvec(&h).expect("kv matvec at hidden width");
     let kv_latent = rms_norm(&kv_latent, &w.attn.kv_a_norm, dims.norm_eps);
     debug_assert_eq!(kv_latent.len(), dims.kv_lora_rank);
+    // RoPE on the kv-rope portion of the latent. Treat as a single
+    // "head" of width `kv_lora_rank`; rotate the first `rope_dim`
+    // dims at the current token position.
+    let kv_latent = if dims.rope_dim > 0 && dims.rope_dim <= dims.kv_lora_rank {
+        let row = Array2::from_shape_vec((1, kv_latent.len()), kv_latent.to_vec())
+            .expect("kv reshape for rope");
+        let rotated = super::rope::apply_rope_partial_at(
+            &row,
+            1,
+            dims.kv_lora_rank,
+            dims.rope_base,
+            dims.rope_dim as f64 / dims.kv_lora_rank as f64,
+            cache.next_position,
+        );
+        rotated.row(0).to_owned()
+    } else {
+        kv_latent
+    };
 
     // Append to cache for this layer.
     let layer_cache = &mut cache.layers[layer];
@@ -446,6 +491,8 @@ mod tests {
             vocab: 5,
             norm_eps: 1e-6,
             expert_weights_scale: 1.0,
+            rope_dim: 0,
+            rope_base: 10000.0,
         }
     }
 
