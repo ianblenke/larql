@@ -35,6 +35,12 @@ pub(super) fn write_norms_and_router(
             arch.post_feedforward_layernorm_key(layer),
             arch.attn_q_norm_key(layer),
             arch.attn_k_norm_key(layer),
+            // Qwen 3.6 full-attention layers use per-head RMSNorm
+            // weights stored under `attn_{q,k}_norm.weight` (without
+            // a `_proj` infix). The arch returns `None` for layers
+            // where they don't apply (e.g. linear-attention layers).
+            arch.attn_q_per_head_norm_key(layer),
+            arch.attn_k_per_head_norm_key(layer),
             // Gemma 4 per-layer scalar multiplier. Stored as a 0-D scalar
             // in safetensors, surfaced through WeightSource as a 1-element
             // vector. The forward path multiplies h by this value after

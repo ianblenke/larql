@@ -105,6 +105,34 @@ pub fn load_qwen35_weights_from_vindex(
     }));
     let arch = std::mem::replace(&mut weights.arch, placeholder);
 
+    // `ssm_conv1d` is written into `norms.bin` as a flattened VECTOR
+    // entry but `qwen35_load::load_deltanet_layer` reads it via
+    // `get_tensor` (2-D from `weights.tensors`). Reshape every linear
+    // layer's flat conv1d vector back to the GGUF wire shape
+    // `[conv_dim, d_conv]` so the consumer's standard dim-swap +
+    // transpose produces the `[d_conv, conv_dim]` per-tap-channel
+    // layout the forward expects (per `qwen35_load.rs:322-340`).
+    let d_conv = arch.ssm_conv_kernel();
+    for layer in 0..weights.num_layers {
+        if !arch.is_linear_attention_layer(layer) {
+            continue;
+        }
+        let Some(key) = arch.ssm_conv1d_key(layer) else {
+            continue;
+        };
+        let Some(flat) = weights.vectors.get(&key).cloned() else {
+            continue;
+        };
+        if d_conv == 0 || flat.len() % d_conv != 0 {
+            continue;
+        }
+        let conv_dim = flat.len() / d_conv;
+        let arr = Array2::from_shape_vec((conv_dim, d_conv), flat).map_err(|e| {
+            VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string()))
+        })?;
+        weights.tensors.insert(key, arr.into_shared());
+    }
+
     populate_deltanet_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_attn_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_moe_quant_tensors(vindex_dir, &*arch, &mut weights)?;
