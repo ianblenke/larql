@@ -1,6 +1,7 @@
 pub mod architectures;
 pub mod config;
 pub mod detect;
+pub mod embed;
 pub mod loading;
 pub mod quant;
 pub mod validation;
