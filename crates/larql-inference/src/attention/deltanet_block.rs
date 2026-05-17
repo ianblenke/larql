@@ -103,6 +103,30 @@ pub struct DeltaNetDims {
 }
 
 impl DeltaNetDims {
+    /// Construct from an architecture handle. Reads the SSM metadata
+    /// fields the `qwen35` / `qwen35moe` archs expose:
+    /// - `hidden` ← `arch.config().hidden_size`
+    /// - `head_v_dim` ← `arch.ssm_state_size()`
+    /// - `n_v_heads` ← `arch.ssm_dt_rank()`
+    /// - `n_k_heads` ← `arch.ssm_group_count()`
+    /// - `d_conv` ← `arch.ssm_conv_kernel()`
+    /// - `eps` ← provided by the caller (typically `1e-6`)
+    ///
+    /// Required by `qwen35_generate_with_sampling` (task 2c.a of
+    /// `vindex-qwen35moe-reader`). Pure utility — every read goes
+    /// through the existing `ModelArchitecture` trait methods that
+    /// PR #167 wired up via the vindex loader's arch reconstruction.
+    pub fn from_arch(arch: &dyn larql_models::ModelArchitecture, eps: f32) -> Self {
+        Self {
+            hidden: arch.config().hidden_size,
+            head_v_dim: arch.ssm_state_size(),
+            n_v_heads: arch.ssm_dt_rank(),
+            n_k_heads: arch.ssm_group_count(),
+            d_conv: arch.ssm_conv_kernel(),
+            eps,
+        }
+    }
+
     /// `head_v_dim * n_k_heads`.
     #[inline]
     pub fn key_dim(&self) -> usize {

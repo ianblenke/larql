@@ -93,6 +93,34 @@ pub struct Qwen35AttentionDims {
 }
 
 impl Qwen35AttentionDims {
+    /// Construct from an architecture handle. Reads the standard
+    /// transformer dims from `arch.config()` plus the MRoPE section
+    /// sum from `arch.rope_dimension_sections()` for `rotary_dim`.
+    /// `eps` is provided by the caller (typically `1e-6`).
+    ///
+    /// Required by `qwen35_generate_with_sampling` (task 2c.a of
+    /// `vindex-qwen35moe-reader`). Pure utility — no integration
+    /// concerns beyond what the existing `ModelArchitecture` trait
+    /// already exposes after PR #167's vindex loader fix.
+    pub fn from_arch(arch: &dyn larql_models::ModelArchitecture, eps: f32) -> Self {
+        let cfg = arch.config();
+        let rotary_dim = arch
+            .rope_dimension_sections()
+            .map(|secs| secs.iter().copied().sum())
+            .unwrap_or(cfg.head_dim);
+        Self {
+            hidden: cfg.hidden_size,
+            n_head: cfg.num_q_heads,
+            n_head_kv: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            rotary_dim,
+            // `rope_base_for_layer` per the trait — Qwen 3.6 is
+            // uniform across layers so layer 0 stands in.
+            rope_base: arch.rope_base_for_layer(0),
+            eps,
+        }
+    }
+
     /// `n_head * head_dim`.
     #[inline]
     pub fn q_dim(&self) -> usize {

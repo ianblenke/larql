@@ -128,4 +128,78 @@ fn qwen35_35b_a3b_vindex_loads_into_structurally_complete_qwen35weights() {
         "smoke OK — 40 layers ({linear} linear + {full} full-attn), \
          {moe_present} MoE blocks, final_norm + lm_head_quant present"
     );
+
+    // Verify the from_arch dim constructors against the real arch.
+    // The driver (task 2c.a) will call these — assert the numbers
+    // line up with Qwen3.6-35B-A3B's known shapes before the driver
+    // depends on them.
+    use larql_inference::attention::deltanet_block::DeltaNetDims;
+    use larql_inference::attention::qwen35_block::Qwen35AttentionDims;
+    let arch: &dyn larql_models::ModelArchitecture = &*weights_arch_box(&path);
+    let dn = DeltaNetDims::from_arch(arch, 1e-6);
+    let attn = Qwen35AttentionDims::from_arch(arch, 1e-6);
+    assert_eq!(dn.hidden, 2048, "Qwen 3.6 35B-A3B hidden=2048");
+    assert_eq!(dn.d_conv, 4, "DeltaNet Conv1D window=4");
+    assert!(
+        dn.head_v_dim > 0 && dn.n_v_heads > 0 && dn.n_k_heads > 0,
+        "DeltaNet head dims must be non-zero: {dn:?}"
+    );
+    assert_eq!(attn.hidden, 2048, "attn hidden=2048");
+    assert!(
+        attn.n_head > 0 && attn.n_head_kv > 0 && attn.head_dim > 0,
+        "attn dims must be non-zero: {attn:?}"
+    );
+    eprintln!("from_arch dims OK — DeltaNetDims: {dn:?}; Qwen35AttentionDims: {attn:?}");
+}
+
+/// Re-construct the arch from the vindex config so the from_arch
+/// dim helpers can be exercised independently of the `Qwen35Weights`
+/// produced by `load_qwen35_weights_from_vindex`.
+fn weights_arch_box(vindex_dir: &std::path::Path) -> Box<dyn larql_models::ModelArchitecture> {
+    let cfg = larql_vindex::load_vindex_config(vindex_dir).expect("config");
+    let mc = cfg.model_config.expect("model_config");
+    let mut json = serde_json::json!({
+        "model_type": mc.model_type,
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_layers,
+        "intermediate_size": cfg.intermediate_size,
+        "num_attention_heads": mc.num_q_heads,
+        "num_key_value_heads": mc.num_kv_heads,
+        "head_dim": mc.head_dim,
+        "rope_theta": mc.rope_base,
+        "vocab_size": cfg.vocab_size,
+    });
+    let obj = json.as_object_mut().unwrap();
+    if let Some(v) = mc.full_attention_interval {
+        obj.insert("full_attention_interval".into(), v.into());
+    }
+    if let Some(v) = mc.ssm_state_size {
+        obj.insert("ssm_state_size".into(), v.into());
+    }
+    if let Some(v) = mc.ssm_inner_size {
+        obj.insert("ssm_inner_size".into(), v.into());
+    }
+    if let Some(v) = mc.ssm_dt_rank {
+        obj.insert("ssm_dt_rank".into(), v.into());
+    }
+    if let Some(v) = mc.ssm_group_count {
+        obj.insert("ssm_group_count".into(), v.into());
+    }
+    if let Some(v) = mc.ssm_conv_kernel {
+        obj.insert("ssm_conv_kernel".into(), v.into());
+    }
+    if let Some(ref v) = mc.rope_dimension_sections {
+        obj.insert(
+            "rope_dimension_sections".into(),
+            serde_json::to_value(v).unwrap_or_default(),
+        );
+    }
+    if let Some(ref moe) = mc.moe {
+        obj.insert("num_experts".into(), moe.num_experts.into());
+        obj.insert("top_k_experts".into(), moe.top_k.into());
+        if let Some(v) = moe.moe_intermediate_size {
+            obj.insert("moe_intermediate_size".into(), v.into());
+        }
+    }
+    larql_models::detect_from_json(&json)
 }
