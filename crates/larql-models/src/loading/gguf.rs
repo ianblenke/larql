@@ -708,8 +708,7 @@ pub fn load_gguf_lazy_tensors(
         // microbenchmarks were inadvertently bypassing.
         if key == embed_key_normalised {
             weights.embed_quant = Some(qt);
-            weights.embed = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
-                .expect("empty array is always valid");
+            weights.embed = crate::embed::EmbedMatrix::empty();
         } else if key == "lm_head.weight" || key_raw == GGUF_OUTPUT_WEIGHT {
             weights.lm_head_quant = Some(qt);
             weights.lm_head = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
@@ -937,7 +936,7 @@ pub(crate) fn load_gguf_filtered_with_validation(
         skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
-        embed,
+        embed: crate::embed::EmbedMatrix::from_array(embed),
         embed_quant: None,
         lm_head,
         lm_head_quant: None,
