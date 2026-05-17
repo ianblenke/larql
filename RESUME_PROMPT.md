@@ -226,7 +226,32 @@ the full tensor name. DeltaNet small tensors + the post-#155
 router land there automatically. No new reader code needed for
 Step 2b's consumers — they read by key.
 
-### Step 2b — adapter stub ✅ MERGED (PR #157)
+### Step 2b — adapter complete ✅ SMOKE-VALIDATED on v4 vindex
+
+Live smoke result against
+`/tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v4/`:
+
+```
+smoke OK — 40 layers (30 linear + 10 full-attn), 40 MoE blocks,
+           final_norm + lm_head_quant present
+```
+
+All Step 2b PRs merged:
+- #157 stub
+- #161 DeltaNet bridge (2b.2)
+- #163 sparse attn accessor (2b.3a)
+- #164 full-attn bridge (2b.3b)
+- #165 MoE 256-expert packed bridge (2b.4)
+- #166 orchestrator body (2b.5)
+- #167 smoke test + 3 surface bugs (writer per-head norms, arch
+  metadata drop, ssm_conv1d shape reshape) — 2b.6
+
+`load_qwen35_weights_from_vindex(dir)` produces a structurally
+complete `Qwen35Weights` from any qwen35moe vindex built by
+PR #147+ with the router fixes. Load time: ~77 s on the 60 GB
+vindex.
+
+### Step 2b — adapter stub (historical reference)
 
 `crates/larql-inference/src/attention/qwen35_load_vindex.rs` (NEW)
 lands the module skeleton + `VindexLoadError` enum + public
