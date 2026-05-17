@@ -567,7 +567,7 @@ fn drop_ffn_weights_removes_ffn_tensors() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: small.clone(),
+        embed: larql_models::embed::EmbedMatrix::Heap(small.clone()),
         embed_quant: None,
         lm_head: small.clone(),
         lm_head_quant: None,
@@ -652,7 +652,7 @@ fn drop_ffn_weights_removes_moe_experts() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: small.clone(),
+        embed: larql_models::embed::EmbedMatrix::Heap(small.clone()),
         embed_quant: None,
         lm_head: small.clone(),
         lm_head_quant: None,
@@ -727,7 +727,7 @@ fn drop_ffn_weights_removes_starcoder2_ffn_tensors_and_biases() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: small.clone(),
+        embed: larql_models::embed::EmbedMatrix::Heap(small.clone()),
         embed_quant: None,
         lm_head: small.clone(),
         lm_head_quant: None,
@@ -1475,7 +1475,7 @@ fn minimal_weights() -> larql_models::ModelWeights {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: small.clone(),
+        embed: larql_models::embed::EmbedMatrix::Heap(small.clone()),
         embed_quant: None,
         lm_head: small.clone(),
         lm_head_quant: None,
@@ -1528,7 +1528,7 @@ fn drop_embed_zeroes_matrix_and_reports_freed() {
     let mut w = minimal_weights();
     let freed = w.drop_embed();
     assert_eq!(freed, 2 * 4 * 4);
-    assert_eq!(w.embed.shape(), &[0, 0]);
+    assert_eq!(w.embed.shape(), [0, 0]);
 }
 
 #[test]

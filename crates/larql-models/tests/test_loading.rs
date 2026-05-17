@@ -314,11 +314,11 @@ fn load_f32_tensors_correct_values() {
     );
 
     let weights = load_model_dir(dir.path()).unwrap();
-    assert_eq!(weights.embed.shape(), &[10, 4]);
+    assert_eq!(weights.embed.shape(), [10, 4]);
     // First element: known[0] = 0.0
-    assert!((weights.embed[[0, 0]] - known[0]).abs() < 1e-6);
+    assert!((weights.embed.row(0)[0] - known[0]).abs() < 1e-6);
     // Last element: known[39] = 3.9
-    assert!((weights.embed[[9, 3]] - known[39]).abs() < 1e-5);
+    assert!((weights.embed.row(9)[3] - known[39]).abs() < 1e-5);
 }
 
 // Trigger an invalid attention geometry that survives the
@@ -393,9 +393,9 @@ fn load_f16_tensors_converts_to_f32() {
     );
 
     let weights = load_model_dir(dir.path()).unwrap();
-    assert_eq!(weights.embed.shape(), &[10, 4]);
+    assert_eq!(weights.embed.shape(), [10, 4]);
     // f16 1.0 → f32 1.0
-    assert!((weights.embed[[0, 0]] - 1.0).abs() < 1e-4);
+    assert!((weights.embed.row(0)[0] - 1.0).abs() < 1e-4);
 }
 
 #[test]
@@ -411,8 +411,8 @@ fn load_bf16_tensors_converts_to_f32() {
     );
 
     let weights = load_model_dir(dir.path()).unwrap();
-    assert_eq!(weights.embed.shape(), &[10, 4]);
-    assert!((weights.embed[[0, 0]] - 1.0).abs() < 1e-4);
+    assert_eq!(weights.embed.shape(), [10, 4]);
+    assert!((weights.embed.row(0)[0] - 1.0).abs() < 1e-4);
 }
 
 #[test]
@@ -738,7 +738,7 @@ fn filtered_custom_predicate_skips_target() {
         .tensors
         .contains_key("layers.0.self_attn.q_proj.weight"));
     // embed and lm_head are not filtered
-    assert_eq!(weights.embed.shape(), &[10, 4]);
+    assert_eq!(weights.embed.shape(), [10, 4]);
 }
 
 #[test]
@@ -834,7 +834,7 @@ fn mlx_weights_subdir_is_found() {
     .unwrap();
 
     let weights = load_model_dir(dir.path()).unwrap();
-    assert_eq!(weights.embed.shape(), &[10, 4]);
+    assert_eq!(weights.embed.shape(), [10, 4]);
 }
 
 #[test]
@@ -885,7 +885,7 @@ fn load_gguf_via_load_model_dir() {
 
     let weights = load_model_dir(dir.path()).unwrap();
     // embed_tokens: dims=[4, 100] in GGUF → shape [100, 4] after GGUF dim swap
-    assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.embed.shape(), [100, 4]);
     assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
     assert_eq!(weights.hidden_size, 4);
@@ -898,7 +898,7 @@ fn load_gguf_single_file() {
     write_minimal_gguf(&path);
 
     let weights = load_model_dir(&path).unwrap();
-    assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.embed.shape(), [100, 4]);
     assert_eq!(weights.vocab_size, 100);
     assert_eq!(weights.num_layers, 1);
 }
@@ -911,7 +911,7 @@ fn load_gguf_preserves_explicit_small_vocab_metadata() {
 
     let weights = load_model_dir(&path).unwrap();
 
-    assert_eq!(weights.embed.shape(), &[128, 4]);
+    assert_eq!(weights.embed.shape(), [128, 4]);
     assert_eq!(weights.vocab_size, 128);
 }
 
@@ -923,7 +923,7 @@ fn load_gguf_uses_shape_vocab_when_metadata_and_tokenizer_are_absent() {
 
     let weights = load_model_dir(&path).unwrap();
 
-    assert_eq!(weights.embed.shape(), &[64, 4]);
+    assert_eq!(weights.embed.shape(), [64, 4]);
     assert_eq!(weights.vocab_size, 64);
 }
 
@@ -950,7 +950,7 @@ fn load_gguf_walk_only_excludes_ffn_tensor() {
     assert!(!weights
         .tensors
         .contains_key("layers.0.mlp.gate_proj.weight"));
-    assert_eq!(weights.embed.shape(), &[100, 4]);
+    assert_eq!(weights.embed.shape(), [100, 4]);
 }
 
 #[test]
