@@ -517,6 +517,23 @@ fn run_gguf_to_vindex(
         _ => larql_vindex::ExtractLevel::Browse,
     };
 
+    // MLA arches (DSv4) have no Q/K/V/O tensors — the f32 inference
+    // writer would emit wrong-shape junk under those slot names. Force
+    // the build to browse-tier only when MLA + Q4K is requested; the
+    // Q4_K writer (which has an MLA code path) is the one that emits
+    // the real inference artefacts (`mla_weights_q4k.bin` + aux).
+    let extract_level = if weights.arch.uses_mla() && q4k {
+        if extract_level != larql_vindex::ExtractLevel::Browse {
+            eprintln!(
+                "  MLA arch detected: build_vindex runs browse-tier; \
+                 the Q4_K writer emits inference artefacts"
+            );
+        }
+        larql_vindex::ExtractLevel::Browse
+    } else {
+        extract_level
+    };
+
     let dtype = if use_f16 {
         larql_vindex::StorageDtype::F16
     } else {
