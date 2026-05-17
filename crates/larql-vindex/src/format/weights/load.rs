@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ndarray::Array2;
+use ndarray::{ArcArray2, Array2};
 
 use larql_models::ModelWeights;
 
@@ -195,7 +195,7 @@ pub fn load_model_weights_with_opts(
     // residual-vector requests and never see token IDs.
     let embed = if opts.skip_embed {
         callbacks.on_file_start("embeddings (skipped)", "opts.skip_embed=true");
-        Array2::<f32>::zeros((0, 0))
+        larql_models::embed::EmbedMatrix::empty()
     } else {
         callbacks.on_file_start(
             "embeddings",
@@ -204,14 +204,25 @@ pub fn load_model_weights_with_opts(
         let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
         let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
         let expected_embed_f32 = config.vocab_size * config.hidden_size * 4;
-        let embed_dtype = if embed_mmap.len() == expected_embed_f32 {
-            crate::config::dtype::StorageDtype::F32
+        if embed_mmap.len() == expected_embed_f32 {
+            // Arc 2: zero-copy mmap view, skips the ~2 GB `to_vec`.
+            larql_models::embed::EmbedMatrix::from_mmap(
+                std::sync::Arc::new(embed_mmap),
+                config.vocab_size,
+                config.hidden_size,
+            )
         } else {
-            crate::config::dtype::StorageDtype::F16
-        };
-        let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, embed_dtype);
-        Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
-            .map_err(|e| VindexError::Parse(e.to_string()))?
+            // f16: decode is mandatory; the Vec allocation is the
+            // unavoidable cost of converting half→single precision.
+            let embed_floats = crate::config::dtype::decode_floats(
+                &embed_mmap,
+                crate::config::dtype::StorageDtype::F16,
+            );
+            let arr =
+                ArcArray2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
+                    .map_err(|e| VindexError::Parse(e.to_string()))?;
+            larql_models::embed::EmbedMatrix::from_array(arr)
+        }
     };
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
@@ -357,14 +368,18 @@ pub fn load_model_weights_with_opts(
     callbacks.on_file_done("model_weights", entries.len(), 0.0);
 
     let cfg = arch.config();
-    let embed = embed.into_shared();
     // Embed-tied fallback: models like Gemma share embed ↔ lm_head
     // weights. When the caller asked to skip lm_head we don't want to
-    // clone embed into it — use an empty placeholder instead.
+    // materialise embed into it — use an empty placeholder. Otherwise
+    // `embed.as_array().into_owned()` is a refcount bump for the Heap
+    // variant and a one-time allocation for the Mmap variant (the
+    // Arc 2 cost of falling back to tied embeddings; in practice
+    // mmap-backed embeds come with their own lm_head_q4 so this rarely
+    // fires).
     let lm_head = if opts.skip_lm_head {
         lm_head_loaded.unwrap_or_else(|| Array2::<f32>::zeros((0, 0)).into_shared())
     } else {
-        lm_head_loaded.unwrap_or_else(|| embed.clone())
+        lm_head_loaded.unwrap_or_else(|| embed.as_array().into_owned())
     };
 
     Ok(ModelWeights {
@@ -549,14 +564,22 @@ pub fn load_model_weights_q4k_shard(
     let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
     let expected_f32 = config.vocab_size * config.hidden_size * 4;
-    let embed_dtype = if embed_mmap.len() == expected_f32 {
-        crate::config::dtype::StorageDtype::F32
+    let embed = if embed_mmap.len() == expected_f32 {
+        // Arc 2: zero-copy mmap view, skips the ~2 GB `to_vec`.
+        larql_models::embed::EmbedMatrix::from_mmap(
+            std::sync::Arc::new(embed_mmap),
+            config.vocab_size,
+            config.hidden_size,
+        )
     } else {
-        crate::config::dtype::StorageDtype::F16
+        let embed_floats = crate::config::dtype::decode_floats(
+            &embed_mmap,
+            crate::config::dtype::StorageDtype::F16,
+        );
+        let arr = ArcArray2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
+            .map_err(|e| VindexError::Parse(e.to_string()))?;
+        larql_models::embed::EmbedMatrix::from_array(arr)
     };
-    let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, embed_dtype);
-    let embed = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
     callbacks.on_file_done("embeddings", config.vocab_size, 0.0);
 
     // norms.bin (f32) — loaded via weight_manifest.json, filtered to vector entries.
@@ -785,8 +808,8 @@ pub fn load_model_weights_q4k_shard(
     }
 
     let cfg = arch.config();
-    let embed = embed.into_shared();
-    let lm_head = lm_head_loaded.unwrap_or_else(|| embed.clone());
+    // Tied-embedding fallback — see comment in the f32 path above.
+    let lm_head = lm_head_loaded.unwrap_or_else(|| embed.as_array().into_owned());
 
     Ok(ModelWeights {
         tensors,

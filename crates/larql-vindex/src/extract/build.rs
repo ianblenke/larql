@@ -231,10 +231,11 @@ impl<'a> BuildContext<'a> {
         let embed_path = self.output_dir.join(EMBEDDINGS_BIN);
         let stored_vocab = self.weights.embed.shape()[0];
         let logical_vocab = self.weights.vocab_size;
+        let embed_arr = self.weights.embed.as_array();
         let embed_view = if stored_vocab > logical_vocab {
-            self.weights.embed.slice(ndarray::s![..logical_vocab, ..])
+            embed_arr.slice(ndarray::s![..logical_vocab, ..])
         } else {
-            self.weights.embed.slice(ndarray::s![.., ..])
+            embed_arr.slice(ndarray::s![.., ..])
         };
         let embed_data: Vec<f32> = embed_view.iter().copied().collect();
         let embed_bytes = crate::config::dtype::encode_floats(&embed_data, self.dtype);
@@ -291,9 +292,10 @@ impl<'a> BuildContext<'a> {
         let cluster_layer_max = 28.min(self.num_layers);
 
         // Build whole-word vocab once, shared across layers
+        let embed_arr = self.weights.embed.as_array();
         let (ww_ids_shared, ww_embed_shared) = build_whole_word_vocab(
             self.tokenizer,
-            &self.weights.embed,
+            &*embed_arr,
             self.vocab_size,
             self.hidden_size,
         );
@@ -378,7 +380,8 @@ impl<'a> BuildContext<'a> {
                         .to_owned();
                     let cpu = larql_compute::CpuBackend;
                     use larql_compute::MatMul;
-                    let chunk_logits = cpu.matmul(self.weights.embed.view(), w_chunk.view());
+                    let embed_arr_loc = self.weights.embed.as_array();
+                    let chunk_logits = cpu.matmul(embed_arr_loc.view(), w_chunk.view());
 
                     for feat in batch_start..batch_end {
                         let col = chunk_logits.column(feat - batch_start);
@@ -686,8 +689,9 @@ pub fn build_vindex_resume(
     let mut cluster_output_tokens: Vec<String> = Vec::new();
 
     eprintln!("  Building whole-word vocabulary...");
+    let embed_arr_outer = weights.embed.as_array();
     let (ww_ids, ww_embed) =
-        build_whole_word_vocab(tokenizer, &weights.embed, vocab_size, hidden_size);
+        build_whole_word_vocab(tokenizer, &*embed_arr_outer, vocab_size, hidden_size);
 
     eprintln!(
         "  Computing gate input tokens for L{}-{}...",
@@ -987,7 +991,7 @@ mod tests {
             skipped_tensors: Vec::new(),
             packed_mmaps: HashMap::new(),
             packed_byte_ranges: HashMap::new(),
-            embed,
+            embed: larql_models::embed::EmbedMatrix::from_array(embed),
             embed_quant: None,
             lm_head,
             lm_head_quant: None,

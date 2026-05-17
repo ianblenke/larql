@@ -160,7 +160,7 @@ pub fn load_qwen35_weights(
     let final_norm = get_vec(weights, arch.final_norm_key())?;
 
     Ok(Qwen35Weights {
-        embed: weights.embed.clone(),
+        embed: weights.embed.as_array().into_owned(),
         embed_quant: weights.embed_quant.clone(),
         layers,
         final_norm,
@@ -680,7 +680,7 @@ mod tests {
             packed_mmaps: HashMap::new(),
             skipped_tensors: Vec::new(),
             packed_byte_ranges: HashMap::new(),
-            embed,
+            embed: larql_models::embed::EmbedMatrix::from_array(embed),
             embed_quant: None,
             lm_head,
             lm_head_quant: None,
@@ -784,7 +784,11 @@ mod tests {
             packed_mmaps: std::collections::HashMap::new(),
             skipped_tensors: Vec::new(),
             packed_byte_ranges: std::collections::HashMap::new(),
-            embed: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
+            embed: larql_models::embed::EmbedMatrix::from_array(make_2d(
+                cfg.vocab_size.unwrap(),
+                cfg.hidden_size,
+                0.5,
+            )),
             embed_quant: None,
             lm_head: make_2d(cfg.vocab_size.unwrap(), cfg.hidden_size, 0.5),
             lm_head_quant: None,
@@ -895,7 +899,7 @@ mod tests {
             packed_mmaps: HashMap::new(),
             skipped_tensors: Vec::new(),
             packed_byte_ranges: HashMap::new(),
-            embed: make_2d(1, 1, 0.0),
+            embed: larql_models::embed::EmbedMatrix::from_array(make_2d(1, 1, 0.0)),
             embed_quant: None,
             lm_head: make_2d(1, 1, 0.0),
             lm_head_quant: None,
@@ -1870,7 +1874,8 @@ mod tests {
             pearson
         );
         // Check: is lm_head == embed (tied)?
-        let embed = &weights.embed;
+        let embed_cow = weights.embed.as_array();
+        let embed: &ndarray::ArcArray2<f32> = &*embed_cow;
         eprintln!(
             "lm_head shape: {:?}  embed shape: {:?}",
             lm_head.shape(),
@@ -1956,7 +1961,8 @@ mod tests {
         };
         let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
         let lm_head = &weights.lm_head;
-        let embed = &weights.embed;
+        let embed_cow = weights.embed.as_array();
+        let embed: &ndarray::ArcArray2<f32> = &*embed_cow;
         let vocab = lm_head.shape()[0];
         let hidden = lm_head.shape()[1];
         eprintln!(

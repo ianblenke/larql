@@ -344,7 +344,7 @@ fn load_model_dir_filtered_with_validation(
         skipped_tensors,
         packed_mmaps,
         packed_byte_ranges,
-        embed,
+        embed: crate::embed::EmbedMatrix::from_array(embed),
         embed_quant: None,
         lm_head,
         lm_head_quant: None,

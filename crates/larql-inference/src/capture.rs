@@ -195,9 +195,10 @@ impl InferenceModel {
             );
 
             // Write residuals
+            let embed_arr = self.weights.embed.as_array();
             for (layer, vector) in &trace.residuals {
                 let top_k = project_to_vocab(
-                    &self.weights.embed,
+                    &*embed_arr,
                     vector,
                     DEFAULT_RESIDUAL_TOP_K,
                     &self.tokenizer,

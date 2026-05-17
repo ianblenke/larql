@@ -57,7 +57,7 @@ pub(super) fn weights_with_embed(embed: ndarray::Array2<f32>, vocab_size: usize)
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: embed.into_shared(),
+        embed: larql_models::embed::EmbedMatrix::from_array(embed.into_shared()),
         embed_quant: None,
         lm_head: lm_head.into_shared(),
         lm_head_quant: None,

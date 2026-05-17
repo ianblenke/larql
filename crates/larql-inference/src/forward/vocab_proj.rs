@@ -74,7 +74,8 @@ pub fn embedding_neighbors(weights: &ModelWeights, query: &[f32], k: usize) -> V
     if q_norm == 0.0 {
         return Vec::new();
     }
-    cosine_topk_against_matrix(weights.embed.view(), q_view, q_norm, k)
+    let embed_arr = weights.embed.as_array();
+    cosine_topk_against_matrix(embed_arr.view(), q_view, q_norm, k)
 }
 
 /// Raw unembedding projection: returns top-k `(token_id, logit)` pairs

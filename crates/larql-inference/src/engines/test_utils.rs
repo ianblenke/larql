@@ -152,7 +152,7 @@ pub fn make_test_weights_with(dims: SyntheticDims) -> ModelWeights {
         packed_mmaps: HashMap::new(),
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
-        embed,
+        embed: larql_models::embed::EmbedMatrix::from_array(embed),
         embed_quant: None,
         lm_head,
         lm_head_quant: None,
@@ -401,7 +401,7 @@ pub fn make_gemma3_test_weights() -> ModelWeights {
         packed_mmaps: HashMap::new(),
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
-        embed,
+        embed: larql_models::embed::EmbedMatrix::from_array(embed),
         embed_quant: None,
         lm_head,
         lm_head_quant: None,
@@ -548,7 +548,7 @@ pub fn make_starcoder2_test_weights() -> ModelWeights {
         packed_mmaps: HashMap::new(),
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
-        embed,
+        embed: larql_models::embed::EmbedMatrix::from_array(embed),
         embed_quant: None,
         lm_head,
         lm_head_quant: None,
@@ -633,7 +633,7 @@ mod tests {
     fn gemma3_fixture_shape_matches_dims() {
         let w = make_gemma3_test_weights();
         assert_eq!(w.num_layers, 2);
-        assert_eq!(w.embed.shape(), &[w.vocab_size, w.hidden_size]);
+        assert_eq!(w.embed.shape(), [w.vocab_size, w.hidden_size]);
         assert_eq!(w.lm_head.shape(), &[w.vocab_size, w.hidden_size]);
     }
 
@@ -641,7 +641,7 @@ mod tests {
     fn starcoder2_fixture_shape_matches_dims() {
         let w = make_starcoder2_test_weights();
         assert_eq!(w.num_layers, 2);
-        assert_eq!(w.embed.shape(), &[w.vocab_size, w.hidden_size]);
+        assert_eq!(w.embed.shape(), [w.vocab_size, w.hidden_size]);
         assert_eq!(w.lm_head.shape(), &[w.vocab_size, w.hidden_size]);
     }
 }
