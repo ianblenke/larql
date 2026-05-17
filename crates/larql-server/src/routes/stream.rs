@@ -697,6 +697,7 @@ mod tests {
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
             qwen35_weights: std::sync::OnceLock::new(),
+            dsv4_weights: std::sync::OnceLock::new(),
             probe_labels: labels,
             ffn_l2_cache: FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),

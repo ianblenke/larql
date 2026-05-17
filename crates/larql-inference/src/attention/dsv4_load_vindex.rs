@@ -25,13 +25,17 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use larql_models::quant::ggml::TYPE_F32;
 use larql_models::quant::lazy::QuantTensor;
-use ndarray::Array2;
 
 use super::dsv4_forward::{
-    Dsv4AttnWeights, Dsv4Dims, Dsv4LayerWeights, Dsv4MoeWeights, Dsv4Weights,
+    dsv4_forward_step, Dsv4AttnWeights, Dsv4Dims, Dsv4KvCache, Dsv4LayerWeights, Dsv4MoeWeights,
+    Dsv4Weights,
+};
+use crate::layer_graph::generate::{
+    Detokenizer, EosConfig, GenerateResult, Sampler, SamplingConfig,
 };
 
 /// Errors surfaced by [`load_dsv4_weights_from_vindex`].
@@ -607,4 +611,105 @@ fn mmap_file(path: &Path) -> Result<Arc<memmap2::Mmap>, Dsv4LoadError> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     Ok(Arc::new(mmap))
+}
+
+/// Derive the runtime `Dsv4Dims` from a `Dsv4Weights`'s embedded
+/// shapes. Mirrors `derive_dims` but doesn't need the vindex config
+/// — useful for callers (like the server dispatch) that have the
+/// cached weights but not the config.
+pub fn dsv4_dims_from_weights(weights: &Dsv4Weights) -> Dsv4Dims {
+    let hidden = weights.embed.shape()[1];
+    let vocab = weights.embed.shape()[0];
+    let [_, kv_lora_rank] = weights.layers[0].attn.kv.shape();
+    let [_, q_lora_rank] = weights.layers[0].attn.q_a.shape();
+    let [q_b_rows, _] = weights.layers[0].attn.q_b.shape();
+    let [output_intermediate, _] = weights.layers[0].attn.output_a.shape();
+    let [_, ffn_dim] = weights.layers[0].moe.shared_down.shape();
+    let num_experts = weights.layers[0].moe.expert_gate_ups.len();
+    // V4 published values for fields we can't reconstruct from the
+    // weights alone (n_heads, top-k, scales).
+    Dsv4Dims {
+        hidden,
+        q_lora_rank,
+        kv_lora_rank,
+        n_heads: 64,
+        head_dim: q_b_rows / 64,
+        output_intermediate,
+        ffn_dim,
+        num_experts,
+        experts_per_token: 6,
+        num_shared_experts: 1,
+        vocab,
+        norm_eps: 1e-6,
+        expert_weights_scale: 1.5,
+    }
+}
+
+/// Full generate driver — mirrors `qwen35_generate_with_sampling`
+/// for the DSv4 path. Prefill on the prompt tokens, then decode up
+/// to `max_tokens` via the sampler. Returns the same
+/// `GenerateResult` shape the server's chat handler consumes.
+pub fn dsv4_generate_with_sampling(
+    weights: &Dsv4Weights,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> GenerateResult {
+    let dims = dsv4_dims_from_weights(weights);
+
+    if prompt_ids.is_empty() {
+        return GenerateResult::empty_error(crate::layer_graph::generate::GenerateError::Other {
+            reason: "prompt_ids is empty".into(),
+        });
+    }
+
+    let num_layers = weights.layers.len();
+    let mut cache = Dsv4KvCache::new(num_layers, dims.kv_lora_rank);
+
+    // Prefill: only the last token's logits matter for the first
+    // decode step. Earlier tokens advance the KV-latent cache.
+    let prefill_start = Instant::now();
+    let mut last_logits = None;
+    for &tok in prompt_ids {
+        last_logits = Some(dsv4_forward_step(tok, weights, &dims, &mut cache));
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut sampler = Sampler::new(sampling);
+    let mut detok = Detokenizer::new(tokenizer);
+    detok.seed(prompt_ids);
+
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+    let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+
+    for _ in 0..max_tokens {
+        let step_start = Instant::now();
+        let Some(logits) = last_logits.take() else {
+            break;
+        };
+        let Some(next_id) =
+            sampler.sample_with_history(logits.as_slice().unwrap_or(&[]), &generated)
+        else {
+            break;
+        };
+        let text = detok.push(next_id);
+        if eos.is_eos(next_id, &text) {
+            break;
+        }
+        out.push((text, 1.0));
+        generated.push(next_id);
+        last_logits = Some(dsv4_forward_step(next_id, weights, &dims, &mut cache));
+        decode_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    GenerateResult {
+        tokens: out,
+        prefill_ms,
+        decode_ms,
+        stage_timings: crate::layer_graph::generate::StageTimings::default(),
+        error: None,
+    }
 }
