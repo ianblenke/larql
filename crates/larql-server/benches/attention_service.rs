@@ -112,6 +112,7 @@ fn build_loaded_model(weights: ModelWeights) -> LoadedModel {
         embed_store: None,
         release_mmap_after_request: false,
         weights: lock,
+        qwen35_weights: OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: Arc::new(larql_server::metrics::LayerLatencyTracker::new()),
