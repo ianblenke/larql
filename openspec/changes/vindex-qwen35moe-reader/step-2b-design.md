@@ -419,6 +419,118 @@ against `larql serve /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v4`.
 Success = HTTP 200 + non-empty completion text + no panic. Full
 parity vs llama.cpp is a separate change.
 
+## Step 2c — driver readiness (post-#170 investigation)
+
+Concrete implementation checklist for `qwen35_generate_with_sampling`,
+based on the existing `real_gguf_qwen35_token_diff_vs_llama_cpp`
+loop (`crates/larql-inference/src/attention/qwen35_load.rs:2641`)
+and the in-tree primitives:
+
+### Inputs
+
+```rust
+pub fn qwen35_generate_with_sampling(
+    weights: &Qwen35Weights,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> GenerateResult
+```
+
+The server's `run_chat_completion` (`chat.rs:738`) builds
+`prompt_ids` + `sampling` + `eos` already and threads
+`max_tokens` through. The driver dispatch arm becomes:
+
+```rust
+let qwen35_weights = larql_inference::attention::qwen35_load_vindex
+    ::load_qwen35_weights_from_vindex(model.vindex_dir())?;
+qwen35_generate_with_sampling(
+    &qwen35_weights, &model.tokenizer, &prompt_ids,
+    max_tokens, sampling, &eos,
+)
+```
+
+### Construction
+
+1. **`DeltaNetDims`** from the arch (`weights.arch.config()` exposes
+   the SSM fields after PR #167's loader fix): `hidden`,
+   `head_v_dim = ssm_state_size`, `n_v_heads = ssm_dt_rank`,
+   `n_k_heads = ssm_group_count`, `d_conv = ssm_conv_kernel`.
+2. **`Qwen35AttentionDims`**: `hidden`, `n_head`, `head_dim`,
+   `n_head_kv` from `arch.config()`. Use the `rope_dimension_sections`
+   when present (4-section MRoPE).
+3. **`DeltaNetHybridCache::allocate(layer_kinds, kv_dim, d_conv,
+   conv_dim, head_v_dim, n_v_heads)`** — `layer_kinds[i] =
+   arch.is_linear_attention_layer(i)`, `kv_dim =
+   attn_dims.kv_dim()`, `conv_dim = dn_dims.conv_dim()`.
+
+### Loop
+
+```rust
+let mut cache = DeltaNetHybridCache::allocate(...);
+let mut all_tokens = Vec::with_capacity(prompt_ids.len() + max_tokens);
+
+// Prefill — feed every prompt token; only the final logits matter.
+let mut last_logits = None;
+for &tok in prompt_ids {
+    last_logits = Some(qwen35_forward_step(
+        tok, weights, &dn_dims, &attn_dims, &mut cache, 1e-6,
+    ));
+}
+
+// Decode loop.
+let mut detok = Detokenizer::new(tokenizer);
+let mut out: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+for _ in 0..max_tokens {
+    let logits = last_logits.take().expect("prefill produced logits");
+    let (tid, prob) = sample_from_logits(&logits, &sampling);
+    let text = detok.push(tid);
+    if eos.is_eos(tid, &text) { break; }
+    out.push((text, prob));
+    last_logits = Some(qwen35_forward_step(
+        tid, weights, &dn_dims, &attn_dims, &mut cache, 1e-6,
+    ));
+}
+GenerateResult { tokens: out, prompt_token_count: prompt_ids.len() }
+```
+
+### Glue dependencies
+
+- `SamplingConfig` + `EosConfig`: re-use the existing
+  `larql_inference::layer_graph::{SamplingConfig, EosConfig}` types.
+- `Detokenizer`: re-use `larql_inference::tokenizer::Detokenizer`.
+- `GenerateResult`: re-use the existing struct.
+- `sample_from_logits`: extract from `generate_streaming` or
+  re-implement as a small helper (greedy = argmax; sampling =
+  top-k + top-p + temperature + sampler).
+
+### Server-side wiring
+
+Replace the guard in `chat.rs:739-769` (added by PR #170) with the
+actual dispatch arm. Drop the `index` / `backend` / `cached_layers`
+parameters — the qwen35 driver doesn't use them (CPU-only forward,
+no KNN lm_head).
+
+Add `qwen35_weights` to `LoadedModel` (or load on-demand per
+request — re-loading 60 GB per chat is unworkable, so cache it on
+first use behind an `OnceLock` keyed by vindex path).
+
+### Estimated breakdown
+
+| Sub-task | LoC | Risk |
+|---|---:|---|
+| 2c.a `qwen35_generate_with_sampling` body | ~120 | Medium (sampling + EOS + detok integration) |
+| 2c.b `sample_from_logits` helper extraction | ~40 | Low (greedy is argmax; sampling is mechanical) |
+| 2c.c `Qwen35Weights` caching in `LoadedModel` | ~40 | Low (`OnceLock` keyed by vindex path) |
+| 2c.d Server dispatch arm replacing guard | ~15 | Low (mechanical replacement of PR #170's stub) |
+| 2c.e Live HTTP smoke | ~50 | Low (curl against `larql serve`) |
+
+Total ~265 LoC across 5 sub-tasks. The first runtime-meaningful
+end state is HTTP 200 with non-empty completion text from
+`/v1/chat/completions` against the v4 vindex.
+
 ## Out of scope (still)
 
 - Step 2c — server dispatch routing `qwen35*` arches.
