@@ -511,6 +511,34 @@ pub fn load_model_weights_q4k_shard(
             obj.insert("enable_moe_block".into(), true.into());
         }
     }
+    // Qwen 3.6 Gated DeltaNet hybrid-attention metadata. Without these
+    // fields the rebuilt arch via `detect_from_json` decays to a
+    // non-hybrid Qwen — `qwen35`/`qwen35moe` detection requires
+    // `full_attention_interval > 0` per `detect.rs`.
+    if let Some(v) = model_cfg.full_attention_interval {
+        obj.insert("full_attention_interval".into(), v.into());
+    }
+    if let Some(v) = model_cfg.ssm_state_size {
+        obj.insert("ssm_state_size".into(), v.into());
+    }
+    if let Some(v) = model_cfg.ssm_inner_size {
+        obj.insert("ssm_inner_size".into(), v.into());
+    }
+    if let Some(v) = model_cfg.ssm_dt_rank {
+        obj.insert("ssm_dt_rank".into(), v.into());
+    }
+    if let Some(v) = model_cfg.ssm_group_count {
+        obj.insert("ssm_group_count".into(), v.into());
+    }
+    if let Some(v) = model_cfg.ssm_conv_kernel {
+        obj.insert("ssm_conv_kernel".into(), v.into());
+    }
+    if let Some(ref v) = model_cfg.rope_dimension_sections {
+        obj.insert(
+            "rope_dimension_sections".into(),
+            serde_json::to_value(v).unwrap_or_default(),
+        );
+    }
     let arch = larql_models::detect_from_json(&arch_obj);
 
     // Embeddings — required for token lookup at layer 0.
