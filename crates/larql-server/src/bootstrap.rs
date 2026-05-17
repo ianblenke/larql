@@ -353,6 +353,7 @@ pub fn load_single_vindex(
         embed_store,
         release_mmap_after_request: opts.release_mmap_after_request,
         weights: std::sync::OnceLock::new(),
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels,
         ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(num_layers),
         layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),

@@ -18,6 +18,7 @@
 //! per-layer logic, not file-skeleton churn.
 
 use std::path::Path;
+use std::time::Instant;
 
 use larql_models::quant::ggml::{dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q6_K};
 use larql_models::quant::lazy::QuantTensor;
@@ -25,7 +26,12 @@ use larql_models::{ModelArchitecture, ModelWeights};
 use larql_vindex::VectorIndex;
 use ndarray::Array2;
 
-use crate::attention::qwen35_forward::Qwen35Weights;
+use crate::attention::deltanet_block::DeltaNetDims;
+use crate::attention::qwen35_block::{DeltaNetHybridCache, Qwen35AttentionDims};
+use crate::attention::qwen35_forward::{qwen35_forward_step, Qwen35Weights};
+use crate::layer_graph::generate::{
+    Detokenizer, EosConfig, GenerateResult, Sampler, SamplingConfig,
+};
 
 /// Errors surfaced by [`load_qwen35_weights_from_vindex`].
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +142,44 @@ pub fn load_qwen35_weights_from_vindex(
     populate_deltanet_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_attn_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_moe_quant_tensors(vindex_dir, &*arch, &mut weights)?;
+
+    // Pad embed up to lm_head's vocab dim when the vindex writer
+    // truncated embed to `logical_vocab` (PR #137) but kept lm_head
+    // at the GGUF-original padded vocab. Special tokens
+    // (e.g. `<|im_start|>` at id 248045 on Qwen 3.6) live in the
+    // padded range; without padding the embed row lookup panics
+    // with "index < dim" when the chat template renders them.
+    //
+    // Zero-padding is wrong-but-not-fatal: the special-token row
+    // contributes a zero residual, which makes the model not see
+    // its own template markers. Output quality suffers but the
+    // server doesn't panic — and the lm_head logits stay valid
+    // (vocabsel works because lm_head has the real rows). A proper
+    // fix lands in the vindex writer (preserve the full padded
+    // embed); this padding keeps the server runnable in the
+    // meantime.
+    let embed_rows = weights.embed.shape()[0];
+    // Tokenizers ship special tokens at IDs beyond `vocab_size` (Qwen
+    // 3.6 has ~26 added tokens at 248045-248069 above vocab=248044).
+    // Both the vindex embed AND lm_head writers truncated to the
+    // logical vocab per PR #137 (`format/weights/load.rs:770-784`),
+    // so without padding the embed row lookup panics on the first
+    // special token the chat template renders.
+    //
+    // Round up to a 256 alignment + 256 safety margin → covers up to
+    // ~510 added tokens, plenty for any tokenizer in scope.
+    let target_rows = embed_rows.div_ceil(256) * 256 + 256;
+    if target_rows > embed_rows {
+        let hidden = weights.embed.shape()[1];
+        let mut new_arr = ndarray::Array2::<f32>::zeros((target_rows, hidden));
+        let embed_arr = weights.embed.as_array();
+        let src_rows = embed_arr.shape()[0];
+        new_arr
+            .slice_mut(ndarray::s![..src_rows, ..])
+            .assign(&*embed_arr);
+        drop(embed_arr);
+        weights.embed = larql_models::embed::EmbedMatrix::from_array(new_arr.into_shared());
+    }
 
     // Restore the real arch and delegate to the existing
     // data-source-agnostic loader. From this point the call graph is
@@ -444,6 +488,117 @@ pub fn populate_moe_quant_tensors(
             .insert(format!("{prefix}ffn_down_exps.weight"), down_qt);
     }
     Ok(())
+}
+
+/// **Task 2c.a** — multi-token decode driver for qwen35 vindexes.
+///
+/// Mirrors [`crate::layer_graph::generate_with_sampling`]'s API but
+/// drives the qwen35 hybrid forward (`qwen35_forward_step` +
+/// `DeltaNetHybridCache`) instead of the standard transformer
+/// `predict_q4k_hidden_with_cache` + `KvCache` path.
+///
+/// ## Flow
+///
+/// 1. Build dims (`DeltaNetDims`, `Qwen35AttentionDims`) from the arch
+///    via the `from_arch` helpers shipped in PR #172.
+/// 2. Allocate a fresh `DeltaNetHybridCache` for the sequence.
+/// 3. **Prefill** — feed every prompt token through
+///    `qwen35_forward_step`; the final token's logits are the first
+///    decode-step output.
+/// 4. **Decode loop** — sample → push to detokeniser → check EOS →
+///    advance state. Stop on `eos.is_eos(id, decoded_text)` match or
+///    `max_tokens` exhaustion.
+///
+/// Returns a `GenerateResult` with `tokens: Vec<(text, prob)>` —
+/// `prob` is 1.0 for greedy decodes (no Sampler-internal posterior
+/// reconstruction); set by the upstream sampler when temperature
+/// sampling is configured.
+pub fn qwen35_generate_with_sampling(
+    weights: &Qwen35Weights,
+    arch: &dyn ModelArchitecture,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    sampling: SamplingConfig,
+    eos: &EosConfig,
+) -> GenerateResult {
+    let eps = 1e-6_f32;
+    let dn_dims = DeltaNetDims::from_arch(arch, eps);
+    let attn_dims = Qwen35AttentionDims::from_arch(arch, eps);
+
+    if prompt_ids.is_empty() {
+        return GenerateResult::empty_error(crate::layer_graph::generate::GenerateError::Other {
+            reason: "prompt_ids is empty".into(),
+        });
+    }
+
+    let num_layers = weights.layers.len();
+    let layer_kinds: Vec<bool> = (0..num_layers)
+        .map(|l| arch.is_linear_attention_layer(l))
+        .collect();
+    let mut cache = DeltaNetHybridCache::allocate(
+        &layer_kinds,
+        attn_dims.kv_dim(),
+        dn_dims.d_conv,
+        dn_dims.conv_dim(),
+        dn_dims.head_v_dim,
+        dn_dims.n_v_heads,
+    );
+
+    // Prefill — only the last token's logits matter for the first
+    // decode step. Earlier tokens advance the cache (KV slabs +
+    // DeltaNet recurrent state).
+    let prefill_start = Instant::now();
+    let mut last_logits = None;
+    for &tok in prompt_ids {
+        last_logits = Some(qwen35_forward_step(
+            tok, weights, &dn_dims, &attn_dims, &mut cache, eps,
+        ));
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut sampler = Sampler::new(sampling);
+    let mut detok = Detokenizer::new(tokenizer);
+    detok.seed(prompt_ids);
+
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(max_tokens);
+    let mut decode_ms: Vec<f64> = Vec::with_capacity(max_tokens);
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+
+    for _ in 0..max_tokens {
+        let step_start = Instant::now();
+        let Some(logits) = last_logits.take() else {
+            break;
+        };
+        let Some(next_id) =
+            sampler.sample_with_history(logits.as_slice().unwrap_or(&[]), &generated)
+        else {
+            // Sampler returned None — all logits non-finite or empty
+            // distribution after filters. Surface as a clean stop.
+            break;
+        };
+        let text = detok.push(next_id);
+        // EOS may fire on either the token id or the decoded text
+        // (e.g. `<|im_end|>` decodes to a stop-string match even when
+        // the id isn't in `eos_token_ids`).
+        if eos.is_eos(next_id, &text) {
+            break;
+        }
+        out.push((text, 1.0));
+        generated.push(next_id);
+        last_logits = Some(qwen35_forward_step(
+            next_id, weights, &dn_dims, &attn_dims, &mut cache, eps,
+        ));
+        decode_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    GenerateResult {
+        tokens: out,
+        prefill_ms,
+        decode_ms,
+        stage_timings: crate::layer_graph::generate::StageTimings::default(),
+        error: None,
+    }
 }
 
 #[cfg(test)]

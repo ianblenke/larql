@@ -250,7 +250,7 @@ fn make_loaded_model(
         packed_mmaps: HashMap::new(),
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
-        embed: embed.clone(),
+        embed: larql_models::embed::EmbedMatrix::from_array(embed.clone()),
         embed_quant: None,
         lm_head: embed,
         lm_head_quant: None,
@@ -284,6 +284,7 @@ fn make_loaded_model(
         embed_store: None,
         release_mmap_after_request: false,
         weights: lock,
+        qwen35_weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

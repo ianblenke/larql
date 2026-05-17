@@ -65,6 +65,14 @@ pub struct LoadedModel {
     /// `OnceLock<RwLock<...>>` rather than `RwLock<Option<...>>` so
     /// the lazy-init logic stays lock-free until first use.
     pub weights: std::sync::OnceLock<std::sync::RwLock<ModelWeights>>,
+    /// Lazy-cached `Qwen35Weights` for qwen35 / qwen35moe arches —
+    /// the vindex → `Qwen35Weights` conversion is ~30-40s for a 60 GB
+    /// vindex, far too slow to do per request. Initialised on first
+    /// `/v1/chat/completions` for a qwen35* model and reused for the
+    /// rest of the server's lifetime. `None` for all other arches.
+    pub qwen35_weights: std::sync::OnceLock<
+        std::sync::Arc<larql_inference::attention::qwen35_forward::Qwen35Weights>,
+    >,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -449,6 +457,7 @@ mod loaded_model_tests {
             embed_store: None,
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
+            qwen35_weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -558,6 +567,7 @@ mod loaded_model_tests {
             embed_store: None,
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
+            qwen35_weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
