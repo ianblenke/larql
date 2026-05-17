@@ -79,14 +79,43 @@ pub fn load_qwen35_weights_from_vindex(
         ));
     }
 
-    todo!(
-        "2b.3 (full-attn) + 2b.4 (MoE) bridges, then delegate to \
-         `qwen35_load::load_qwen35_weights(&weights, &*arch)`. \
-         The 2b.2 DeltaNet bridge below is ready; the standard \
-         attn / Q-K-V-O bridge and MoE-256-expert packed bridge are \
-         the remaining concrete blockers. See \
-         openspec/changes/vindex-qwen35moe-reader/step-2b-design.md."
-    )
+    // Manifest-driven weights — populates `vectors` (norms +
+    // DeltaNet small tensors + MoE router via PR #155) but NOT the
+    // `quant_tensors` map the qwen35 forward expects. The three
+    // bridges below fill that gap.
+    let mut callbacks = larql_vindex::index::SilentLoadCallbacks;
+    let mut weights = larql_vindex::load_model_weights_q4k_shard(vindex_dir, &mut callbacks, None)?;
+
+    // VectorIndex for byte-level access to the Q4_K matmul tensors
+    // (DeltaNet attn_qkv/gate/alpha/beta/out and full-attn Q/K/V/O).
+    let mut idx = larql_vindex::VectorIndex::load_vindex(vindex_dir, &mut callbacks)?;
+    idx.load_attn_q4k(vindex_dir)?;
+    idx.load_deltanet_q4k(vindex_dir)?;
+
+    // Temporarily swap the arch out of `weights` so the bridge calls
+    // can simultaneously borrow `&*arch` and `&mut weights.*` without
+    // tripping the borrow checker on `&weights.arch`. The placeholder
+    // is a trivial `GenericArch` that's never used — `weights.arch`
+    // gets restored before `load_qwen35_weights` is invoked.
+    let placeholder = larql_models::detect_from_json(&serde_json::json!({
+        "model_type": "generic",
+        "hidden_size": 1,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+    }));
+    let arch = std::mem::replace(&mut weights.arch, placeholder);
+
+    populate_deltanet_quant_tensors(&idx, &*arch, &mut weights)?;
+    populate_attn_quant_tensors(&idx, &*arch, &mut weights)?;
+    populate_moe_quant_tensors(vindex_dir, &*arch, &mut weights)?;
+
+    // Restore the real arch and delegate to the existing
+    // data-source-agnostic loader. From this point the call graph is
+    // identical to the GGUF path — every field of the produced
+    // `Qwen35Weights` is populated by `qwen35_load::load_qwen35_weights`.
+    weights.arch = arch;
+    crate::attention::qwen35_load::load_qwen35_weights(&weights, &*weights.arch)
+        .map_err(|e| VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string())))
 }
 
 /// **Task 2b.2** — bridge DeltaNet Q4_K bytes into a `ModelWeights`.
