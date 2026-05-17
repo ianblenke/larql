@@ -345,6 +345,80 @@ existing reader picks up automatically. **Implication for Step
 2b.2/2b.4:** consume those vectors via `vectors.get(key)`. No new
 reader code is needed.
 
+## Step 2c — server dispatch (scope correction, post-2b green)
+
+Investigation while opening Step 2c found the original ~100 LoC
+estimate was wrong. The server's `run_chat_completion` at
+`crates/larql-server/src/routes/openai/chat.rs:695` dispatches
+through `larql_inference::layer_graph::generate_with_sampling` —
+the standard transformer multi-token generate driver that calls
+`predict_q4k_hidden_with_cache` per token and threads a `KvCache`
+through.
+
+qwen35 needs a **parallel generate driver** with three distinct
+shape changes:
+
+1. Per-token forward is `qwen35_forward_step(token, weights,
+   dn_dims, attn_dims, hybrid_cache, eps)` — a different
+   signature than the generic forward.
+2. Cache is `DeltaNetHybridCache { kv_cache, dn_state,
+   layer_kinds }`, not a plain `KvCache`. The DeltaNet linear
+   layers carry per-layer matrix-valued recurrent state instead
+   of K/V slabs.
+3. Sampling + EOS + greedy + constrained-masking glue all need
+   to be replicated. About half of `generate_with_sampling`'s
+   ~200 LoC.
+
+Refined estimate: **~150-200 LoC** for `qwen35_generate_with_sampling`
++ the arch-family dispatch in `run_chat_completion`. The dispatch
+itself is ~10 LoC:
+
+```rust
+let result = if matches!(arch_family, "qwen35" | "qwen35moe") {
+    qwen35_generate_with_sampling(...)
+} else if let Some(schema) = constrained_schema {
+    generate_constrained_streaming_sampled(...)
+} else {
+    generate_with_sampling(...)
+};
+```
+
+The hard part is `qwen35_generate_with_sampling` itself —
+materially a duplicate of `generate_with_sampling` with the three
+shape changes. Could potentially factor a generic
+"per-token-forward + sampling" template if both paths converge on
+a trait, but that's premature; copy-and-modify first, factor
+later.
+
+### Dependencies
+
+- Step 2b ✅ green (PR #167 smoke validated the Qwen35Weights
+  produced by `load_qwen35_weights_from_vindex` is structurally
+  complete).
+- `qwen35_forward_step` ✅ exists and is battle-tested via
+  `real_gguf_qwen35_bench`.
+- `DeltaNetHybridCache` ✅ exists in
+  `crates/larql-inference/src/attention/qwen35_block.rs`.
+
+Nothing new required; just glue.
+
+### Smoke gate
+
+Live HTTP request:
+
+```
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-35b-a3b",
+    "messages": [{"role": "user", "content": "Hi"}]
+  }'
+```
+
+against `larql serve /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v4`.
+Success = HTTP 200 + non-empty completion text + no panic. Full
+parity vs llama.cpp is a separate change.
+
 ## Out of scope (still)
 
 - Step 2c — server dispatch routing `qwen35*` arches.
