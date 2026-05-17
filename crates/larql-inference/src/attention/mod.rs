@@ -11,6 +11,8 @@ pub mod decode;
 pub mod deltanet_block;
 pub mod deltanet_recurrence;
 pub mod deltanet_state;
+pub mod dsv4_forward;
+pub mod dsv4_load_vindex;
 pub mod fine_profile;
 pub mod gpu;
 pub mod gpu_tier;
