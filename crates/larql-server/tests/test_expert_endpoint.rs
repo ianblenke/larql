@@ -285,6 +285,7 @@ fn make_loaded_model(
         release_mmap_after_request: false,
         weights: lock,
         qwen35_weights: std::sync::OnceLock::new(),
+        dsv4_weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(

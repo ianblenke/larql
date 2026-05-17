@@ -163,6 +163,7 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
         release_mmap_after_request: false,
         weights: std::sync::OnceLock::new(),
         qwen35_weights: std::sync::OnceLock::new(),
+        dsv4_weights: std::sync::OnceLock::new(),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
