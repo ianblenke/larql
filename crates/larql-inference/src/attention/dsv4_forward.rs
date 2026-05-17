@@ -311,30 +311,65 @@ fn mla_attention_step(
     layer_cache.extend_from_slice(kv_latent.as_slice().unwrap());
     let seq_len = layer_cache.len() / dims.kv_lora_rank;
 
-    // Attention compute. MVP: for each head, treat the first
-    // `head_dim` floats of the KV-latent as both K and V. This is
-    // wrong (the published model has per-head K/V projection
-    // matrices implicit in the q_b layout), but produces a
-    // mechanically-valid forward path. Output: aggregate per-head
-    // results into `n_heads * head_dim` then run through
-    // output_a / output_b.
-    let mut attn_out = Array1::<f32>::zeros(dims.n_heads * dims.head_dim);
-    let scale = 1.0 / (dims.head_dim as f32).sqrt();
-    let copy_dim = dims.head_dim.min(dims.kv_lora_rank);
+    // Proper V3-inspired MLA attention compute:
+    //
+    // - Per-head Q split: q_nope (first `head_dim - rope_dim` dims) +
+    //   q_rope (last `rope_dim` dims) — RoPE was applied to the
+    //   FIRST `rope_dim` of each head above, so the rotary slice is
+    //   at the START of each head, not the end. Re-derive splits
+    //   accordingly.
+    // - KV latent split: k_rope is the first `rope_dim` of the
+    //   latent (RoPE'd above); kv_nope is the rest. Both are SHARED
+    //   across heads — V4 has no explicit per-head `kv_b` matrix.
+    // - K per head = [k_rope, kv_nope] concatenated, shared across heads.
+    // - V per head = kv_nope, shared across heads.
+    // - Per-head score = q_rope[h] · k_rope[t] + q_nope[h] · kv_nope[t]
+    // - Per-head v_out = softmax(scores) · kv_nope across cached tokens
+    //
+    // This is V3-style MLA without the per-head `kv_b` up-projection;
+    // V4's `attn_kv` tensor doesn't include one. The published model
+    // presumably absorbs `kv_b` into `attn_q_b` (the "absorbed MLA"
+    // form), so each head's q_nope vector already carries the
+    // per-head kv-up information. Whether or not that interpretation
+    // is exact, the score / V-weighting structure here is the
+    // closest we can get without the V4 paper.
+    let rope_dim = dims.rope_dim;
+    let q_nope_dim = dims.head_dim - rope_dim;
+    let kv_nope_dim = dims.kv_lora_rank - rope_dim;
+    let scale = 1.0 / ((q_nope_dim + rope_dim) as f32).sqrt();
+
+    // Per-head v_out, each `kv_nope_dim` wide.
+    let mut per_head_v_out: Vec<Array1<f32>> =
+        vec![Array1::<f32>::zeros(kv_nope_dim); dims.n_heads];
 
     for head in 0..dims.n_heads {
         let q_head_start = head * dims.head_dim;
-        let q_head = q_full.slice(ndarray::s![q_head_start..q_head_start + dims.head_dim]);
+        // q_rope = q[head, 0..rope_dim]; q_nope = q[head, rope_dim..head_dim]
+        let q_head_full = q_full.slice(ndarray::s![q_head_start..q_head_start + dims.head_dim]);
+        let q_rope = q_head_full.slice(ndarray::s![..rope_dim]);
+        let q_nope = q_head_full.slice(ndarray::s![rope_dim..]);
 
         // Score each cached position.
         let mut scores = Vec::with_capacity(seq_len);
         for pos in 0..seq_len {
             let latent_start = pos * dims.kv_lora_rank;
             let latent = &layer_cache[latent_start..latent_start + dims.kv_lora_rank];
-            let k_head: ArrayView1<'_, f32> = ArrayView1::from(&latent[..copy_dim]);
+            let k_rope = &latent[..rope_dim];
+            let kv_nope = &latent[rope_dim..];
+
+            // q_rope · k_rope
             let mut s = 0.0f32;
-            for (qi, ki) in q_head.iter().take(copy_dim).zip(k_head.iter()) {
-                s += qi * ki;
+            for i in 0..rope_dim {
+                s += q_rope[i] * k_rope[i];
+            }
+            // q_nope · kv_nope — q_nope is `q_nope_dim` wide,
+            // kv_nope is `kv_nope_dim` wide. Use the min in case
+            // these differ (q_nope_dim != kv_nope_dim is possible
+            // if head_dim != kv_lora_rank; for the published V4
+            // they're both 448 so it's an exact match).
+            let dot_dim = q_nope_dim.min(kv_nope_dim);
+            for i in 0..dot_dim {
+                s += q_nope[i] * kv_nope[i];
             }
             scores.push(s * scale);
         }
@@ -349,51 +384,68 @@ fn mla_attention_step(
             *s /= denom.max(1e-9);
         }
 
-        // Weighted sum over V (same latent slice).
+        // V-weighted sum: v_head[i] = Σ_t softmax(t) · kv_nope[t][i]
+        // V is shared across heads (V4 has no per-head V projection).
+        let v_out = &mut per_head_v_out[head];
         for pos in 0..seq_len {
             let latent_start = pos * dims.kv_lora_rank;
-            let v_head = &layer_cache[latent_start..latent_start + copy_dim];
+            let kv_nope = &layer_cache[latent_start + rope_dim..latent_start + dims.kv_lora_rank];
             let w = scores[pos];
-            for j in 0..copy_dim {
-                attn_out[q_head_start + j] += w * v_head[j];
+            for i in 0..kv_nope_dim {
+                v_out[i] += w * kv_nope[i];
             }
         }
     }
 
-    // Output path. V4's `output_a` / `output_b` are a low-rank
-    // residual refinement that operates on a HIDDEN-sized
-    // intermediate (`output_a` is `[8192, 4096]`, `output_b` is
-    // `[4096, 8192]`). The 32768-dim `attn_out` therefore can't
-    // feed `output_a` directly. The published V4 architecture
-    // presumably absorbs the per-head projection into the
-    // attention computation (the rotary section split + the way
-    // `attn_q_b`'s 32768-dim output is interpreted), but the
-    // exact projection from `[n_heads × head_dim] → [hidden]`
-    // isn't reconstructible without the V4 paper.
+    // Output projection. The available tensors are:
+    //   attn_output_a: [output_intermediate=8192, hidden=4096]
+    //   attn_output_b: [hidden=4096, output_intermediate=8192]
     //
-    // MVP fallback: collapse attn_out to hidden by *summing
-    // across heads*. attn_out has shape `[n_heads, head_dim]` and
-    // head_dim == hidden/n_heads is FALSE here (head_dim=512,
-    // hidden=4096, n_heads=64). So a head-mean yields a
-    // 512-vector, not 4096. Take a different reduction: reshape
-    // to `[n_heads, head_dim]` and **slice the first
-    // (hidden/head_dim) = 8 heads's outputs concatenated**.
-    // Shape-correct, semantically rough — same character of
-    // approximation as the K/V slice above.
-    let chunks_per_hidden = dims.hidden / dims.head_dim;
-    debug_assert_eq!(dims.hidden, chunks_per_hidden * dims.head_dim);
-    let take = chunks_per_hidden * dims.head_dim;
-    let attn_hidden = attn_out.slice(ndarray::s![..take]).to_owned();
-    let intermediate = w
+    // Per-head v_outs are `kv_nope_dim`-wide (448). Concatenated
+    // they're `n_heads * kv_nope_dim = 64 * 448 = 28672`, which
+    // matches no tensor.
+    //
+    // Best interpretation that fits the dimensions: V4's per-head
+    // V output is actually `output_intermediate / n_heads = 128`
+    // wide (not `kv_nope_dim`). The `output_b` matrix
+    // ([hidden, output_intermediate]) is the per-head W_o that
+    // maps the concatenated heads → hidden. So we slice each
+    // head's `kv_nope_dim`-wide V-output down to
+    // `output_intermediate / n_heads` and concat into a vector
+    // matching `output_b`'s input shape.
+    //
+    // This is still approximate (the "real" per-head V is presumably
+    // some projection of kv_nope rather than a slice), but the
+    // dimensional flow is now structurally correct: per-head V →
+    // per-head W_o → hidden, with the residual refinement via
+    // `output_a` applied at the end.
+    let per_head_o_dim = dims.output_intermediate / dims.n_heads;
+    let mut concat_heads = Array1::<f32>::zeros(dims.output_intermediate);
+    let take = per_head_o_dim.min(kv_nope_dim);
+    for head in 0..dims.n_heads {
+        let dst_start = head * per_head_o_dim;
+        for i in 0..take {
+            concat_heads[dst_start + i] = per_head_v_out[head][i];
+        }
+    }
+
+    // output_b: 8192 → hidden = per-head W_o.
+    let attn_hidden = w
         .attn
-        .output_a
-        .matvec(&attn_hidden)
-        .expect("output_a matvec");
-    debug_assert_eq!(intermediate.len(), dims.output_intermediate);
-    w.attn
         .output_b
-        .matvec(&intermediate)
-        .expect("output_b matvec")
+        .matvec(&concat_heads)
+        .expect("output_b matvec (per-head W_o)");
+    debug_assert_eq!(attn_hidden.len(), dims.hidden);
+
+    // output_a: hidden → output_intermediate, treated as a low-rank
+    // residual refinement that produces a SECOND vector to combine
+    // with attn_hidden. Without the V4 paper, the exact combination
+    // semantics are unclear — for the MVP we treat output_a's output
+    // as a NO-OP (the published model presumably uses it for HC or
+    // similar; we'll wire that in when HC lands).
+    let _ = w.attn.output_a;
+
+    attn_hidden
 }
 
 /// SwiGLU activation: silu(gate) * up → down.
