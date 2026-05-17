@@ -451,12 +451,6 @@ impl GgufFile {
             "phi" | "phi2" | "phi3" => "phi",
             "gpt2" => "gpt2",
             "deepseek" | "deepseek2" => "deepseek_v2",
-            // DeepSeek V4 Flash (antirez Q4KExperts quant): MoE + MLA +
-            // V4-specific HC / indexer / compressor / hash-routing blocks.
-            // Preserves the bare `deepseek4` family so detect.rs's
-            // explicit-match arm picks `DeepSeekV4Arch` rather than the
-            // generic `t.starts_with("deepseek")` → `DeepSeekArch` (V3) fallback.
-            "deepseek4" => "deepseek4",
             other => other,
         };
 
@@ -546,11 +540,8 @@ impl GgufFile {
             config["moe_intermediate_size"] = serde_json::json!(v);
         }
         // DeepSeek family extras: shared-expert count + MLA LoRA ranks.
-        // Both V3 and V4 GGUFs report these under `{arch}.expert_shared_count`
-        // and `{arch}.attention.{q,kv}_lora_rank`. V4 additionally exposes
-        // `attention.key_length` as the joint KV-latent width (the second
-        // dim of `attn_kv`), so when the explicit `kv_lora_rank` key is
-        // absent fall back to `key_length` for DSv4.
+        // V2/V3 GGUFs report these under `{arch}.expert_shared_count`
+        // and `{arch}.attention.{q,kv}_lora_rank`.
         if let Some(v) = get_arch_u32_opt("expert_shared_count") {
             config["n_shared_experts"] = serde_json::json!(v);
         }
@@ -559,10 +550,6 @@ impl GgufFile {
         }
         if let Some(v) = get_arch_u32_opt("attention.kv_lora_rank") {
             config["kv_lora_rank"] = serde_json::json!(v);
-        } else if arch == "deepseek4" {
-            if let Some(v) = get_arch_u32_opt("attention.key_length") {
-                config["kv_lora_rank"] = serde_json::json!(v);
-            }
         }
 
         config

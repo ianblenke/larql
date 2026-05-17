@@ -18,7 +18,7 @@ pub(super) fn ensure_standard_attention_supported(
     arch: &dyn larql_models::ModelArchitecture,
     surface: &'static str,
 ) -> Result<(), VindexError> {
-    if arch.uses_mla() && !surface_has_mla_writer(surface, arch.family()) {
+    if arch.uses_mla() {
         return Err(VindexError::UnsupportedArchitecture {
             family: arch.family().to_string(),
             feature: FEATURE_MLA.into(),
@@ -27,16 +27,6 @@ pub(super) fn ensure_standard_attention_supported(
     }
 
     Ok(())
-}
-
-/// Whether the given writer surface has an MLA-aware code path for
-/// this arch family. Only the Q4_K writer ships one (DSv4 emits the
-/// 5 MLA tensors per layer through `attn_mla` + a sidecar for V4
-/// aux blocks). The f32 writer and extract pipeline still reject
-/// MLA — they'd silently emit the wrong tensors under the Q/K/V/O
-/// slots otherwise (DSv4 has no such tensors).
-fn surface_has_mla_writer(surface: &str, family: &str) -> bool {
-    surface == SURFACE_Q4K_WEIGHT_WRITER && family == "deepseek4"
 }
 
 /// Entry-point gate for the extract pipeline: reject unsupported attention

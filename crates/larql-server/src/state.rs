@@ -73,13 +73,6 @@ pub struct LoadedModel {
     pub qwen35_weights: std::sync::OnceLock<
         std::sync::Arc<larql_inference::attention::qwen35_forward::Qwen35Weights>,
     >,
-    /// Lazy-cached `Dsv4Weights` for the `deepseek4` arch. Same
-    /// rationale as `qwen35_weights` — the vindex → weights
-    /// reconstruction reads ~500 GB worth of Q4_K mmaps and per-expert
-    /// tensors, which is too slow to do per request. Initialised on
-    /// first `/v1/chat/completions` for a deepseek4 model.
-    pub dsv4_weights:
-        std::sync::OnceLock<std::sync::Arc<larql_inference::attention::dsv4_forward::Dsv4Weights>>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -465,7 +458,6 @@ mod loaded_model_tests {
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
             qwen35_weights: std::sync::OnceLock::new(),
-            dsv4_weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -576,7 +568,6 @@ mod loaded_model_tests {
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
             qwen35_weights: std::sync::OnceLock::new(),
-            dsv4_weights: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),

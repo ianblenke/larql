@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use crate::architectures::deepseek::DeepSeekArch;
-use crate::architectures::deepseek_v4::DeepSeekV4Arch;
 use crate::architectures::gemma2::Gemma2Arch;
 use crate::architectures::gemma3::Gemma3Arch;
 use crate::architectures::gemma4::Gemma4Arch;
@@ -92,12 +91,14 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "qwen35" => Box::new(Qwen35Arch::from_config(model_config)),
         // Qwen family (dense and MoE share same keys)
         t if t.starts_with("qwen") => Box::new(QwenArch::from_config(model_config)),
-        // DeepSeek V4 Flash — distinct GGUF arch family (`deepseek4`)
-        // with MoE + MLA + HC + indexer + compressor + hash-routing.
-        // Must come before the `starts_with("deepseek")` arm or it'd be
-        // misrouted to the V3-shape `DeepSeekArch`.
-        "deepseek4" => Box::new(DeepSeekV4Arch::from_config(model_config)),
-        // DeepSeek family (MoE + MLA) — V2 / V3
+        // DeepSeek family (MoE + MLA) — V2 / V3 only. DeepSeek V4
+        // Flash uses a hybrid attention design (sliding-window +
+        // CSA + HCA + Manifold-Constrained Hyper-Connections +
+        // grouped output projection + hash-routed MoE bootstrap)
+        // that this codebase does NOT implement. Loading a
+        // `general.architecture = "deepseek4"` GGUF here will fall
+        // through to the generic fallback below; do not expect
+        // working inference.
         t if t.starts_with("deepseek") => Box::new(DeepSeekArch::from_config(model_config)),
         // StarCoder 2
         "starcoder2" => Box::new(StarCoder2Arch::from_config(model_config)),
