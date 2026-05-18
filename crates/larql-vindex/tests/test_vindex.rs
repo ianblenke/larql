@@ -2288,6 +2288,8 @@ fn gguf_config_from_metadata() {
         tensor_infos: vec![],
         data_offset: 0,
         path: std::path::PathBuf::new(),
+        shard_paths: vec![std::path::PathBuf::new()],
+        shard_data_offsets: vec![0],
     };
     let config = gguf.to_config_json();
     assert_eq!(config["model_type"], "llama");

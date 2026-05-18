@@ -147,7 +147,11 @@ pub enum GgufValue {
 impl GgufValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
+            GgufValue::U8(v) => Some(*v as u32),
+            GgufValue::U16(v) => Some(*v as u32),
             GgufValue::U32(v) => Some(*v),
+            GgufValue::I8(v) => Some(*v as u32),
+            GgufValue::I16(v) => Some(*v as u32),
             GgufValue::I32(v) => Some(*v as u32),
             GgufValue::U64(v) => Some(*v as u32),
             _ => None,
@@ -180,6 +184,11 @@ pub struct GgufTensorInfo {
     dims: Vec<u64>,
     tensor_type: u32,
     offset: u64,
+    /// Index into [`GgufFile::shard_paths`] / [`GgufFile::shard_data_offsets`]
+    /// for the shard that owns this tensor's data bytes. `0` for
+    /// single-shard GGUFs; varies per tensor for multi-shard (Qwen3-235B,
+    /// DeepSeek V3, etc., which exceed llama.cpp's 50 GB default shard cap).
+    shard_idx: usize,
 }
 
 impl GgufTensorInfo {
@@ -200,6 +209,11 @@ impl GgufTensorInfo {
     pub fn tensor_type(&self) -> u32 {
         self.tensor_type
     }
+    /// Which shard's file holds this tensor's data bytes
+    /// ([`GgufFile::shard_paths`] index). `0` for single-shard.
+    pub fn shard_idx(&self) -> usize {
+        self.shard_idx
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -209,75 +223,98 @@ impl GgufTensorInfo {
 pub struct GgufFile {
     pub metadata: HashMap<String, GgufValue>,
     pub tensor_infos: Vec<GgufTensorInfo>,
+    /// Data-section start offset within `path` (the first shard).
+    /// Kept for backward compat with consumers that expected a single
+    /// data offset; new code SHOULD use `shard_data_offsets[info.shard_idx]`
+    /// to support multi-shard.
     pub data_offset: u64,
+    /// Path to the first shard. Use `shard_paths` for multi-shard.
     pub path: std::path::PathBuf,
+    /// One path per shard for multi-shard GGUFs. Single-shard models
+    /// have `shard_paths.len() == 1` and `shard_paths[0] == path`.
+    pub shard_paths: Vec<std::path::PathBuf>,
+    /// Per-shard data-section start offset within each shard. Index
+    /// aligns with `shard_paths` and with `tensor_infos[i].shard_idx`.
+    pub shard_data_offsets: Vec<u64>,
 }
 
 impl GgufFile {
     /// Parse a GGUF file header and tensor info (does not read tensor data yet).
+    ///
+    /// Transparently handles multi-shard GGUFs (`split.count > 1`): on
+    /// detecting a split, walks sibling shards matching the
+    /// `…-NNNNN-of-MMMMM.gguf` naming pattern, parses each shard's
+    /// header + tensor info, and merges them into one logical view.
+    /// Tensor data offsets stay relative to each shard's own data
+    /// section; `tensor_infos[i].shard_idx()` picks the right shard.
     pub fn open(path: &Path) -> Result<Self, ModelError> {
-        let file = std::fs::File::open(path)?;
-        let mut r = BufReader::new(file);
+        let (metadata, mut tensor_infos, data_offset) = parse_shard_header(path)?;
 
-        // Magic
-        let magic = read_u32(&mut r)?;
-        if magic != GGUF_MAGIC {
-            return Err(ModelError::Parse(format!(
-                "not a GGUF file (magic: 0x{:08X}, expected 0x{:08X})",
-                magic, GGUF_MAGIC
-            )));
-        }
-
-        // Version
-        let version = read_u32(&mut r)?;
-        if !(2..=3).contains(&version) {
-            return Err(ModelError::Parse(format!(
-                "unsupported GGUF version: {version}"
-            )));
-        }
-
-        let n_tensors = read_u64(&mut r)? as usize;
-        let n_metadata = read_u64(&mut r)? as usize;
-
-        // Read metadata
-        let mut metadata = HashMap::new();
-        for _ in 0..n_metadata {
-            let key = read_string(&mut r)?;
-            let value = read_value(&mut r)?;
-            metadata.insert(key, value);
-        }
-
-        // Read tensor infos
-        let mut tensor_infos = Vec::with_capacity(n_tensors);
-        for _ in 0..n_tensors {
-            let name = read_string(&mut r)?;
-            let n_dims = read_u32(&mut r)?;
-            let mut dims = Vec::with_capacity(n_dims as usize);
-            for _ in 0..n_dims {
-                dims.push(read_u64(&mut r)?);
+        // Detect multi-shard. `split.count` is u16 in GGUF v3 split format.
+        let split_count = metadata
+            .get("split.count")
+            .and_then(|v| v.as_u32())
+            .unwrap_or(0) as usize;
+        if split_count <= 1 {
+            // Mark every tensor as belonging to shard 0.
+            for info in tensor_infos.iter_mut() {
+                info.shard_idx = 0;
             }
-            let tensor_type = read_u32(&mut r)?;
-            let offset = read_u64(&mut r)?;
-            tensor_infos.push(GgufTensorInfo {
-                name,
-                n_dims,
-                dims,
-                tensor_type,
-                offset,
+            return Ok(GgufFile {
+                metadata,
+                tensor_infos,
+                data_offset,
+                path: path.to_path_buf(),
+                shard_paths: vec![path.to_path_buf()],
+                shard_data_offsets: vec![data_offset],
             });
         }
 
-        // Data starts at next alignment boundary (32 bytes)
-        let pos = r.stream_position().map_err(ModelError::Io)?;
-        let alignment = 32u64;
-        let data_offset = pos.div_ceil(alignment) * alignment;
-
+        // Multi-shard. Tag this shard's tensors as shard 0, then walk
+        // sibling shards.
+        for info in tensor_infos.iter_mut() {
+            info.shard_idx = 0;
+        }
+        let (sibling_paths, mut shard_data_offsets, mut shard_tensor_lists) =
+            walk_sibling_shards(path, split_count)?;
+        shard_data_offsets.insert(0, data_offset);
+        let mut shard_paths = vec![path.to_path_buf()];
+        shard_paths.extend(sibling_paths);
+        // Append each sibling's tensors with the right shard_idx.
+        for (sibling_idx, mut shard_tensors) in shard_tensor_lists.drain(..).enumerate() {
+            let idx = sibling_idx + 1;
+            for info in shard_tensors.iter_mut() {
+                info.shard_idx = idx;
+            }
+            tensor_infos.extend(shard_tensors);
+        }
         Ok(GgufFile {
             metadata,
             tensor_infos,
             data_offset,
             path: path.to_path_buf(),
+            shard_paths,
+            shard_data_offsets,
         })
+    }
+
+    /// Snapshot of the data-offset for the shard owning `info.shard_idx`,
+    /// or `data_offset` for single-shard GGUFs. Helper for callers that
+    /// want to compute absolute byte offsets without indexing the vector
+    /// themselves.
+    pub fn shard_data_offset(&self, info: &GgufTensorInfo) -> u64 {
+        *self
+            .shard_data_offsets
+            .get(info.shard_idx)
+            .unwrap_or(&self.data_offset)
+    }
+
+    /// Open + mmap the shard file owning `info`'s data bytes.
+    pub fn shard_path(&self, info: &GgufTensorInfo) -> &Path {
+        self.shard_paths
+            .get(info.shard_idx)
+            .map(|p| p.as_path())
+            .unwrap_or(&self.path)
     }
 
     /// Load all tensors, dequantizing to f32.
@@ -310,8 +347,10 @@ impl GgufFile {
         ),
         ModelError,
     > {
-        let file = std::fs::File::open(&self.path)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Lazy per-shard mmaps so multi-shard GGUFs only pay the
+        // mmap cost for shards that actually carry tensors we read.
+        let mut shard_mmaps: Vec<Option<memmap2::Mmap>> =
+            (0..self.shard_paths.len()).map(|_| None).collect();
 
         let mut tensors = HashMap::new();
         let mut vectors = HashMap::new();
@@ -324,10 +363,12 @@ impl GgufFile {
                 continue;
             }
 
-            let abs_offset = self.data_offset.checked_add(info.offset).ok_or_else(|| {
+            let shard_idx = info.shard_idx;
+            let shard_data_offset = self.shard_data_offsets[shard_idx];
+            let abs_offset = shard_data_offset.checked_add(info.offset).ok_or_else(|| {
                 ModelError::Parse(format!(
                     "tensor {}: data_offset {} + tensor offset {} overflows u64",
-                    info.name, self.data_offset, info.offset,
+                    info.name, shard_data_offset, info.offset,
                 ))
             })?;
             let n_elements: u64 = info.dims.iter().product();
@@ -345,12 +386,19 @@ impl GgufFile {
                     info.name, abs_offset_usize, data_size,
                 ))
             })?;
+
+            if shard_mmaps[shard_idx].is_none() {
+                let f = std::fs::File::open(&self.shard_paths[shard_idx])?;
+                shard_mmaps[shard_idx] = Some(unsafe { memmap2::Mmap::map(&f)? });
+            }
+            let mmap = shard_mmaps[shard_idx].as_ref().unwrap();
             if end > mmap.len() {
                 return Err(ModelError::Parse(format!(
-                    "tensor {} data out of bounds (offset {} + size {} > file {})",
+                    "tensor {} data out of bounds (offset {} + size {} > shard {} file {})",
                     info.name,
                     abs_offset,
                     data_size,
+                    shard_idx,
                     mmap.len()
                 )));
             }
@@ -593,16 +641,21 @@ pub fn load_gguf_lazy_lm_head(path: &Path) -> Result<ModelWeights, ModelError> {
     if info.n_dims != 2 {
         return Ok(weights);
     }
-    let abs_offset_usize = (gguf.data_offset + info.offset) as usize;
+    // lm_head lives on whichever shard owns it (multi-shard: usually
+    // the last one because writers emit `output.weight` late).
+    let shard_data_offset = gguf.shard_data_offset(info);
+    let shard_path = gguf.shard_path(info);
+    let abs_offset_usize = (shard_data_offset + info.offset) as usize;
     let n_elements: usize = info.dims.iter().product::<u64>() as usize;
     let data_size = tensor_data_size(info.tensor_type, n_elements)?;
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(shard_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     if abs_offset_usize + data_size > mmap.len() {
         return Err(ModelError::Parse(format!(
-            "lazy lm_head: tensor data out of bounds (offset {} + size {} > file {})",
+            "lazy lm_head: tensor data out of bounds (offset {} + size {} > shard {} file {})",
             abs_offset_usize,
             data_size,
+            info.shard_idx(),
             mmap.len()
         )));
     }
@@ -644,20 +697,11 @@ pub fn load_gguf_lazy_tensors(
     }
     let gguf = GgufFile::open(path)?;
     let prefixes = weights.arch.key_prefixes_to_strip();
-    let file = std::fs::File::open(path)?;
-    // Phase G.1: keep the mmap alive in an Arc so per-tensor
-    // QuantTensor views can be zero-copy slices into it. RSS only
-    // accrues for pages actually touched during forward — the
-    // inactive ~95 % of MoE expert weights never enter RSS.
-    //
-    // Phase G.2: `LARQL_QWEN35_HEAP_LOAD=1` opts back into the
-    // pre-G.1 behaviour where each lazy tensor is copied to a
-    // dedicated `Vec<u8>` heap allocation. That puts all 22 GiB of
-    // a model's weights in RSS at load time, but eliminates the
-    // per-token page-fault cost on first-touch of cold MoE experts.
-    // Use on RAM-rich machines where steady-state throughput beats
-    // RSS-minimisation; default (unset) stays mmap-backed.
-    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+    // Per-shard mmaps, lazily created. Each `QuantTensor` zero-copy
+    // view holds an `Arc<Mmap>` of the shard it lives on; cold shards
+    // never enter RSS until a tensor on them is touched.
+    let mut shard_mmaps: Vec<Option<std::sync::Arc<memmap2::Mmap>>> =
+        (0..gguf.shard_paths.len()).map(|_| None).collect();
     let heap_load = std::env::var("LARQL_QWEN35_HEAP_LOAD").ok().as_deref() == Some("1");
     for info in &gguf.tensor_infos {
         // Accept 2D tensors plus 3D MoE expert tensors. 3D GGUF tensors
@@ -673,15 +717,23 @@ pub fn load_gguf_lazy_tensors(
         if !lazy_keys.contains(&key) {
             continue;
         }
-        let abs_offset_usize = (gguf.data_offset + info.offset) as usize;
+        let shard_idx = info.shard_idx;
+        if shard_mmaps[shard_idx].is_none() {
+            let f = std::fs::File::open(&gguf.shard_paths[shard_idx])?;
+            shard_mmaps[shard_idx] = Some(std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f)? }));
+        }
+        let mmap = shard_mmaps[shard_idx].as_ref().unwrap();
+        let shard_data_offset = gguf.shard_data_offsets[shard_idx];
+        let abs_offset_usize = (shard_data_offset + info.offset) as usize;
         let n_elements: usize = info.dims.iter().product::<u64>() as usize;
         let data_size = tensor_data_size(info.tensor_type, n_elements)?;
         if abs_offset_usize + data_size > mmap.len() {
             return Err(ModelError::Parse(format!(
-                "load_gguf_lazy_tensors: {} data out of bounds (offset {} + size {} > file {})",
+                "load_gguf_lazy_tensors: {} data out of bounds (offset {} + size {} > shard {} file {})",
                 info.name,
                 abs_offset_usize,
                 data_size,
+                shard_idx,
                 mmap.len(),
             )));
         }
@@ -704,7 +756,7 @@ pub fn load_gguf_lazy_tensors(
             crate::quant::lazy::QuantTensor::from_raw(bytes, info.tensor_type, rows, cols)?
         } else {
             crate::quant::lazy::QuantTensor::from_mmap_region(
-                std::sync::Arc::clone(&mmap),
+                std::sync::Arc::clone(mmap),
                 abs_offset_usize,
                 data_size,
                 info.tensor_type,
@@ -1460,6 +1512,123 @@ fn dequantize(data: &[u8], tensor_type: u32, n_elements: usize) -> Result<Vec<f3
     crate::quant::ggml::dequantize(data, tensor_type, n_elements)
 }
 
+/// Parse one shard's header. Returns the shard's metadata,
+/// per-shard tensor list (with `shard_idx` still set to 0 — the
+/// caller assigns the right index after merging), and the
+/// data-section start offset within the shard.
+#[allow(clippy::type_complexity)]
+fn parse_shard_header(
+    path: &Path,
+) -> Result<(HashMap<String, GgufValue>, Vec<GgufTensorInfo>, u64), ModelError> {
+    let file = std::fs::File::open(path)?;
+    let mut r = BufReader::new(file);
+
+    let magic = read_u32(&mut r)?;
+    if magic != GGUF_MAGIC {
+        return Err(ModelError::Parse(format!(
+            "not a GGUF file (magic: 0x{:08X}, expected 0x{:08X}, at {})",
+            magic,
+            GGUF_MAGIC,
+            path.display(),
+        )));
+    }
+    let version = read_u32(&mut r)?;
+    if !(2..=3).contains(&version) {
+        return Err(ModelError::Parse(format!(
+            "unsupported GGUF version: {version} (at {})",
+            path.display()
+        )));
+    }
+    let n_tensors = read_u64(&mut r)? as usize;
+    let n_metadata = read_u64(&mut r)? as usize;
+
+    let mut metadata = HashMap::new();
+    for _ in 0..n_metadata {
+        let key = read_string(&mut r)?;
+        let value = read_value(&mut r)?;
+        metadata.insert(key, value);
+    }
+
+    let mut tensor_infos = Vec::with_capacity(n_tensors);
+    for _ in 0..n_tensors {
+        let name = read_string(&mut r)?;
+        let n_dims = read_u32(&mut r)?;
+        let mut dims = Vec::with_capacity(n_dims as usize);
+        for _ in 0..n_dims {
+            dims.push(read_u64(&mut r)?);
+        }
+        let tensor_type = read_u32(&mut r)?;
+        let offset = read_u64(&mut r)?;
+        tensor_infos.push(GgufTensorInfo {
+            name,
+            n_dims,
+            dims,
+            tensor_type,
+            offset,
+            shard_idx: 0,
+        });
+    }
+
+    let pos = r.stream_position().map_err(ModelError::Io)?;
+    let alignment = 32u64;
+    let data_offset = pos.div_ceil(alignment) * alignment;
+    Ok((metadata, tensor_infos, data_offset))
+}
+
+/// Walk sibling shards `00002-of-MMMMM` … `MMMMM-of-MMMMM` for a
+/// multi-shard GGUF rooted at shard 1. Returns `(paths, data_offsets,
+/// tensor_lists)` aligned with shards 2..MMMMM.
+#[allow(clippy::type_complexity)]
+fn walk_sibling_shards(
+    first_path: &Path,
+    split_count: usize,
+) -> Result<(Vec<std::path::PathBuf>, Vec<u64>, Vec<Vec<GgufTensorInfo>>), ModelError> {
+    // `first_path` must match `…-NNNNN-of-MMMMM.gguf`. Extract the
+    // shard-number slot so we can substitute it for each sibling.
+    let file_name = first_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            ModelError::Parse(format!(
+                "shard path has no filename component: {}",
+                first_path.display()
+            ))
+        })?;
+    let pattern = format!("-of-{split_count:05}.gguf");
+    let suffix_idx = file_name.find(&pattern).ok_or_else(|| {
+        ModelError::Parse(format!(
+            "shard filename {file_name:?} does not contain `{pattern}` (multi-shard GGUF \
+             expects llama.cpp-style `…-NNNNN-of-MMMMM.gguf` naming)"
+        ))
+    })?;
+    // The shard-number slot is the 5 chars just before `-of-MMMMM`.
+    let num_start = suffix_idx
+        .checked_sub(5)
+        .ok_or_else(|| ModelError::Parse(format!("shard filename {file_name:?}: malformed")))?;
+    let prefix = &file_name[..num_start];
+    let suffix = &file_name[suffix_idx..];
+
+    let parent = first_path.parent().unwrap_or(Path::new("."));
+    let mut paths = Vec::with_capacity(split_count - 1);
+    let mut data_offsets = Vec::with_capacity(split_count - 1);
+    let mut tensor_lists = Vec::with_capacity(split_count - 1);
+    for n in 2..=split_count {
+        let name = format!("{prefix}{n:05}{suffix}");
+        let p = parent.join(&name);
+        if !p.exists() {
+            return Err(ModelError::Parse(format!(
+                "multi-shard GGUF: shard {n}/{split_count} missing at {}",
+                p.display()
+            )));
+        }
+        let (_meta, tinfos, doff) = parse_shard_header(&p)?;
+        paths.push(p);
+        data_offsets.push(doff);
+        tensor_lists.push(tinfos);
+    }
+    Ok((paths, data_offsets, tensor_lists))
+}
+
 /// Normalize GGUF tensor key names to match HuggingFace conventions.
 pub fn normalize_gguf_key(name: &str) -> String {
     // GGUF uses "blk.N.attn_q.weight" format
@@ -1860,6 +2029,8 @@ mod tests {
             tensor_infos: Vec::new(),
             data_offset: 0,
             path: std::path::PathBuf::from("<no-file>"),
+            shard_paths: vec![std::path::PathBuf::from("<no-file>")],
+            shard_data_offsets: vec![0],
         };
         let cfg = gguf.to_config_json();
 
@@ -1903,6 +2074,8 @@ mod tests {
             tensor_infos: Vec::new(),
             data_offset: 0,
             path: std::path::PathBuf::from("<no-file>"),
+            shard_paths: vec![std::path::PathBuf::from("<no-file>")],
+            shard_data_offsets: vec![0],
         };
         let cfg = gguf.to_config_json();
 
