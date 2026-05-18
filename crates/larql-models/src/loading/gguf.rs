@@ -493,7 +493,7 @@ impl GgufFile {
             "llama" => "llama",
             "gemma" | "gemma2" | "gemma3" | "gemma4" => &arch,
             "qwen" | "qwen2" => "qwen2",
-            "qwen35" | "qwen35moe" => &arch,
+            "qwen35" | "qwen35moe" | "qwen3next" => &arch,
             "mistral" => "mistral",
             "mixtral" => "mixtral",
             "phi" | "phi2" | "phi3" => "phi",
@@ -570,6 +570,22 @@ impl GgufFile {
             if !sections.is_empty() {
                 config["rope_dimension_sections"] = serde_json::json!(sections);
             }
+        }
+        // `rope.dimension_count` (Qwen3-Next / Qwen3-Coder-Next): a
+        // single scalar in `qwen3next.rope.dimension_count` that
+        // says how many of each head's `head_dim` channels carry
+        // rotary encoding. HF config.json exposes this as
+        // `partial_rotary_factor = dim_count / head_dim`. Forward
+        // both: the explicit `partial_rotary_factor` keeps round-
+        // trip parity with safetensors-loaded models, and the
+        // raw `rope_dimension_count` for any consumer that needs
+        // the absolute count.
+        if let Some(dim_count) = get_arch_u32_opt("rope.dimension_count") {
+            if head_dim > 0 {
+                let factor = dim_count as f64 / head_dim as f64;
+                config["partial_rotary_factor"] = serde_json::json!(factor);
+            }
+            config["rope_dimension_count"] = serde_json::json!(dim_count);
         }
 
         // ── MoE metadata flow-through ──
@@ -957,6 +973,18 @@ pub(crate) fn load_gguf_filtered_with_validation(
     // returned by `attn_q_key` / `attn_k_key` / `attn_v_key`.
     split_fused_qkv(&mut normalized_tensors, &mut vectors, &*arch);
 
+    // Qwen3-Next GGUFs (Qwen3-Coder-Next + siblings) ship the DeltaNet
+    // β/α projection FUSED into a single `ssm_ba.weight` of shape
+    // `[2 * n_v_heads, hidden]` (the first half is β, the second half
+    // is α). Qwen 3.6 35B-A3B uses separate `ssm_alpha.weight` and
+    // `ssm_beta.weight` per-layer tensors. The qwen35 writer +
+    // forward both consume the split form via `arch.ssm_alpha_key` /
+    // `arch.ssm_beta_key`, so synthesise the split here at load
+    // time. Once split, the rest of the pipeline is identical.
+    if arch.family() == "qwen3next" {
+        split_fused_ssm_ba(&mut normalized_tensors);
+    }
+
     // Gemma 3/4 GGUFs ship 4 layernorms per layer under names that don't
     // line up with the standard `attn_norm` / `ffn_norm` mapping in
     // [`GGUF_TO_HF_KEY_REPLACEMENTS`] (which is correct for Llama where
@@ -1318,6 +1346,70 @@ fn remap_gemma_norms(
 ///
 /// Driven entirely by `ModelArchitecture` keys + `ModelConfig` dimensions —
 /// no family-specific branching.
+/// Split Qwen3-Next's fused `ssm_ba.weight [2N, hidden]` into per-layer
+/// `ssm_beta.weight [N, hidden]` + `ssm_alpha.weight [N, hidden]`.
+///
+/// The split convention is **`ssm_ba` = stack(β, α)**: the first `N`
+/// rows are β, the second `N` rows are α. The tensor name itself
+/// reads "b·a" left-to-right (β before α), which matches the upstream
+/// llama.cpp convention for the equivalent `time_step_proj` decomposition.
+///
+/// Only operates on tensors whose post-normalization key matches
+/// `layers.{L}.ssm_ba.weight`. After the split, the original
+/// `ssm_ba` entry is removed so the qwen35 writer only sees the
+/// canonical split form.
+fn split_fused_ssm_ba(tensors: &mut HashMap<String, crate::WeightArray>) {
+    let ba_keys: Vec<String> = tensors
+        .keys()
+        .filter(|k| k.starts_with("layers.") && k.ends_with(".ssm_ba.weight"))
+        .cloned()
+        .collect();
+    for ba_key in ba_keys {
+        let Some(fused) = tensors.remove(&ba_key) else {
+            continue;
+        };
+        let rows = fused.shape()[0];
+        let cols = fused.shape()[1];
+        if rows % 2 != 0 {
+            // Re-insert and skip — shouldn't happen for a Qwen3-Next ssm_ba.
+            tensors.insert(ba_key, fused);
+            continue;
+        }
+        let half = rows / 2;
+        // Derive per-layer prefix `layers.{L}.` from the full key.
+        let prefix = &ba_key[..ba_key.len() - "ssm_ba.weight".len()];
+        let view = fused.view();
+        // Override via env to flip the convention if the empirical
+        // result on a smoke run is degenerate. Default `false` =
+        // β-first; setting `LARQL_QWEN3NEXT_SSM_BA_AB=1` flips to
+        // α-first.
+        let ab_first = std::env::var("LARQL_QWEN3NEXT_SSM_BA_AB").ok().as_deref() == Some("1");
+        let (beta_slice, alpha_slice) = if ab_first {
+            (
+                view.slice(ndarray::s![half.., ..]),
+                view.slice(ndarray::s![..half, ..]),
+            )
+        } else {
+            (
+                view.slice(ndarray::s![..half, ..]),
+                view.slice(ndarray::s![half.., ..]),
+            )
+        };
+        let beta = beta_slice
+            .to_owned()
+            .into_shape_with_order((half, cols))
+            .expect("ssm_beta split shape")
+            .into_shared();
+        let alpha = alpha_slice
+            .to_owned()
+            .into_shape_with_order((half, cols))
+            .expect("ssm_alpha split shape")
+            .into_shared();
+        tensors.insert(format!("{prefix}ssm_beta.weight"), beta);
+        tensors.insert(format!("{prefix}ssm_alpha.weight"), alpha);
+    }
+}
+
 fn split_fused_qkv(
     tensors: &mut HashMap<String, crate::WeightArray>,
     vectors: &mut HashMap<String, Vec<f32>>,

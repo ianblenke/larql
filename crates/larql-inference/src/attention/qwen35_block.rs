@@ -104,9 +104,18 @@ impl Qwen35AttentionDims {
     /// already exposes after PR #167's vindex loader fix.
     pub fn from_arch(arch: &dyn larql_models::ModelArchitecture, eps: f32) -> Self {
         let cfg = arch.config();
+        // Multi-section RoPE (Qwen 3.6) sums the section sizes. Single-
+        // dim partial RoPE (Qwen3-Next / Qwen3-Coder-Next) uses
+        // `partial_rotary_factor * head_dim`. Fall back to full head_dim
+        // for plain RoPE.
         let rotary_dim = arch
             .rope_dimension_sections()
             .map(|secs| secs.iter().copied().sum())
+            .or_else(|| {
+                cfg.partial_rotary_factor
+                    .map(|f| ((cfg.head_dim as f64) * f).round() as usize)
+                    .filter(|d| *d > 0)
+            })
             .unwrap_or(cfg.head_dim);
         Self {
             hidden: cfg.hidden_size,
