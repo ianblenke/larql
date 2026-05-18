@@ -750,7 +750,10 @@ fn run_chat_completion(
     // schema-bound qwen35 callers know to wait. Free-form qwen35
     // chat goes through the dedicated path below.
     let arch_family = weights.arch.family();
-    let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe");
+    // qwen3next (Qwen3-Coder-Next + siblings) is the same hybrid
+    // Gated-DeltaNet + full-attention MoE family as Qwen 3.6; routes
+    // through the same generate driver.
+    let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe" | "qwen3next");
     if is_qwen35 && constrained_schema.is_some() {
         return Err(ServerError::Internal(format!(
             "/v1/chat/completions with response_format/tools is not yet wired \

@@ -25,6 +25,7 @@ use super::half::{decode_bf16, decode_f16};
 use crate::detect::ModelError;
 
 pub mod legacy;
+pub mod mxfp4;
 pub mod q4_k;
 pub mod q4k_q8k;
 pub mod q5_k;
@@ -37,6 +38,7 @@ pub mod quantize;
 pub use legacy::{
     dequantize_q4_0, dequantize_q5_0, dequantize_q5_1, dequantize_q8_0, q8_0_row_dot,
 };
+pub use mxfp4::dequantize_mxfp4;
 pub use q4_k::{dequantize_q4_k, q4k_row_dot, q4k_row_scaled_add};
 pub use q4k_q8k::{q4k_q8k_row_dot, quantize_to_q8_k, Q8_K_BLOCK_BYTES, Q8_K_BLOCK_ELEMS};
 pub use q5_k::dequantize_q5_k;
@@ -95,6 +97,16 @@ pub const TYPE_I8: u32 = 24;
 pub const TYPE_I16: u32 = 25;
 pub const TYPE_I32: u32 = 26;
 pub const TYPE_I64: u32 = 27;
+
+/// MXFP4 (4-bit microscaling float) — interleaved block format used
+/// by recent GGUF builds (Qwen3-Coder-Next shared experts, GPT-OSS
+/// variants). Each 32-element block is laid out as
+/// `[scale(u8, E8M0), nibbles(16 × u8)]` = 17 bytes per 32 elements.
+/// Distinct from the safetensors MXFP4 layout (separate blocks + scales
+/// tensors) which `quant::mxfp4` already handles.
+pub const TYPE_MXFP4: u32 = 39;
+pub const MXFP4_BLOCK_ELEMS: usize = 32;
+pub const MXFP4_BLOCK_BYTES: usize = 17;
 
 /// True if `tensor_type` is one of the integer-index types
 /// (`I8`/`I16`/`I32`/`I64`). Callers that want to skip non-weight
@@ -211,6 +223,7 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
         TYPE_I16 => Ok(n_elements * 2),
         TYPE_I32 => Ok(n_elements * 4),
         TYPE_I64 => Ok(n_elements * 8),
+        TYPE_MXFP4 => Ok(n_elements / MXFP4_BLOCK_ELEMS * MXFP4_BLOCK_BYTES),
         _ => Err(ModelError::Parse(format!(
             "tensor_data_size: unsupported type id {tensor_type}"
         ))),
@@ -234,6 +247,7 @@ pub fn type_name(tensor_type: u32) -> &'static str {
         TYPE_Q5_K => "Q5_K",
         TYPE_Q6_K => "Q6_K",
         TYPE_BF16 => "BF16",
+        TYPE_MXFP4 => "MXFP4",
         TYPE_I8 => "I8",
         TYPE_I16 => "I16",
         TYPE_I32 => "I32",
@@ -277,6 +291,7 @@ pub fn dequantize(
         TYPE_Q4_K => dequantize_q4_k(data, n_elements),
         TYPE_Q5_K => dequantize_q5_k(data, n_elements),
         TYPE_Q6_K => dequantize_q6_k(data, n_elements),
+        TYPE_MXFP4 => dequantize_mxfp4(data, n_elements),
         other => Err(ModelError::UnsupportedDtype(format!("GGML type {other}"))),
     }
 }

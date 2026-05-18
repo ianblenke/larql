@@ -89,6 +89,14 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         // `QwenArch`).
         "qwen35moe" => Box::new(Qwen35MoeArch::from_config(model_config)),
         "qwen35" => Box::new(Qwen35Arch::from_config(model_config)),
+        // Qwen3-Next family (Qwen3-Coder-Next + siblings) — hybrid
+        // Gated DeltaNet + full-attention MoE, architecturally
+        // identical to Qwen3.6 35B-A3B. GGUFs report
+        // `general.architecture = "qwen3next"`; HF config.json
+        // reports `model_type = "qwen3_next"`. Both route through
+        // `Qwen35MoeArch` which already covers the hybrid tensor
+        // contract.
+        "qwen3next" | "qwen3_next" => Box::new(Qwen35MoeArch::from_config(model_config)),
         // Qwen family (dense and MoE share same keys)
         t if t.starts_with("qwen") => Box::new(QwenArch::from_config(model_config)),
         // DeepSeek family (MoE + MLA) — V2 / V3 only. DeepSeek V4

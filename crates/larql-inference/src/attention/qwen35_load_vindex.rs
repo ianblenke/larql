@@ -78,7 +78,7 @@ pub fn load_qwen35_weights_from_vindex(
         .as_ref()
         .map(|c| c.model_type.clone())
         .unwrap_or_default();
-    if arch_family != "qwen35" && arch_family != "qwen35moe" {
+    if arch_family != "qwen35" && arch_family != "qwen35moe" && arch_family != "qwen3next" {
         return Err(VindexLoadError::UnexpectedArch(
             vindex_dir.to_path_buf(),
             arch_family,
