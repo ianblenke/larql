@@ -109,11 +109,21 @@ impl<'a> BuildContext<'a> {
         dtype: StorageDtype,
         down_top_k: usize,
     ) -> Self {
+        // Preserve any vocab-row padding the GGUF carries (Qwen3.6
+        // has 248320 padded vs 248044 logical — the extra rows hold
+        // special tokens like `<|im_start|>`/`<|im_end|>` that the
+        // chat template emits). Without preserving them, the embed
+        // lookup at the special-token IDs lands in unwritten space,
+        // gets zero-padded by the loader's workaround, and corrupts
+        // the DeltaNet recurrent state across the first ~6 layers of
+        // every prompt.
+        let stored_embed_rows = weights.embed.shape()[0];
+        let vocab_size = stored_embed_rows.max(weights.vocab_size);
         Self {
             num_layers: weights.num_layers,
             hidden_size: weights.hidden_size,
             intermediate_size: weights.intermediate_size,
-            vocab_size: weights.vocab_size,
+            vocab_size,
             embed_scale: weights.arch.embed_scale(),
             is_moe: weights.arch.is_moe(),
             n_experts: weights.arch.num_experts(),
@@ -217,27 +227,24 @@ impl<'a> BuildContext<'a> {
 
     /// Stage 2 — write `embeddings.bin`.
     ///
-    /// Some GGUFs (Gemma 3 4B unsloth Q4_K_M, for one) store `token_embd`
-    /// with more rows than the model's logical vocab — e.g. shape
-    /// `(262208, 2560)` while `gemma3.vocab_size = 262144`. The extra 64
-    /// rows are padding for SIMD-friendly alignment in llama.cpp. Writing
-    /// the full embed buffer leaves the on-disk vocab dimension out of
-    /// sync with `index.json`'s `vocab_size`, which makes
-    /// `load_vindex_embeddings`'s `from_shape_vec((vocab_size, hidden), …)`
-    /// trip a `ShapeError`. Truncate to the logical vocab on write so
-    /// reader and config agree.
+    /// GGUFs often store `token_embd` with more rows than the model's
+    /// LOGICAL vocab — Gemma 3 4B Q4_K_M ships 262208 rows vs
+    /// `gemma3.vocab_size = 262144` (the extra 64 are SIMD-alignment
+    /// padding), and Qwen 3.6 ships 248320 rows vs 248044 logical
+    /// (the extra 276 hold special tokens like `<|im_start|>` /
+    /// `<|im_end|>` that the chat template emits). PRESERVE all
+    /// rows so token-id lookups at the padded range return real
+    /// embeddings rather than triggering a loader-side zero-pad
+    /// workaround that corrupts the recurrent state. `self.vocab_size`
+    /// is already set to `max(weights.embed.shape()[0],
+    /// weights.vocab_size)` so the reader's
+    /// `from_shape_vec((vocab_size, hidden), …)` matches the on-disk
+    /// row count.
     fn write_embeddings(&mut self) -> Result<(), VindexError> {
         self.callbacks.on_stage(STAGE_EMBEDDINGS);
         let embed_path = self.output_dir.join(EMBEDDINGS_BIN);
-        let stored_vocab = self.weights.embed.shape()[0];
-        let logical_vocab = self.weights.vocab_size;
         let embed_arr = self.weights.embed.as_array();
-        let embed_view = if stored_vocab > logical_vocab {
-            embed_arr.slice(ndarray::s![..logical_vocab, ..])
-        } else {
-            embed_arr.slice(ndarray::s![.., ..])
-        };
-        let embed_data: Vec<f32> = embed_view.iter().copied().collect();
+        let embed_data: Vec<f32> = embed_arr.iter().copied().collect();
         let embed_bytes = crate::config::dtype::encode_floats(&embed_data, self.dtype);
         std::fs::write(&embed_path, &embed_bytes)?;
         self.callbacks.on_stage_done(STAGE_EMBEDDINGS, 0.0);
