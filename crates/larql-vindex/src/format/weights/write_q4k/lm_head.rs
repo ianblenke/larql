@@ -22,19 +22,15 @@ pub(super) fn write_lm_head_q4k(
     norm_entries: &mut Vec<WeightEntry>,
 ) -> Result<(), VindexError> {
     if let Some((data, rows, cols)) = source.lm_head() {
-        // Truncate to logical vocab so the on-disk row count matches
-        // `config.vocab_size` (and therefore matches what the loader
-        // expects). Some GGUFs ship `token_embd` / lm_head with extra
-        // SIMD-alignment rows beyond the logical vocab — see
-        // `build::write_embeddings` for the matching truncation on the
-        // embed side.
-        let logical_vocab = source.arch().config().vocab_size.unwrap_or(rows);
-        let (truncated_data, truncated_rows) = if rows > logical_vocab {
-            let truncated: Vec<f32> = data[..logical_vocab * cols].to_vec();
-            (truncated, logical_vocab)
-        } else {
-            (data, rows)
-        };
+        // Preserve all rows. GGUFs commonly ship `token_embd` / lm_head
+        // with padded vocab (extra rows for special tokens like
+        // `<|im_start|>` on Qwen 3.6, or SIMD alignment on Gemma 3).
+        // Truncating to the logical vocab makes the loader fall back
+        // to a zero-pad workaround at the special-token IDs, which
+        // corrupts the DeltaNet recurrent state on the first prompt
+        // tokens (those are the chat-template special tokens). Match
+        // `build::write_embeddings` and keep the full padded matrix.
+        let (truncated_data, truncated_rows) = (data, rows);
         let (padded, padded_cols) = pad_rows_to_block(&truncated_data, truncated_rows, cols);
         let q_bytes = quantize_q4_k(&padded);
         std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
