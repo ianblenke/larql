@@ -149,6 +149,10 @@ impl DeltaNetDims {
 /// One-token forward through the DeltaNet block. Mutates `state` in
 /// place; returns the block's output, ready to be added back to the
 /// residual stream by the caller.
+///
+/// `layer` is purely diagnostic — used to key the per-sub-op binary
+/// dumps when `LARQL_QWEN35_DUMP_LAYER_BOUNDARY` is set. Pass any
+/// value (e.g. `0`) when not dumping.
 pub fn deltanet_block_step(
     x: &Array1<f32>,
     weights: &DeltaNetLayerWeights,
@@ -156,6 +160,7 @@ pub fn deltanet_block_step(
     state: &mut DeltaNetLayerState,
     backend: Option<&dyn larql_compute::ComputeBackend>,
     sequence_pos: usize,
+    layer: usize,
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
@@ -178,8 +183,36 @@ pub fn deltanet_block_step(
     use crate::attention::fine_profile::*;
     use crate::time_section;
 
+    // Per-sub-op dump helper: writes `<dir>/<token_tag>/<name>_l<NN>.bin`
+    // in the same `[i64 ne[4]; f32 data]` format as the layer-boundary
+    // dump in `qwen35_forward_step`, so each binary lines up with a
+    // llama-eval-callback `LLAMA_DUMP_BIN_DIR` tensor. The format is
+    // documented in `common/debug.cpp:188+` of the llama.cpp clone at
+    // `/home/ianblenke/3rd-party/llama.cpp/`. Cheap when unset (single
+    // `std::env::var` cache hit, no allocation).
+    let dump_subop = |name: &str, data: &[f32]| {
+        if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY") {
+            let token_tag = std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG")
+                .unwrap_or_else(|_| "tok".to_string());
+            let layer_dir = format!("{dir}/{token_tag}");
+            let _ = std::fs::create_dir_all(&layer_dir);
+            let path = format!("{layer_dir}/{name}_l{layer:02}.bin");
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                use std::io::Write;
+                let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+                for n in ne {
+                    let _ = f.write_all(&n.to_le_bytes());
+                }
+                for v in data {
+                    let _ = f.write_all(&v.to_le_bytes());
+                }
+            }
+        }
+    };
+
     // 1. Pre-mixer RMSNorm.
     let x_norm = time_section!(DN_RMS_NORM_X, rms_norm_1d(x, &weights.attn_norm, dims.eps));
+    dump_subop("dn_x_norm", x_norm.as_slice().unwrap_or(&[]));
     // Diagnostic dump for layer 0 tensor comparison vs
     // llama-eval-callback. Verified C.5a: x_norm matches llama.cpp
     // bit-exactly at positions 0, 1, 2, N-3, N-2, N-1 for
@@ -262,6 +295,8 @@ pub fn deltanet_block_step(
             (qkv_mixed, z)
         }
     );
+    dump_subop("dn_qkv_mixed", qkv_mixed.as_slice().unwrap_or(&[]));
+    dump_subop("dn_z_gate", z.as_slice().unwrap_or(&[]));
     // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
     // at C.5a. Likely Q5_K dequant rounding (weights are Q5_K-quant).
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
@@ -373,6 +408,7 @@ pub fn deltanet_block_step(
             *v = silu(*v);
         }
     });
+    dump_subop("dn_qkv_conv_silu", qkv_conv.as_slice().unwrap_or(&[]));
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = qkv_conv.len();
         eprintln!(
@@ -664,6 +700,7 @@ pub fn deltanet_block_step(
         r
     });
     debug_assert_eq!(o_flat_pre.len(), value_dim);
+    dump_subop("dn_o_recurrence", o_flat_pre.as_slice().unwrap_or(&[]));
 
     // 7. Per-head RMSNorm by ssm_norm (weight is [head_v_dim], shared
     //    across heads). Reshape to [1, value_dim] for rms_norm_heads.
@@ -695,12 +732,15 @@ pub fn deltanet_block_step(
         }
     });
 
+    dump_subop("dn_o_postnorm", o_flat.as_slice().unwrap_or(&[]));
+
     // 8. Multiply by SiLU(Z) element-wise.
     time_section!(DN_SILU_Z, {
         for c in 0..value_dim {
             o_flat[c] *= silu(z[c]);
         }
     });
+    dump_subop("dn_o_gated", o_flat.as_slice().unwrap_or(&[]));
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
         let n = o_flat.len();
         // Optional: dump full final_out (and other vectors) to binary file
@@ -900,7 +940,7 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::from_elem(dims.hidden, 1.0_f32);
 
-        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
+        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0, 0);
         assert_eq!(y.len(), dims.hidden);
         assert!(y.iter().all(|v| v.is_finite()));
 
@@ -952,7 +992,7 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::zeros(dims.hidden);
 
-        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
+        let y = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0, 0);
         for &v in y.iter() {
             assert!(v.abs() < 1e-5, "expected zero output, got {v}");
         }
@@ -1020,9 +1060,9 @@ mod tests {
             DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
         let x = Array1::from_elem(dims.hidden, 1.0_f32);
 
-        let _y1 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0);
+        let _y1 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 0, 0);
         let state_mass_after_1: f32 = state.recurrent_state.iter().map(|&v| v.abs()).sum();
-        let _y2 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 1);
+        let _y2 = deltanet_block_step(&x, &weights, &dims, &mut state, None, 1, 0);
         let state_mass_after_2: f32 = state.recurrent_state.iter().map(|&v| v.abs()).sum();
 
         // Without decay, the state should retain at least as much

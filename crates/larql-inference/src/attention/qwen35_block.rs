@@ -506,7 +506,7 @@ pub fn hybrid_layer_step(
             let state = hybrid_cache.dn_state.layers[layer]
                 .as_mut()
                 .expect("linear-layer state should be allocated");
-            deltanet_block_step(x, w, dn_dims, state, backend, sequence_pos)
+            deltanet_block_step(x, w, dn_dims, state, backend, sequence_pos, layer)
         }
         (Qwen35LayerWeights::Attention(w), false) => {
             let kv_layer = hybrid_cache.kv_layers[layer]
