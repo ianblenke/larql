@@ -809,6 +809,50 @@ benchmark refresh.
 
 ---
 
+## P1 — Kimi Linear MoE support (added 2026-05-19)
+
+Driver: Kimi Linear is a 48B-total / **3B-activated** MoE released
+2026 by Kimi (`moonshotai`); structurally the same shape as Qwen 3.6
+35B-A3B (small activated path, big total). Pre-trained on 1.4T tokens
+per `arxiv:2603.15031` ("Attention Residuals"). Two things make it
+worth tracking as a follow-on showcase target after Qwen 3.6 is
+coherent:
+
+1. **MoE plumbing reuse.** The router + top-K dispatch + per-expert
+   SwiGLU we built for Qwen 3.6 (see openspec changes
+   `vindex-qwen35moe-extraction` / `vindex-qwen35moe-reader`)
+   transfers directly. New work is arch detection + tensor name
+   mapping, not new MoE math.
+2. **Architectural divergence to evaluate.** Kimi Linear was the
+   experimental vehicle for **AttnRes** (softmax-weighted residual
+   stream instead of fixed unit residuals, arxiv 2603.15031). If the
+   public release uses AttnRes, our standard residual-stream forward
+   would diverge — needs an AttnRes-aware variant of the per-layer
+   step. If the public release uses standard residuals (AttnRes only
+   in a separately released checkpoint), it's a normal MoE
+   integration.
+
+| # | Item | Crate | Status | Notes |
+|---|------|-------|--------|-------|
+| KL1 | Inspect a Kimi Linear GGUF (`moonshotai/Kimi-Linear-48B-A3B-Instruct` or equivalent) — tensor types, RoPE config, attention shape, residual structure | larql-models | not started | Confirms whether AttnRes is on the inference path or training-only; sets scope for KL2–KL4 |
+| KL2 | Arch detection: route Kimi Linear GGUF to either `Qwen35MoeArch` (if structurally identical) or a new `KimiLinearArch` (if AttnRes / divergent attention) | larql-models | not started | Mirror the pattern from PR #188 (qwen3next → Qwen35MoeArch reuse with 5 small adaptations) |
+| KL3 | Vindex extraction: extend the Q4_K / Q8_0 bit-passthrough writers (PRs #195 / #196) to Kimi-specific tensor names | larql-vindex | not started | Bulk of the change is name aliases; passthrough infrastructure already covers Q4_K + Q6_K + Q8_0 sources |
+| KL4 | If AttnRes is on the inference path: add per-layer soft-mixing residual variant to the qwen35 forward, gated by arch family | larql-inference | not started | Likely a new path through `qwen35_forward_step` with a learned softmax over per-block residuals; cache the softmax weights at load time |
+| KL5 | Bench parity vs llama.cpp on Kimi Linear (if llama.cpp adds support) | larql-cli + bench/ | not started | Same harness as Qwen 3.6 — `bench/baselines/cross-arch/` |
+
+**Acceptance**: Kimi Linear chat completion produces coherent output
+under greedy decode (matches llama.cpp's `llama-cli` for at least
+the first 20 tokens of a standard prompt). Same bar as Qwen 3.6's
+exit criterion.
+
+**Why P1 not critical-path**: Qwen 3.6 35B-A3B coverage isn't yet
+coherent end-to-end (forward bug bisected, fix in flight via PRs
+#194-#196). Kimi follows once Qwen 3.6 ships. The two share enough
+plumbing that Kimi work derisks future hybrid-MoE additions
+(DeepSeek-V3-class architectures excluded under ADR-019).
+
+---
+
 ## P1 — Boundary refs and cold-context storage
 
 Driver: replace unbounded KV retention in long-context and multi-host scenarios

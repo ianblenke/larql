@@ -121,6 +121,19 @@ pub static QUANT_FORMATS: &[QuantFormatInfo] = &[
         row_scaled_add: Some(ggml::q6k_row_scaled_add),
     },
     QuantFormatInfo {
+        tag: "Q5_K",
+        block_elements: ggml::K_QUANT_BLOCK_ELEMS,
+        bytes_per_block: ggml::Q5_K_BLOCK_BYTES,
+        dequantize: ggml::dequantize_q5_k,
+        // No f32-input `q5k_row_dot` (only the Q8K-input fast path);
+        // consumers that need a row_dot can dequantize first via the
+        // `dequantize` fn pointer. The qwen35 forward dispatches Q5_K
+        // through `QuantTensor::matvec` which has its own
+        // q5k_q8k_row_dot fast path.
+        row_dot: None,
+        row_scaled_add: None,
+    },
+    QuantFormatInfo {
         tag: "Q8_0",
         block_elements: ggml::LEGACY_BLOCK_ELEMS,
         bytes_per_block: ggml::Q8_0_BLOCK_BYTES,
