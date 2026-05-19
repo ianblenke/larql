@@ -26,7 +26,8 @@ use crate::error::VindexError;
 
 use super::super::write_f32::WeightSource;
 use super::super::write_layers::{
-    quantize_dense_entry, quantize_moe_entries, write_layer_weights, LayerEntry, LayerWeightFormat,
+    pad_cols_to_256, quantize_f32, quantize_moe_entries, write_layer_weights, LayerEntry,
+    LayerWeightFormat,
 };
 
 pub(super) fn write_per_layer_moe_q4k(
@@ -97,29 +98,107 @@ fn build_per_expert_entries(
     let arch = source.arch();
     let mut entries: Vec<LayerEntry> = Vec::with_capacity(num_experts);
 
+    // Maps a `LayerWeightFormat` (per-file) to the GGML tensor_type
+    // we'd accept for raw-byte passthrough at the gate_up slot.
+    // Returns `None` for formats we don't have a passthrough kernel
+    // for at the MoE expert tier yet.
+    fn passthrough_tensor_type(fmt: LayerWeightFormat) -> Option<u32> {
+        match fmt {
+            LayerWeightFormat::Q4_K => Some(larql_models::quant::ggml::TYPE_Q4_K),
+            LayerWeightFormat::Q6_K => Some(larql_models::quant::ggml::TYPE_Q6_K),
+            _ => None,
+        }
+    }
+
     for expert_id in 0..num_experts {
         let gate_key = arch.expert_ffn_gate_key(layer, expert_id);
         let up_key = arch.expert_ffn_up_key(layer, expert_id);
         let down_key = arch.expert_ffn_down_key(layer, expert_id);
 
-        let gate = gate_key.as_ref().and_then(|k| source.get_tensor(k));
-        let up = up_key.as_ref().and_then(|k| source.get_tensor(k));
-        let down = down_key.as_ref().and_then(|k| source.get_tensor(k));
+        // Try raw byte-concat passthrough for the gate+up half of the
+        // entry: in K-quant formats each [inter, hidden] row is an
+        // independent run of super-blocks (no cross-row state), so
+        // bytewise concatenation of two raw-quant tensors of the same
+        // format equals the bytes of quantizing their f32 concat. This
+        // preserves imatrix-aware quantization for the MoE gate/up
+        // path — PR #195/#196/#197 established the same pattern for
+        // attn/deltanet writers. For Coder-Next, gate/up are both
+        // Q4_K and hidden is 2048 (multiple of 256), so passthrough
+        // fires; the f32-round-trip below stays as the safe fallback.
+        //
+        // `down` is treated separately below — when source format
+        // matches target, byte-passthrough; otherwise the existing
+        // f32 dequant + pad + requant runs (no behavioural change).
+        let target_ttype = passthrough_tensor_type(fmt);
+        let gate_raw = gate_key
+            .as_ref()
+            .and_then(|k| source.get_quant_raw(k))
+            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
+        let up_raw = up_key
+            .as_ref()
+            .and_then(|k| source.get_quant_raw(k))
+            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
+        let down_raw = down_key
+            .as_ref()
+            .and_then(|k| source.get_quant_raw(k))
+            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
 
-        let (Some((gate_f32, _, _)), Some((up_f32, _, _)), Some((down_f32, _, _))) =
-            (gate, up, down)
-        else {
-            // Any expert missing → skip the layer entirely. The dense
-            // `quantize_dense_entry` requires all three tensors, and a
-            // partial layer would mislead the manifest. Producing a
-            // half-populated layer file is worse than producing none —
-            // a downstream loader would assume `num_entries=num_experts`
-            // and read garbage offsets.
-            return Ok(Vec::new());
+        let gate_up_passthrough = match (&gate_raw, &up_raw) {
+            (Some((gb, _, gr, gc)), Some((ub, _, ur, uc)))
+                if gr == ur && gc == uc && *gc == hidden && *gr == moe_inter =>
+            {
+                let mut bytes = Vec::with_capacity(gb.len() + ub.len());
+                bytes.extend_from_slice(gb);
+                bytes.extend_from_slice(ub);
+                Some(bytes)
+            }
+            _ => None,
         };
 
-        let entry = quantize_dense_entry(&gate_f32, &up_f32, &down_f32, moe_inter, hidden, fmt)?;
-        entries.push(entry);
+        let down_passthrough = match &down_raw {
+            Some((db, _, dr, dc))
+                if *dr == hidden
+                    && *dc == moe_inter
+                    && moe_inter.is_multiple_of(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS) =>
+            {
+                Some(db.clone())
+            }
+            _ => None,
+        };
+
+        // Resolve gate_up bytes: try raw concat first, then fall back
+        // to f32 dequant + interleave + quantize.
+        let gate_up = if let Some(bytes) = gate_up_passthrough {
+            bytes
+        } else {
+            let gate = gate_key.as_ref().and_then(|k| source.get_tensor(k));
+            let up = up_key.as_ref().and_then(|k| source.get_tensor(k));
+            let (Some((gate_f32, _, _)), Some((up_f32, _, _))) = (gate, up) else {
+                // Missing — skip the layer entirely (a half-populated
+                // layer file would mislead downstream readers that
+                // assume `num_entries=num_experts`).
+                return Ok(Vec::new());
+            };
+            let mut gate_up_f32 = Vec::with_capacity(gate_f32.len() + up_f32.len());
+            gate_up_f32.extend_from_slice(&gate_f32);
+            gate_up_f32.extend_from_slice(&up_f32);
+            quantize_f32(&gate_up_f32, fmt)?
+        };
+
+        // Resolve down bytes: same pattern — raw passthrough when
+        // source matches target, else f32 dequant + pad + quantize.
+        let down = if let Some(bytes) = down_passthrough {
+            bytes
+        } else {
+            let Some((down_f32, _, _)) = down_key.as_ref().and_then(|k| source.get_tensor(k))
+            else {
+                return Ok(Vec::new());
+            };
+            let (down_padded, _) = pad_cols_to_256(&down_f32, hidden, moe_inter);
+            quantize_f32(&down_padded, fmt)?
+        };
+
+        entries.push(LayerEntry { gate_up, down });
     }
 
     Ok(entries)
