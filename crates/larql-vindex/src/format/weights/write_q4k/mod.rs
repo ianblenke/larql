@@ -41,12 +41,15 @@ mod ple;
 pub mod feature_major_down;
 
 /// Per-block quantisation format for a single tensor in the Q4_K pipeline.
-/// Serde writes / reads the literal strings `"Q4_K"`, `"Q6_K"`, `"Q8_0"`
-/// to match llama.cpp / Ollama on-disk conventions.
+/// Serde writes / reads the on-disk strings (`"Q4_K"`, `"Q5_K"`, `"Q6_K"`,
+/// `"Q8_0"`) to match llama.cpp / Ollama conventions. New formats land
+/// here + as a row in [`crate::quant::registry::QUANT_FORMATS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantBlockFormat {
     #[serde(rename = "Q4_K")]
     Q4K,
+    #[serde(rename = "Q5_K")]
+    Q5K,
     #[serde(rename = "Q6_K")]
     Q6K,
     /// Legacy GGUF 32-element-block 8-bit format. Higher precision
@@ -138,6 +141,7 @@ pub(super) fn try_q4k_passthrough(
     }
     let expected = match target {
         QuantBlockFormat::Q4K => larql_models::quant::ggml::TYPE_Q4_K,
+        QuantBlockFormat::Q5K => larql_models::quant::ggml::TYPE_Q5_K,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::TYPE_Q6_K,
         QuantBlockFormat::Q8_0 => larql_models::quant::ggml::TYPE_Q8_0,
     };
@@ -147,6 +151,7 @@ pub(super) fn try_q4k_passthrough(
     // Sanity-check the byte count matches the (rows, cols) at target format.
     let block_bytes = match target {
         QuantBlockFormat::Q4K => larql_models::quant::ggml::Q4_K_BLOCK_BYTES,
+        QuantBlockFormat::Q5K => larql_models::quant::ggml::Q5_K_BLOCK_BYTES,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::Q6_K_BLOCK_BYTES,
         QuantBlockFormat::Q8_0 => larql_models::quant::ggml::Q8_0_BLOCK_BYTES,
     };
@@ -158,8 +163,8 @@ pub(super) fn try_q4k_passthrough(
 }
 
 /// Source-preserving passthrough: pick the storage format from
-/// whatever the source carries (Q4_K / Q6_K / Q8_0), rather than
-/// requiring the caller to specify a target. Returns
+/// whatever the source carries (Q4_K / Q5_K / Q6_K / Q8_0), rather
+/// than requiring the caller to specify a target. Returns
 /// `(bytes, source_format, rows, cols)` when:
 ///
 /// - the source carries the tensor as raw quant bytes (GGUF-backed)
@@ -167,24 +172,26 @@ pub(super) fn try_q4k_passthrough(
 /// - alignment + byte count check out for that format's block size
 ///
 /// Use this in writer sites where the policy is "store at whatever
-/// precision the source provides" — i.e. preserve Q8_0 instead of
-/// downquantizing to Q4_K. Falls back to `None` (caller dequant +
-/// requantize) for anything that doesn't match.
+/// precision the source provides" — i.e. preserve Q5_K / Q8_0
+/// instead of downquantizing to Q4_K. Falls back to `None` (caller
+/// dequant + requantize) for anything that doesn't match.
 ///
-/// Q4_K uses 256-element super-blocks (144 B); Q6_K is 256/210 B;
-/// **Q8_0 uses 32-element blocks (34 B/block)** — different
-/// alignment constraint, so the check is per-format.
+/// Q4_K / Q5_K / Q6_K share the K-quant 256-element super-block
+/// (144 / 176 / 210 B respectively). **Q8_0 uses 32-element blocks
+/// (34 B/block)** — different alignment constraint, so the check
+/// is per-format.
 pub(super) fn try_preserve_quant_passthrough(
     source: &dyn WeightSource,
     key: &str,
 ) -> Option<(Vec<u8>, QuantBlockFormat, usize, usize)> {
     use larql_models::quant::ggml::{
-        K_QUANT_BLOCK_ELEMS, LEGACY_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-        Q8_0_BLOCK_BYTES, TYPE_Q4_K, TYPE_Q6_K, TYPE_Q8_0,
+        K_QUANT_BLOCK_ELEMS, LEGACY_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES,
+        Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
     };
     let (bytes, ttype, rows, cols) = source.get_quant_raw(key)?;
     let (format, block_elems, block_bytes) = match ttype {
         x if x == TYPE_Q4_K => (QuantBlockFormat::Q4K, K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES),
+        x if x == TYPE_Q5_K => (QuantBlockFormat::Q5K, K_QUANT_BLOCK_ELEMS, Q5_K_BLOCK_BYTES),
         x if x == TYPE_Q6_K => (QuantBlockFormat::Q6K, K_QUANT_BLOCK_ELEMS, Q6_K_BLOCK_BYTES),
         x if x == TYPE_Q8_0 => (QuantBlockFormat::Q8_0, LEGACY_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
         _ => return None,

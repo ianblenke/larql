@@ -90,7 +90,8 @@ pub(super) fn write_deltanet_weights_q4k(
         for key_opt in slots {
             let Some(key) = key_opt else { continue };
 
-            // Tier 1 passthrough: Q4_K source → Q4_K target (bit-exact).
+            // Tier 1: Q4_K source → Q4_K target (bit-exact, imatrix-
+            // preserved). PR #195.
             if let Some((q_bytes, rows, padded_cols)) =
                 try_q4k_passthrough(source, &key, QuantBlockFormat::Q4K)
             {
@@ -107,9 +108,11 @@ pub(super) fn write_deltanet_weights_q4k(
                 continue;
             }
 
-            // Tier 2 passthrough: preserve a higher-precision source
-            // format (Q8_0 most often, for Unsloth Q4_K_M GGUFs)
-            // instead of downquantizing through f32 to Q4_K.
+            // Tier 2: preserve a higher-precision source quant
+            // (Q5_K, Q6_K, Q8_0) instead of downquantizing through f32
+            // to Q4_K. Qwen3-Coder-Next ships attn_qkv / ssm_out as
+            // Q5_K; Unsloth Q4_K_M ships them as Q8_0 — both round-trip
+            // byte-for-byte through this path.
             if let Some((q_bytes, source_format, rows, padded_cols)) =
                 try_preserve_quant_passthrough(source, &key)
             {

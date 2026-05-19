@@ -20,7 +20,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use larql_models::quant::ggml::{dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q6_K, TYPE_Q8_0};
+use larql_models::quant::ggml::{
+    dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+};
 use larql_models::quant::lazy::QuantTensor;
 use larql_models::{ModelArchitecture, ModelWeights};
 use larql_vindex::VectorIndex;
@@ -249,6 +251,7 @@ pub fn populate_deltanet_quant_tensors(
             let (rows, cols) = (shape[0], shape[1]);
             let tensor_type = match *fmt {
                 "Q4_K" => TYPE_Q4_K,
+                "Q5_K" => TYPE_Q5_K,
                 "Q6_K" => TYPE_Q6_K,
                 "Q8_0" => TYPE_Q8_0,
                 _ => continue,
@@ -324,6 +327,7 @@ pub fn populate_attn_quant_tensors(
             let (rows, cols) = (shape[0], shape[1]);
             let tensor_type = match *fmt {
                 "Q4_K" => TYPE_Q4_K,
+                "Q5_K" => TYPE_Q5_K,
                 "Q6_K" => TYPE_Q6_K,
                 "Q8_0" => TYPE_Q8_0,
                 _ => continue,

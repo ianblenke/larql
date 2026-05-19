@@ -78,9 +78,9 @@ pub(super) fn write_attn_weights_q4k(
                 QuantBlockFormat::Q4K
             };
 
-            // Tier 1 passthrough: source already in the requested
-            // target format (e.g. Q4_K GGUF → Q4_K vindex). Bytes go
-            // through unchanged. Preserves imatrix-aware quantization.
+            // Tier 1: source already in the requested target format
+            // (e.g. Q4_K GGUF → Q4_K vindex). Bytes go through
+            // unchanged. Preserves imatrix-aware quantization (PR #195).
             if let Some((q_bytes, rows, padded_cols)) =
                 try_q4k_passthrough(source, key, target_format)
             {
@@ -97,14 +97,13 @@ pub(super) fn write_attn_weights_q4k(
                 continue;
             }
 
-            // Tier 2 passthrough: source carries the tensor at a
-            // **higher**-precision quant (e.g. Q8_0 in Unsloth Q4_K_M
-            // GGUFs for attention weights). Preserve the source format
-            // instead of downquantizing through f32 — the latter loses
-            // ~0.1% per element, compounding through the network. The
-            // loader / forward already handle whatever quant format the
-            // manifest records (the QuantTensor dispatch in
-            // `quant/lazy.rs` covers Q4_K / Q6_K / Q5_K / Q8_0).
+            // Tier 2: source carries the tensor at a higher-precision
+            // quant than the requested target (e.g. Q8_0 / Q5_K in
+            // Unsloth Q4_K_M GGUFs for attention weights). Preserve the
+            // source format instead of downquantizing through f32 —
+            // the latter loses ~0.1% per element, compounding through
+            // the network. The loader / `QuantTensor::matvec` already
+            // dispatch every K-quant family (Q4_K / Q5_K / Q6_K / Q8_0).
             if let Some((q_bytes, source_format, rows, padded_cols)) =
                 try_preserve_quant_passthrough(source, key)
             {
