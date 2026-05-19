@@ -526,6 +526,18 @@ pub fn qwen35_generate_with_sampling(
     let dn_dims = DeltaNetDims::from_arch(arch, eps);
     let attn_dims = Qwen35AttentionDims::from_arch(arch, eps);
 
+    if std::env::var("LARQL_QWEN35_MOE_DUMP").is_ok() {
+        eprintln!(
+            "qwen35_generate: arch family={} is_moe={} n_experts={} top_k={} moe_inter={} weights.layers[0].moe.is_some={}",
+            arch.family(),
+            arch.is_moe(),
+            arch.num_experts(),
+            arch.num_experts_per_token(),
+            arch.moe_intermediate_size(),
+            weights.layers.first().map(|l| l.moe.is_some()).unwrap_or(false),
+        );
+    }
+
     if prompt_ids.is_empty() {
         return GenerateResult::empty_error(crate::layer_graph::generate::GenerateError::Other {
             reason: "prompt_ids is empty".into(),
