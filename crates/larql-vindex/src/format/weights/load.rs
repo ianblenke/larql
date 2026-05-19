@@ -705,8 +705,7 @@ pub fn load_model_weights_q4k_shard(
                         // Use the shared key builder from larql-models so the
                         // loader and `ModelWeights::get_layer_entry_bytes` stay
                         // in lockstep. Drift here causes silent None returns.
-                        for (e, (gu_off, gu_bytes, dn_off, dn_bytes)) in offsets.iter().enumerate()
-                        {
+                        for (e, row) in offsets.iter().enumerate() {
                             // Skip experts outside the owned range [start, end_excl).
                             if let Some((start, end_excl)) = expert_filter {
                                 if e < start || e >= end_excl {
@@ -719,7 +718,7 @@ pub fn load_model_weights_q4k_shard(
                                     e,
                                     larql_models::weights::PER_LAYER_FFN_GATE_UP,
                                 ),
-                                (filename.clone(), *gu_off, *gu_bytes),
+                                (filename.clone(), row.gate_up_offset, row.gate_up_len),
                             );
                             packed_byte_ranges.insert(
                                 larql_models::weights::per_layer_ffn_key(
@@ -727,7 +726,7 @@ pub fn load_model_weights_q4k_shard(
                                     e,
                                     larql_models::weights::PER_LAYER_FFN_DOWN,
                                 ),
-                                (filename.clone(), *dn_off, *dn_bytes),
+                                (filename.clone(), row.down_offset, row.down_len),
                             );
                         }
                         packed_mmaps.insert(filename, mmap);

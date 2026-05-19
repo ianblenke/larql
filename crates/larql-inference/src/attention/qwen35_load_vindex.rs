@@ -421,32 +421,69 @@ pub fn populate_moe_quant_tensors(
                 ),
             )));
         }
-        let tensor_type = match fmt {
-            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q4_K => TYPE_Q4_K,
-            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q6_K => TYPE_Q6_K,
-            other => {
-                return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+        // Per-projection format support (LYRW v2): all entries in a
+        // layer file share the same gate_up/down formats (the writer
+        // makes the decision per-source-format, not per-expert), but
+        // gate_up and down themselves may differ — Coder-Next ships
+        // Q4_K gate/up + Q6_K down across all experts. Read the first
+        // entry's overrides (or fall back to the file-level `fmt` for
+        // LYRW v1 files where overrides are None).
+        let layer_fmt_to_ttype =
+            |lf: larql_vindex::format::weights::write_layers::LayerWeightFormat| match lf {
+                larql_vindex::format::weights::write_layers::LayerWeightFormat::Q4_K => {
+                    Ok(TYPE_Q4_K)
+                }
+                larql_vindex::format::weights::write_layers::LayerWeightFormat::Q5_K => {
+                    Ok(TYPE_Q5_K)
+                }
+                larql_vindex::format::weights::write_layers::LayerWeightFormat::Q6_K => {
+                    Ok(TYPE_Q6_K)
+                }
+                other => Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
                     format!("layers/layer_{layer:02}.weights: format {other:?} unsupported"),
+                ))),
+            };
+        let first = offsets.first().ok_or_else(|| {
+            VindexLoadError::Vindex(larql_vindex::VindexError::Parse(format!(
+                "layers/layer_{layer:02}.weights: no entries"
+            )))
+        })?;
+        let gate_up_fmt = first.gate_up_format;
+        let down_fmt = first.down_format;
+        let gate_up_ttype = layer_fmt_to_ttype(gate_up_fmt)?;
+        let down_ttype = layer_fmt_to_ttype(down_fmt)?;
+        // Sanity: assert all entries agree (the writer guarantees this,
+        // but a future caller that doesn't follow the convention should
+        // fail loudly).
+        for row in &offsets {
+            if row.gate_up_format != gate_up_fmt || row.down_format != down_fmt {
+                return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    format!("layers/layer_{layer:02}.weights: per-entry format drift not yet supported"),
                 )));
             }
-        };
+        }
+        let _ = fmt; // file-level default — informational only when v2 carries overrides
 
-        // Concat all 256 experts' bytes. The writer guarantees
+        // Concat all `num_experts` experts' bytes. The writer guarantees
         // `gate_up_bytes` is `[2 * inter, hidden]` row-major
-        // (gate rows then up rows), so a midpoint byte cut is
-        // safe — row boundaries align to super-block boundaries
-        // for any block-quantised format.
+        // (gate rows then up rows), so a midpoint byte cut is safe —
+        // row boundaries align to super-block boundaries for any
+        // block-quantised format we support.
         let mut packed_gate: Vec<u8> = Vec::new();
         let mut packed_up: Vec<u8> = Vec::new();
         let mut packed_down: Vec<u8> = Vec::new();
         let mut down_len_per_expert: usize = 0;
-        for (gu_off, gu_len, dn_off, dn_len) in &offsets {
-            let gu_end = gu_off.checked_add(*gu_len).ok_or_else(|| {
+        for row in &offsets {
+            let gu_off = row.gate_up_offset;
+            let gu_len = row.gate_up_len;
+            let dn_off = row.down_offset;
+            let dn_len = row.down_len;
+            let gu_end = gu_off.checked_add(gu_len).ok_or_else(|| {
                 VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
                     "expert gate_up byte range overflows usize".into(),
                 ))
             })?;
-            let dn_end = dn_off.checked_add(*dn_len).ok_or_else(|| {
+            let dn_end = dn_off.checked_add(dn_len).ok_or_else(|| {
                 VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
                     "expert down byte range overflows usize".into(),
                 ))
@@ -457,18 +494,22 @@ pub fn populate_moe_quant_tensors(
                 )));
             }
             let half = gu_len / 2;
-            packed_gate.extend_from_slice(&mmap[*gu_off..*gu_off + half]);
-            packed_up.extend_from_slice(&mmap[*gu_off + half..gu_end]);
-            packed_down.extend_from_slice(&mmap[*dn_off..dn_end]);
-            down_len_per_expert = *dn_len;
+            packed_gate.extend_from_slice(&mmap[gu_off..gu_off + half]);
+            packed_up.extend_from_slice(&mmap[gu_off + half..gu_end]);
+            packed_down.extend_from_slice(&mmap[dn_off..dn_end]);
+            down_len_per_expert = dn_len;
         }
 
         // `down` per expert is `[hidden, padded_inter]`. Derive
         // padded_inter from byte count: bytes_per_block × blocks_per_row × hidden.
+        // Use down's tensor_type (not gate_up's) — they may differ.
         let block_elems = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
-        let bytes_per_block = match fmt {
+        let bytes_per_block = match down_fmt {
             larql_vindex::format::weights::write_layers::LayerWeightFormat::Q4_K => {
                 larql_models::quant::ggml::Q4_K_BLOCK_BYTES
+            }
+            larql_vindex::format::weights::write_layers::LayerWeightFormat::Q5_K => {
+                larql_models::quant::ggml::Q5_K_BLOCK_BYTES
             }
             larql_vindex::format::weights::write_layers::LayerWeightFormat::Q6_K => {
                 larql_models::quant::ggml::Q6_K_BLOCK_BYTES
@@ -479,10 +520,15 @@ pub fn populate_moe_quant_tensors(
         let padded_inter = blocks_per_row * block_elems;
 
         let prefix = format!("layers.{layer}.");
-        let gate_qt = QuantTensor::from_raw(packed_gate, tensor_type, num_experts * inter, hidden)?;
-        let up_qt = QuantTensor::from_raw(packed_up, tensor_type, num_experts * inter, hidden)?;
-        let down_qt =
-            QuantTensor::from_raw(packed_down, tensor_type, num_experts * hidden, padded_inter)?;
+        let gate_qt =
+            QuantTensor::from_raw(packed_gate, gate_up_ttype, num_experts * inter, hidden)?;
+        let up_qt = QuantTensor::from_raw(packed_up, gate_up_ttype, num_experts * inter, hidden)?;
+        let down_qt = QuantTensor::from_raw(
+            packed_down,
+            down_ttype,
+            num_experts * hidden,
+            padded_inter,
+        )?;
         weights
             .quant_tensors
             .insert(format!("{prefix}ffn_gate_exps.weight"), gate_qt);

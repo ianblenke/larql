@@ -193,7 +193,10 @@ mod tests {
     fn lookup_unknown_returns_none() {
         // The whole point of the registry: typo'd tags fail loudly at
         // the seam instead of triggering a silent `_ => None` arm.
-        assert!(lookup("Q5_K").is_none());
+        // Q5_K was added 2026-05-19 (PR #197); Q5_M / iq4_xs / etc. still
+        // aren't supported, so they should still return None.
+        assert!(lookup("Q5_M").is_none());
+        assert!(lookup("iq4_xs").is_none());
         assert!(lookup("q4_k").is_none()); // case-sensitive — manifest uses "Q4_K"
         assert!(lookup("").is_none());
     }
