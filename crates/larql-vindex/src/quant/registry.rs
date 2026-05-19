@@ -120,6 +120,16 @@ pub static QUANT_FORMATS: &[QuantFormatInfo] = &[
         row_dot: Some(ggml::q6k_row_dot),
         row_scaled_add: Some(ggml::q6k_row_scaled_add),
     },
+    QuantFormatInfo {
+        tag: "Q8_0",
+        block_elements: ggml::LEGACY_BLOCK_ELEMS,
+        bytes_per_block: ggml::Q8_0_BLOCK_BYTES,
+        dequantize: ggml::dequantize_q8_0,
+        row_dot: Some(ggml::q8_0_row_dot),
+        // No dedicated `q8_0_row_scaled_add` kernel; consumers that
+        // need scaled-add fall back to dequant + ndarray axpy.
+        row_scaled_add: None,
+    },
 ];
 
 /// Look up a format by its on-disk tag (e.g. `"Q4_K"`). Returns

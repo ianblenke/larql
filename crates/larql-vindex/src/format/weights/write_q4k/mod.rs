@@ -41,14 +41,20 @@ mod ple;
 pub mod feature_major_down;
 
 /// Per-block quantisation format for a single tensor in the Q4_K pipeline.
-/// Serde writes / reads the literal strings `"Q4_K"` and `"Q6_K"` to match
-/// llama.cpp / Ollama on-disk conventions.
+/// Serde writes / reads the literal strings `"Q4_K"`, `"Q6_K"`, `"Q8_0"`
+/// to match llama.cpp / Ollama on-disk conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantBlockFormat {
     #[serde(rename = "Q4_K")]
     Q4K,
     #[serde(rename = "Q6_K")]
     Q6K,
+    /// Legacy GGUF 32-element-block 8-bit format. Higher precision
+    /// than Q4_K (2.7 bpw less compression). Used by Unsloth-style
+    /// "Q4_K_M" GGUFs to keep high-importance tensors (attn / lm_head)
+    /// at near-f16 precision while compressing FFN experts.
+    #[serde(rename = "Q8_0")]
+    Q8_0,
 }
 
 /// Pad a row-major f32 buffer to the next multiple of 256 with zeros
@@ -133,6 +139,7 @@ pub(super) fn try_q4k_passthrough(
     let expected = match target {
         QuantBlockFormat::Q4K => larql_models::quant::ggml::TYPE_Q4_K,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::TYPE_Q6_K,
+        QuantBlockFormat::Q8_0 => larql_models::quant::ggml::TYPE_Q8_0,
     };
     if ttype != expected {
         return None;
@@ -141,12 +148,55 @@ pub(super) fn try_q4k_passthrough(
     let block_bytes = match target {
         QuantBlockFormat::Q4K => larql_models::quant::ggml::Q4_K_BLOCK_BYTES,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::Q6_K_BLOCK_BYTES,
+        QuantBlockFormat::Q8_0 => larql_models::quant::ggml::Q8_0_BLOCK_BYTES,
     };
     let expected_bytes = rows * (cols / block) * block_bytes;
     if bytes.len() != expected_bytes {
         return None;
     }
     Some((bytes, rows, cols))
+}
+
+/// Source-preserving passthrough: pick the storage format from
+/// whatever the source carries (Q4_K / Q6_K / Q8_0), rather than
+/// requiring the caller to specify a target. Returns
+/// `(bytes, source_format, rows, cols)` when:
+///
+/// - the source carries the tensor as raw quant bytes (GGUF-backed)
+/// - the source tensor_type is one we know how to store
+/// - alignment + byte count check out for that format's block size
+///
+/// Use this in writer sites where the policy is "store at whatever
+/// precision the source provides" — i.e. preserve Q8_0 instead of
+/// downquantizing to Q4_K. Falls back to `None` (caller dequant +
+/// requantize) for anything that doesn't match.
+///
+/// Q4_K uses 256-element super-blocks (144 B); Q6_K is 256/210 B;
+/// **Q8_0 uses 32-element blocks (34 B/block)** — different
+/// alignment constraint, so the check is per-format.
+pub(super) fn try_preserve_quant_passthrough(
+    source: &dyn WeightSource,
+    key: &str,
+) -> Option<(Vec<u8>, QuantBlockFormat, usize, usize)> {
+    use larql_models::quant::ggml::{
+        K_QUANT_BLOCK_ELEMS, LEGACY_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+        Q8_0_BLOCK_BYTES, TYPE_Q4_K, TYPE_Q6_K, TYPE_Q8_0,
+    };
+    let (bytes, ttype, rows, cols) = source.get_quant_raw(key)?;
+    let (format, block_elems, block_bytes) = match ttype {
+        x if x == TYPE_Q4_K => (QuantBlockFormat::Q4K, K_QUANT_BLOCK_ELEMS, Q4_K_BLOCK_BYTES),
+        x if x == TYPE_Q6_K => (QuantBlockFormat::Q6K, K_QUANT_BLOCK_ELEMS, Q6_K_BLOCK_BYTES),
+        x if x == TYPE_Q8_0 => (QuantBlockFormat::Q8_0, LEGACY_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
+        _ => return None,
+    };
+    if !cols.is_multiple_of(block_elems) {
+        return None;
+    }
+    let expected_bytes = rows * (cols / block_elems) * block_bytes;
+    if bytes.len() != expected_bytes {
+        return None;
+    }
+    Some((bytes, format, rows, cols))
 }
 
 /// Resolve the V tensor for a layer in the Q4_K writer.

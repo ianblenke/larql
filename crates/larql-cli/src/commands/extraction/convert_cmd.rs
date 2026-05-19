@@ -480,27 +480,48 @@ fn run_gguf_to_vindex(
     let gguf_file = larql_models::loading::gguf::GgufFile::open(input)?;
 
     // Lazy keys: 3-D MoE expert tensors (per-expert HF aliases, post #120)
-    // PLUS 2-D Q4_K / Q6_K tensors so their raw GGUF bytes are preserved
-    // in `quant_tensors` for the Q4_K writer's bit-passthrough fast path
-    // (PR #194 finding: re-quantizing imatrix-aware GGUFs through f32
-    // diverges by ~0.1% per element, compounding through the network).
-    use larql_models::quant::ggml::{TYPE_Q4_K, TYPE_Q6_K};
+    // PLUS 2-D **quantised** tensors so their raw GGUF bytes are preserved
+    // in `quant_tensors` for the Q4_K writer's bit-passthrough fast paths
+    // (PR #194/#195: re-quantizing imatrix-aware GGUFs through f32 diverges
+    // by ~0.1% per element; Unsloth Q4_K_M ships attn / lm_head / shared
+    // experts as Q8_0 specifically to keep them at near-f16 precision —
+    // they must round-trip as Q8_0, NOT get downquantized to Q4_K).
+    use larql_models::quant::ggml::{TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
     let moe_lazy_keys: std::collections::HashSet<String> = gguf_file
         .tensor_infos
         .iter()
         .filter(|info| {
+            // Exclude the input embed and output (lm_head). They have
+            // special-cased extract paths (`write_embeddings`,
+            // `write_lm_head_q4k`) that assume `weights.embed` /
+            // `weights.lm_head` are populated as dense f32 — the lazy
+            // loader instead steers them into `embed_quant` /
+            // `lm_head_quant` and zeroes the dense field, which makes
+            // the existing writers emit 0-byte files. The passthrough
+            // optimisation only matters for the per-layer matmuls
+            // (attn / deltanet) anyway; vocab-sized embed/lm_head
+            // matmuls are 1-shot per forward, not the per-layer
+            // compounding drift source.
+            let name = info.name();
+            if name == "token_embd.weight" || name == "output.weight" || name == "lm_head.weight" {
+                return false;
+            }
             (info.dims().len() == 3
-                && (info.name().ends_with("ffn_gate_exps.weight")
-                    || info.name().ends_with("ffn_up_exps.weight")
-                    || info.name().ends_with("ffn_down_exps.weight")))
-                || (info.dims().len() == 2 && matches!(info.tensor_type(), TYPE_Q4_K | TYPE_Q6_K))
+                && (name.ends_with("ffn_gate_exps.weight")
+                    || name.ends_with("ffn_up_exps.weight")
+                    || name.ends_with("ffn_down_exps.weight")))
+                || (info.dims().len() == 2
+                    && matches!(
+                        info.tensor_type(),
+                        TYPE_Q4_K | TYPE_Q6_K | TYPE_Q5_K | TYPE_Q8_0
+                    ))
         })
         .map(|info| larql_models::loading::gguf::normalize_gguf_key(info.name()))
         .collect();
 
     let weights = if !moe_lazy_keys.is_empty() {
         eprintln!(
-            "  Lazy loader: {} tensors (3-D MoE experts + 2-D Q4_K/Q6_K matmuls)",
+            "  Lazy loader: {} tensors (3-D MoE experts + 2-D quantised matmuls)",
             moe_lazy_keys.len()
         );
         larql_models::loading::gguf::load_gguf_lazy_tensors(input, &moe_lazy_keys)?
