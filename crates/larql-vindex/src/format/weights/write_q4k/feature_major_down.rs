@@ -73,9 +73,10 @@ impl FeatureMajorDownState {
             QuantBlockFormat::Q6K => quantize_q6_k(&fm_padded),
             QuantBlockFormat::Q4K => quantize_q4_k(&fm_padded),
             // feature_major_down only emits Q4_K / Q6_K (the formats
-            // it's called with by the FFN writer). Q5_K / Q8_0 storage
-            // is attn/deltanet-only for now and never reaches this site.
-            QuantBlockFormat::Q5K | QuantBlockFormat::Q8_0 => {
+            // it's called with by the FFN writer). Q5_K / Q8_0 / MXFP4
+            // storage is attn/deltanet-only for now and never reaches
+            // this site.
+            QuantBlockFormat::Q5K | QuantBlockFormat::Q8_0 | QuantBlockFormat::Mxfp4 => {
                 return Err(VindexError::Parse(format!(
                     "feature_major_down does not yet support {:?} storage",
                     format,

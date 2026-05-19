@@ -396,6 +396,27 @@ impl QuantTensor {
                     out_slice[r] = acc;
                 }
             }
+            crate::quant::ggml::TYPE_MXFP4 => {
+                // GGUF interleaved MXFP4: 17 B per 32-element block
+                // ([scale: u8 E8M0, 16 × u8 nibbles]). No dedicated
+                // matvec kernel yet — dequantize each row to f32 and
+                // do a scalar dot. Only used for `ffn_*_shexp.weight`
+                // on Qwen3-Coder-Next (one shared-expert pair per
+                // layer × 48 layers = 96 tensors), which is one
+                // matvec per token per layer — small enough to live
+                // with the dequant cost until a fused kernel arrives.
+                use rayon::prelude::*;
+                let rb = self.row_bytes;
+                let data = view_bytes;
+                let cols = self.cols;
+                let tensor_type = self.tensor_type;
+                out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                    let row = &data[r * rb..(r + 1) * rb];
+                    let deq = crate::quant::ggml::dequantize(row, tensor_type, cols)
+                        .expect("dequantize_mxfp4 row");
+                    *out_r = deq.iter().zip(x_slice).map(|(a, b)| a * b).sum();
+                });
+            }
             other => {
                 return Err(ModelError::Parse(format!(
                     "QuantTensor::matvec: unsupported tensor type id {other} ({})",

@@ -58,6 +58,11 @@ pub enum QuantBlockFormat {
     /// at near-f16 precision while compressing FFN experts.
     #[serde(rename = "Q8_0")]
     Q8_0,
+    /// GGUF interleaved MXFP4 — 17 B per 32-element block. Used by
+    /// Qwen3-Coder-Next's `ffn_*_shexp.weight` (shared-expert gate/up).
+    /// Block size 32 — alignment constraint differs from K-quants.
+    #[serde(rename = "MXFP4")]
+    Mxfp4,
 }
 
 /// Pad a row-major f32 buffer to the next multiple of 256 with zeros
@@ -144,6 +149,7 @@ pub(super) fn try_q4k_passthrough(
         QuantBlockFormat::Q5K => larql_models::quant::ggml::TYPE_Q5_K,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::TYPE_Q6_K,
         QuantBlockFormat::Q8_0 => larql_models::quant::ggml::TYPE_Q8_0,
+        QuantBlockFormat::Mxfp4 => larql_models::quant::ggml::TYPE_MXFP4,
     };
     if ttype != expected {
         return None;
@@ -154,6 +160,7 @@ pub(super) fn try_q4k_passthrough(
         QuantBlockFormat::Q5K => larql_models::quant::ggml::Q5_K_BLOCK_BYTES,
         QuantBlockFormat::Q6K => larql_models::quant::ggml::Q6_K_BLOCK_BYTES,
         QuantBlockFormat::Q8_0 => larql_models::quant::ggml::Q8_0_BLOCK_BYTES,
+        QuantBlockFormat::Mxfp4 => larql_models::quant::ggml::MXFP4_BLOCK_BYTES,
     };
     let expected_bytes = rows * (cols / block) * block_bytes;
     if bytes.len() != expected_bytes {
@@ -185,8 +192,9 @@ pub(super) fn try_preserve_quant_passthrough(
     key: &str,
 ) -> Option<(Vec<u8>, QuantBlockFormat, usize, usize)> {
     use larql_models::quant::ggml::{
-        K_QUANT_BLOCK_ELEMS, LEGACY_BLOCK_ELEMS, Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES,
-        Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+        K_QUANT_BLOCK_ELEMS, LEGACY_BLOCK_ELEMS, MXFP4_BLOCK_BYTES, MXFP4_BLOCK_ELEMS,
+        Q4_K_BLOCK_BYTES, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, TYPE_MXFP4,
+        TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
     };
     let (bytes, ttype, rows, cols) = source.get_quant_raw(key)?;
     let (format, block_elems, block_bytes) = match ttype {
@@ -194,6 +202,7 @@ pub(super) fn try_preserve_quant_passthrough(
         x if x == TYPE_Q5_K => (QuantBlockFormat::Q5K, K_QUANT_BLOCK_ELEMS, Q5_K_BLOCK_BYTES),
         x if x == TYPE_Q6_K => (QuantBlockFormat::Q6K, K_QUANT_BLOCK_ELEMS, Q6_K_BLOCK_BYTES),
         x if x == TYPE_Q8_0 => (QuantBlockFormat::Q8_0, LEGACY_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
+        x if x == TYPE_MXFP4 => (QuantBlockFormat::Mxfp4, MXFP4_BLOCK_ELEMS, MXFP4_BLOCK_BYTES),
         _ => return None,
     };
     if !cols.is_multiple_of(block_elems) {

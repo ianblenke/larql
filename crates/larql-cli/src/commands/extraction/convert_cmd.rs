@@ -487,7 +487,9 @@ fn run_gguf_to_vindex(
     // shared experts as Q8_0; Qwen3-Coder-Next ships attn_qkv / ssm_out as
     // Q5_K — they must round-trip in their source format, NOT get
     // downquantized to Q4_K).
-    use larql_models::quant::ggml::{TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
+    use larql_models::quant::ggml::{
+        TYPE_MXFP4, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+    };
     let moe_lazy_keys: std::collections::HashSet<String> = gguf_file
         .tensor_infos
         .iter()
@@ -514,7 +516,7 @@ fn run_gguf_to_vindex(
                 || (info.dims().len() == 2
                     && matches!(
                         info.tensor_type(),
-                        TYPE_Q4_K | TYPE_Q5_K | TYPE_Q6_K | TYPE_Q8_0
+                        TYPE_Q4_K | TYPE_Q5_K | TYPE_Q6_K | TYPE_Q8_0 | TYPE_MXFP4
                     ))
         })
         .map(|info| larql_models::loading::gguf::normalize_gguf_key(info.name()))
@@ -522,7 +524,7 @@ fn run_gguf_to_vindex(
 
     let weights = if !moe_lazy_keys.is_empty() {
         eprintln!(
-            "  Lazy loader: {} tensors (3-D MoE experts + 2-D Q4_K/Q5_K/Q6_K/Q8_0 matmuls)",
+            "  Lazy loader: {} tensors (3-D MoE experts + 2-D Q4_K/Q5_K/Q6_K/Q8_0/MXFP4 matmuls)",
             moe_lazy_keys.len()
         );
         larql_models::loading::gguf::load_gguf_lazy_tensors(input, &moe_lazy_keys)?
