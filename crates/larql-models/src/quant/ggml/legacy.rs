@@ -204,6 +204,37 @@ pub fn dequantize_q5_0(data: &[u8], n_elements: usize) -> Result<Vec<f32>, Model
     Ok(out)
 }
 
+/// Q5_1: block = f16 scale (2B) + f16 min (2B) + 4 bytes high bits + 16 bytes low nibbles.
+/// combined = lo4 | (hi1 << 4), value = combined * scale + min
+pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
+    let block_size = 24;
+    let n_blocks = check_block_input("Q5_1", data, n_elements, 32, block_size)?;
+    let mut out = Vec::with_capacity(n_elements);
+
+    for i in 0..n_blocks {
+        let block = &data[i * block_size..(i + 1) * block_size];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let high_bits = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let quants = &block[8..];
+
+        for (j, &byte) in quants[..16].iter().enumerate() {
+            let lo_lo4 = byte & 0x0F;
+            let hi_lo4 = (byte >> 4) & 0x0F;
+
+            let lo_hi1 = ((high_bits >> (j * 2)) & 1) as u8;
+            let hi_hi1 = ((high_bits >> (j * 2 + 1)) & 1) as u8;
+
+            let lo_combined = lo_lo4 | (lo_hi1 << 4);
+            let hi_combined = hi_lo4 | (hi_hi1 << 4);
+
+            out.push(lo_combined as f32 * scale + min);
+            out.push(hi_combined as f32 * scale + min);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,35 +275,4 @@ mod tests {
         let x = vec![0.0_f32; 33];
         assert!(q8_0_row_dot(&data, &x).is_err());
     }
-}
-
-/// Q5_1: block = f16 scale (2B) + f16 min (2B) + 4 bytes high bits + 16 bytes low nibbles.
-/// combined = lo4 | (hi1 << 4), value = combined * scale + min
-pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Result<Vec<f32>, ModelError> {
-    let block_size = 24;
-    let n_blocks = check_block_input("Q5_1", data, n_elements, 32, block_size)?;
-    let mut out = Vec::with_capacity(n_elements);
-
-    for i in 0..n_blocks {
-        let block = &data[i * block_size..(i + 1) * block_size];
-        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
-        let high_bits = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        let quants = &block[8..];
-
-        for (j, &byte) in quants[..16].iter().enumerate() {
-            let lo_lo4 = byte & 0x0F;
-            let hi_lo4 = (byte >> 4) & 0x0F;
-
-            let lo_hi1 = ((high_bits >> (j * 2)) & 1) as u8;
-            let hi_hi1 = ((high_bits >> (j * 2 + 1)) & 1) as u8;
-
-            let lo_combined = lo_lo4 | (lo_hi1 << 4);
-            let hi_combined = hi_lo4 | (hi_hi1 << 4);
-
-            out.push(lo_combined as f32 * scale + min);
-            out.push(hi_combined as f32 * scale + min);
-        }
-    }
-    Ok(out)
 }

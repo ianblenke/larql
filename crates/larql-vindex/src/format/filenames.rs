@@ -93,6 +93,17 @@ pub const ATTN_WEIGHTS_Q8_MANIFEST_JSON: &str = "attn_weights_q8_manifest.json";
 pub const DELTANET_WEIGHTS_Q4K_BIN: &str = "deltanet_weights_q4k.bin";
 pub const DELTANET_WEIGHTS_Q4K_MANIFEST_JSON: &str = "deltanet_weights_q4k_manifest.json";
 
+// ── Shared-expert weights (§5.12) ──────────────────────────────────────
+//
+// Per-layer shared-expert gate / up / down projections for MoE arches
+// that ship a shared expert alongside the routed top-K (Qwen 3.6 35B-A3B,
+// Qwen3-Coder-Next, future Kimi Linear). Each layer contributes 3
+// manifest entries (gate, up, down) with per-projection format strings —
+// reuses `Q4kManifestEntry` schema. File is absent on dense / non-shexp
+// MoE arches.
+pub const SHEXP_WEIGHTS_Q4K_BIN: &str = "shexp_weights_q4k.bin";
+pub const SHEXP_WEIGHTS_Q4K_MANIFEST_JSON: &str = "shexp_weights_q4k_manifest.json";
+
 // ── Per-layer FFN weights (§5.12) ──────────────────────────────────────
 //
 // Unified format for both dense and MoE FFN weights. One file per layer.

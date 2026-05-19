@@ -257,6 +257,18 @@ fn load_qwen35_moe_ffn(
         });
     }
 
+    // Shared-expert per-feature sigmoid gate, optional. Lives in
+    // `weights.vectors` (1D F32 [hidden]). Both Qwen 3.6 35B-A3B and
+    // Coder-Next ship `ffn_gate_inp_shexp.weight`; without applying it
+    // as `sigmoid(x · gate_inp) * shared_output`, the shared expert
+    // adds an over-amplified contribution that destabilises the
+    // token distribution. arch.shared_expert_gate_inp_key() exposes
+    // the key; the default impl returns None for arches without one.
+    let shexp_gate_inp: Option<Arc<[f32]>> = weights
+        .vectors
+        .get(&key("ffn_gate_inp_shexp.weight"))
+        .map(|v| Arc::from(v.clone()));
+
     Ok(Qwen35MoeFfnWeights {
         router,
         gate_exps,
@@ -265,6 +277,7 @@ fn load_qwen35_moe_ffn(
         shexp_gate,
         shexp_up,
         shexp_down,
+        shexp_gate_inp,
         num_experts,
         top_k,
     })

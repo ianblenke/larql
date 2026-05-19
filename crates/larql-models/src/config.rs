@@ -647,6 +647,15 @@ pub trait ModelArchitecture: Send + Sync {
         None
     }
 
+    /// Per-feature sigmoid gate applied to the shared-expert output
+    /// (HF Qwen3MoeSparseMoeBlock's `shared_expert_gate` 1-D row).
+    /// Qwen 3.6 35B-A3B and Qwen3-Coder-Next both ship one at
+    /// `ffn_gate_inp_shexp.weight`. Default: `None` for arches
+    /// without an explicit gate.
+    fn shared_expert_gate_inp_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
     // ── Hybrid MoE (Gemma 4 A4B: dense MLP + expert block summed per layer) ──
 
     /// Whether this model has a hybrid dense-MLP + expert block per layer.

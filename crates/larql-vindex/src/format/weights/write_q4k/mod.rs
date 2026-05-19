@@ -37,6 +37,7 @@ mod lm_head;
 mod moe_layers;
 mod norms;
 mod ple;
+mod shexp;
 
 pub mod feature_major_down;
 
@@ -202,7 +203,11 @@ pub(super) fn try_preserve_quant_passthrough(
         x if x == TYPE_Q5_K => (QuantBlockFormat::Q5K, K_QUANT_BLOCK_ELEMS, Q5_K_BLOCK_BYTES),
         x if x == TYPE_Q6_K => (QuantBlockFormat::Q6K, K_QUANT_BLOCK_ELEMS, Q6_K_BLOCK_BYTES),
         x if x == TYPE_Q8_0 => (QuantBlockFormat::Q8_0, LEGACY_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
-        x if x == TYPE_MXFP4 => (QuantBlockFormat::Mxfp4, MXFP4_BLOCK_ELEMS, MXFP4_BLOCK_BYTES),
+        x if x == TYPE_MXFP4 => (
+            QuantBlockFormat::Mxfp4,
+            MXFP4_BLOCK_ELEMS,
+            MXFP4_BLOCK_BYTES,
+        ),
         _ => return None,
     };
     if !cols.is_multiple_of(block_elems) {
@@ -299,6 +304,7 @@ pub fn write_model_weights_q4k_with_opts(
     deltanet::write_deltanet_weights_q4k(source, dir, num_layers, callbacks)?;
     ffn::write_interleaved_ffn_q4k(source, dir, num_layers, opts, callbacks)?;
     moe_layers::write_per_layer_moe_q4k(source, dir, num_layers)?;
+    shexp::write_shexp_weights_q4k(source, dir, num_layers)?;
     let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;
     ple::write_ple_weights(source, dir, num_layers, &mut entries)?;
     lm_head::write_lm_head_q4k(source, dir, &mut entries)?;

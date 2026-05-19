@@ -56,6 +56,14 @@ pub struct Qwen35MoeFfnWeights {
     pub shexp_gate: Option<larql_models::quant::lazy::QuantTensor>,
     pub shexp_up: Option<larql_models::quant::lazy::QuantTensor>,
     pub shexp_down: Option<larql_models::quant::lazy::QuantTensor>,
+    /// Per-feature sigmoid gate for the shared expert.
+    /// `ffn_gate_inp_shexp.weight` (1D F32 [hidden]). Applied as
+    /// `y_moe += sigmoid(x · shexp_gate_inp) * swiglu(shexp...)(x)`.
+    /// Without this gate, the shared expert contribution is
+    /// uncontrolled and produces noticeable token-distribution noise
+    /// at every layer. Some Qwen MoE variants ship without it (None
+    /// → unweighted addition fallback, the legacy path).
+    pub shexp_gate_inp: Option<Arc<[f32]>>,
     pub num_experts: usize,
     pub top_k: usize,
 }
@@ -256,6 +264,7 @@ pub fn qwen35_forward_step(
                 moe.shexp_gate.as_ref(),
                 moe.shexp_up.as_ref(),
                 moe.shexp_down.as_ref(),
+                moe.shexp_gate_inp.as_deref(),
                 moe.num_experts,
                 moe.top_k,
                 weights.backend.as_deref(),
@@ -543,6 +552,7 @@ fn swiglu_moe_lazy(
     shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
     shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
     shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_gate_inp: Option<&[f32]>,
     num_experts: usize,
     top_k: usize,
     backend: Option<&dyn larql_compute::ComputeBackend>,
@@ -586,10 +596,7 @@ fn swiglu_moe_lazy(
     let weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
 
     if std::env::var("LARQL_QWEN35_MOE_DUMP").is_ok() {
-        eprintln!(
-            "MOE weights: {:?} (sum={:.4})",
-            weights, sum_exp,
-        );
+        eprintln!("MOE weights: {:?} (sum={:.4})", weights, sum_exp,);
     }
 
     // 4. Per-expert SwiGLU. Each expert_slice is a zero-copy view of
@@ -653,9 +660,20 @@ fn swiglu_moe_lazy(
         }
     }
 
-    // 5. Shared expert (always-on, no routing weight). Some Qwen MoE
-    //    variants ship without one — in which case the parameters are
-    //    `None` and we skip.
+    // 5. Shared expert (always-on, sigmoid-gated). Some Qwen MoE
+    //    variants ship without one — `None` skips the whole branch.
+    //    When the per-feature `shexp_gate_inp` is present (Qwen 3.6
+    //    35B-A3B + Coder-Next both ship one as
+    //    `ffn_gate_inp_shexp.weight`, 1D F32 [hidden]), apply the
+    //    HF Qwen3MoeSparseMoeBlock pattern:
+    //
+    //        gate_scalar = sigmoid(x · shexp_gate_inp)
+    //        y_moe += gate_scalar * swiglu(shexp_gate, shexp_up, shexp_down)(x)
+    //
+    //    Without the sigmoid scaling, the shared expert dumps an
+    //    over-amplified contribution into the residual every layer,
+    //    producing visible token-distribution noise on Qwen3-Coder-
+    //    Next greedy completions (verified empirically).
     if let (Some(g), Some(u), Some(d)) = (shexp_gate, shexp_up, shexp_down) {
         let y_shared = swiglu_ffn_lazy(
             x,
@@ -667,8 +685,15 @@ fn swiglu_moe_lazy(
             &empty_2d,
             backend,
         );
+        let gate_scalar = match shexp_gate_inp {
+            Some(w) => {
+                let dot: f32 = x.iter().zip(w).map(|(a, b)| a * b).sum();
+                1.0 / (1.0 + (-dot).exp())
+            }
+            None => 1.0, // legacy unweighted addition for arches without an explicit gate
+        };
         for h in 0..hidden {
-            y_moe[h] += y_shared[h];
+            y_moe[h] += gate_scalar * y_shared[h];
         }
     }
 
@@ -1042,6 +1067,7 @@ mod tests {
             Some(&shexp_g),
             Some(&shexp_u),
             Some(&shexp_d),
+            None, // no per-feature sigmoid gate → unweighted shexp (legacy)
             num_experts,
             top_k,
             None, // CPU path through QuantTensor::matvec
@@ -1093,6 +1119,7 @@ mod tests {
             None,
             None,
             None,
+            None, // no shexp_gate_inp — branch is dead when shexp_* are None anyway
             num_experts,
             top_k,
             None,
