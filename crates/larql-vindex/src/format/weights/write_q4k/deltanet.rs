@@ -37,7 +37,9 @@ use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
 use super::super::write_f32::WeightSource;
-use super::{pad_rows_to_block, try_q4k_passthrough, QuantBlockFormat};
+use super::{
+    pad_rows_to_block, try_preserve_quant_passthrough, try_q4k_passthrough, QuantBlockFormat,
+};
 
 /// Write per-linear-attention-layer DeltaNet matmul tensors to
 /// `deltanet_weights_q4k.bin`. Emits one manifest entry per present
@@ -88,8 +90,7 @@ pub(super) fn write_deltanet_weights_q4k(
         for key_opt in slots {
             let Some(key) = key_opt else { continue };
 
-            // Bit-passthrough fast path — see [`super::try_q4k_passthrough`].
-            // Preserves imatrix-aware quantization of GGUF source tensors.
+            // Tier 1 passthrough: Q4_K source → Q4_K target (bit-exact).
             if let Some((q_bytes, rows, padded_cols)) =
                 try_q4k_passthrough(source, &key, QuantBlockFormat::Q4K)
             {
@@ -99,6 +100,25 @@ pub(super) fn write_deltanet_weights_q4k(
                     key,
                     shape: vec![rows, padded_cols],
                     format: QuantBlockFormat::Q4K,
+                    offset: dn_offset,
+                    length,
+                });
+                dn_offset += length;
+                continue;
+            }
+
+            // Tier 2 passthrough: preserve a higher-precision source
+            // format (Q8_0 most often, for Unsloth Q4_K_M GGUFs)
+            // instead of downquantizing through f32 to Q4_K.
+            if let Some((q_bytes, source_format, rows, padded_cols)) =
+                try_preserve_quant_passthrough(source, &key)
+            {
+                dn_file.write_all(&q_bytes)?;
+                let length = q_bytes.len() as u64;
+                dn_manifest.push(Q4kManifestEntry {
+                    key,
+                    shape: vec![rows, padded_cols],
+                    format: source_format,
                     offset: dn_offset,
                     length,
                 });

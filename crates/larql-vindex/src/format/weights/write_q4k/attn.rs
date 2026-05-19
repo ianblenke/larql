@@ -12,7 +12,10 @@ use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
 use super::super::write_f32::WeightSource;
-use super::{pad_rows_to_block, resolve_v_tensor, try_q4k_passthrough, QuantBlockFormat};
+use super::{
+    pad_rows_to_block, resolve_v_tensor, try_preserve_quant_passthrough, try_q4k_passthrough,
+    QuantBlockFormat,
+};
 
 /// Write Q/K/V/O attention projections to `attn_weights_q4k.bin`,
 /// emitting a sidecar manifest with per-tensor offsets and formats.
@@ -69,29 +72,57 @@ pub(super) fn write_attn_weights_q4k(
         for (i, (key, tensor)) in slots.iter().enumerate() {
             // V (index 2) gets Q6_K, others get Q4_K.
             let is_v = i == 2;
-            let format = if is_v {
+            let target_format = if is_v {
                 QuantBlockFormat::Q6K
             } else {
                 QuantBlockFormat::Q4K
             };
 
-            // Bit-passthrough fast path: when the source carries the
-            // tensor as raw GGUF Q4_K/Q6_K bytes in the matching
-            // format with no row-padding needed, copy bytes directly.
-            // Preserves imatrix-aware quantization (PR #194).
-            if let Some((q_bytes, rows, padded_cols)) = try_q4k_passthrough(source, key, format) {
+            // Tier 1 passthrough: source already in the requested
+            // target format (e.g. Q4_K GGUF → Q4_K vindex). Bytes go
+            // through unchanged. Preserves imatrix-aware quantization.
+            if let Some((q_bytes, rows, padded_cols)) =
+                try_q4k_passthrough(source, key, target_format)
+            {
                 attn_file.write_all(&q_bytes)?;
                 let length = q_bytes.len() as u64;
                 attn_manifest.push(Q4kManifestEntry {
                     key: key.to_string(),
                     shape: vec![rows, padded_cols],
-                    format,
+                    format: target_format,
                     offset: attn_offset,
                     length,
                 });
                 attn_offset += length;
                 continue;
             }
+
+            // Tier 2 passthrough: source carries the tensor at a
+            // **higher**-precision quant (e.g. Q8_0 in Unsloth Q4_K_M
+            // GGUFs for attention weights). Preserve the source format
+            // instead of downquantizing through f32 — the latter loses
+            // ~0.1% per element, compounding through the network. The
+            // loader / forward already handle whatever quant format the
+            // manifest records (the QuantTensor dispatch in
+            // `quant/lazy.rs` covers Q4_K / Q6_K / Q5_K / Q8_0).
+            if let Some((q_bytes, source_format, rows, padded_cols)) =
+                try_preserve_quant_passthrough(source, key)
+            {
+                attn_file.write_all(&q_bytes)?;
+                let length = q_bytes.len() as u64;
+                attn_manifest.push(Q4kManifestEntry {
+                    key: key.to_string(),
+                    shape: vec![rows, padded_cols],
+                    format: source_format,
+                    offset: attn_offset,
+                    length,
+                });
+                attn_offset += length;
+                continue;
+            }
+            // Keep `format` available below for the dequant+requant
+            // fallback (still Q4_K / Q6_K depending on slot index).
+            let format = target_format;
 
             let (data, rows, cols) = match tensor {
                 Some(t) => t.clone(),
