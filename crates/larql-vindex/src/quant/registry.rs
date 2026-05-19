@@ -143,6 +143,16 @@ pub static QUANT_FORMATS: &[QuantFormatInfo] = &[
         // need scaled-add fall back to dequant + ndarray axpy.
         row_scaled_add: None,
     },
+    QuantFormatInfo {
+        tag: "MXFP4",
+        block_elements: ggml::MXFP4_BLOCK_ELEMS,
+        bytes_per_block: ggml::MXFP4_BLOCK_BYTES,
+        dequantize: ggml::dequantize_mxfp4,
+        // No f32-input MXFP4 matvec kernel yet; `QuantTensor::matvec`
+        // dispatches MXFP4 via per-row dequant + scalar dot.
+        row_dot: None,
+        row_scaled_add: None,
+    },
 ];
 
 /// Look up a format by its on-disk tag (e.g. `"Q4_K"`). Returns
