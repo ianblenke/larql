@@ -100,6 +100,55 @@ pub(super) fn pad_rows_to_block(data: &[f32], rows: usize, cols: usize) -> (Vec<
     (out, padded_cols)
 }
 
+/// Try a bit-exact passthrough of GGUF Q4_K (or Q6_K) bytes from
+/// `source` into the writer when:
+///
+/// - the source carries the tensor as raw quant bytes (GGUF-backed)
+/// - the source's tensor_type matches the writer's target format
+/// - `cols` is already a multiple of the super-block size (256) so
+///   no row-padding is needed
+///
+/// Returns `Some((bytes, rows, cols))` on a successful passthrough.
+/// `None` falls back to the legacy dequant → re-quantize path
+/// (`quantize_q4_k(pad_rows_to_block(get_tensor(...)))`).
+///
+/// Imatrix-aware quantizers (Unsloth, TheBloke 2026, Qwen team)
+/// pick per-block scales informed by a calibration dataset's
+/// activation distribution. Our naïve `quantize_q4_k` doesn't have
+/// that signal — it minimizes per-block reconstruction error in
+/// f32 space. The two produce ~0.1% per-element divergence, which
+/// compounds through 40 layers × ~5 matmuls/layer into the residual
+/// stream and breaks chat-completion coherence by L31 on Qwen 3.6
+/// 35B-A3B (per PR #194's bisection).
+pub(super) fn try_q4k_passthrough(
+    source: &dyn WeightSource,
+    key: &str,
+    target: QuantBlockFormat,
+) -> Option<(Vec<u8>, usize, usize)> {
+    let (bytes, ttype, rows, cols) = source.get_quant_raw(key)?;
+    let block = larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+    if !cols.is_multiple_of(block) {
+        return None;
+    }
+    let expected = match target {
+        QuantBlockFormat::Q4K => larql_models::quant::ggml::TYPE_Q4_K,
+        QuantBlockFormat::Q6K => larql_models::quant::ggml::TYPE_Q6_K,
+    };
+    if ttype != expected {
+        return None;
+    }
+    // Sanity-check the byte count matches the (rows, cols) at target format.
+    let block_bytes = match target {
+        QuantBlockFormat::Q4K => larql_models::quant::ggml::Q4_K_BLOCK_BYTES,
+        QuantBlockFormat::Q6K => larql_models::quant::ggml::Q6_K_BLOCK_BYTES,
+    };
+    let expected_bytes = rows * (cols / block) * block_bytes;
+    if bytes.len() != expected_bytes {
+        return None;
+    }
+    Some((bytes, rows, cols))
+}
+
 /// Resolve the V tensor for a layer in the Q4_K writer.
 ///
 /// When `v_proj` is absent from the source (e.g. Gemma 4 31B global

@@ -87,6 +87,21 @@ pub trait WeightSource {
     /// Raw BF16 bytes for a packed expert tensor (e.g. Gemma 4 experts.gate_up_proj).
     /// Returns None if the key is absent or the tensor is not BF16.
     fn get_packed_bf16(&self, key: &str) -> Option<Vec<u8>>;
+
+    /// Raw quantised bytes for a tensor when the source carries it in
+    /// its native GGUF form (e.g. Q4_K / Q6_K from a GGUF GGML loader).
+    /// Returns `Some((bytes, tensor_type, rows, cols))`.
+    ///
+    /// Used by the Q4_K writer to **bit-passthrough** original GGUF
+    /// quants instead of round-tripping through f32 — preserves
+    /// imatrix-aware quantisation choices that the naive
+    /// `quantize_q4_k` re-quantizer would otherwise discard.
+    ///
+    /// Default: `None` (legacy: dequant→requant). Sources that carry
+    /// raw quant bytes (GGUF-backed `ModelWeights`) override this.
+    fn get_quant_raw(&self, _key: &str) -> Option<(Vec<u8>, u32, usize, usize)> {
+        None
+    }
 }
 
 // ── ModelWeights implementation ──
@@ -137,6 +152,24 @@ impl WeightSource for ModelWeights {
 
     fn get_packed_bf16(&self, key: &str) -> Option<Vec<u8>> {
         self.raw_bytes.get(key).cloned()
+    }
+
+    fn get_quant_raw(&self, key: &str) -> Option<(Vec<u8>, u32, usize, usize)> {
+        let qt = self.quant_tensors.get(key)?;
+        let shape = qt.shape();
+        // Only 2D matrices supported in the passthrough path. Higher-rank
+        // packed expert tensors go through the dense path (they need
+        // per-expert slicing the Q4_K writer doesn't know how to do
+        // bit-exactly yet).
+        if shape.len() != 2 {
+            return None;
+        }
+        Some((
+            qt.raw_bytes().to_vec(),
+            qt.tensor_type(),
+            shape[0],
+            shape[1],
+        ))
     }
 }
 

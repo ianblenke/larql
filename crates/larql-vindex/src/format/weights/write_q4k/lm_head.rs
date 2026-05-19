@@ -14,13 +14,31 @@ use crate::error::VindexError;
 use crate::format::filenames::*;
 
 use super::super::write_f32::{kind, WeightEntry, WeightSource};
-use super::pad_rows_to_block;
+use super::{pad_rows_to_block, try_q4k_passthrough, QuantBlockFormat};
 
 pub(super) fn write_lm_head_q4k(
     source: &dyn WeightSource,
     dir: &Path,
     norm_entries: &mut Vec<WeightEntry>,
 ) -> Result<(), VindexError> {
+    // Bit-passthrough fast path: when the source carries lm_head as
+    // raw GGUF Q4_K bytes with cols % 256 == 0, copy directly.
+    // Falls back to dequant+requant otherwise. See
+    // [`super::try_q4k_passthrough`].
+    if let Some((q_bytes, rows, padded_cols)) =
+        try_q4k_passthrough(source, "lm_head.weight", QuantBlockFormat::Q4K)
+    {
+        std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
+        norm_entries.push(WeightEntry {
+            key: "lm_head.weight".into(),
+            kind: kind::TENSOR_Q4K.into(),
+            shape: vec![rows, padded_cols],
+            offset: 0,
+            length: q_bytes.len() as u64,
+            file: LM_HEAD_Q4_BIN.into(),
+        });
+        return Ok(());
+    }
     if let Some((data, rows, cols)) = source.lm_head() {
         // Preserve all rows. GGUFs commonly ship `token_embd` / lm_head
         // with padded vocab (extra rows for special tokens like

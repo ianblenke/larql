@@ -12,7 +12,7 @@ use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
 use super::super::write_f32::WeightSource;
-use super::{pad_rows_to_block, resolve_v_tensor, QuantBlockFormat};
+use super::{pad_rows_to_block, resolve_v_tensor, try_q4k_passthrough, QuantBlockFormat};
 
 /// Write Q/K/V/O attention projections to `attn_weights_q4k.bin`,
 /// emitting a sidecar manifest with per-tensor offsets and formats.
@@ -67,13 +67,37 @@ pub(super) fn write_attn_weights_q4k(
         ];
 
         for (i, (key, tensor)) in slots.iter().enumerate() {
+            // V (index 2) gets Q6_K, others get Q4_K.
+            let is_v = i == 2;
+            let format = if is_v {
+                QuantBlockFormat::Q6K
+            } else {
+                QuantBlockFormat::Q4K
+            };
+
+            // Bit-passthrough fast path: when the source carries the
+            // tensor as raw GGUF Q4_K/Q6_K bytes in the matching
+            // format with no row-padding needed, copy bytes directly.
+            // Preserves imatrix-aware quantization (PR #194).
+            if let Some((q_bytes, rows, padded_cols)) = try_q4k_passthrough(source, key, format) {
+                attn_file.write_all(&q_bytes)?;
+                let length = q_bytes.len() as u64;
+                attn_manifest.push(Q4kManifestEntry {
+                    key: key.to_string(),
+                    shape: vec![rows, padded_cols],
+                    format,
+                    offset: attn_offset,
+                    length,
+                });
+                attn_offset += length;
+                continue;
+            }
+
             let (data, rows, cols) = match tensor {
                 Some(t) => t.clone(),
                 None => continue, // tensor genuinely absent — skip
             };
 
-            // V (index 2) gets Q6_K, others get Q4_K.
-            let is_v = i == 2;
             // Row-pad to 256 so each row aligns to a super-block boundary.
             // Critical for models with non-256 inner dims (e.g. Gemma 4 26B A4B
             // where the dense intermediate is 2112). `padded_cols` is what the
@@ -84,11 +108,6 @@ pub(super) fn write_attn_weights_q4k(
                 quantize_q6_k(&padded)
             } else {
                 quantize_q4_k(&padded)
-            };
-            let format = if is_v {
-                QuantBlockFormat::Q6K
-            } else {
-                QuantBlockFormat::Q4K
             };
 
             attn_file.write_all(&q_bytes)?;
