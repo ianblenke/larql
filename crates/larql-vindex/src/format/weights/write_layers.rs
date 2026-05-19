@@ -177,7 +177,14 @@ pub fn write_layer_weights(
         cursor += down_bytes;
         let gu_fmt = entry.gate_up_format.unwrap_or(format);
         let dn_fmt = entry.down_format.unwrap_or(format);
-        rows.push((gu_fmt, dn_fmt, gate_up_off, gate_up_bytes, down_off, down_bytes));
+        rows.push((
+            gu_fmt,
+            dn_fmt,
+            gate_up_off,
+            gate_up_bytes,
+            down_off,
+            down_bytes,
+        ));
     }
 
     for (gu_fmt, dn_fmt, gate_up_off, gate_up_bytes, down_off, down_bytes) in &rows {
@@ -348,7 +355,11 @@ pub fn parse_layer_weights_header(data: &[u8]) -> Option<LayerWeightsHeader> {
         let (gate_up_format, down_format, off0) = if version == FORMAT_VERSION_V2 {
             let gu_raw = u32::from_le_bytes(data[base..base + 4].try_into().ok()?);
             let dn_raw = u32::from_le_bytes(data[base + 4..base + 8].try_into().ok()?);
-            (decode_layer_format(gu_raw)?, decode_layer_format(dn_raw)?, base + 8)
+            (
+                decode_layer_format(gu_raw)?,
+                decode_layer_format(dn_raw)?,
+                base + 8,
+            )
         } else {
             (format, format, base)
         };

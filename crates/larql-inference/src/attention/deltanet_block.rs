@@ -192,8 +192,8 @@ pub fn deltanet_block_step(
     // `std::env::var` cache hit, no allocation).
     let dump_subop = |name: &str, data: &[f32]| {
         if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY") {
-            let token_tag = std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG")
-                .unwrap_or_else(|_| "tok".to_string());
+            let token_tag =
+                std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
             let layer_dir = format!("{dir}/{token_tag}");
             let _ = std::fs::create_dir_all(&layer_dir);
             let path = format!("{layer_dir}/{name}_l{layer:02}.bin");

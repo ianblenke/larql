@@ -487,9 +487,7 @@ fn run_gguf_to_vindex(
     // shared experts as Q8_0; Qwen3-Coder-Next ships attn_qkv / ssm_out as
     // Q5_K — they must round-trip in their source format, NOT get
     // downquantized to Q4_K).
-    use larql_models::quant::ggml::{
-        TYPE_MXFP4, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
-    };
+    use larql_models::quant::ggml::{TYPE_MXFP4, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
     let moe_lazy_keys: std::collections::HashSet<String> = gguf_file
         .tensor_infos
         .iter()
