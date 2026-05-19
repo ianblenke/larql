@@ -120,8 +120,8 @@ pub(super) fn write_shexp_weights_q4k(
     file.flush()?;
     drop(file);
 
-    let manifest_json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| VindexError::Parse(e.to_string()))?;
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(SHEXP_WEIGHTS_Q4K_MANIFEST_JSON), manifest_json)?;
     Ok(())
 }

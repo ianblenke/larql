@@ -203,7 +203,11 @@ pub(super) fn try_preserve_quant_passthrough(
         x if x == TYPE_Q5_K => (QuantBlockFormat::Q5K, K_QUANT_BLOCK_ELEMS, Q5_K_BLOCK_BYTES),
         x if x == TYPE_Q6_K => (QuantBlockFormat::Q6K, K_QUANT_BLOCK_ELEMS, Q6_K_BLOCK_BYTES),
         x if x == TYPE_Q8_0 => (QuantBlockFormat::Q8_0, LEGACY_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
-        x if x == TYPE_MXFP4 => (QuantBlockFormat::Mxfp4, MXFP4_BLOCK_ELEMS, MXFP4_BLOCK_BYTES),
+        x if x == TYPE_MXFP4 => (
+            QuantBlockFormat::Mxfp4,
+            MXFP4_BLOCK_ELEMS,
+            MXFP4_BLOCK_BYTES,
+        ),
         _ => return None,
     };
     if !cols.is_multiple_of(block_elems) {

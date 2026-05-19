@@ -20,9 +20,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use larql_models::quant::ggml::{
-    dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
-};
+use larql_models::quant::ggml::{dequantize, TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
 use larql_models::quant::lazy::QuantTensor;
 use larql_models::{ModelArchitecture, ModelWeights};
 use larql_vindex::VectorIndex;
@@ -459,7 +457,9 @@ pub fn populate_moe_quant_tensors(
         for row in &offsets {
             if row.gate_up_format != gate_up_fmt || row.down_format != down_fmt {
                 return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
-                    format!("layers/layer_{layer:02}.weights: per-entry format drift not yet supported"),
+                    format!(
+                        "layers/layer_{layer:02}.weights: per-entry format drift not yet supported"
+                    ),
                 )));
             }
         }
@@ -524,12 +524,8 @@ pub fn populate_moe_quant_tensors(
         let gate_qt =
             QuantTensor::from_raw(packed_gate, gate_up_ttype, num_experts * inter, hidden)?;
         let up_qt = QuantTensor::from_raw(packed_up, gate_up_ttype, num_experts * inter, hidden)?;
-        let down_qt = QuantTensor::from_raw(
-            packed_down,
-            down_ttype,
-            num_experts * hidden,
-            padded_inter,
-        )?;
+        let down_qt =
+            QuantTensor::from_raw(packed_down, down_ttype, num_experts * hidden, padded_inter)?;
         weights
             .quant_tensors
             .insert(format!("{prefix}ffn_gate_exps.weight"), gate_qt);
@@ -564,8 +560,9 @@ pub fn populate_shexp_quant_tensors(
     let bytes = std::fs::read(&bin_path)?;
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let manifest: Vec<larql_vindex::format::weights::Q4kManifestEntry> =
-        serde_json::from_str(&manifest_text)
-            .map_err(|e| VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string())))?;
+        serde_json::from_str(&manifest_text).map_err(|e| {
+            VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string()))
+        })?;
 
     for entry in &manifest {
         let off = entry.offset as usize;

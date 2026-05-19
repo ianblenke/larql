@@ -596,10 +596,7 @@ fn swiglu_moe_lazy(
     let weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
 
     if std::env::var("LARQL_QWEN35_MOE_DUMP").is_ok() {
-        eprintln!(
-            "MOE weights: {:?} (sum={:.4})",
-            weights, sum_exp,
-        );
+        eprintln!("MOE weights: {:?} (sum={:.4})", weights, sum_exp,);
     }
 
     // 4. Per-expert SwiGLU. Each expert_slice is a zero-copy view of
