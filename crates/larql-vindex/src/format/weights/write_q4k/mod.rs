@@ -37,6 +37,7 @@ mod lm_head;
 mod moe_layers;
 mod norms;
 mod ple;
+mod shexp;
 
 pub mod feature_major_down;
 
@@ -299,6 +300,7 @@ pub fn write_model_weights_q4k_with_opts(
     deltanet::write_deltanet_weights_q4k(source, dir, num_layers, callbacks)?;
     ffn::write_interleaved_ffn_q4k(source, dir, num_layers, opts, callbacks)?;
     moe_layers::write_per_layer_moe_q4k(source, dir, num_layers)?;
+    shexp::write_shexp_weights_q4k(source, dir, num_layers)?;
     let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;
     ple::write_ple_weights(source, dir, num_layers, &mut entries)?;
     lm_head::write_lm_head_q4k(source, dir, &mut entries)?;

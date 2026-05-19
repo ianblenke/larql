@@ -144,6 +144,7 @@ pub fn load_qwen35_weights_from_vindex(
     populate_deltanet_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_attn_quant_tensors(&idx, &*arch, &mut weights)?;
     populate_moe_quant_tensors(vindex_dir, &*arch, &mut weights)?;
+    populate_shexp_quant_tensors(vindex_dir, &mut weights)?;
 
     // Pad embed up to lm_head's vocab dim when the vindex writer
     // truncated embed to `logical_vocab` (PR #137) but kept lm_head
@@ -539,6 +540,71 @@ pub fn populate_moe_quant_tensors(
             .quant_tensors
             .insert(format!("{prefix}ffn_down_exps.weight"), down_qt);
     }
+    Ok(())
+}
+
+/// Populate `weights.quant_tensors` with per-layer shared-expert
+/// projections from `shexp_weights_q4k.bin` + manifest. No-op when
+/// the file is absent (dense / non-shexp arch).
+///
+/// The downstream `load_qwen35_moe_ffn` reads keys exactly as
+/// `layers.{L}.ffn_{gate,up,down}_shexp.weight` — the writer records
+/// these keys, the loader inserts under the same names.
+pub fn populate_shexp_quant_tensors(
+    vindex_dir: &Path,
+    weights: &mut ModelWeights,
+) -> Result<(), VindexLoadError> {
+    let bin_path = vindex_dir.join(larql_vindex::format::filenames::SHEXP_WEIGHTS_Q4K_BIN);
+    let manifest_path =
+        vindex_dir.join(larql_vindex::format::filenames::SHEXP_WEIGHTS_Q4K_MANIFEST_JSON);
+    if !bin_path.exists() || !manifest_path.exists() {
+        return Ok(()); // no shexp — file-absent is a valid "no shared expert" signal
+    }
+
+    let bytes = std::fs::read(&bin_path)?;
+    let manifest_text = std::fs::read_to_string(&manifest_path)?;
+    let manifest: Vec<larql_vindex::format::weights::Q4kManifestEntry> =
+        serde_json::from_str(&manifest_text)
+            .map_err(|e| VindexLoadError::Vindex(larql_vindex::VindexError::Parse(e.to_string())))?;
+
+    for entry in &manifest {
+        let off = entry.offset as usize;
+        let len = entry.length as usize;
+        let end = off.checked_add(len).ok_or_else(|| {
+            VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                "shexp manifest entry length overflows usize".into(),
+            ))
+        })?;
+        if end > bytes.len() {
+            return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                format!(
+                    "shexp entry {:?} byte range past EOF (off={off} len={len} file={})",
+                    entry.key,
+                    bytes.len(),
+                ),
+            )));
+        }
+        if entry.shape.len() != 2 {
+            continue;
+        }
+        let (rows, cols) = (entry.shape[0], entry.shape[1]);
+        let tensor_type = match entry.format_tag() {
+            "Q4_K" => TYPE_Q4_K,
+            "Q5_K" => TYPE_Q5_K,
+            "Q6_K" => TYPE_Q6_K,
+            "Q8_0" => TYPE_Q8_0,
+            "MXFP4" => larql_models::quant::ggml::TYPE_MXFP4,
+            other => {
+                return Err(VindexLoadError::Vindex(larql_vindex::VindexError::Parse(
+                    format!("shexp entry {:?}: unsupported format {other}", entry.key),
+                )));
+            }
+        };
+        let slice = bytes[off..end].to_vec();
+        let qt = QuantTensor::from_raw(slice, tensor_type, rows, cols)?;
+        weights.quant_tensors.insert(entry.key.clone(), qt);
+    }
+
     Ok(())
 }
 

@@ -52,6 +52,13 @@ pub(super) fn write_norms_and_router(
             } else {
                 None
             },
+            // MoE shared-expert sigmoid gate (1-D F32 per layer) —
+            // `ffn_gate_inp_shexp.weight` on Qwen 3.6 35B-A3B and
+            // Qwen3-Coder-Next. The forward applies
+            // `sigmoid(x · gate_inp) * shared_swiglu(x)`; without
+            // this entry the shared-expert contribution is ungated
+            // and over-amplifies the residual.
+            arch.shared_expert_gate_inp_key(layer),
         ]
         .into_iter()
         .flatten()

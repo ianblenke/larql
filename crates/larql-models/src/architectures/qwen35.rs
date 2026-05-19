@@ -378,6 +378,40 @@ impl ModelArchitecture for Qwen35MoeArch {
             self.layer_prefix(layer)
         ))
     }
+
+    // Shared-expert keys — Qwen 3.6 MoE variants (35B-A3B, Coder-Next)
+    // ship a per-layer shared expert alongside the routed top-K. The
+    // GGUF stores it as `blk.{L}.ffn_{gate,up,down}_shexp.weight`,
+    // which the loader normalizes to `layers.{L}.ffn_{...}_shexp.weight`
+    // (the `blk.` → `layers.` replacement). `load_qwen35_moe_ffn`'s
+    // `pull_opt(...)` reads exactly these keys.
+    fn shared_expert_gate_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() {
+            return None;
+        }
+        Some(format!("{}ffn_gate_shexp.weight", self.layer_prefix(layer)))
+    }
+    fn shared_expert_up_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() {
+            return None;
+        }
+        Some(format!("{}ffn_up_shexp.weight", self.layer_prefix(layer)))
+    }
+    fn shared_expert_down_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() {
+            return None;
+        }
+        Some(format!("{}ffn_down_shexp.weight", self.layer_prefix(layer)))
+    }
+    fn shared_expert_gate_inp_key(&self, layer: usize) -> Option<String> {
+        if !self.is_moe() {
+            return None;
+        }
+        Some(format!(
+            "{}ffn_gate_inp_shexp.weight",
+            self.layer_prefix(layer)
+        ))
+    }
 }
 
 #[cfg(test)]
