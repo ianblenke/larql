@@ -37,7 +37,7 @@ use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
 use super::super::write_f32::WeightSource;
-use super::{pad_rows_to_block, QuantBlockFormat};
+use super::{pad_rows_to_block, try_q4k_passthrough, QuantBlockFormat};
 
 /// Write per-linear-attention-layer DeltaNet matmul tensors to
 /// `deltanet_weights_q4k.bin`. Emits one manifest entry per present
@@ -87,6 +87,25 @@ pub(super) fn write_deltanet_weights_q4k(
 
         for key_opt in slots {
             let Some(key) = key_opt else { continue };
+
+            // Bit-passthrough fast path — see [`super::try_q4k_passthrough`].
+            // Preserves imatrix-aware quantization of GGUF source tensors.
+            if let Some((q_bytes, rows, padded_cols)) =
+                try_q4k_passthrough(source, &key, QuantBlockFormat::Q4K)
+            {
+                dn_file.write_all(&q_bytes)?;
+                let length = q_bytes.len() as u64;
+                dn_manifest.push(Q4kManifestEntry {
+                    key,
+                    shape: vec![rows, padded_cols],
+                    format: QuantBlockFormat::Q4K,
+                    offset: dn_offset,
+                    length,
+                });
+                dn_offset += length;
+                continue;
+            }
+
             let Some((data, rows, cols)) = source.get_tensor(&key) else {
                 continue;
             };

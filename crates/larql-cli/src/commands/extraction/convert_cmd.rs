@@ -478,21 +478,29 @@ fn run_gguf_to_vindex(
     // extract/build.rs), so the lazy aliases get consumed correctly
     // when writing `gate_vectors.bin` / down meta.
     let gguf_file = larql_models::loading::gguf::GgufFile::open(input)?;
+
+    // Lazy keys: 3-D MoE expert tensors (per-expert HF aliases, post #120)
+    // PLUS 2-D Q4_K / Q6_K tensors so their raw GGUF bytes are preserved
+    // in `quant_tensors` for the Q4_K writer's bit-passthrough fast path
+    // (PR #194 finding: re-quantizing imatrix-aware GGUFs through f32
+    // diverges by ~0.1% per element, compounding through the network).
+    use larql_models::quant::ggml::{TYPE_Q4_K, TYPE_Q6_K};
     let moe_lazy_keys: std::collections::HashSet<String> = gguf_file
         .tensor_infos
         .iter()
         .filter(|info| {
-            info.dims().len() == 3
+            (info.dims().len() == 3
                 && (info.name().ends_with("ffn_gate_exps.weight")
                     || info.name().ends_with("ffn_up_exps.weight")
-                    || info.name().ends_with("ffn_down_exps.weight"))
+                    || info.name().ends_with("ffn_down_exps.weight")))
+                || (info.dims().len() == 2 && matches!(info.tensor_type(), TYPE_Q4_K | TYPE_Q6_K))
         })
         .map(|info| larql_models::loading::gguf::normalize_gguf_key(info.name()))
         .collect();
 
     let weights = if !moe_lazy_keys.is_empty() {
         eprintln!(
-            "  MoE detected: {} packed expert tensors → lazy loader",
+            "  Lazy loader: {} tensors (3-D MoE experts + 2-D Q4_K/Q6_K matmuls)",
             moe_lazy_keys.len()
         );
         larql_models::loading::gguf::load_gguf_lazy_tensors(input, &moe_lazy_keys)?
