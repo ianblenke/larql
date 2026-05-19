@@ -339,6 +339,10 @@ pub fn qwen35_forward_step(
                 residual.as_slice().unwrap_or(&[]),
             );
             write_at(
+                &format!("ffn_in_l{layer:02}.bin"),
+                ffn_in.as_slice().unwrap_or(&[]),
+            );
+            write_at(
                 &format!("ffn_out_l{layer:02}.bin"),
                 ffn_out.as_slice().unwrap_or(&[]),
             );
