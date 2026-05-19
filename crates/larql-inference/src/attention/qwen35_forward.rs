@@ -564,6 +564,14 @@ fn swiglu_moe_lazy(
     idx_logit.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top: Vec<(usize, f32)> = idx_logit.into_iter().take(top_k).collect();
 
+    if std::env::var("LARQL_QWEN35_MOE_DUMP").is_ok() {
+        eprintln!(
+            "MOE topk: experts={:?} logits_top={:?}",
+            top.iter().map(|x| x.0).collect::<Vec<_>>(),
+            top.iter().map(|x| x.1).collect::<Vec<_>>(),
+        );
+    }
+
     // 3. Softmax over the top-K logits (numerically stable).
     let max_logit = top
         .iter()
@@ -572,6 +580,13 @@ fn swiglu_moe_lazy(
     let exps: Vec<f32> = top.iter().map(|&(_, l)| (l - max_logit).exp()).collect();
     let sum_exp: f32 = exps.iter().sum();
     let weights: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+    if std::env::var("LARQL_QWEN35_MOE_DUMP").is_ok() {
+        eprintln!(
+            "MOE weights: {:?} (sum={:.4})",
+            weights, sum_exp,
+        );
+    }
 
     // 4. Per-expert SwiGLU. Each expert_slice is a zero-copy view of
     //    the 3D-packed parent tensor (F.1).
