@@ -98,14 +98,14 @@ fn build_per_expert_entries(
     let arch = source.arch();
     let mut entries: Vec<LayerEntry> = Vec::with_capacity(num_experts);
 
-    // Maps a `LayerWeightFormat` (per-file) to the GGML tensor_type
-    // we'd accept for raw-byte passthrough at the gate_up slot.
-    // Returns `None` for formats we don't have a passthrough kernel
-    // for at the MoE expert tier yet.
-    fn passthrough_tensor_type(fmt: LayerWeightFormat) -> Option<u32> {
-        match fmt {
-            LayerWeightFormat::Q4_K => Some(larql_models::quant::ggml::TYPE_Q4_K),
-            LayerWeightFormat::Q6_K => Some(larql_models::quant::ggml::TYPE_Q6_K),
+    // Map a source GGML tensor_type to the LayerWeightFormat we'd use
+    // to record it in a v2 per-projection override. Returns `None`
+    // for source types we don't yet plumb through the MoE writer
+    // (MXFP4 is the obvious gap — see `write_q4k::moe_layers` followups).
+    fn source_to_layer_format(ttype: u32) -> Option<LayerWeightFormat> {
+        match ttype {
+            x if x == larql_models::quant::ggml::TYPE_Q4_K => Some(LayerWeightFormat::Q4_K),
+            x if x == larql_models::quant::ggml::TYPE_Q6_K => Some(LayerWeightFormat::Q6_K),
             _ => None,
         }
     }
@@ -115,61 +115,55 @@ fn build_per_expert_entries(
         let up_key = arch.expert_ffn_up_key(layer, expert_id);
         let down_key = arch.expert_ffn_down_key(layer, expert_id);
 
-        // Try raw byte-concat passthrough for the gate+up half of the
-        // entry: in K-quant formats each [inter, hidden] row is an
-        // independent run of super-blocks (no cross-row state), so
-        // bytewise concatenation of two raw-quant tensors of the same
-        // format equals the bytes of quantizing their f32 concat. This
-        // preserves imatrix-aware quantization for the MoE gate/up
-        // path — PR #195/#196/#197 established the same pattern for
-        // attn/deltanet writers. For Coder-Next, gate/up are both
-        // Q4_K and hidden is 2048 (multiple of 256), so passthrough
-        // fires; the f32-round-trip below stays as the safe fallback.
-        //
-        // `down` is treated separately below — when source format
-        // matches target, byte-passthrough; otherwise the existing
-        // f32 dequant + pad + requant runs (no behavioural change).
-        let target_ttype = passthrough_tensor_type(fmt);
-        let gate_raw = gate_key
-            .as_ref()
-            .and_then(|k| source.get_quant_raw(k))
-            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
-        let up_raw = up_key
-            .as_ref()
-            .and_then(|k| source.get_quant_raw(k))
-            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
-        let down_raw = down_key
-            .as_ref()
-            .and_then(|k| source.get_quant_raw(k))
-            .filter(|(_, t, _, _)| Some(*t) == target_ttype);
+        // Try raw byte passthrough for each projection. K-quant formats
+        // (Q4_K / Q5_K / Q6_K) encode each row as an independent
+        // super-block, so the bytes of `quantize(concat(gate_f32,
+        // up_f32))` equal `concat(gate_bytes, up_bytes)` when
+        // cols % 256 == 0. We accept any K-quant source format and
+        // record the chosen format in the LayerEntry's per-projection
+        // override (LYRW v2) — the loader / downstream forward
+        // dispatch keys off that recorded format, so mixed gate_up
+        // (Q4_K) + down (Q6_K) within the same layer file works.
+        let gate_raw = gate_key.as_ref().and_then(|k| source.get_quant_raw(k));
+        let up_raw = up_key.as_ref().and_then(|k| source.get_quant_raw(k));
+        let down_raw = down_key.as_ref().and_then(|k| source.get_quant_raw(k));
 
+        // gate_up passthrough fires only when gate AND up share the
+        // same source format (otherwise the byte concat would mix
+        // formats, which the matvec dispatch can't handle today).
         let gate_up_passthrough = match (&gate_raw, &up_raw) {
-            (Some((gb, _, gr, gc)), Some((ub, _, ur, uc)))
-                if gr == ur && gc == uc && *gc == hidden && *gr == moe_inter =>
+            (Some((gb, gt, gr, gc)), Some((ub, ut, ur, uc)))
+                if gt == ut
+                    && gr == ur
+                    && gc == uc
+                    && *gc == hidden
+                    && *gr == moe_inter
+                    && source_to_layer_format(*gt).is_some() =>
             {
                 let mut bytes = Vec::with_capacity(gb.len() + ub.len());
                 bytes.extend_from_slice(gb);
                 bytes.extend_from_slice(ub);
-                Some(bytes)
+                Some((bytes, source_to_layer_format(*gt).unwrap()))
             }
             _ => None,
         };
 
         let down_passthrough = match &down_raw {
-            Some((db, _, dr, dc))
+            Some((db, dt, dr, dc))
                 if *dr == hidden
                     && *dc == moe_inter
-                    && moe_inter.is_multiple_of(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS) =>
+                    && moe_inter.is_multiple_of(larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS)
+                    && source_to_layer_format(*dt).is_some() =>
             {
-                Some(db.clone())
+                Some((db.clone(), source_to_layer_format(*dt).unwrap()))
             }
             _ => None,
         };
 
-        // Resolve gate_up bytes: try raw concat first, then fall back
-        // to f32 dequant + interleave + quantize.
-        let gate_up = if let Some(bytes) = gate_up_passthrough {
-            bytes
+        // Resolve gate_up bytes + format. Passthrough preserves the
+        // source format; fallback uses the file default `fmt`.
+        let (gate_up, gate_up_format) = if let Some((bytes, src_fmt)) = gate_up_passthrough {
+            (bytes, Some(src_fmt))
         } else {
             let gate = gate_key.as_ref().and_then(|k| source.get_tensor(k));
             let up = up_key.as_ref().and_then(|k| source.get_tensor(k));
@@ -182,23 +176,27 @@ fn build_per_expert_entries(
             let mut gate_up_f32 = Vec::with_capacity(gate_f32.len() + up_f32.len());
             gate_up_f32.extend_from_slice(&gate_f32);
             gate_up_f32.extend_from_slice(&up_f32);
-            quantize_f32(&gate_up_f32, fmt)?
+            (quantize_f32(&gate_up_f32, fmt)?, None)
         };
 
-        // Resolve down bytes: same pattern — raw passthrough when
-        // source matches target, else f32 dequant + pad + quantize.
-        let down = if let Some(bytes) = down_passthrough {
-            bytes
+        // Resolve down bytes + format.
+        let (down, down_format) = if let Some((bytes, src_fmt)) = down_passthrough {
+            (bytes, Some(src_fmt))
         } else {
             let Some((down_f32, _, _)) = down_key.as_ref().and_then(|k| source.get_tensor(k))
             else {
                 return Ok(Vec::new());
             };
             let (down_padded, _) = pad_cols_to_256(&down_f32, hidden, moe_inter);
-            quantize_f32(&down_padded, fmt)?
+            (quantize_f32(&down_padded, fmt)?, None)
         };
 
-        entries.push(LayerEntry { gate_up, down });
+        entries.push(LayerEntry {
+            gate_up,
+            down,
+            gate_up_format,
+            down_format,
+        });
     }
 
     Ok(entries)
