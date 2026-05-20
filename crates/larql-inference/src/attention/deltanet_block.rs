@@ -100,6 +100,15 @@ pub struct DeltaNetDims {
     pub d_conv: usize,
     /// RMSNorm epsilon. Qwen 3.6: 1e-6.
     pub eps: f32,
+    /// GQA broadcast pattern between V and K heads when `n_v > n_k`.
+    /// `true` = BLOCK (V head `h` reads K head `h / repeat_factor`,
+    /// matching qwen3next's interleave-repeat in `ggml_reshape_4d`
+    /// + `ggml_repeat_4d` + reshape). `false` = CYCLE (V head `h`
+    /// reads K head `h % h_k`, matching qwen35moe's direct
+    /// `ggml_repeat_4d` tile). Both reduce to identity when
+    /// `n_v == n_k`. See `delta_net_step` for the elementwise-
+    /// verified rationale.
+    pub block_gqa: bool,
 }
 
 impl DeltaNetDims {
@@ -117,6 +126,11 @@ impl DeltaNetDims {
     /// through the existing `ModelArchitecture` trait methods that
     /// PR #167 wired up via the vindex loader's arch reconstruction.
     pub fn from_arch(arch: &dyn larql_models::ModelArchitecture, eps: f32) -> Self {
+        // qwen3next uses interleave-repeat (BLOCK); qwen35moe uses
+        // tile-repeat (CYCLE). Both are GQA broadcast patterns between
+        // V and K heads; selecting the wrong one randomises the
+        // recurrence output (verified elementwise vs llama-eval).
+        let block_gqa = matches!(arch.family(), "qwen3next");
         Self {
             hidden: arch.config().hidden_size,
             head_v_dim: arch.ssm_state_size(),
@@ -124,6 +138,7 @@ impl DeltaNetDims {
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
             eps,
+            block_gqa,
         }
     }
 
@@ -649,10 +664,26 @@ pub fn deltanet_block_step(
                     ndarray::Array2::from_shape_vec((dims.head_v_dim, dims.n_v_heads), out).ok()
                 })
                 .unwrap_or_else(|| {
-                    delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+                    delta_net_step(
+                        &q,
+                        &k,
+                        &v,
+                        &log_g,
+                        &beta,
+                        &mut state.recurrent_state,
+                        dims.block_gqa,
+                    )
                 })
         } else {
-            delta_net_step(&q, &k, &v, &log_g, &beta, &mut state.recurrent_state)
+            delta_net_step(
+                &q,
+                &k,
+                &v,
+                &log_g,
+                &beta,
+                &mut state.recurrent_state,
+                dims.block_gqa,
+            )
         }
     );
     if std::env::var("LARQL_QWEN35_DUMP_L0").is_ok() {
@@ -910,6 +941,7 @@ mod tests {
             n_k_heads: 1,
             d_conv: 2,
             eps: 1e-6,
+            block_gqa: true,
         }
     }
 
@@ -1007,6 +1039,7 @@ mod tests {
             n_k_heads: 16,
             d_conv: 4,
             eps: 1e-6,
+            block_gqa: true,
         };
         // Qwen 3.6 27B sanity check.
         assert_eq!(dims.key_dim(), 128 * 16); // 2048
