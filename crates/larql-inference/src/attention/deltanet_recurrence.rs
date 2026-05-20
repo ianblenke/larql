@@ -68,23 +68,25 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head `h` reads Q/K head `h % h_k` (CYCLE pattern).
+        // GQA broadcast: V head `h` reads Q/K head `h / repeat_factor`
+        // (BLOCK pattern, matching llama.cpp's interleave-repeat).
         //
-        // Authority: llama.cpp `ggml/src/ggml-cpu/ops.cpp`
-        // `ggml_compute_forward_gated_delta_net_one_chunk`, line 10542-10543:
-        //   const int64_t iq1 = iv1 % neq1;
-        //   const int64_t ik1 = iv1 % nek1;
+        // llama.cpp's `qwen3next.cpp::build_layer_attn_linear` repeats
+        // the un-repeated Q/K (16 heads) by `repeat_factor = num_v_heads /
+        // num_k_heads` along an inserted dim *before* dim 0, then reshapes
+        // to (head_k_dim, num_v_heads). That produces the interleaved
+        // layout `h_v = h_k * repeat_factor + r`, so V head `h_v` reads
+        // K head `h_v / repeat_factor`. Our impl keeps Q/K un-repeated, so
+        // we map `kh = h / repeat_factor` directly.
         //
-        // Verified by C.5i elementwise diff of `final_out` against
-        // llama-eval-callback binary dumps: with CYCLE, pearson=1.000,
-        // max|diff|=0.006 on token 0 layer 0 (vs BLOCK pearson=0.77,
-        // max|diff|=3.17 from heads being assigned to wrong K groups).
-        //
-        // The C.5h reversion was wrong: it relied on token-rank as the
-        // metric, but rank is contaminated by downstream bugs and didn't
-        // catch this. Elementwise parity is the correct oracle.
-        let kh = h % h_k;
-        let _ = repeat_factor;
+        // Verified 2026-05-19 (Coder-Next) via the per-layer elementwise
+        // bisection: BLOCK gives cos=1.000000 on `attn_output-0` token 0;
+        // the previously-shipped CYCLE pattern (`h % h_k`) gave cos=0.72.
+        // The earlier "CYCLE bit-verified" claim was a false positive —
+        // the dotted-out test used `final_output` (post-ssm_norm +
+        // silu(z) gate), where the per-head scalars partially mask the
+        // wrong-head pairing. Raw recurrence is the correct oracle.
+        let kh = h / repeat_factor;
         let g_h = log_g[h].exp();
         let b_h = beta[h];
 

@@ -59,7 +59,7 @@ extern "C" __global__ void deltanet_step_decay_first_f32(
     if (h >= h_v) return;
     int tid = threadIdx.x;
     int bdim = blockDim.x;
-    int kh = h % h_k;
+    int kh = h * h_k / h_v;
     float g = expf(log_g[h]);
     float b = beta[h];
     float scale_q = rsqrtf((float)s);
@@ -698,7 +698,7 @@ mod tests {
         let scale_q = 1.0 / (s as f32).sqrt();
 
         for h in 0..h_v {
-            let kh = h % h_k;
+            let kh = h * h_k / h_v;
             let g = log_g[h].exp();
             for r in 0..s {
                 for c in 0..s {
