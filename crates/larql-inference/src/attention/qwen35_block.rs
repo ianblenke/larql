@@ -108,13 +108,24 @@ impl Qwen35AttentionDims {
         // dim partial RoPE (Qwen3-Next / Qwen3-Coder-Next) uses
         // `partial_rotary_factor * head_dim`. Fall back to full head_dim
         // for plain RoPE.
-        let rotary_dim = arch
-            .rope_dimension_sections()
-            .map(|secs| secs.iter().copied().sum())
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer the explicit count: on 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) the section-sum is half the
+        // correct rotary_dim — using it as-is rotated only the first
+        // 32 dims of each head and produced sentence-level garbage
+        // ('Basic 86841ったった...' on greedy 'Hi'). Falls back to
+        // sum(sections) only when no partial_rotary_factor is set.
+        let rotary_dim = cfg
+            .partial_rotary_factor
+            .map(|f| ((cfg.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
             .or_else(|| {
-                cfg.partial_rotary_factor
-                    .map(|f| ((cfg.head_dim as f64) * f).round() as usize)
-                    .filter(|d| *d > 0)
+                arch.rope_dimension_sections()
+                    .map(|secs| secs.iter().copied().sum())
             })
             .unwrap_or(cfg.head_dim);
         Self {

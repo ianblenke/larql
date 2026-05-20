@@ -1230,9 +1230,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -1320,9 +1335,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -1483,9 +1513,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -1701,9 +1746,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -2220,9 +2280,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -2551,9 +2626,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
@@ -2775,9 +2865,24 @@ mod tests {
             d_conv: arch.ssm_conv_kernel(),
             eps: 1e-6,
         };
+        // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
+        // `rope_dimension_sections`, but the section sum is in PAIR
+        // units (number of (i, i+n_dims/2) pairs assigned to each
+        // position channel). The total rotated dim count is
+        // `rope.dimension_count` (== `partial_rotary_factor * head_dim`).
+        // Prefer that explicit count so 35B-A3B (sections [11,11,10,0]
+        // sum=32, but rotated dim=64) routes correctly. Falls back to
+        // sum(sections) when no partial_rotary_factor is set (e.g.
+        // pre-Qwen3-Next configs), then to head_dim for plain RoPE.
         let rotary_dim: usize = arch
-            .rope_dimension_sections()
-            .map(|s| s.iter().sum())
+            .config()
+            .partial_rotary_factor
+            .map(|f| ((weights.head_dim as f64) * f).round() as usize)
+            .filter(|d| *d > 0)
+            .or_else(|| {
+                arch.rope_dimension_sections()
+                    .map(|s| s.iter().sum::<usize>())
+            })
             .unwrap_or(weights.head_dim);
         let attn_dims = crate::attention::qwen35_block::Qwen35AttentionDims {
             hidden: weights.hidden_size,
