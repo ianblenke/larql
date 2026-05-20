@@ -45,6 +45,7 @@ pub fn delta_net_step(
     log_g: &Array1<f32>,
     beta: &Array1<f32>,
     state: &mut Array3<f32>,
+    block_gqa: bool,
 ) -> Array2<f32> {
     let s_v = v.shape()[0];
     let h_v = v.shape()[1];
@@ -68,25 +69,37 @@ pub fn delta_net_step(
     let mut d = vec![0.0_f32; s_v];
 
     for h in 0..h_v {
-        // GQA broadcast: V head `h` reads Q/K head `h / repeat_factor`
-        // (BLOCK pattern, matching llama.cpp's interleave-repeat).
+        // GQA broadcast pattern is **arch-dependent**:
         //
-        // llama.cpp's `qwen3next.cpp::build_layer_attn_linear` repeats
-        // the un-repeated Q/K (16 heads) by `repeat_factor = num_v_heads /
-        // num_k_heads` along an inserted dim *before* dim 0, then reshapes
-        // to (head_k_dim, num_v_heads). That produces the interleaved
-        // layout `h_v = h_k * repeat_factor + r`, so V head `h_v` reads
-        // K head `h_v / repeat_factor`. Our impl keeps Q/K un-repeated, so
-        // we map `kh = h / repeat_factor` directly.
+        // - **BLOCK** (`kh = h_v / repeat_factor`, the qwen3next style):
+        //   llama.cpp's `qwen3next.cpp::build_layer_attn_linear` repeats
+        //   the un-repeated Q/K (16 heads) by inserting a dim of 1 +
+        //   `repeat_factor` before dim 0, then reshaping back. That
+        //   produces interleaved layout `h_v = h_k * repeat_factor + r`,
+        //   so V head `h_v` reads K head `h_v / repeat_factor`.
+        //   Coder-Next + sibling qwen3next GGUFs use this.
         //
-        // Verified 2026-05-19 (Coder-Next) via the per-layer elementwise
-        // bisection: BLOCK gives cos=1.000000 on `attn_output-0` token 0;
-        // the previously-shipped CYCLE pattern (`h % h_k`) gave cos=0.72.
-        // The earlier "CYCLE bit-verified" claim was a false positive —
-        // the dotted-out test used `final_output` (post-ssm_norm +
-        // silu(z) gate), where the per-head scalars partially mask the
-        // wrong-head pairing. Raw recurrence is the correct oracle.
-        let kh = h / repeat_factor;
+        // - **CYCLE** (`kh = h_v % h_k`, the qwen35moe style):
+        //   `qwen35moe.cpp::build_layer_attn_linear` uses `ggml_repeat_4d`
+        //   directly without the intermediate dim, which tiles the K
+        //   heads (V head `h_v` ↔ K head `h_v % h_k`). 35B-A3B + sibling
+        //   qwen35moe GGUFs use this.
+        //
+        // Both reduce to identity when `h_v == h_k`. Existing unit tests
+        // all use that degenerate case so the test result doesn't
+        // distinguish the two patterns.
+        //
+        // Verified 2026-05-20 (35B-A3B) via per-layer elementwise
+        // bisection: CYCLE gives cos=1.000000 on `attn_output-0` token 0
+        // (where state=0 collapses to a closed-form formula), BLOCK gives
+        // cos=0.04 (random direction). Mirrors the 2026-05-19 finding for
+        // Coder-Next where BLOCK gives cos=1.000000 and CYCLE gives
+        // cos=0.52 — the two models genuinely use different patterns.
+        let kh = if block_gqa {
+            h / repeat_factor
+        } else {
+            h % h_k
+        };
         let g_h = log_g[h].exp();
         let b_h = beta[h];
 
@@ -224,7 +237,7 @@ mod tests {
         let beta = Array1::from(vec![1.0_f32]);
         let mut state = Array3::<f32>::zeros((s, s, 1));
 
-        let out = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let out = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         // After the step:
         //   sk = state^T @ k = 0 (state was zero).
@@ -261,7 +274,7 @@ mod tests {
         state[[0, 0, 0]] = 5.0;
         state[[1, 1, 0]] = 7.0;
 
-        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         // After: state * g (=1) + 0 = state. Unchanged.
         assert!((state[[0, 0, 0]] - 5.0).abs() < 1e-6);
@@ -282,7 +295,7 @@ mod tests {
         state[[0, 0, 0]] = 5.0;
         state[[1, 1, 0]] = 7.0;
 
-        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         assert!((state[[0, 0, 0]] - 2.5).abs() < 1e-6);
         assert!((state[[1, 1, 0]] - 3.5).abs() < 1e-6);
@@ -306,14 +319,14 @@ mod tests {
         // Step 1.
         let k1 = array![[1.0_f32], [0.0]];
         let v1 = array![[3.0_f32], [0.0]];
-        let _ = delta_net_step(&q, &k1, &v1, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k1, &v1, &log_g, &beta, &mut state, true);
         assert!((state[[0, 0, 0]] - 3.0).abs() < 1e-6);
         assert!(state[[1, 1, 0]].abs() < 1e-6);
 
         // Step 2.
         let k2 = array![[0.0_f32], [1.0]];
         let v2 = array![[0.0_f32], [5.0]];
-        let _ = delta_net_step(&q, &k2, &v2, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k2, &v2, &log_g, &beta, &mut state, true);
         assert!((state[[0, 0, 0]] - 3.0).abs() < 1e-6);
         assert!((state[[1, 1, 0]] - 5.0).abs() < 1e-6);
         assert!(state[[0, 1, 0]].abs() < 1e-6);
@@ -334,7 +347,7 @@ mod tests {
         let beta = Array1::from(vec![1.0_f32, 1.0, 1.0]);
         let mut state = Array3::<f32>::zeros((s, s, 3));
 
-        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         // Each head h's update is k ⊗ v[:, h] (since state was 0).
         // K = [1, 0], so state[r, c, h] = k[r] * v[c, h]:
@@ -380,7 +393,7 @@ mod tests {
         state[[1, 0, 0]] = 0.0;
         state[[1, 1, 0]] = 0.0;
 
-        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let _ = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         // State should remain the seeded rank-1.
         assert!((state[[0, 0, 0]] - 3.0).abs() < 1e-5);
@@ -409,7 +422,7 @@ mod tests {
         let beta = Array1::from(vec![1.0_f32]);
         let mut state = Array3::<f32>::zeros((s, s, h_v));
 
-        let out = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state);
+        let out = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state, true);
 
         // Expected o[c, 0] = 1 / sqrt(4) = 0.5 for every c.
         for c in 0..s {

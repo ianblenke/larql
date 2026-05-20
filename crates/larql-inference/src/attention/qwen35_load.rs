@@ -953,6 +953,7 @@ mod tests {
             n_k_heads: cfg.ssm_group_count.unwrap(),
             d_conv: cfg.ssm_conv_kernel.unwrap(),
             eps: 1e-6,
+            block_gqa: true,
         }
     }
 
@@ -1228,6 +1229,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -1333,6 +1335,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -1511,6 +1514,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -1744,6 +1748,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -2278,6 +2283,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -2624,6 +2630,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with
@@ -2863,6 +2870,7 @@ mod tests {
             n_v_heads: arch.ssm_dt_rank(),
             n_k_heads: arch.ssm_group_count(),
             d_conv: arch.ssm_conv_kernel(),
+            block_gqa: matches!(arch.family(), "qwen3next"),
             eps: 1e-6,
         };
         // For Qwen3-Next / Qwen3.6 MoE both ship MRoPE with

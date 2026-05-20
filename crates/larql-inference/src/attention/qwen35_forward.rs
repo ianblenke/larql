@@ -830,6 +830,7 @@ mod tests {
             n_k_heads: 1,
             d_conv: 2,
             eps: 1e-6,
+            block_gqa: true,
         }
     }
 
