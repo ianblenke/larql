@@ -433,4 +433,62 @@ mod tests {
             );
         }
     }
+
+    /// Verify the BLOCK vs CYCLE GQA mapping diverges as expected
+    /// when `h_v > h_k`. With `h_v=4, h_k=2, repeat_factor=2`:
+    ///   BLOCK: kh = h_v / 2  → V heads {0,1} ↔ K head 0; V heads {2,3} ↔ K head 1.
+    ///   CYCLE: kh = h_v % 2  → V heads {0,2} ↔ K head 0; V heads {1,3} ↔ K head 1.
+    /// Constructed so BLOCK and CYCLE produce **different** outputs on
+    /// the same inputs. Locks in PR #206's per-arch dispatch — any
+    /// future refactor that collapses to a single pattern will fail
+    /// this test on the wrong-pattern half.
+    #[test]
+    fn delta_net_step_block_vs_cycle_diverge_when_h_v_gt_h_k() {
+        let s = 2;
+        let h_k = 2;
+        let h_v = 4;
+
+        // q = k = identity (each row picks one position). Use distinct
+        // values per K head so the kh choice affects the qk dot.
+        let q = array![[1.0_f32, 0.0], [0.0, 2.0]];
+        let k = array![[1.0_f32, 0.0], [0.0, 2.0]];
+        // v: 4 distinct V-head magnitudes, separated so the head→K-head
+        // mapping is visible in the output.
+        let v = array![[10.0_f32, 20.0, 30.0, 40.0], [11.0, 22.0, 33.0, 44.0]];
+        let log_g = Array1::from(vec![0.0_f32, 0.0, 0.0, 0.0]); // no decay
+        let beta = Array1::from(vec![1.0_f32, 1.0, 1.0, 1.0]); // unit β
+
+        let mut state_block = Array3::<f32>::zeros((s, s, h_v));
+        let mut state_cycle = Array3::<f32>::zeros((s, s, h_v));
+        let out_block = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state_block, true);
+        let out_cycle = delta_net_step(&q, &k, &v, &log_g, &beta, &mut state_cycle, false);
+
+        // They must differ — otherwise this test is broken.
+        let mut diff_max: f32 = 0.0;
+        for c in 0..s {
+            for h in 0..h_v {
+                diff_max = diff_max.max((out_block[[c, h]] - out_cycle[[c, h]]).abs());
+            }
+        }
+        assert!(
+            diff_max > 0.1,
+            "BLOCK and CYCLE outputs should differ when h_v > h_k; max|diff|={diff_max}",
+        );
+
+        // Verify the qk-dot derivation matches the pattern. At state=0,
+        // with k[r, h] = (1 if r == position else 0) and identity-like
+        // q, the output o[c, h] = v[c, h] * (q[:, kh] · k[:, kh]) / sqrt(s).
+        let scale = 1.0 / (s as f32).sqrt();
+        // BLOCK: V head 0,1 read K head 0 → (q[:, 0] · k[:, 0]) = 1*1 + 0*0 = 1.
+        //        V head 2,3 read K head 1 → (q[:, 1] · k[:, 1]) = 0*0 + 2*2 = 4.
+        assert!((out_block[[0, 0]] - 10.0 * 1.0 * scale).abs() < 1e-5);
+        assert!((out_block[[0, 1]] - 20.0 * 1.0 * scale).abs() < 1e-5);
+        assert!((out_block[[0, 2]] - 30.0 * 4.0 * scale).abs() < 1e-5);
+        assert!((out_block[[0, 3]] - 40.0 * 4.0 * scale).abs() < 1e-5);
+        // CYCLE: V head 0,2 read K head 0 → qk=1. V head 1,3 read K head 1 → qk=4.
+        assert!((out_cycle[[0, 0]] - 10.0 * 1.0 * scale).abs() < 1e-5);
+        assert!((out_cycle[[0, 1]] - 20.0 * 4.0 * scale).abs() < 1e-5);
+        assert!((out_cycle[[0, 2]] - 30.0 * 1.0 * scale).abs() < 1e-5);
+        assert!((out_cycle[[0, 3]] - 40.0 * 4.0 * scale).abs() < 1e-5);
+    }
 }
