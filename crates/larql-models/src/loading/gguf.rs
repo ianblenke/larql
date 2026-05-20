@@ -1370,7 +1370,7 @@ fn split_fused_ssm_ba(tensors: &mut HashMap<String, crate::WeightArray>) {
         };
         let rows = fused.shape()[0];
         let cols = fused.shape()[1];
-        if rows % 2 != 0 {
+        if rows % 4 != 0 {
             // Re-insert and skip — shouldn't happen for a Qwen3-Next ssm_ba.
             tensors.insert(ba_key, fused);
             continue;
@@ -1379,34 +1379,59 @@ fn split_fused_ssm_ba(tensors: &mut HashMap<String, crate::WeightArray>) {
         // Derive per-layer prefix `layers.{L}.` from the full key.
         let prefix = &ba_key[..ba_key.len() - "ssm_ba.weight".len()];
         let view = fused.view();
-        // Override via env to flip the convention if the empirical
-        // result on a smoke run is degenerate. Default `false` =
-        // β-first; setting `LARQL_QWEN3NEXT_SSM_BA_AB=1` flips to
-        // α-first.
+
+        // llama.cpp's qwen3next interpretation: `mixed_ba = ssm_ba @ x`
+        // produces `[2*n_v_heads]` per token, then it is reshaped to
+        // `[ba_new_dim=4, num_k_heads=16, n_tokens]` (dim 0 inner). A
+        // view at offset 0 inner-size 2 takes β; offset 2 inner-size 2
+        // takes α. After `ggml_cont` the flat layouts are:
+        //
+        //   β_flat[h_v] = mixed_ba[(h_v // 2) * 4 + (h_v % 2)]
+        //              = matvec_row r where r in {0,1,4,5,8,9,...,60,61}
+        //   α_flat[h_v] = mixed_ba[(h_v // 2) * 4 + 2 + (h_v % 2)]
+        //              = matvec_row r where r in {2,3,6,7,10,11,...,62,63}
+        //
+        // i.e. the per-k-head 4-tuple of rows is laid out as [β_a, β_b,
+        // α_a, α_b] for repeat_factor=2. Our previously-shipped
+        // "first half = β, second half = α" convention was empirically
+        // wrong (gives cos≈0.16 vs llama at L0 tok0), but happened to
+        // produce semi-coherent output because the wrong β/α values are
+        // still in the right magnitude range and the downstream
+        // post-norm + silu(z) mask part of the per-head scrambling.
+        //
+        // Verified 2026-05-20 via gguf-py dequant of Coder-Next L0
+        // ssm_ba @ x_norm tok0 vs llama `b-0.bin`: interleaved gives
+        // cos=0.999999; first-half gives cos=0.16.
+        //
+        // Override via env to flip convention: setting
+        // `LARQL_QWEN3NEXT_SSM_BA_AB=1` swaps β and α roles (in case a
+        // future Qwen3-Next sibling stores them in the opposite order).
         let ab_first = std::env::var("LARQL_QWEN3NEXT_SSM_BA_AB").ok().as_deref() == Some("1");
-        let (beta_slice, alpha_slice) = if ab_first {
-            (
-                view.slice(ndarray::s![half.., ..]),
-                view.slice(ndarray::s![..half, ..]),
-            )
-        } else {
-            (
-                view.slice(ndarray::s![..half, ..]),
-                view.slice(ndarray::s![half.., ..]),
-            )
-        };
-        let beta = beta_slice
-            .to_owned()
-            .into_shape_with_order((half, cols))
-            .expect("ssm_beta split shape")
-            .into_shared();
-        let alpha = alpha_slice
-            .to_owned()
-            .into_shape_with_order((half, cols))
-            .expect("ssm_alpha split shape")
-            .into_shared();
-        tensors.insert(format!("{prefix}ssm_beta.weight"), beta);
-        tensors.insert(format!("{prefix}ssm_alpha.weight"), alpha);
+
+        let mut beta = ndarray::Array2::<f32>::zeros((half, cols));
+        let mut alpha = ndarray::Array2::<f32>::zeros((half, cols));
+        for h_v in 0..half {
+            // Within each k-head's 4-row group, the first 2 rows are β
+            // (or α if ab_first), the next 2 are α (or β if ab_first).
+            let group = h_v / 2;
+            let within = h_v % 2;
+            let beta_row = if ab_first {
+                group * 4 + 2 + within
+            } else {
+                group * 4 + within
+            };
+            let alpha_row = if ab_first {
+                group * 4 + within
+            } else {
+                group * 4 + 2 + within
+            };
+            for c in 0..cols {
+                beta[[h_v, c]] = view[[beta_row, c]];
+                alpha[[h_v, c]] = view[[alpha_row, c]];
+            }
+        }
+        tensors.insert(format!("{prefix}ssm_beta.weight"), beta.into_shared());
+        tensors.insert(format!("{prefix}ssm_alpha.weight"), alpha.into_shared());
     }
 }
 
