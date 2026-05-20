@@ -915,6 +915,7 @@ impl ComputeBackend for CudaBackend {
         h_k: usize,
         h_v: usize,
         sequence_pos: usize,
+        block_gqa: bool,
     ) -> Option<Vec<f32>> {
         super::deltanet::deltanet_step_cached(
             self,
@@ -928,6 +929,7 @@ impl ComputeBackend for CudaBackend {
             h_k,
             h_v,
             sequence_pos,
+            block_gqa,
         )
         .ok()
     }
@@ -968,6 +970,7 @@ impl ComputeBackend for CudaBackend {
         n_k_heads: usize,
         eps: f32,
         sequence_pos: usize,
+        block_gqa: bool,
     ) -> Option<Vec<f32>> {
         super::qwen35_block::deltanet_recurrence_block_cached(
             self,
@@ -983,6 +986,7 @@ impl ComputeBackend for CudaBackend {
             n_k_heads,
             eps,
             sequence_pos,
+            block_gqa,
         )
         .ok()
     }
@@ -1071,6 +1075,7 @@ impl ComputeBackend for CudaBackend {
         d_conv: usize,
         eps: f32,
         sequence_pos: usize,
+        block_gqa: bool,
     ) -> Option<Vec<f32>> {
         super::qwen35_block::deltanet_postproj_step_cached(
             self,
@@ -1088,6 +1093,7 @@ impl ComputeBackend for CudaBackend {
             d_conv,
             eps,
             sequence_pos,
+            block_gqa,
         )
         .ok()
     }

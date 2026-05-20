@@ -93,6 +93,7 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         _h_k: usize,
         _h_v: usize,
         _sequence_pos: usize,
+        _block_gqa: bool,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -161,6 +162,7 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         _n_k_heads: usize,
         _eps: f32,
         _sequence_pos: usize,
+        _block_gqa: bool,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -249,6 +251,7 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         _d_conv: usize,
         _eps: f32,
         _sequence_pos: usize,
+        _block_gqa: bool,
     ) -> Option<Vec<f32>> {
         None
     }
