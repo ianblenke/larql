@@ -179,6 +179,7 @@ pub fn qwen35_attention_block_step(
     kv_layer: &mut (Array2<f32>, Array2<f32>),
     position: usize,
     backend: Option<&dyn larql_compute::ComputeBackend>,
+    layer: usize,
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
@@ -197,8 +198,33 @@ pub fn qwen35_attention_block_step(
         debug_assert_eq!(weights.attn_output.shape(), [dims.hidden, dims.q_dim()]);
     }
 
+    // Layer-boundary dumps for elementwise bisection against
+    // llama-eval-callback. Mirrors deltanet_block's pattern: writes
+    // `<dir>/<token_tag>/<name>_l{layer:02}.bin` in the same
+    // `[i64 ne[4]; f32 data]` format as `LLAMA_DUMP_BIN_DIR`.
+    let dump_fa = |name: &str, data: &[f32]| {
+        if let Ok(dir) = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY") {
+            let token_tag =
+                std::env::var("LARQL_QWEN35_DUMP_TOKEN_TAG").unwrap_or_else(|_| "tok".to_string());
+            let layer_dir = format!("{dir}/{token_tag}");
+            let _ = std::fs::create_dir_all(&layer_dir);
+            let path = format!("{layer_dir}/{name}_l{layer:02}.bin");
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                use std::io::Write;
+                let ne: [i64; 4] = [data.len() as i64, 1, 1, 1];
+                for n in ne {
+                    let _ = f.write_all(&n.to_le_bytes());
+                }
+                for v in data {
+                    let _ = f.write_all(&v.to_le_bytes());
+                }
+            }
+        }
+    };
+
     // 1. Pre-attention RMSNorm.
     let x_norm = super::deltanet_block::rms_norm_1d_pub(x, &weights.attn_norm, dims.eps);
+    dump_fa("fa_x_norm", x_norm.as_slice().unwrap_or(&[]));
 
     // 2. Projections.
     use crate::attention::gpu_tier::{self, GpuClass};
@@ -222,6 +248,9 @@ pub fn qwen35_attention_block_step(
     } else {
         weights.attn_v.dot(&x_norm)
     }; // [kv_dim]
+    dump_fa("fa_qcur_full", q_fused_1d.as_slice().unwrap_or(&[]));
+    dump_fa("fa_kcur", k_1d.as_slice().unwrap_or(&[]));
+    dump_fa("fa_vcur", v_1d.as_slice().unwrap_or(&[]));
 
     // 3. Split Q+gate. split_q_gate takes [seq_len, fused_q_dim] →
     //    (q [seq_len, q_dim], gate [seq_len, q_dim]). Wrap our
@@ -230,6 +259,8 @@ pub fn qwen35_attention_block_step(
         .into_shape_with_order((1, dims.fused_q_dim()))
         .expect("q_fused reshape");
     let (q_2d, gate_2d) = split_q_gate(&q_fused_2d, dims.n_head, dims.head_dim);
+    dump_fa("fa_q_split", q_2d.as_slice().unwrap_or(&[]));
+    dump_fa("fa_gate_sigmoid", gate_2d.as_slice().unwrap_or(&[]));
 
     // 4. Per-head RMSNorm for Q and K.
     let q_normed = crate::residual::rms_norm_heads(
@@ -249,6 +280,8 @@ pub fn qwen35_attention_block_step(
         dims.head_dim,
         0.0,
     );
+    dump_fa("fa_q_normed", q_normed.as_slice().unwrap_or(&[]));
+    dump_fa("fa_k_normed", k_normed.as_slice().unwrap_or(&[]));
 
     // 5. Partial RoPE applied at `position`. RoPE is a 2D op so the
     //    1-row matrices work directly.
@@ -268,6 +301,8 @@ pub fn qwen35_attention_block_step(
         dims.rope_fraction(),
         position,
     );
+    dump_fa("fa_q_roped", q_roped.as_slice().unwrap_or(&[]));
+    dump_fa("fa_k_roped", k_roped.as_slice().unwrap_or(&[]));
 
     // 6. Append the new K/V row to the cumulative cache slabs.
     let v_2d_in = v_1d
@@ -291,11 +326,13 @@ pub fn qwen35_attention_block_step(
         dims.head_dim,
         scale,
     );
+    dump_fa("fa_attn_pregate", attn_out_1d.as_slice().unwrap_or(&[]));
     // Wrap back into 1-row matrix to reuse the C.3 gate-apply helper.
     let mut attn_out = attn_out_1d
         .into_shape_with_order((1, dims.q_dim()))
         .expect("attn_out reshape");
     apply_q_gate(&mut attn_out, &gate_2d);
+    dump_fa("fa_attn_gated", attn_out.as_slice().unwrap_or(&[]));
 
     // 9. Output projection: y = attn_output @ attn_out[0].
     let attn_out_1d = attn_out.row(0).to_owned();
@@ -519,6 +556,7 @@ pub fn hybrid_layer_step(
                 kv_layer,
                 hybrid_cache.next_position,
                 backend,
+                layer,
             )
         }
         _ => panic!(
