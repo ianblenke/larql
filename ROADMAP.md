@@ -853,6 +853,70 @@ plumbing that Kimi work derisks future hybrid-MoE additions
 
 ---
 
+## P1 — Serving wins from VibeServe (added 2026-05-20)
+
+Driver: UW SyFi's VibeServe paper (`https://syfi.cs.washington.edu/blog/2026-05-12-introducing-vibeserve/`)
+catalogues two serving wins with measured speedups that map directly
+onto larql's current model coverage. Both gate on Qwen 3.6 / Coder-Next
+forward correctness landing first (so we don't speed up a broken decode
+path).
+
+### Hybrid-architecture prefix-cache snapshot (3.45× on Olmo)
+
+VibeServe snapshots the SSM/DeltaNet recurrent state once at the
+prefix boundary and reuses it across every request that shares that
+prefix, instead of recomputing the recurrence per request. Applies
+directly to Qwen 3.6 35B-A3B and Qwen3-Coder-Next (both hybrid
+DeltaNet + full-attn) for chat scenarios with a fixed system prompt.
+
+| # | Item | Crate | Status | Notes |
+|---|------|-------|--------|-------|
+| VS1 | Add `DeltaNetHybridCache::snapshot_at(position)` + `restore_from(snapshot)` — capture the conv state + recurrent state for every linear-attn layer at a given token boundary | larql-inference | not started | Mirrors the existing `kv_layers` snapshot pattern; tricky bit is `recurrent_state` is `Array3<f32>` per layer (state_size × state_size × n_v_heads ≈ 128×128×32 = 0.5 MB/layer × 36 linear layers = ~18 MB per snapshot for Coder-Next — small enough for in-memory LRU) |
+| VS2 | Server-side prefix-snapshot table keyed by `(model_id, hash(prefix_tokens))` with LRU eviction | larql-server | not started | Hash on the chat template + system prompt; common system prompts get reused across requests. Limit memory: 10 GB cap → ~500 prompts cached. Skipping the prefix recompute means linear-attn cost goes to O(decoded_tokens) instead of O(prompt+decoded). For 4K-token system prompts this is the bulk of the recurrence work |
+| VS3 | Bench: throughput at fixed concurrency with shared system prompt across 100 requests vs cold-prefix baseline | larql-cli + bench/ | not started | Target: ≥ 3× speedup on Coder-Next "code-edit" workload (shared system prompt, varied user query) |
+
+**Acceptance**: ≥ 2.5× throughput on a Coder-Next workload with 16
+concurrent requests sharing a 2K-token system prompt. (3.45× is the
+VibeServe Olmo number on L4; we'd take 2.5× as our floor given
+DeltaNet's higher per-layer cost vs Mamba.)
+
+### Predicted-output speculative decoding (5.95× on code editing)
+
+VibeServe verifies user-supplied predicted output tokens in 16-token
+blocks without a draft model — the "speculative" part is the user
+pre-committing to most of the output (e.g., "rewrite this Python
+function, here's the existing source"). Verification is a single
+prefill pass; accepted-token-count is observable post-hoc. Directly
+applies to Coder-Next (a code model) for the IDE-style edit workflow,
+which is the primary expected use case once Qwen3-Coder-Next ships.
+
+| # | Item | Crate | Status | Notes |
+|---|------|-------|--------|-------|
+| PS1 | OpenAI-API extension: accept `prediction: { type: "content", content: "..." }` on chat completions — proposal-level, no implementation yet | larql-server | not started | Mirrors OpenAI's predicted outputs (preview) API: server attempts to verify the predicted tokens block-by-block before falling back to greedy decode |
+| PS2 | Block-verify primitive: prefill the predicted tokens, compare argmax of each predicted token's logits against the predicted token, accept the longest prefix that matches, emit accepted tokens, resume decode from the first divergent position | larql-inference | not started | Reuses the existing prefill path (`predict_q4k_hidden_with_cache` analogue for qwen35); the math is "treat the predicted tokens as appended input, return the largest k such that argmax(logits[i]) == predicted[i+1] for i in 0..k". Block size: 16 (VibeServe default) |
+| PS3 | Server-side acceptance accounting + diagnostics (tokens predicted vs accepted vs rejected, fall-back rate) | larql-server | not started | Needed for tuning and for the bench harness to attribute speedups |
+| PS4 | Bench: code-editing workload (Qwen3-Coder-Next, "edit this file" prompts with 90 % output overlap) vs greedy baseline | larql-cli + bench/ | not started | Target: ≥ 3× on the head case (90 %+ predicted-overlap edits); ≥ 1.5× on partial-overlap |
+
+**Acceptance**: ≥ 3× speedup on a code-edit workload where ≥ 80 % of
+the output is supplied as `prediction`, measured against the same
+model running greedy decode without the prediction hint. Falls back
+gracefully (no slower than baseline) when prediction is wrong.
+
+**Why P1 not critical-path**: depends on Qwen3-Coder-Next forward
+producing fully coherent decode (currently at 7-token first-sentence
+match per PR #202; remaining drift is precision-tail). Both items
+become valuable the moment the forward path is correct. The
+prefix-cache snapshot also benefits 35B-A3B once its remaining bugs
+clear.
+
+**Why these two and not the rest of the VibeServe catalogue**: the
+CFG-stride / encoder-state / XGrammar wins from the paper either
+don't apply (we have no diffusion or ASR path) or are known
+techniques worth doing later. These two are the highest-ROI items
+that map onto models we already ship.
+
+---
+
 ## P1 — Boundary refs and cold-context storage
 
 Driver: replace unbounded KV retention in long-context and multi-host scenarios
