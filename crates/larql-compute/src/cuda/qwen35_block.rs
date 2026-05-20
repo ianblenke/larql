@@ -180,6 +180,7 @@ fn launch_deltanet_step_device(
     s: usize,
     h_k: usize,
     h_v: usize,
+    block_gqa: bool,
 ) -> Result<(), CudaInitError> {
     let block_dim: u32 = 256;
     let cfg = LaunchConfig {
@@ -190,6 +191,7 @@ fn launch_deltanet_step_device(
     let s_i = s as i32;
     let h_k_i = h_k as i32;
     let h_v_i = h_v as i32;
+    let block_gqa_i: i32 = if block_gqa { 1 } else { 0 };
     unsafe {
         drv.stream
             .launch_builder(func)
@@ -203,6 +205,7 @@ fn launch_deltanet_step_device(
             .arg(&s_i)
             .arg(&h_k_i)
             .arg(&h_v_i)
+            .arg(&block_gqa_i)
             .launch(cfg)
             .map_err(|e| CudaInitError::DriverMissing(format!("launch deltanet_step: {e:?}")))?;
     }
@@ -425,6 +428,7 @@ pub(crate) fn deltanet_recurrence_block_cached(
     n_k_heads: usize,
     eps: f32,
     sequence_pos: usize,
+    block_gqa: bool,
 ) -> Result<Vec<f32>, CudaInitError> {
     let key_dim = head_v_dim * n_k_heads;
     let value_dim = head_v_dim * n_v_heads;
@@ -500,6 +504,7 @@ pub(crate) fn deltanet_recurrence_block_cached(
             head_v_dim,
             n_k_heads,
             n_v_heads,
+            block_gqa,
         )
     })?;
 
@@ -556,6 +561,7 @@ pub(crate) fn deltanet_postproj_step_cached(
     d_conv: usize,
     eps: f32,
     sequence_pos: usize,
+    block_gqa: bool,
 ) -> Result<Vec<f32>, CudaInitError> {
     let key_dim = head_v_dim * n_k_heads;
     let value_dim = head_v_dim * n_v_heads;
@@ -696,6 +702,7 @@ pub(crate) fn deltanet_postproj_step_cached(
             head_v_dim,
             n_k_heads,
             n_v_heads,
+            block_gqa,
         )
     })?;
 
@@ -1212,6 +1219,7 @@ mod tests {
             n_k_heads,
             n_v_heads,
             1,
+            true,
         )
         .expect("recurrence");
         // Reshape dim→head_major flat.

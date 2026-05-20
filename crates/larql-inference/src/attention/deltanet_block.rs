@@ -488,6 +488,7 @@ pub fn deltanet_block_step(
                 dims.d_conv,
                 crate::residual::DEFAULT_EPS as f32,
                 sequence_pos,
+                dims.block_gqa,
             )
         })
     } else {
@@ -587,6 +588,7 @@ pub fn deltanet_block_step(
                     dims.n_k_heads,
                     crate::residual::DEFAULT_EPS as f32,
                     sequence_pos,
+                    dims.block_gqa,
                 )
             })
         )
@@ -658,6 +660,7 @@ pub fn deltanet_block_step(
                         dims.n_k_heads,
                         dims.n_v_heads,
                         sequence_pos,
+                        dims.block_gqa,
                     )
                 })
                 .and_then(|out| {

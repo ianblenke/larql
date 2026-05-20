@@ -53,13 +53,18 @@ extern "C" __global__ void deltanet_step_decay_first_f32(
     float* __restrict__ out,
     int s,
     int h_k,
-    int h_v
+    int h_v,
+    int block_gqa
 ) {
     int h = blockIdx.x;
     if (h >= h_v) return;
     int tid = threadIdx.x;
     int bdim = blockDim.x;
-    int kh = h * h_k / h_v;
+    // GQA broadcast pattern — arch-dependent. See
+    // `delta_net_step` in crates/larql-inference/src/attention/deltanet_recurrence.rs
+    // for the bit-verified rationale (BLOCK for qwen3next, CYCLE for qwen35moe).
+    // Both reduce to identity when `h_v == h_k`.
+    int kh = block_gqa ? (h * h_k / h_v) : (h % h_k);
     float g = expf(log_g[h]);
     float b = beta[h];
     float scale_q = rsqrtf((float)s);
@@ -389,6 +394,7 @@ pub(crate) fn deltanet_step(
     s: usize,
     h_k: usize,
     h_v: usize,
+    block_gqa: bool,
 ) -> Result<Vec<f32>, CudaInitError> {
     if s == 0
         || h_k == 0
@@ -430,6 +436,7 @@ pub(crate) fn deltanet_step(
     let s_i = s as i32;
     let h_k_i = h_k as i32;
     let h_v_i = h_v as i32;
+    let block_gqa_i: i32 = if block_gqa { 1 } else { 0 };
     unsafe {
         drv.stream
             .launch_builder(func)
@@ -443,6 +450,7 @@ pub(crate) fn deltanet_step(
             .arg(&s_i)
             .arg(&h_k_i)
             .arg(&h_v_i)
+            .arg(&block_gqa_i)
             .launch(cfg)
             .map_err(|e| CudaInitError::DriverMissing(format!("launch deltanet: {e:?}")))?;
     }
@@ -466,6 +474,7 @@ pub(crate) fn deltanet_step_cached(
     h_k: usize,
     h_v: usize,
     sequence_pos: usize,
+    block_gqa: bool,
 ) -> Result<Vec<f32>, CudaInitError> {
     if s == 0
         || h_k == 0
@@ -506,6 +515,7 @@ pub(crate) fn deltanet_step_cached(
     let s_i = s as i32;
     let h_k_i = h_k as i32;
     let h_v_i = h_v as i32;
+    let block_gqa_i: i32 = if block_gqa { 1 } else { 0 };
     backend.with_qwen35_state_device_buf(state, sequence_pos, |state_dev| {
         unsafe {
             drv.stream
@@ -520,6 +530,7 @@ pub(crate) fn deltanet_step_cached(
                 .arg(&s_i)
                 .arg(&h_k_i)
                 .arg(&h_v_i)
+                .arg(&block_gqa_i)
                 .launch(cfg)
                 .map_err(|e| {
                     CudaInitError::DriverMissing(format!("launch cached deltanet: {e:?}"))
@@ -729,7 +740,7 @@ mod tests {
             }
         }
 
-        let out = deltanet_step(&backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v)
+        let out = deltanet_step(&backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v, true)
             .expect("cuda deltanet");
         for i in 0..out.len() {
             assert!((out[i] - expected[i]).abs() < 1e-5, "out[{i}]");
