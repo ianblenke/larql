@@ -1043,7 +1043,7 @@ mod tests {
         let scale_q = 1.0_f32 / (s as f32).sqrt();
         let mut expected = vec![0.0_f32; s * h_v];
         for h in 0..h_v {
-            let kh = h % h_k;
+            let kh = h * h_k / h_v;
             let g = (log_g[h]).exp();
             for r in 0..s {
                 for c in 0..s {
