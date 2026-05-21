@@ -36,6 +36,12 @@ pub enum GpuClass {
     LmHead,
     /// Full-attention block's Q/K/V/O projection matvecs.
     AttnProj,
+    /// Full-attention block's softmax + score / weighted-V scan
+    /// (`gqa_decode_step`). Separate from `AttnProj` because the scan
+    /// is the part that *uses* the KV cache — disabling it forces the
+    /// CPU autoregressive path even when the Q/K/V projections
+    /// themselves are GPU-side.
+    AttnDecode,
     /// DeltaNet block's projection matvecs (attn_qkv, attn_gate, ssm_out).
     DnProj,
     /// DeltaNet recurrence chain (conv1d, L2 norm, recurrence kernel,
@@ -53,6 +59,7 @@ impl GpuClass {
         match self {
             Self::LmHead => "LARQL_QWEN35_GPU_NO_LM_HEAD",
             Self::AttnProj => "LARQL_QWEN35_GPU_NO_ATTN_PROJ",
+            Self::AttnDecode => "LARQL_QWEN35_GPU_NO_ATTN_DECODE",
             Self::DnProj => "LARQL_QWEN35_GPU_NO_DN_PROJ",
             Self::DnRecurrence => "LARQL_QWEN35_GPU_NO_DN_RECURRENCE",
             Self::Ffn => "LARQL_QWEN35_GPU_NO_FFN",
@@ -71,6 +78,7 @@ pub fn is_enabled(class: GpuClass) -> bool {
     thread_local! {
         static LM_HEAD: Cell<Option<bool>> = const { Cell::new(None) };
         static ATTN_PROJ: Cell<Option<bool>> = const { Cell::new(None) };
+        static ATTN_DECODE: Cell<Option<bool>> = const { Cell::new(None) };
         static DN_PROJ: Cell<Option<bool>> = const { Cell::new(None) };
         static DN_RECURRENCE: Cell<Option<bool>> = const { Cell::new(None) };
         static FFN: Cell<Option<bool>> = const { Cell::new(None) };
@@ -78,6 +86,7 @@ pub fn is_enabled(class: GpuClass) -> bool {
     let cell = match class {
         GpuClass::LmHead => &LM_HEAD,
         GpuClass::AttnProj => &ATTN_PROJ,
+        GpuClass::AttnDecode => &ATTN_DECODE,
         GpuClass::DnProj => &DN_PROJ,
         GpuClass::DnRecurrence => &DN_RECURRENCE,
         GpuClass::Ffn => &FFN,
