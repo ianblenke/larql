@@ -411,6 +411,198 @@ pub fn qwen35_attention_block_step(
     }
 }
 
+/// Phase 4b-integration — batched-prefill sibling of
+/// [`qwen35_attention_block_step`].
+///
+/// Processes `seq_len = x.nrows()` token positions through one full-
+/// attention block in a single call. Per-position helpers (RMSNorm,
+/// Q/K/V projections, output projection) currently loop over rows
+/// internally — the win in this PR is **the attention scan**, which
+/// runs as one batched CUDA kernel call via
+/// [`ComputeBackend::qwen35_attention_prefill_batch`] instead of
+/// `seq_len` sequential per-token calls.
+///
+/// Future PRs in the batched-prefill arc replace the per-row matvec
+/// loops with batched matmul (4c-projections), and the host append
+/// loop with a single bulk write.
+///
+/// Not yet wired into `qwen35_forward_prefill` — the integration
+/// needs the matching DeltaNet / MoE batched siblings (Phases
+/// 4c/4d) so the entire per-layer flow can run multi-position. Until
+/// then this function exists as a tested entry point that
+/// `qwen35_forward_prefill` will swap in once those land.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_attention_block_prefill(
+    x: &Array2<f32>,
+    weights: &Qwen35AttentionLayerWeights,
+    dims: &Qwen35AttentionDims,
+    kv_layer: &mut (Array2<f32>, Array2<f32>),
+    base_pos: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    layer: usize,
+) -> Array2<f32> {
+    use crate::attention::gpu_tier::{self, GpuClass};
+    use crate::attention::quant_dispatch::matvec_with_backend;
+
+    let seq_len = x.shape()[0];
+    debug_assert_eq!(x.shape()[1], dims.hidden);
+    debug_assert!(
+        seq_len > 0,
+        "qwen35_attention_block_prefill needs seq_len >= 1"
+    );
+
+    let proj_backend = gpu_tier::backend_for(GpuClass::AttnProj, backend);
+    let attn_decode_backend = gpu_tier::backend_for(GpuClass::AttnDecode, backend);
+
+    // 1. Pre-attention RMSNorm of each row.
+    let mut x_norm = Array2::<f32>::zeros((seq_len, dims.hidden));
+    for r in 0..seq_len {
+        let row = x.row(r).to_owned();
+        let n = super::deltanet_block::rms_norm_1d_pub(&row, &weights.attn_norm, dims.eps);
+        x_norm.row_mut(r).assign(&n);
+    }
+
+    // 2. Q/K/V projections (per-row matvec; future PR batches to matmul).
+    let mut q_fused = Array2::<f32>::zeros((seq_len, dims.fused_q_dim()));
+    let mut k_full = Array2::<f32>::zeros((seq_len, dims.kv_dim()));
+    let mut v_full = Array2::<f32>::zeros((seq_len, dims.kv_dim()));
+    for r in 0..seq_len {
+        let x_r = x_norm.row(r).to_owned();
+        let qf = if let Some(q) = weights.attn_q_quant.as_ref() {
+            matvec_with_backend(q, &x_r, proj_backend)
+        } else {
+            weights.attn_q.dot(&x_r)
+        };
+        let kr = if let Some(q) = weights.attn_k_quant.as_ref() {
+            matvec_with_backend(q, &x_r, proj_backend)
+        } else {
+            weights.attn_k.dot(&x_r)
+        };
+        let vr = if let Some(q) = weights.attn_v_quant.as_ref() {
+            matvec_with_backend(q, &x_r, proj_backend)
+        } else {
+            weights.attn_v.dot(&x_r)
+        };
+        q_fused.row_mut(r).assign(&qf);
+        k_full.row_mut(r).assign(&kr);
+        v_full.row_mut(r).assign(&vr);
+    }
+
+    // 3. Split Q + gate (already batched-capable).
+    let (q_2d, gate_2d) = split_q_gate(&q_fused, dims.n_head, dims.head_dim);
+
+    // 4. Per-head RMSNorm for Q and K (batched-capable helper).
+    let q_normed = crate::residual::rms_norm_heads(
+        &q_2d,
+        &weights.attn_q_norm,
+        dims.n_head,
+        dims.head_dim,
+        0.0,
+    );
+    let k_normed = crate::residual::rms_norm_heads(
+        &k_full,
+        &weights.attn_k_norm,
+        dims.n_head_kv,
+        dims.head_dim,
+        0.0,
+    );
+
+    // 5. Partial RoPE — per-row positions start at base_pos.
+    let q_roped = super::rope::apply_rope_partial_at(
+        &q_normed,
+        dims.n_head,
+        dims.head_dim,
+        dims.rope_base,
+        dims.rope_fraction(),
+        base_pos,
+    );
+    let k_roped = super::rope::apply_rope_partial_at(
+        &k_normed,
+        dims.n_head_kv,
+        dims.head_dim,
+        dims.rope_base,
+        dims.rope_fraction(),
+        base_pos,
+    );
+
+    // 6. Append all `seq_len` new K/V rows to the host cache slabs.
+    for r in 0..seq_len {
+        append_row(&mut kv_layer.0, k_roped.row(r));
+        append_row(&mut kv_layer.1, v_full.row(r));
+    }
+
+    // 7. Batched attention scan. Routes through
+    //    `qwen35_attention_prefill_batch` when the backend offers it;
+    //    falls back to the per-row `gqa_decode_step` loop otherwise.
+    let scale = (dims.head_dim as f64).powf(-0.5);
+    let mut attn_out_seq = Array2::<f32>::zeros((seq_len, dims.q_dim()));
+    let mut handled_via_kernel = false;
+    if let Some(b) = attn_decode_backend {
+        let max_seq = std::env::var("LARQL_QWEN35_KV_MAX_SEQ")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ);
+        let q_flat = q_roped.as_slice().expect("q_roped contiguous");
+        let k_flat = k_roped.as_slice().expect("k_roped contiguous");
+        let v_flat = v_full.as_slice().expect("v_full contiguous");
+        if let Some(out) = b.qwen35_attention_prefill_batch(
+            layer as u64,
+            max_seq,
+            base_pos,
+            q_flat,
+            k_flat,
+            v_flat,
+            dims.n_head,
+            dims.n_head_kv,
+            dims.head_dim,
+            seq_len,
+        ) {
+            let arr =
+                ndarray::Array2::from_shape_vec((seq_len, dims.q_dim()), out).expect("attn shape");
+            attn_out_seq.assign(&arr);
+            handled_via_kernel = true;
+        }
+    }
+    if !handled_via_kernel {
+        // CPU / unsupported-backend fallback: per-row single-position
+        // gqa_decode_step against the (now-populated) host slabs.
+        // The slabs were appended row-by-row above; for row `r` the
+        // cache spans positions [0, base_pos + r + 1).
+        for r in 0..seq_len {
+            let cache_end = base_pos + r + 1;
+            let k_view = kv_layer.0.slice(ndarray::s![..cache_end, ..]).to_owned();
+            let v_view = kv_layer.1.slice(ndarray::s![..cache_end, ..]).to_owned();
+            let q_row = q_roped.row(r).to_owned();
+            let out_row = gqa_decode_step(
+                &q_row,
+                &k_view,
+                &v_view,
+                dims.n_head,
+                dims.n_head_kv,
+                dims.head_dim,
+                scale,
+            );
+            attn_out_seq.row_mut(r).assign(&out_row);
+        }
+    }
+
+    // 8. Apply Q gate (batched-capable).
+    apply_q_gate(&mut attn_out_seq, &gate_2d);
+
+    // 9. Output projection per row.
+    let mut out = Array2::<f32>::zeros((seq_len, dims.hidden));
+    for r in 0..seq_len {
+        let attn_r = attn_out_seq.row(r).to_owned();
+        let y = if let Some(q) = weights.attn_output_quant.as_ref() {
+            matvec_with_backend(q, &attn_r, proj_backend)
+        } else {
+            weights.attn_output.dot(&attn_r)
+        };
+        out.row_mut(r).assign(&y);
+    }
+    out
+}
+
 /// Autoregressive GQA softmax attention for a single new Q row over
 /// cumulative K/V slabs.
 ///
@@ -1017,5 +1209,121 @@ mod tests {
     fn silu_helper_is_reachable() {
         let _ = super::_silu(0.0);
         let _ = DeltaNetLayerState::allocate(2, 4, 2, 1);
+    }
+
+    /// Phase 4b-integration parity gate: the batched-prefill
+    /// `qwen35_attention_block_prefill` must produce bit-similar
+    /// outputs to running `qwen35_attention_block_step` once per
+    /// position over the same input. CPU backend is `None` so the
+    /// kernel-routed fast path is bypassed — this test exercises
+    /// the host-side per-row fallback (which the `handled_via_kernel`
+    /// branch falls through to) end-to-end.
+    #[test]
+    fn attention_block_prefill_matches_per_position_loop() {
+        use ndarray::Array1;
+        let attn_dims = tiny_attn_dims();
+        let hidden = attn_dims.hidden;
+        let kv_dim = attn_dims.kv_dim();
+        let fused_q = attn_dims.fused_q_dim();
+        let q_dim = attn_dims.q_dim();
+
+        // Synthetic weights — deterministic, non-zero, not too large.
+        let attn_norm: Vec<f32> = (0..hidden).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let attn_q_norm: Vec<f32> = (0..attn_dims.head_dim)
+            .map(|i| 0.7 + 0.05 * i as f32)
+            .collect();
+        let attn_k_norm: Vec<f32> = (0..attn_dims.head_dim)
+            .map(|i| 0.9 - 0.05 * i as f32)
+            .collect();
+        let attn_q = Array2::from_shape_fn((fused_q, hidden), |(r, c)| {
+            0.01 * (r as f32) + 0.02 * (c as f32) - 0.1
+        });
+        let attn_k = Array2::from_shape_fn((kv_dim, hidden), |(r, c)| {
+            0.03 * (r as f32) - 0.01 * (c as f32) + 0.05
+        });
+        let attn_v = Array2::from_shape_fn((kv_dim, hidden), |(r, c)| {
+            -0.02 * (r as f32) + 0.04 * (c as f32) + 0.02
+        });
+        let attn_output = Array2::from_shape_fn((hidden, q_dim), |(r, c)| {
+            0.015 * (r as f32) + 0.025 * (c as f32) - 0.07
+        });
+
+        // Build TWO copies of the weights — `into_shared` consumes
+        // the Array2 so we make two so each path gets its own.
+        let weights_seq = make_attn_w(
+            attn_norm.clone(),
+            attn_q.clone(),
+            attn_k.clone(),
+            attn_v.clone(),
+            attn_q_norm.clone(),
+            attn_k_norm.clone(),
+            attn_output.clone(),
+        );
+        let weights_batch = make_attn_w(
+            attn_norm,
+            attn_q,
+            attn_k,
+            attn_v,
+            attn_q_norm,
+            attn_k_norm,
+            attn_output,
+        );
+
+        let seq_len = 3_usize;
+        let x_seq = Array2::from_shape_fn((seq_len, hidden), |(r, c)| {
+            0.1 + 0.05 * (r as f32) + 0.07 * (c as f32)
+        });
+
+        // Reference: per-position loop, base_pos=0.
+        let mut kv_seq = (
+            Array2::<f32>::zeros((0, kv_dim)),
+            Array2::<f32>::zeros((0, kv_dim)),
+        );
+        let mut ref_outs: Vec<Array1<f32>> = Vec::with_capacity(seq_len);
+        for r in 0..seq_len {
+            let xr = x_seq.row(r).to_owned();
+            let y =
+                qwen35_attention_block_step(&xr, &weights_seq, &attn_dims, &mut kv_seq, r, None, 0);
+            ref_outs.push(y);
+        }
+
+        // Subject under test: batched call with seq_len=3, base_pos=0.
+        let mut kv_batch = (
+            Array2::<f32>::zeros((0, kv_dim)),
+            Array2::<f32>::zeros((0, kv_dim)),
+        );
+        let batch_out = qwen35_attention_block_prefill(
+            &x_seq,
+            &weights_batch,
+            &attn_dims,
+            &mut kv_batch,
+            0,
+            None,
+            0,
+        );
+
+        assert_eq!(batch_out.shape(), &[seq_len, hidden]);
+        for r in 0..seq_len {
+            for c in 0..hidden {
+                let a = batch_out[[r, c]];
+                let b = ref_outs[r][c];
+                let diff = (a - b).abs();
+                let tol = 1e-4 + 1e-4 * a.abs().max(b.abs());
+                assert!(
+                    diff < tol,
+                    "mismatch at row {r} col {c}: batched={a:.6} ref={b:.6} diff={diff:.2e}"
+                );
+            }
+        }
+        // KV cache slabs should also be bit-identical after both runs.
+        assert_eq!(kv_seq.0.shape(), kv_batch.0.shape());
+        for r in 0..kv_seq.0.shape()[0] {
+            for c in 0..kv_seq.0.shape()[1] {
+                let diff_k = (kv_seq.0[[r, c]] - kv_batch.0[[r, c]]).abs();
+                let diff_v = (kv_seq.1[[r, c]] - kv_batch.1[[r, c]]).abs();
+                assert!(diff_k < 1e-5, "K mismatch at [{r},{c}]");
+                assert!(diff_v < 1e-5, "V mismatch at [{r},{c}]");
+            }
+        }
     }
 }
