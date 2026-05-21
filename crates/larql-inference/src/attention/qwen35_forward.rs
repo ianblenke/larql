@@ -769,6 +769,44 @@ fn swiglu_moe_lazy(
     top_k: usize,
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array1<f32> {
+    swiglu_moe_lazy_with_optional_logits(
+        x,
+        None,
+        router,
+        gate_exps,
+        up_exps,
+        down_exps,
+        shexp_gate,
+        shexp_up,
+        shexp_down,
+        shexp_gate_inp,
+        num_experts,
+        top_k,
+        backend,
+    )
+}
+
+/// Same body as `swiglu_moe_lazy` but with the option to pass
+/// pre-computed router logits. When `Some(logits)`, the router
+/// matvec is skipped — used by `swiglu_moe_lazy_prefill` to batch
+/// the router into one matmul across all prompt positions instead
+/// of `seq_len` separate matvecs.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_moe_lazy_with_optional_logits(
+    x: &Array1<f32>,
+    precomputed_logits: Option<&[f32]>,
+    router: &larql_models::quant::lazy::QuantTensor,
+    gate_exps: &larql_models::quant::lazy::QuantTensor,
+    up_exps: &larql_models::quant::lazy::QuantTensor,
+    down_exps: &larql_models::quant::lazy::QuantTensor,
+    shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_gate_inp: Option<&[f32]>,
+    num_experts: usize,
+    top_k: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+) -> Array1<f32> {
     use crate::attention::gpu_tier::{self, GpuClass};
     use crate::attention::quant_dispatch::matvec_with_backend;
     use ndarray::ArcArray2;
@@ -778,8 +816,15 @@ fn swiglu_moe_lazy(
     // VRAM-minimal mode larql's value prop targets).
     let backend = gpu_tier::backend_for(GpuClass::Ffn, backend);
 
-    // 1. Router logits.
-    let logits = matvec_with_backend(router, x, backend);
+    // 1. Router logits — pre-computed by the batched-matmul path
+    //    in `swiglu_moe_lazy_prefill`, or computed here per-token.
+    let logits: Array1<f32> = match precomputed_logits {
+        Some(slice) => {
+            debug_assert_eq!(slice.len(), num_experts);
+            Array1::from(slice.to_vec())
+        }
+        None => matvec_with_backend(router, x, backend),
+    };
     debug_assert_eq!(logits.len(), num_experts);
 
     // 2. Top-K selection on host. num_experts is typically 128-256 so a
@@ -1063,10 +1108,29 @@ fn swiglu_moe_lazy_prefill(
     let seq_len = x_seq.nrows();
     let hidden = x_seq.ncols();
     let mut out = Array2::<f32>::zeros((seq_len, hidden));
+
+    // Batched router: one `router.matmul(x_seq)` matmul replaces
+    // `seq_len` separate per-row router matvecs. Same L3-reuse win
+    // as PR #239's attention projections — each rayon worker pulls
+    // the router weight matrix into cache once and reuses it across
+    // its slice of positions. For Qwen3.6 35B-A3B router is small
+    // (`[128 experts, 2048 hidden]` Q4_K, ~0.5 MB) so the bandwidth
+    // win is modest, but kernel-launch amortisation is real and
+    // this lays the path for the per-expert SwiGLU batching that
+    // will follow (Phase 4c-internals proper).
+    //
+    // Falls back to per-token router matvec when matmul errors
+    // (currently never; defensive).
+    let precomputed_logits: Option<Array2<f32>> = router.matmul(x_seq).ok();
+
     for i in 0..seq_len {
         let x_row: Array1<f32> = x_seq.row(i).to_owned();
-        let y = swiglu_moe_lazy(
+        let logits_row: Option<Array1<f32>> =
+            precomputed_logits.as_ref().map(|all| all.row(i).to_owned());
+        let logits_slice = logits_row.as_ref().and_then(|a| a.as_slice());
+        let y = swiglu_moe_lazy_with_optional_logits(
             &x_row,
+            logits_slice,
             router,
             gate_exps,
             up_exps,
