@@ -866,6 +866,62 @@ fn swiglu_moe_lazy(
     y_moe
 }
 
+/// Multi-position MoE-FFN sibling of `swiglu_moe_lazy`. Processes
+/// `seq_len = x_seq.nrows()` token positions through the same MoE
+/// SwiGLU as the per-token path.
+///
+/// Phase 4c-scaffold: the body is a per-position loop over
+/// `swiglu_moe_lazy`. The wrapper exists so that
+/// `qwen35_forward_prefill` (Phase 4a) and `qwen35_attention_block_prefill`
+/// (Phase 4b-host) have a matching MoE entry point to integrate
+/// against — once the batched router + scatter-gather expert
+/// dispatch lands in a follow-up, only this function's body
+/// changes; every call site keeps working.
+///
+/// The parity test
+/// `swiglu_moe_lazy_prefill_matches_per_position_loop` is the
+/// safety gate: it locks the multi-position contract so the
+/// follow-up can swap the body without silently breaking shape /
+/// numerics.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn swiglu_moe_lazy_prefill(
+    x_seq: &Array2<f32>,
+    router: &larql_models::quant::lazy::QuantTensor,
+    gate_exps: &larql_models::quant::lazy::QuantTensor,
+    up_exps: &larql_models::quant::lazy::QuantTensor,
+    down_exps: &larql_models::quant::lazy::QuantTensor,
+    shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_gate_inp: Option<&[f32]>,
+    num_experts: usize,
+    top_k: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+) -> Array2<f32> {
+    let seq_len = x_seq.nrows();
+    let hidden = x_seq.ncols();
+    let mut out = Array2::<f32>::zeros((seq_len, hidden));
+    for i in 0..seq_len {
+        let x_row: Array1<f32> = x_seq.row(i).to_owned();
+        let y = swiglu_moe_lazy(
+            &x_row,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp_gate,
+            shexp_up,
+            shexp_down,
+            shexp_gate_inp,
+            num_experts,
+            top_k,
+            backend,
+        );
+        out.row_mut(i).assign(&y);
+    }
+    out
+}
+
 /// Cross-expert batched CPU MoE FFN. Replaces the per-expert
 /// `swiglu_ffn_lazy` loop with two big par_iter passes — one over
 /// `(expert × ffn_row)` for fused gate+up+silu, one over
@@ -1464,6 +1520,95 @@ mod tests {
             expected_y0
         );
         assert!(got[1].abs() < 1e-5, "got[1]={}", got[1]);
+    }
+
+    /// Phase 4c-scaffold parity test: `swiglu_moe_lazy_prefill` over
+    /// `seq_len` positions must produce the same output as running
+    /// `swiglu_moe_lazy` once per position. Locks the multi-position
+    /// contract so the follow-up (batched router + scatter-gather
+    /// expert dispatch) can swap the wrapper's body without silently
+    /// changing numerics. Uses the same synthetic-QuantTensor pattern
+    /// as `swiglu_moe_lazy_without_shared_expert`.
+    #[test]
+    fn swiglu_moe_lazy_prefill_matches_per_position_loop() {
+        use larql_models::quant::lazy::QuantTensor;
+        let hidden = 2usize;
+        let ffn_dim = 2usize;
+        let num_experts = 2usize;
+        let top_k = 1usize;
+        let seq_len = 3usize;
+
+        // Router that picks expert 0 when x[0] dominates, expert 1
+        // when x[1] dominates. With our 3 test rows we exercise both.
+        let router_v = vec![
+            1.0_f32, 0.0, // expert 0
+            0.0, 1.0, // expert 1
+        ];
+        // Two distinct experts so the per-position selection actually
+        // routes different rows to different code paths.
+        let gate_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+        let up_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+        let down_exps_v = vec![1.0_f32, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+
+        let router = QuantTensor::from_f32_rows(num_experts, hidden, &router_v);
+        let gate_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &gate_exps_v);
+        let up_exps = QuantTensor::from_f32_rows(num_experts * ffn_dim, hidden, &up_exps_v);
+        let down_exps = QuantTensor::from_f32_rows(num_experts * hidden, ffn_dim, &down_exps_v);
+
+        // Mix of x rows: expert-0 favouring, expert-1 favouring, mixed.
+        let x_seq =
+            Array2::from_shape_vec((seq_len, hidden), vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
+
+        // Per-position loop reference.
+        let mut expected = Array2::<f32>::zeros((seq_len, hidden));
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let y = swiglu_moe_lazy(
+                &x_row,
+                &router,
+                &gate_exps,
+                &up_exps,
+                &down_exps,
+                None,
+                None,
+                None,
+                None,
+                num_experts,
+                top_k,
+                None,
+            );
+            expected.row_mut(i).assign(&y);
+        }
+
+        // Batched wrapper.
+        let got = swiglu_moe_lazy_prefill(
+            &x_seq,
+            &router,
+            &gate_exps,
+            &up_exps,
+            &down_exps,
+            None,
+            None,
+            None,
+            None,
+            num_experts,
+            top_k,
+            None,
+        );
+
+        assert_eq!(got.shape(), expected.shape());
+        for i in 0..seq_len {
+            for h in 0..hidden {
+                let g = got[[i, h]];
+                let e = expected[[i, h]];
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "moe_prefill[{i},{h}] got={} expected={}",
+                    g,
+                    e,
+                );
+            }
+        }
     }
 
     #[test]
