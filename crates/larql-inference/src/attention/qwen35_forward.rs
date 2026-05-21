@@ -866,52 +866,74 @@ fn swiglu_ffn_lazy(
         }
     }
 
-    let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
-        let paired = match (backend, gate_q, up_q) {
-            (Some(b), Some(gq), Some(uq)) => {
-                let gfmt = ggml_type_to_quant_format(gq.tensor_type());
-                let ufmt = ggml_type_to_quant_format(uq.tensor_type());
-                if matches!(gfmt, Some(QuantFormat::Q4_K))
-                    && matches!(ufmt, Some(QuantFormat::Q4_K))
-                {
-                    let x_slice = x.as_slice().expect("Array1 contiguous");
-                    let g_shape = gq.shape();
-                    let u_shape = uq.shape();
-                    b.qwen35_paired_q4k_matvec(
-                        gq.raw_bytes(),
-                        g_shape[0],
-                        uq.raw_bytes(),
-                        u_shape[0],
-                        x_slice,
-                        g_shape[1],
-                    )
-                } else {
-                    None
-                }
-            }
+    // Fused (gate, up, SwiGLU) CPU path — when backend is absent
+    // (CPU-FFN mode), gate_q and up_q have matching shape/format, and
+    // the activation is Q8_K-compatible (cols multiple of 256). One
+    // row-loop pass over gate+up+silu instead of three sequential
+    // passes — fewer intermediate allocations and better L1/L2
+    // residency (gate row, up row, x-Q8K all hot per iteration vs
+    // gate-all-rows then up-all-rows).
+    let fused = if backend.is_none() {
+        match (gate_q, up_q) {
+            (Some(gq), Some(uq)) => time_section!(
+                FFN_GATE_UP_PAIR,
+                gq.fused_gate_up_silu(uq, x).ok().flatten()
+            ),
             _ => None,
-        };
-        if let Some((gv, uv)) = paired {
-            (Array1::from(gv), Array1::from(uv))
-        } else {
-            let g = match gate_q {
-                Some(q) => matvec_with_backend(q, x, backend),
-                None => gate_dense.dot(x),
-            };
-            let u = match up_q {
-                Some(q) => matvec_with_backend(q, x, backend),
-                None => up_dense.dot(x),
-            };
-            (g, u)
         }
-    });
-    let inter = time_section!(FFN_SILU_LOOP, {
-        let mut inter = Array1::<f32>::zeros(g.len());
-        for i in 0..g.len() {
-            inter[i] = (g[i] * sigmoid(g[i])) * u[i];
-        }
-        inter
-    });
+    } else {
+        None
+    };
+    let inter = if let Some(inter_fused) = fused {
+        inter_fused
+    } else {
+        let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
+            let paired = match (backend, gate_q, up_q) {
+                (Some(b), Some(gq), Some(uq)) => {
+                    let gfmt = ggml_type_to_quant_format(gq.tensor_type());
+                    let ufmt = ggml_type_to_quant_format(uq.tensor_type());
+                    if matches!(gfmt, Some(QuantFormat::Q4_K))
+                        && matches!(ufmt, Some(QuantFormat::Q4_K))
+                    {
+                        let x_slice = x.as_slice().expect("Array1 contiguous");
+                        let g_shape = gq.shape();
+                        let u_shape = uq.shape();
+                        b.qwen35_paired_q4k_matvec(
+                            gq.raw_bytes(),
+                            g_shape[0],
+                            uq.raw_bytes(),
+                            u_shape[0],
+                            x_slice,
+                            g_shape[1],
+                        )
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some((gv, uv)) = paired {
+                (Array1::from(gv), Array1::from(uv))
+            } else {
+                let g = match gate_q {
+                    Some(q) => matvec_with_backend(q, x, backend),
+                    None => gate_dense.dot(x),
+                };
+                let u = match up_q {
+                    Some(q) => matvec_with_backend(q, x, backend),
+                    None => up_dense.dot(x),
+                };
+                (g, u)
+            }
+        });
+        time_section!(FFN_SILU_LOOP, {
+            let mut inter = Array1::<f32>::zeros(g.len());
+            for i in 0..g.len() {
+                inter[i] = (g[i] * sigmoid(g[i])) * u[i];
+            }
+            inter
+        })
+    };
     time_section!(
         FFN_DOWN,
         match down_q {
