@@ -16,6 +16,14 @@ rayon = "1.10"
 # Wire-format constants (Q4_K_BLOCK_ELEMS, etc.) for padding decisions.
 # Tests/benches depend on it too — keep both lists in sync.
 larql-models = { path = "../larql-models" }
+# RotorQuant K/V cache compression — Phase 1 of the long-context arc.
+# Pulled in only with the `cuda` feature; the CPU build doesn't link
+# RotorQuant since the device-resident KV cache (`Qwen35KvSlabDev`)
+# only exists on CUDA. The crate's `cuda` feature exposes
+# `copy_f16_to_quantized_device` / `dequantize_to_f32_device` —
+# the f16↔compressed device-side wrappers we'll wire into the qwen35
+# attention path.
+larql-rotorquant = { path = "../larql-rotorquant", optional = true, default-features = false }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
@@ -78,7 +86,7 @@ metal = ["dep:metal", "dep:objc"]
 # cuda — CUDA backend on Linux (NVIDIA GPUs). Uses cudarc/cuBLAS for
 # f32 GEMM/GEMV and correctness-first quantized matvec paths; fused
 # layer-pipeline integration remains staged through follow-up changes.
-cuda = ["dep:cudarc", "dep:half"]
+cuda = ["dep:cudarc", "dep:half", "dep:larql-rotorquant", "larql-rotorquant/cuda"]
 # Experimental cuda-oxide custom-kernel pilot. Kept separate from `cuda`
 # so future Rust-authored kernels can be evaluated without changing the
 # default cudarc/cuBLAS path.

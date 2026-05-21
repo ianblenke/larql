@@ -1082,7 +1082,7 @@ mod tests {
         }
 
         let out = super::super::deltanet::deltanet_step(
-            &backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v,
+            &backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v, false,
         )
         .expect("cuda deltanet @ qwen35 shape");
         // The kernel does the 16384-element decay loop in parallel
@@ -1161,6 +1161,7 @@ mod tests {
             d_conv,
             eps,
             0,
+            false,
         )
         .expect("fused postproj");
 
