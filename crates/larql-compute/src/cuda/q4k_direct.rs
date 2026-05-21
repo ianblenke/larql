@@ -220,6 +220,13 @@ pub(crate) fn matvec_pair(
             x.len()
         )));
     }
+    // Note (`cuda-moe-multistream` extension explored 2026-05-21,
+    // reverted): tried issuing `a` and `b` on separate worker streams.
+    // No measurable improvement vs the single-stream path on
+    // Qwen3.6-35B-A3B because each matvec (attn_qkv ~10240 rows,
+    // attn_gate ~6144 rows) is large enough to saturate the SMs by
+    // itself. Multi-stream helps when individual kernels are small
+    // (MoE expert dispatch — gate/up/down on a 2048-wide hidden).
     let drv = backend.driver();
     let x_dev = drv.device_buf_from(x)?;
     let a_dev = matvec_device(backend, a_q4k, &x_dev, a_rows, hidden)?;
