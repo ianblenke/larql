@@ -764,14 +764,52 @@ fn run_chat_completion(
     let result = if is_qwen35 {
         // Lazy-cache the heavy `Qwen35Weights` reconstruction (~30-40s
         // for a 60 GB vindex) for the model's lifetime.
+        // Attach a CUDA backend (or the no-op CPU stub when the
+        // `cuda` feature is off) so the per-class GPU tier knobs
+        // (LARQL_QWEN35_GPU_NO_FFN etc.) fire. Before this, the qwen35
+        // forward saw `backend: None` and all `matvec_with_backend` /
+        // `qwen35_deltanet_step` etc. dispatches fell through to the
+        // CPU rayon path even with `LARQL_QWEN35_GPU=1` set. The fix
+        // is to attach exactly once at vindex-load time — the same
+        // Arc is shared across every chat request via OnceLock.
         let qwen35_w = match model.qwen35_weights.get() {
             Some(w) => std::sync::Arc::clone(w),
             None => {
-                let loaded = larql_inference::attention::qwen35_load_vindex
+                // `mut` is needed by the feature-gated `loaded.backend = …`
+                // assignment below; `#[allow]` keeps non-feature builds clean
+                // without splitting the binding.
+                #[allow(unused_mut)]
+                let mut loaded = larql_inference::attention::qwen35_load_vindex
                     ::load_qwen35_weights_from_vindex(&model.path)
                     .map_err(|e| ServerError::Internal(format!(
                         "qwen35 vindex load failed: {e}"
                     )))?;
+                // Attach the compute backend ONLY when a real GPU
+                // backend is compiled in. The non-feature build's
+                // `default_backend()` returns `CpuBackend`, whose
+                // `q4k_matvec` / `q5k_matvec` impls differ slightly
+                // from `QuantTensor::matvec` (different summation
+                // order in their inner row dots). Hooking it up
+                // would silently change the FFN output values and
+                // break greedy decode — verified empirically.
+                //
+                // When `--features cuda` (or future `--features metal`)
+                // is enabled, the same `attention_compute_backend()`
+                // path returns a real CUDA/Metal backend whose
+                // `quant_matvec` actually dispatches to GPU kernels;
+                // its CPU fallback (when the format isn't supported
+                // device-side) returns `None` to surface the issue
+                // rather than silently re-routing through a
+                // marginally-different CPU kernel.
+                #[cfg(any(
+                    feature = "cuda",
+                    all(feature = "metal-experts", target_os = "macos")
+                ))]
+                {
+                    loaded.backend = Some(std::sync::Arc::from(
+                        super::super::attention::attention_compute_backend(),
+                    ));
+                }
                 let arc = std::sync::Arc::new(loaded);
                 // OnceLock semantics: first writer wins; if a parallel
                 // request already initialised, drop ours and use theirs.

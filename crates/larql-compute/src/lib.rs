@@ -67,6 +67,9 @@ pub mod pipeline;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 // ── Re-exports: pipeline types ──
 
 pub use pipeline::{
@@ -151,6 +154,13 @@ pub fn default_backend() -> Box<dyn ComputeBackend> {
             return Box::new(m);
         }
         eprintln!("[compute] Metal not available, falling back to CPU");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        match cuda::CudaBackend::new() {
+            Ok(c) => return Box::new(c),
+            Err(e) => eprintln!("[compute] CUDA not available ({e}), falling back to CPU"),
+        }
     }
     Box::new(cpu::CpuBackend)
 }
