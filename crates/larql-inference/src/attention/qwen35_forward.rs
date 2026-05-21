@@ -262,13 +262,17 @@ pub fn qwen35_forward_prefill(
         );
         // 2b. Residual add 1 — `residual = x_seq + block_out`.
         let residual: Array2<f32> = &x_seq + &block_out;
-        // 2c. Post-attention RMSNorm per row.
+        // 2c. Post-attention RMSNorm — batched-in-place to avoid
+        //     per-row Array1 allocations (~64 GB of intermediate
+        //     allocate-then-copy traffic over a 32K × 40-layer
+        //     prefill; pure overhead, no compute change).
         let mut ffn_in = Array2::<f32>::zeros((seq_len, hidden));
-        for i in 0..seq_len {
-            let row: Array1<f32> = residual.row(i).to_owned();
-            let normed = rms_norm_1d_pub(&row, &layer_w.attn_post_norm, eps);
-            ffn_in.row_mut(i).assign(&normed);
-        }
+        crate::attention::deltanet_block::rms_norm_2d_into(
+            residual.view(),
+            &layer_w.attn_post_norm,
+            eps,
+            ffn_in.view_mut(),
+        );
         // 2d. SwiGLU FFN.
         let ffn_out: Array2<f32> = if let Some(moe) = layer_w.moe.as_ref() {
             swiglu_moe_lazy_prefill(

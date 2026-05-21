@@ -958,6 +958,47 @@ fn rms_norm_1d(x: &Array1<f32>, weight: &[f32], eps: f32) -> Array1<f32> {
     Array1::from_iter(x.iter().zip(weight).map(|(&xv, &wv)| xv * inv * wv))
 }
 
+/// Batched in-place RMSNorm. Writes each row of `out` from the
+/// corresponding row of `x`, using the same per-row formula as
+/// `rms_norm_1d` (f32 mean-of-squares — bit-identical to looping
+/// over `rms_norm_1d` per row).
+///
+/// Lifts the per-row pattern
+/// ```text
+/// for i in 0..seq_len {
+///     let row = x.row(i).to_owned();           // alloc
+///     let normed = rms_norm_1d_pub(&row, w, e); // alloc
+///     out.row_mut(i).assign(&normed);
+/// }
+/// ```
+/// out of `qwen35_forward_prefill`'s post-attention norm step.
+/// For a 32K-token prefill with hidden=2048 and 40 layers that
+/// removes ~64 GB of allocate-then-copy traffic from intermediate
+/// Array1s — pure overhead, no compute change.
+///
+/// `pub(crate)` so the qwen35 forward and block modules can share
+/// it.
+pub(crate) fn rms_norm_2d_into(
+    x: ndarray::ArrayView2<f32>,
+    weight: &[f32],
+    eps: f32,
+    mut out: ndarray::ArrayViewMut2<f32>,
+) {
+    let seq_len = x.shape()[0];
+    let hidden = x.shape()[1];
+    debug_assert_eq!(weight.len(), hidden);
+    debug_assert_eq!(out.shape(), x.shape());
+    for i in 0..seq_len {
+        let row = x.row(i);
+        let mean_sq = row.iter().map(|&v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let mut out_row = out.row_mut(i);
+        for j in 0..hidden {
+            out_row[j] = row[j] * inv * weight[j];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1156,47 @@ mod tests {
         assert_eq!(dims.key_dim(), 128 * 16); // 2048
         assert_eq!(dims.value_dim(), 128 * 48); // 6144
         assert_eq!(dims.conv_dim(), 2 * 2048 + 6144); // 10240
+    }
+
+    /// `rms_norm_2d_into` must produce bit-identical results to
+    /// running `rms_norm_1d_pub` per row + assigning. Locks the
+    /// optimisation in `qwen35_forward_prefill` and
+    /// `qwen35_attention_block_prefill`.
+    #[test]
+    fn rms_norm_2d_into_matches_per_row_loop() {
+        let seq_len = 5usize;
+        let hidden = 7usize;
+        let eps = 1e-6_f32;
+        let data: Vec<f32> = (0..seq_len * hidden)
+            .map(|i| 0.1 + 0.05 * (i as f32) - 0.001 * (i as f32) * (i as f32))
+            .collect();
+        let x = Array2::from_shape_vec((seq_len, hidden), data).unwrap();
+        let weight: Vec<f32> = (0..hidden).map(|i| 0.5 + 0.07 * i as f32).collect();
+
+        // Per-row reference.
+        let mut expected = Array2::<f32>::zeros((seq_len, hidden));
+        for i in 0..seq_len {
+            let row = x.row(i).to_owned();
+            let normed = super::rms_norm_1d_pub(&row, &weight, eps);
+            expected.row_mut(i).assign(&normed);
+        }
+
+        // Batched in-place.
+        let mut got = Array2::<f32>::zeros((seq_len, hidden));
+        super::rms_norm_2d_into(x.view(), &weight, eps, got.view_mut());
+
+        // Bit-identical: same formula, same fp accumulation order.
+        for i in 0..seq_len {
+            for j in 0..hidden {
+                assert_eq!(
+                    got[[i, j]],
+                    expected[[i, j]],
+                    "rms_norm_2d_into[{i},{j}]: got={} expected={}",
+                    got[[i, j]],
+                    expected[[i, j]],
+                );
+            }
+        }
     }
 
     #[test]
