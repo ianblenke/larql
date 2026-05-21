@@ -1128,132 +1128,46 @@ impl ComputeBackend for CudaBackend {
 
     fn qwen35_gqa_decode_step(
         &self,
-        cache_id: u64,
-        max_seq: usize,
-        q: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
+        _cache_id: u64,
+        _max_seq: usize,
+        _q: &[f32],
+        _k_cache: &[f32],
+        _v_cache: &[f32],
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
     ) -> Option<Vec<f32>> {
-        let q_dim = num_q_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        if q.len() != q_dim
-            || k_cache.len() != seq_len * kv_dim
-            || v_cache.len() != seq_len * kv_dim
-            || seq_len == 0
-            || seq_len > max_seq
-        {
-            // Caller-supplied shape can't be served — fall back to CPU.
-            return None;
-        }
-
-        let drv = self.driver();
-        let mut cache = self.qwen35_kv_slab_cache.lock().ok()?;
-        let slab = cache.entry(cache_id).or_insert_with_key(|_| {
-            // Lazily allocate the device K/V slabs on first use. f16
-            // matches `fused_decode_attention_device_kv`'s kernel
-            // signature.
-            let cache_len = max_seq * kv_dim;
-            let k = drv
-                .stream
-                .alloc_zeros::<half::f16>(cache_len)
-                .expect("alloc qwen35_kv_slab K");
-            let v = drv
-                .stream
-                .alloc_zeros::<half::f16>(cache_len)
-                .expect("alloc qwen35_kv_slab V");
-            Qwen35KvSlabDev {
-                k,
-                v,
-                max_seq,
-                kv_dim,
-                cached_seq_len: 0,
-            }
-        });
-
-        // Re-allocate if (max_seq, kv_dim) shifted (model-swap case).
-        if slab.max_seq != max_seq || slab.kv_dim != kv_dim {
-            let cache_len = max_seq * kv_dim;
-            slab.k = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
-            slab.v = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
-            slab.max_seq = max_seq;
-            slab.kv_dim = kv_dim;
-            slab.cached_seq_len = 0;
-        }
-
-        let new_row_idx = seq_len - 1;
-        // Stale-cache repopulation: when the device cache isn't caught
-        // up to "one row before the new token", re-upload everything
-        // up to seq_len-1 as f16 then proceed normally. Avoids silent
-        // drift when the host slab was reset without a matching
-        // `qwen35_gqa_decode_reset`.
-        if slab.cached_seq_len != new_row_idx {
-            if new_row_idx > 0 {
-                let k_prev_f16: Vec<half::f16> = k_cache[..new_row_idx * kv_dim]
-                    .iter()
-                    .map(|&v| half::f16::from_f32(v))
-                    .collect();
-                let v_prev_f16: Vec<half::f16> = v_cache[..new_row_idx * kv_dim]
-                    .iter()
-                    .map(|&v| half::f16::from_f32(v))
-                    .collect();
-                drv.stream
-                    .memcpy_htod(&k_prev_f16, &mut slab.k.slice_mut(..k_prev_f16.len()))
-                    .ok()?;
-                drv.stream
-                    .memcpy_htod(&v_prev_f16, &mut slab.v.slice_mut(..v_prev_f16.len()))
-                    .ok()?;
-            }
-            slab.cached_seq_len = new_row_idx;
-        }
-
-        // The new K/V row (last row of host slab) is what the kernel
-        // both reads as `k_new`/`v_new` AND writes into k_cache_dev/v_cache_dev
-        // at `pos = new_row_idx`.
-        let new_k = &k_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
-        let new_v = &v_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
-        let q_dev = drv.device_buf_from(q).ok()?;
-        let k_new_dev = drv.device_buf_from(new_k).ok()?;
-        let v_new_dev = drv.device_buf_from(new_v).ok()?;
-
-        let scale = (head_dim as f32).powf(-0.5);
-        let opts = super::attn::FusedDecodeAttentionOpts {
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            pos: new_row_idx,
-            max_seq,
-            // qwen35_attention_block_step applies QK-norm and RoPE on
-            // host before reaching here, so the kernel must skip both.
-            rotary_dim: 0,
-            rope_base: 0.0,
-            eps: 0.0,
-            qk_norm_offset: 0.0,
-            attn_scale: scale,
-            softcap: 0.0,
-        };
-        let out_dev = super::attn::fused_decode_attention_device_kv(
-            self,
-            &q_dev,
-            &k_new_dev,
-            &v_new_dev,
-            &mut slab.k,
-            &mut slab.v,
-            None, // no qk-norm — host already applied
-            None,
-            opts,
-        )
-        .ok()?;
-
-        slab.cached_seq_len = seq_len;
-        // dtoh the attention output.
-        let mut out_host = vec![0.0_f32; q_dim];
-        drv.stream.memcpy_dtoh(&out_dev, &mut out_host).ok()?;
-        drv.stream.synchronize().ok()?;
-        Some(out_host)
+        // DISABLED — `fused_decode_attention_device_kv` was designed as
+        // a fully-fused Qwen attention kernel (QK-norm + partial RoPE
+        // + softmax + cache append). The host code in
+        // `qwen35_attention_block_step` already applies QK-norm and
+        // RoPE per-head BEFORE calling this trait method, so the
+        // kernel re-rotating K corrupts it (double-application). The
+        // kernel also rejects `rotary_dim = 0` as "skip RoPE" — it
+        // upgrades to `head_dim`, rotating every dimension.
+        //
+        // Hardware bench 2026-05-21 confirmed the breakage on
+        // Qwen3.6-35B-A3B: greedy chat completion returns 0 tokens
+        // with this path active vs 16 coherent tokens with
+        // `LARQL_QWEN35_GPU_NO_ATTN_DECODE=1`.
+        //
+        // Fix path (see project memory `project_gpu_attn_arc.md`):
+        //   * Option A: kernel change — treat `rotary_dim == 0` as
+        //     "skip RoPE entirely" (single-line change in attn.cu)
+        //     and call this method with `rotary_dim=0`,
+        //     `q_norm/k_norm=None`. Cleanest.
+        //   * Option B: host-side change — skip QK-norm + RoPE on host
+        //     when this trait method will be called, pass the norm
+        //     weights through, set `rotary_dim` correctly. Avoids
+        //     kernel work but couples the dispatch site to the
+        //     backend's RoPE policy.
+        //
+        // Until either lands, returning `None` falls through cleanly
+        // to the host-side `gqa_decode_step` loop. The device KV slab
+        // cache field on `CudaBackend` stays so the future fix can
+        // reuse it.
+        None
     }
 
     fn qwen35_gqa_decode_reset(&self, cache_id: u64) {
