@@ -465,31 +465,32 @@ pub fn qwen35_attention_block_prefill(
         x_norm.view_mut(),
     );
 
-    // 2. Q/K/V projections (per-row matvec; future PR batches to matmul).
-    let mut q_fused = Array2::<f32>::zeros((seq_len, dims.fused_q_dim()));
-    let mut k_full = Array2::<f32>::zeros((seq_len, dims.kv_dim()));
-    let mut v_full = Array2::<f32>::zeros((seq_len, dims.kv_dim()));
-    for r in 0..seq_len {
-        let x_r = x_norm.row(r).to_owned();
-        let qf = if let Some(q) = weights.attn_q_quant.as_ref() {
-            matvec_with_backend(q, &x_r, proj_backend)
-        } else {
-            weights.attn_q.dot(&x_r)
-        };
-        let kr = if let Some(q) = weights.attn_k_quant.as_ref() {
-            matvec_with_backend(q, &x_r, proj_backend)
-        } else {
-            weights.attn_k.dot(&x_r)
-        };
-        let vr = if let Some(q) = weights.attn_v_quant.as_ref() {
-            matvec_with_backend(q, &x_r, proj_backend)
-        } else {
-            weights.attn_v.dot(&x_r)
-        };
-        q_fused.row_mut(r).assign(&qf);
-        k_full.row_mut(r).assign(&kr);
-        v_full.row_mut(r).assign(&vr);
-    }
+    // 2. Q/K/V projections — batched matmul instead of per-row
+    //    matvec. The matmul path quantises all `seq_len` activations
+    //    to Q8_K once (Q4_K/Q5_K/Q6_K/Q8_0) and reads each weight
+    //    row across each rayon worker's slice of activations.
+    //    For seq_len >> num_cores (e.g. 32K prefill on 24 cores → 1.3K
+    //    rows per thread), each weight row stays hot in the worker's
+    //    L2/L3 between activations — weight bandwidth drops from
+    //    `seq_len × W_bytes` to roughly `cores × W_bytes`. The
+    //    `_ = proj_backend` line silences the unused-var lint until
+    //    the GPU batched matmul path lands (follow-up PR).
+    let _ = proj_backend; // kept for future GPU batched matmul path
+    let q_fused = if let Some(q) = weights.attn_q_quant.as_ref() {
+        q.matmul(&x_norm).expect("attn_q matmul")
+    } else {
+        x_norm.dot(&weights.attn_q.t())
+    };
+    let k_full = if let Some(q) = weights.attn_k_quant.as_ref() {
+        q.matmul(&x_norm).expect("attn_k matmul")
+    } else {
+        x_norm.dot(&weights.attn_k.t())
+    };
+    let v_full = if let Some(q) = weights.attn_v_quant.as_ref() {
+        q.matmul(&x_norm).expect("attn_v matmul")
+    } else {
+        x_norm.dot(&weights.attn_v.t())
+    };
 
     // 3. Split Q + gate (already batched-capable).
     let (q_2d, gate_2d) = split_q_gate(&q_fused, dims.n_head, dims.head_dim);
@@ -595,17 +596,13 @@ pub fn qwen35_attention_block_prefill(
     // 8. Apply Q gate (batched-capable).
     apply_q_gate(&mut attn_out_seq, &gate_2d);
 
-    // 9. Output projection per row.
-    let mut out = Array2::<f32>::zeros((seq_len, dims.hidden));
-    for r in 0..seq_len {
-        let attn_r = attn_out_seq.row(r).to_owned();
-        let y = if let Some(q) = weights.attn_output_quant.as_ref() {
-            matvec_with_backend(q, &attn_r, proj_backend)
-        } else {
-            weights.attn_output.dot(&attn_r)
-        };
-        out.row_mut(r).assign(&y);
-    }
+    // 9. Output projection — batched matmul (same shape rationale
+    //    as steps 2's projections; same L3-reuse win).
+    let out = if let Some(q) = weights.attn_output_quant.as_ref() {
+        q.matmul(&attn_out_seq).expect("attn_output matmul")
+    } else {
+        attn_out_seq.dot(&weights.attn_output.t())
+    };
     out
 }
 

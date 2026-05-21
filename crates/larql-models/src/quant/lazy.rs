@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 
 use crate::quant::ggml::{
     dequantize, q4k_q8k_row_dot, q4k_row_dot, q5k_q8k_row_dot, q6k_q8k_row_dot, q6k_row_dot,
@@ -620,6 +620,149 @@ impl QuantTensor {
         self.byte_len
     }
 
+    /// Batched matmul: `out[seq_len, rows] = x_seq[seq_len, cols] @ W.T`
+    /// where `W = self [rows, cols]`. The Array2 sibling of
+    /// [`Self::matvec`].
+    ///
+    /// The first kernel-write step of the Phase 4 internals: replaces
+    /// the per-row pattern
+    ///
+    /// ```rust,ignore
+    /// for r in 0..seq_len {
+    ///     let x_r = x_seq.row(r).to_owned();
+    ///     out.row_mut(r).assign(&qt.matvec(&x_r)?);
+    /// }
+    /// ```
+    ///
+    /// with a single `matmul` call that:
+    /// 1. Pre-quantises **all** `seq_len` activation rows to Q8_K once
+    ///    into one contiguous buffer (the per-row form would either
+    ///    re-quantise per row, or hit the thread-local cache once per
+    ///    row — both pay the launch overhead `seq_len` times).
+    /// 2. Parallelises over output rows (the `seq_len` axis). Each
+    ///    rayon worker sweeps its slice of activation rows × all
+    ///    weight rows. For `seq_len >> num_cores` (32K prefill on a
+    ///    24-core box → ~1.3K rows/thread), each worker pulls the
+    ///    weight matrix into L2/L3 once and reuses it across all of
+    ///    its assigned positions. For Qwen3.6 Q-projection
+    ///    `[4096 × 2048]` Q4_K (~5 MB), that fits in L3 — so the
+    ///    weight bandwidth cost drops from `seq_len × W_bytes` to
+    ///    roughly `cores × W_bytes`.
+    ///
+    /// ## Format support
+    ///
+    /// First PR: Q4_K, Q5_K, Q6_K, Q8_0 (the four formats that
+    /// `matvec` already accelerates via the Q8_K activation cache).
+    /// MXFP4 / mxfp4-mixed and other formats stay on the per-row
+    /// fallback path inside the dispatch wrapper.
+    ///
+    /// ## Parity gate
+    ///
+    /// `matmul` produces the same output as looping `matvec` per row
+    /// (modulo fp accumulation order — `matvec`'s per-row Q8_K cache
+    /// hashes the input bytes; this batched form pre-quantises into
+    /// a buffer instead, so the Q8_K bytes themselves are
+    /// bit-identical). The activations end up byte-equal Q8_K data
+    /// either way, so per-row dots match exactly.
+    pub fn matmul(&self, x_seq: &Array2<f32>) -> Result<Array2<f32>, ModelError> {
+        let shape = x_seq.shape();
+        if shape[1] != self.cols {
+            return Err(ModelError::Parse(format!(
+                "QuantTensor::matmul: x_seq cols {} != self.cols {}",
+                shape[1], self.cols,
+            )));
+        }
+        let seq_len = shape[0];
+        let cols = self.cols;
+        let rows = self.rows;
+        if seq_len == 0 {
+            return Ok(Array2::zeros((0, rows)));
+        }
+        let x_slice = x_seq.as_slice().ok_or_else(|| {
+            ModelError::Parse("QuantTensor::matmul: x_seq must be contiguous".into())
+        })?;
+
+        // Pre-quantise all activation rows to Q8_K in one contiguous
+        // buffer when (a) the format supports Q8_K and (b)
+        // `cols % 256 == 0`. Both hold for Qwen3.6 projections
+        // (hidden=2048 is a multiple of 256) — see q4k_q8k.rs.
+        use crate::quant::ggml::{
+            q4k_q8k_row_dot, q5k_q8k_row_dot, q6k_q8k_row_dot, q8_0_q8k_row_dot, quantize_to_q8_k,
+            Q8_K_BLOCK_BYTES,
+        };
+        use rayon::prelude::*;
+
+        let cols_blocks = cols / 256;
+        let q8k_row_bytes = cols_blocks * Q8_K_BLOCK_BYTES;
+        let use_q8k = cols.is_multiple_of(256)
+            && matches!(
+                self.tensor_type,
+                TYPE_Q4_K | TYPE_Q5_K | TYPE_Q6_K | TYPE_Q8_0,
+            );
+        if !use_q8k {
+            // Per-row fallback: row-by-row matvec into the output.
+            // Loses the L3-cache reuse benefit but stays correct for
+            // unsupported formats.
+            let mut out = Array2::<f32>::zeros((seq_len, rows));
+            for s in 0..seq_len {
+                let x_row = x_seq.row(s).to_owned();
+                let y = self.matvec(&x_row)?;
+                out.row_mut(s).assign(&y);
+            }
+            return Ok(out);
+        }
+
+        // Pre-quantise all activations in parallel — each row is
+        // independent and quantize_to_q8_k is non-trivial.
+        let mut q8k_all = vec![0u8; seq_len * q8k_row_bytes];
+        q8k_all
+            .par_chunks_mut(q8k_row_bytes)
+            .enumerate()
+            .for_each(|(s, dst)| {
+                let row_floats = &x_slice[s * cols..(s + 1) * cols];
+                let row_q8k = quantize_to_q8_k(row_floats);
+                dst.copy_from_slice(&row_q8k);
+            });
+
+        let mut out = Array2::<f32>::zeros((seq_len, rows));
+        let out_slice = out
+            .as_slice_mut()
+            .expect("Array2::zeros gives contiguous slice");
+        let data = self.bytes();
+        let rb = self.row_bytes;
+        let in_rayon = rayon::current_thread_index().is_some();
+        let tensor_type = self.tensor_type;
+
+        type DotFn = fn(&[u8], &[u8]) -> Result<f32, ModelError>;
+        let dot: DotFn = match tensor_type {
+            TYPE_Q4_K => q4k_q8k_row_dot,
+            TYPE_Q5_K => q5k_q8k_row_dot,
+            TYPE_Q6_K => q6k_q8k_row_dot,
+            TYPE_Q8_0 => q8_0_q8k_row_dot,
+            _ => unreachable!("use_q8k gate already filtered formats"),
+        };
+
+        let compute_row = |(s, out_row): (usize, &mut [f32])| {
+            let activation = &q8k_all[s * q8k_row_bytes..(s + 1) * q8k_row_bytes];
+            for r in 0..rows {
+                let weight_row = &data[r * rb..(r + 1) * rb];
+                out_row[r] = dot(weight_row, activation).expect("q8k row_dot");
+            }
+        };
+
+        if in_rayon {
+            for (s, chunk) in out_slice.chunks_mut(rows).enumerate() {
+                compute_row((s, chunk));
+            }
+        } else {
+            out_slice
+                .par_chunks_mut(rows)
+                .enumerate()
+                .for_each(compute_row);
+        }
+        Ok(out)
+    }
+
     /// Borrow the raw GGML bytes for this view. Used by GPU dispatch
     /// — the matvec kernels read the same bit layout the CPU
     /// `q4k_row_dot` / `q6k_row_dot` use, so no conversion is
@@ -733,6 +876,65 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    /// `matmul` over an Array2 input must produce the exact same
+    /// output as looping `matvec` per row + assigning. Exercises
+    /// the F32 fallback path; the Q4_K/Q5_K/Q6_K/Q8_0 fast paths
+    /// dispatch into the same per-format row_dot helpers as
+    /// `matvec` so the wrapper logic is what's under test here.
+    #[test]
+    fn matmul_matches_per_row_matvec_loop() {
+        let rows = 5usize;
+        let cols = 4usize;
+        let seq_len = 3usize;
+        let w_values: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let qt = QuantTensor::from_f32_rows(rows, cols, &w_values);
+
+        let x_data: Vec<f32> = (0..seq_len * cols)
+            .map(|i| 0.5 + 0.07 * i as f32 - 0.003 * (i as f32) * (i as f32))
+            .collect();
+        let x_seq = Array2::from_shape_vec((seq_len, cols), x_data).unwrap();
+
+        // Reference: per-row matvec loop.
+        let mut expected = Array2::<f32>::zeros((seq_len, rows));
+        for s in 0..seq_len {
+            let x_row = x_seq.row(s).to_owned();
+            let y = qt.matvec(&x_row).unwrap();
+            expected.row_mut(s).assign(&y);
+        }
+
+        let got = qt.matmul(&x_seq).unwrap();
+        assert_eq!(got.shape(), expected.shape());
+        for s in 0..seq_len {
+            for r in 0..rows {
+                let g = got[[s, r]];
+                let e = expected[[s, r]];
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "matmul[{s},{r}]: got={} expected={}",
+                    g,
+                    e,
+                );
+            }
+        }
+    }
+
+    /// Empty `x_seq` yields a `[0, rows]` shape.
+    #[test]
+    fn matmul_empty_seq_is_empty_output() {
+        let qt = QuantTensor::from_f32_rows(3, 4, &[0.5_f32; 12]);
+        let x_seq = Array2::<f32>::zeros((0, 4));
+        let got = qt.matmul(&x_seq).unwrap();
+        assert_eq!(got.shape(), [0, 3]);
+    }
+
+    /// Wrong cols → error (mirror of `matvec`'s shape check).
+    #[test]
+    fn matmul_wrong_cols_errors() {
+        let qt = QuantTensor::from_f32_rows(2, 3, &[1.0; 6]);
+        let x_seq = Array2::<f32>::zeros((4, 5));
+        assert!(qt.matmul(&x_seq).is_err());
     }
 
     #[test]
