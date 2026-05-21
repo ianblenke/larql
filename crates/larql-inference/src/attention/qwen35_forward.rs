@@ -643,6 +643,14 @@ fn swiglu_moe_lazy(
         d.prefetch_willneed();
     }
 
+    // Note (Phase G.2 explored 2026-05-21, reverted): tried
+    // `par_iter` across the top-K experts. Regressed throughput on
+    // both GPU FFN (12.2 → 11.1 t/s) and likely CPU FFN — each
+    // expert's internal matvec already saturates the rayon thread
+    // pool, so outer parallelism only adds work-stealing overhead.
+    // GPU FFN additionally serialises all 8 expert kernels on the
+    // single CUDA stream. Keep this loop sequential; the parallelism
+    // win lives inside `QuantTensor::matvec` already.
     for (i, (_expert_id, gate_e, up_e, down_e)) in expert_slices.iter().enumerate() {
         let y_i = swiglu_ffn_lazy(
             x,
