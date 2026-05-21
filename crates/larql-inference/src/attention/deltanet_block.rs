@@ -869,6 +869,73 @@ pub fn deltanet_block_step(
     block_out
 }
 
+/// Multi-position sibling of `deltanet_block_step`. Processes
+/// `seq_len = x_seq.nrows()` positions through one DeltaNet linear-
+/// attention block, chaining the `state` forward exactly as a
+/// per-position loop would.
+///
+/// Phase 4d-scaffold of the batched-prefill arc. Body is a per-row
+/// loop today. The wrapper exists so the prefill flow's three
+/// sibling entry points — `qwen35_attention_block_prefill` (4b-host,
+/// PR #232), `swiglu_moe_lazy_prefill` (4c-scaffold, PR #233), and
+/// this function — share the same multi-position signature shape:
+///
+/// ```rust
+/// pub fn deltanet_block_prefill(
+///     x_seq: &Array2<f32>,
+///     weights, dims,
+///     state: &mut DeltaNetLayerState,
+///     backend,
+///     base_pos: usize,
+///     layer: usize,
+/// ) -> Array2<f32>
+/// ```
+///
+/// Once Phase 4-final wires `qwen35_forward_prefill` to call the
+/// three batched siblings together, only the bodies need to change
+/// to deliver wall-time savings — the call sites stay put.
+///
+/// ## DeltaNet has sequential dependency
+///
+/// Unlike the MoE FFN (positions are independent) and the
+/// full-attention block (positions all see the same K/V slab), the
+/// DeltaNet recurrence is genuinely sequential: position `i`'s
+/// recurrent state depends on position `i-1`'s update. So even the
+/// internals follow-up can't simply parallelise over positions —
+/// it'll need to either (a) reformulate as a prefix-scan, or (b)
+/// batch the non-recurrent parts (projections, RMSNorm, gate/output
+/// proj) and leave the recurrent rank-1 update as a sequential
+/// inner loop. Option (b) is the practical first step; option (a)
+/// is a research project.
+///
+/// ## Parity test
+///
+/// `deltanet_block_prefill_matches_per_position_loop` runs both
+/// paths on a 3-position synthetic input and asserts:
+///   - per-row output values match within `1e-5` absolute,
+///   - final `recurrent_state` and `conv_state` match within
+///     `1e-5` absolute.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn deltanet_block_prefill(
+    x_seq: &Array2<f32>,
+    weights: &DeltaNetLayerWeights,
+    dims: &DeltaNetDims,
+    state: &mut DeltaNetLayerState,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    base_pos: usize,
+    layer: usize,
+) -> Array2<f32> {
+    let seq_len = x_seq.nrows();
+    let hidden = x_seq.ncols();
+    let mut out = Array2::<f32>::zeros((seq_len, hidden));
+    for i in 0..seq_len {
+        let x_row: Array1<f32> = x_seq.row(i).to_owned();
+        let y = deltanet_block_step(&x_row, weights, dims, state, backend, base_pos + i, layer);
+        out.row_mut(i).assign(&y);
+    }
+    out
+}
+
 #[inline]
 fn silu(x: f32) -> f32 {
     x * sigmoid(x)
@@ -1108,5 +1175,101 @@ mod tests {
             state_mass_after_2 >= state_mass_after_1 - 1e-5,
             "state mass shrank without decay: {state_mass_after_1} → {state_mass_after_2}"
         );
+    }
+
+    /// Phase 4d-scaffold parity test: `deltanet_block_prefill` over
+    /// `seq_len` positions must produce the same per-row outputs AND
+    /// the same final `state` as running `deltanet_block_step` once
+    /// per position with state chained forward.
+    ///
+    /// Locks the multi-position contract so the internals follow-up
+    /// can swap the wrapper's per-row loop for batched projections
+    /// (+ sequential recurrence) without silently drifting numerics.
+    #[test]
+    fn deltanet_block_prefill_matches_per_position_loop() {
+        let dims = make_tiny_dims();
+        let conv_dim = dims.conv_dim();
+        let value_dim = dims.value_dim();
+
+        let weights = make_dn_weights(
+            vec![1.0_f32; dims.hidden],
+            Array2::from_elem((conv_dim, dims.hidden), 0.1_f32),
+            Array2::from_elem((value_dim, dims.hidden), 0.1_f32),
+            Array2::from_elem((dims.d_conv, conv_dim), 0.5_f32),
+            vec![0.0_f32; dims.n_v_heads],
+            vec![-0.5_f32; dims.n_v_heads],
+            Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32),
+            Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32),
+            vec![1.0_f32; dims.head_v_dim],
+            Array2::from_elem((dims.hidden, value_dim), 0.5_f32),
+        );
+
+        // Three distinct input rows so the recurrent state's update
+        // sequence actually varies between positions.
+        let seq_len = 3usize;
+        let x_seq_data = vec![
+            1.0_f32, 0.5, -0.25, 0.75, // row 0
+            0.5, 0.5, 0.5, 0.5, // row 1
+            -0.25, 0.75, 1.0, -0.5, // row 2
+        ];
+        let x_seq = Array2::from_shape_vec((seq_len, dims.hidden), x_seq_data).unwrap();
+
+        // Reference: per-position loop, chaining state.
+        let mut ref_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let mut expected = Array2::<f32>::zeros((seq_len, dims.hidden));
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let y = deltanet_block_step(&x_row, &weights, &dims, &mut ref_state, None, i, 0);
+            expected.row_mut(i).assign(&y);
+        }
+
+        // Impl: batched wrapper, fresh state.
+        let mut got_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let got = deltanet_block_prefill(&x_seq, &weights, &dims, &mut got_state, None, 0, 0);
+
+        // Per-row outputs match.
+        assert_eq!(got.shape(), expected.shape());
+        for i in 0..seq_len {
+            for h in 0..dims.hidden {
+                let g = got[[i, h]];
+                let e = expected[[i, h]];
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "dn_prefill[{i},{h}] got={} expected={}",
+                    g,
+                    e,
+                );
+            }
+        }
+
+        // Final state matches exactly — recurrent_state + conv_state.
+        for (i, (&g, &e)) in got_state
+            .recurrent_state
+            .iter()
+            .zip(ref_state.recurrent_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "recurrent_state[{i}] got={} expected={}",
+                g,
+                e,
+            );
+        }
+        for (i, (&g, &e)) in got_state
+            .conv_state
+            .iter()
+            .zip(ref_state.conv_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "conv_state[{i}] got={} expected={}",
+                g,
+                e,
+            );
+        }
     }
 }
