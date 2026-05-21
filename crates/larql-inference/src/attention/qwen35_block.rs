@@ -350,9 +350,19 @@ pub fn qwen35_attention_block_step(
         // concurrent requests don't share device state. Per-sequence
         // resets are propagated via `DeltaNetHybridCache::reset` →
         // `qwen35_gqa_decode_reset`.
+        // `LARQL_QWEN35_KV_MAX_SEQ` lets callers override the default
+        // 4096-row device-cache cap without bumping
+        // `DEFAULT_GPU_KV_CACHE_MAX_SEQ` (which the generic decode
+        // path also keys off). Phase 3 of the long-context arc uses
+        // this to bench at 16K / 32K / 128K context; production
+        // users override per-request workload size.
+        let max_seq = std::env::var("LARQL_QWEN35_KV_MAX_SEQ")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ);
         b.qwen35_gqa_decode_step(
             layer as u64,
-            crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+            max_seq,
             q_row.as_slice().expect("q_row contiguous"),
             k_flat,
             v_flat,
