@@ -715,6 +715,77 @@ mod tests {
         assert_eq!(slab.row(2).to_vec(), vec![10.0, 20.0, 30.0]);
     }
 
+    /// Lock in PR #204's `rotary_dim` priority: `partial_rotary_factor`
+    /// wins over `sum(rope_dimension_sections)` when both are set with
+    /// inconsistent values. The Qwen 3.6 35B-A3B GGUF ships
+    /// `rope.dimension_sections = [11, 11, 10, 0]` (sum 32, in PAIR units
+    /// per llama's mrope_cache_init) together with
+    /// `rope.dimension_count = 64` (the total rotated dim count).
+    /// The previously-shipped code used `sum(sections)` and rotated
+    /// only the first 32 dims per head → garbage output. Fixed by
+    /// preferring `partial_rotary_factor * head_dim`.
+    #[test]
+    fn rotary_dim_prefers_partial_rotary_factor_over_sections() {
+        use larql_models::config::ModelConfig;
+        use larql_models::architectures::qwen35::Qwen35MoeArch;
+
+        // Mock the 35B-A3B config:
+        // - head_dim = 256
+        // - partial_rotary_factor = 0.25 → 64 dims rotated
+        // - rope_dimension_sections sum = 32 (the "wrong" answer)
+        let cfg = ModelConfig {
+            model_type: "qwen35moe".into(),
+            num_layers: 4,
+            hidden_size: 2048,
+            intermediate_size: 0,
+            head_dim: 256,
+            num_q_heads: 16,
+            num_kv_heads: 2,
+            vocab_size: Some(248044),
+            rope_base: 10_000_000.0,
+            rope_local_base: None,
+            sliding_window: None,
+            num_experts: Some(256),
+            num_experts_per_token: Some(8),
+            num_shared_experts: Some(1),
+            kv_lora_rank: None,
+            q_lora_rank: None,
+            rope_scaling: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: None,
+            embedding_multiplier: None,
+            residual_multiplier: None,
+            attention_multiplier: None,
+            logits_scaling: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: Some(0.25),
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            per_layer_embed_dim: None,
+            num_kv_shared_layers: None,
+            enable_moe_block: true,
+            top_k_experts: Some(8),
+            moe_intermediate_size: Some(512),
+            full_attention_interval: Some(4),
+            ssm_state_size: Some(128),
+            ssm_inner_size: Some(4096),
+            ssm_dt_rank: Some(32),
+            ssm_group_count: Some(16),
+            ssm_conv_kernel: Some(4),
+            rope_dimension_sections: Some(vec![11, 11, 10, 0]),
+        };
+        let arch = Qwen35MoeArch::from_config(cfg);
+        let dims = Qwen35AttentionDims::from_arch(&arch, 1e-6);
+        assert_eq!(
+            dims.rotary_dim, 64,
+            "partial_rotary_factor=0.25 * head_dim=256 should give rotary_dim=64; \
+             pre-fix code would have given sum(sections)=32"
+        );
+    }
+
     #[test]
     fn append_row_from_empty_slab() {
         let mut slab = Array2::<f32>::zeros((0, 3));
