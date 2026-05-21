@@ -122,6 +122,25 @@ pub struct CudaBackend {
     /// (e.g. when the host slab was reset without `qwen35_gqa_decode_reset`
     /// being called).
     pub(crate) qwen35_kv_slab_cache: Mutex<HashMap<u64, Qwen35KvSlabDev>>,
+    /// `Step 4 Phase 2`: RotorQuant-compressed K/V slabs. Each
+    /// `Qwen35KvSlabDevQuant` holds packed Iso3 codes
+    /// (≈ 3.13 bits/element) instead of f16 — at max_seq=4096,
+    /// kv_dim=512: 16 KiB × 2 (K+V) per layer × 16 layers ≈ 512 KiB
+    /// vs the f16 path's 64 MiB. Selected by env var
+    /// `LARQL_QWEN35_KV_FORMAT=iso3`; default unset uses the f16
+    /// slab cache above.
+    pub(crate) qwen35_kv_slab_cache_quant: Mutex<HashMap<u64, Qwen35KvSlabDevQuant>>,
+    /// `Step 4 Phase 2`: shared dequant scratch buffers. The
+    /// compressed-cache attention path dequants the full
+    /// `seq_len * kv_dim` slab into f32 scratch, converts to f16,
+    /// then feeds the existing f16 attention kernel. Allocated
+    /// lazily and reused across all attention calls in a step
+    /// (16 layers × 1 call each share these buffers). Sized to the
+    /// first-seen `max_seq * max_kv_dim`; grown on demand if a
+    /// larger shape comes through.
+    pub(crate) qwen35_kv_dequant_f32_scratch: Mutex<Option<CudaSlice<f32>>>,
+    pub(crate) qwen35_kv_dequant_f16_k_scratch: Mutex<Option<CudaSlice<half::f16>>>,
+    pub(crate) qwen35_kv_dequant_f16_v_scratch: Mutex<Option<CudaSlice<half::f16>>>,
 }
 
 /// Device-resident K/V cache slab for one Qwen 3.6 full-attention layer.
@@ -138,6 +157,27 @@ pub(crate) struct Qwen35KvSlabDev {
     /// seq_len the device cache is caught up to. If the next call
     /// arrives with `host_seq_len != cached_seq_len + 1` the slab is
     /// stale and gets re-populated from the host slab.
+    pub cached_seq_len: usize,
+}
+
+/// `Step 4 Phase 2` — RotorQuant-compressed K/V slab.
+///
+/// Codes are stored row-major: packed Iso3 bytes for `max_seq` rows
+/// of `kv_dim` elements each. The per-row packed byte length comes
+/// from `larql_rotorquant::quantized_device_len_bytes(Iso3, kv_dim)`,
+/// not the per-element 3.13 bits divided by 8 — packing is per-block.
+///
+/// Lossy: cosine ≥ ~0.98 vs the original f16. Production validation
+/// is via end-to-end logit-difference bench (greedy decode coherence
+/// match) not exact roundtrip.
+pub(crate) struct Qwen35KvSlabDevQuant {
+    pub codes_k: CudaSlice<u8>,
+    pub codes_v: CudaSlice<u8>,
+    pub max_seq: usize,
+    pub kv_dim: usize,
+    /// Bytes per row in `codes_k` / `codes_v`. Cached so we don't
+    /// re-call `quantized_device_len_bytes` on each step.
+    pub packed_row_bytes: usize,
     pub cached_seq_len: usize,
 }
 
@@ -170,6 +210,10 @@ impl CudaBackend {
             spec_decode_graph: Mutex::new(HashMap::new()),
             spec_decode_warmup: Mutex::new(HashMap::new()),
             qwen35_kv_slab_cache: Mutex::new(HashMap::new()),
+            qwen35_kv_slab_cache_quant: Mutex::new(HashMap::new()),
+            qwen35_kv_dequant_f32_scratch: Mutex::new(None),
+            qwen35_kv_dequant_f16_k_scratch: Mutex::new(None),
+            qwen35_kv_dequant_f16_v_scratch: Mutex::new(None),
         })
     }
 
@@ -777,6 +821,308 @@ impl CudaBackend {
             .ok_or_else(|| CudaInitError::DriverMissing("qwen35 state cache miss".into()))?;
         f(state_dev)
     }
+
+    /// `Step 4 Phase 2` — RotorQuant-Iso3-compressed KV attention step.
+    ///
+    /// Storage: per-layer packed Iso3 codes (≈3.13 bits/element).
+    /// Per call:
+    ///   1. f32 new row → host f16 conversion → htod
+    ///   2. compress(f16) → packed bytes at slab.codes_*[new_row_idx]
+    ///   3. dequant(packed[..seq_len]) → f32 scratch
+    ///   4. f32 → f16 scratch (existing `f32_to_f16_device_into`)
+    ///   5. existing `fused_decode_attention_device_kv` reads f16 scratch
+    ///   6. dtoh attn output
+    ///
+    /// The f32 + f16 scratch buffers are shared across all 16
+    /// full-attn layers in a step (lazily allocated, sized to
+    /// `max_seq * kv_dim`). Net VRAM cost per layer:
+    ///   compressed codes: 2 × packed_row_bytes × max_seq (the K + V slabs)
+    /// vs the f16 path's:
+    ///   2 × kv_dim × max_seq × 2 bytes (the K + V f16 slabs)
+    /// — ≈ 3.5× saving on the per-layer storage at the cost of one
+    /// shared scratch pair sized to the worst-case layer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qwen35_gqa_decode_step_iso3(
+        &self,
+        cache_id: u64,
+        max_seq: usize,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        use larql_rotorquant::{
+            copy_f16_to_quantized_device, dequantize_to_f32_device, quantized_device_len_bytes,
+            CudaStream as RqStream, KvFormat, CUDA_BLOCK_ELEMENTS,
+        };
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        // Iso3 packs in blocks of `CUDA_BLOCK_ELEMENTS` (= 128) elements.
+        // kv_dim must be a multiple. Qwen3.6-35B-A3B: kv_dim = 4 × 128 = 512. OK.
+        if !kv_dim.is_multiple_of(CUDA_BLOCK_ELEMENTS) {
+            return None;
+        }
+        let new_row_idx = seq_len - 1;
+        let drv = self.driver();
+
+        // Get/allocate the per-layer compressed slab.
+        let packed_row_bytes = quantized_device_len_bytes(KvFormat::Iso3, kv_dim).ok()?;
+        let total_packed_bytes = packed_row_bytes.checked_mul(max_seq)?;
+        let mut cache = self.qwen35_kv_slab_cache_quant.lock().ok()?;
+        let slab = cache.entry(cache_id).or_insert_with_key(|_| {
+            let codes_k = drv
+                .stream
+                .alloc_zeros::<u8>(total_packed_bytes)
+                .expect("alloc Iso3 codes_k");
+            let codes_v = drv
+                .stream
+                .alloc_zeros::<u8>(total_packed_bytes)
+                .expect("alloc Iso3 codes_v");
+            Qwen35KvSlabDevQuant {
+                codes_k,
+                codes_v,
+                max_seq,
+                kv_dim,
+                packed_row_bytes,
+                cached_seq_len: 0,
+            }
+        });
+
+        if slab.max_seq != max_seq
+            || slab.kv_dim != kv_dim
+            || slab.packed_row_bytes != packed_row_bytes
+        {
+            slab.codes_k = drv.stream.alloc_zeros::<u8>(total_packed_bytes).ok()?;
+            slab.codes_v = drv.stream.alloc_zeros::<u8>(total_packed_bytes).ok()?;
+            slab.max_seq = max_seq;
+            slab.kv_dim = kv_dim;
+            slab.packed_row_bytes = packed_row_bytes;
+            slab.cached_seq_len = 0;
+        }
+
+        // Stale-cache repopulation: compress all prior rows. Same
+        // logic as the f16 slab path but f16-then-compress instead
+        // of just-htod-f16.
+        if slab.cached_seq_len != new_row_idx {
+            if new_row_idx > 0 {
+                let prev_elements = new_row_idx * kv_dim;
+                let k_prev_f16: Vec<half::f16> = k_cache[..prev_elements]
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect();
+                let v_prev_f16: Vec<half::f16> = v_cache[..prev_elements]
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect();
+                let k_prev_dev = drv.stream.clone_htod(&k_prev_f16).ok()?;
+                let v_prev_dev = drv.stream.clone_htod(&v_prev_f16).ok()?;
+                use cudarc::driver::{DevicePtr, DevicePtrMut};
+                let stream = drv.stream.clone();
+                let rq_stream =
+                    unsafe { RqStream::from_raw(stream.cu_stream() as *mut std::ffi::c_void) };
+                {
+                    let (src_ptr, _g1) = k_prev_dev.device_ptr(&stream);
+                    let (dst_ptr, _g2) = slab.codes_k.device_ptr_mut(&stream);
+                    unsafe {
+                        copy_f16_to_quantized_device(
+                            KvFormat::Iso3,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            prev_elements,
+                            rq_stream,
+                        )
+                    }
+                    .ok()?;
+                }
+                {
+                    let (src_ptr, _g1) = v_prev_dev.device_ptr(&stream);
+                    let (dst_ptr, _g2) = slab.codes_v.device_ptr_mut(&stream);
+                    unsafe {
+                        copy_f16_to_quantized_device(
+                            KvFormat::Iso3,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            prev_elements,
+                            rq_stream,
+                        )
+                    }
+                    .ok()?;
+                }
+            }
+            slab.cached_seq_len = new_row_idx;
+        }
+
+        // Compress the new (single) row into the packed slab at
+        // offset `new_row_idx * packed_row_bytes`.
+        {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let new_k_f16: Vec<half::f16> = k_cache
+                [new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim]
+                .iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect();
+            let new_v_f16: Vec<half::f16> = v_cache
+                [new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim]
+                .iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect();
+            let new_k_dev = drv.stream.clone_htod(&new_k_f16).ok()?;
+            let new_v_dev = drv.stream.clone_htod(&new_v_f16).ok()?;
+            let stream = drv.stream.clone();
+            let rq_stream =
+                unsafe { RqStream::from_raw(stream.cu_stream() as *mut std::ffi::c_void) };
+            let row_byte_offset = new_row_idx * packed_row_bytes;
+            {
+                let (src_ptr, _g1) = new_k_dev.device_ptr(&stream);
+                let mut codes_k_row = slab
+                    .codes_k
+                    .slice_mut(row_byte_offset..row_byte_offset + packed_row_bytes);
+                let (dst_ptr, _g2) = codes_k_row.device_ptr_mut(&stream);
+                unsafe {
+                    copy_f16_to_quantized_device(
+                        KvFormat::Iso3,
+                        src_ptr as *const std::ffi::c_void,
+                        dst_ptr as *mut std::ffi::c_void,
+                        kv_dim,
+                        rq_stream,
+                    )
+                }
+                .ok()?;
+            }
+            {
+                let (src_ptr, _g1) = new_v_dev.device_ptr(&stream);
+                let mut codes_v_row = slab
+                    .codes_v
+                    .slice_mut(row_byte_offset..row_byte_offset + packed_row_bytes);
+                let (dst_ptr, _g2) = codes_v_row.device_ptr_mut(&stream);
+                unsafe {
+                    copy_f16_to_quantized_device(
+                        KvFormat::Iso3,
+                        src_ptr as *const std::ffi::c_void,
+                        dst_ptr as *mut std::ffi::c_void,
+                        kv_dim,
+                        rq_stream,
+                    )
+                }
+                .ok()?;
+            }
+        }
+        slab.cached_seq_len = seq_len;
+
+        // Dequant `seq_len` rows to f32 scratch, then convert to f16
+        // K/V scratches for the existing attention kernel. The f16
+        // scratches are sized to exactly `max_seq * kv_dim` each —
+        // they're transient per-layer, written-and-immediately-read
+        // by one kernel call.
+        let scratch_elements = max_seq * kv_dim;
+        let dequant_elements = seq_len * kv_dim;
+        let mut f32_scratch_lock = self.qwen35_kv_dequant_f32_scratch.lock().ok()?;
+        let mut f16_k_lock = self.qwen35_kv_dequant_f16_k_scratch.lock().ok()?;
+        let mut f16_v_lock = self.qwen35_kv_dequant_f16_v_scratch.lock().ok()?;
+        if f32_scratch_lock
+            .as_ref()
+            .is_none_or(|s| s.len() < scratch_elements)
+        {
+            *f32_scratch_lock = Some(drv.stream.alloc_zeros::<f32>(scratch_elements).ok()?);
+        }
+        if f16_k_lock
+            .as_ref()
+            .is_none_or(|s| s.len() < scratch_elements)
+        {
+            *f16_k_lock = Some(drv.stream.alloc_zeros::<half::f16>(scratch_elements).ok()?);
+        }
+        if f16_v_lock
+            .as_ref()
+            .is_none_or(|s| s.len() < scratch_elements)
+        {
+            *f16_v_lock = Some(drv.stream.alloc_zeros::<half::f16>(scratch_elements).ok()?);
+        }
+        let f32_scratch = f32_scratch_lock.as_mut()?;
+        let k_scratch = f16_k_lock.as_mut()?;
+        let v_scratch = f16_v_lock.as_mut()?;
+
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let stream = drv.stream.clone();
+        let rq_stream = unsafe { RqStream::from_raw(stream.cu_stream() as *mut std::ffi::c_void) };
+
+        // Dequant K → f32 → f16 K-scratch.
+        {
+            let (src_ptr, _g1) = slab.codes_k.device_ptr(&stream);
+            let (dst_ptr, _g2) = f32_scratch.device_ptr_mut(&stream);
+            unsafe {
+                dequantize_to_f32_device(
+                    KvFormat::Iso3,
+                    src_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    dequant_elements,
+                    rq_stream,
+                )
+            }
+            .ok()?;
+        }
+        // Convert. `f32_to_f16_device_into` reads the FULL length of
+        // `f32_scratch` — which is `scratch_elements` (max_seq*kv_dim),
+        // not `dequant_elements`. The trailing rows we don't care
+        // about get written too, but the attention kernel only reads
+        // `pos+1 = seq_len` rows so the tail is harmless. Output
+        // length matches the input length; both scratches are sized
+        // identically.
+        super::elem::f32_to_f16_device_into(self, f32_scratch, k_scratch).ok()?;
+
+        // Dequant V → f32 → f16 V-scratch.
+        {
+            let (src_ptr, _g1) = slab.codes_v.device_ptr(&stream);
+            let (dst_ptr, _g2) = f32_scratch.device_ptr_mut(&stream);
+            unsafe {
+                dequantize_to_f32_device(
+                    KvFormat::Iso3,
+                    src_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    dequant_elements,
+                    rq_stream,
+                )
+            }
+            .ok()?;
+        }
+        super::elem::f32_to_f16_device_into(self, f32_scratch, v_scratch).ok()?;
+
+        // Run the existing fused attention kernel against the f16
+        // scratches. The kernel will *also* write the new K/V row
+        // into the scratches at `pos` — harmless since the scratches
+        // are transient.
+        let new_k = &k_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let new_v = &v_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let q_dev = drv.device_buf_from(q).ok()?;
+        let k_new_dev = drv.device_buf_from(new_k).ok()?;
+        let v_new_dev = drv.device_buf_from(new_v).ok()?;
+
+        let scale = (head_dim as f32).powf(-0.5);
+        let opts = super::attn::FusedDecodeAttentionOpts {
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos: new_row_idx,
+            max_seq,
+            rotary_dim: 0, // host pre-roped; kernel skips RoPE
+            rope_base: 0.0,
+            eps: 0.0,
+            qk_norm_offset: 0.0,
+            attn_scale: scale,
+            softcap: 0.0,
+        };
+        let out_dev = super::attn::fused_decode_attention_device_kv(
+            self, &q_dev, &k_new_dev, &v_new_dev, k_scratch, v_scratch, None, None, opts,
+        )
+        .ok()?;
+
+        let mut out_host = vec![0.0_f32; q_dim];
+        drv.stream.memcpy_dtoh(&out_dev, &mut out_host).ok()?;
+        drv.stream.synchronize().ok()?;
+        Some(out_host)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1147,6 +1493,23 @@ impl ComputeBackend for CudaBackend {
             || seq_len > max_seq
         {
             return None;
+        }
+
+        // `Step 4 Phase 2` dispatch: when `LARQL_QWEN35_KV_FORMAT=iso3`
+        // route through the RotorQuant-compressed KV path. Otherwise
+        // use the f16 device-resident cache (current default).
+        if std::env::var("LARQL_QWEN35_KV_FORMAT").ok().as_deref() == Some("iso3") {
+            return self.qwen35_gqa_decode_step_iso3(
+                cache_id,
+                max_seq,
+                q,
+                k_cache,
+                v_cache,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+            );
         }
 
         let drv = self.driver();
