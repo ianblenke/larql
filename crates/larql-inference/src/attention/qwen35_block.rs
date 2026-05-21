@@ -525,11 +525,14 @@ pub fn qwen35_attention_block_prefill(
         base_pos,
     );
 
-    // 6. Append all `seq_len` new K/V rows to the host cache slabs.
-    for r in 0..seq_len {
-        append_row(&mut kv_layer.0, k_roped.row(r));
-        append_row(&mut kv_layer.1, v_full.row(r));
-    }
+    // 6. Append all `seq_len` new K/V rows to the host cache slabs
+    //    in a single bulk allocation. The per-row `append_row`
+    //    form is quadratic — each call reallocates and recopies
+    //    the entire prior slab, so a 32K prefill spends ~268 GB
+    //    of memory traffic on recopies alone. `append_rows` is
+    //    O(seq_len * kv_dim) — for the same shape, ~16 MB.
+    append_rows(&mut kv_layer.0, &k_roped);
+    append_rows(&mut kv_layer.1, &v_full);
 
     // 7. Batched attention scan. Routes through
     //    `qwen35_attention_prefill_batch` when the backend offers it;
@@ -686,6 +689,34 @@ fn append_row(slab: &mut Array2<f32>, new_row: ndarray::ArrayView1<f32>) {
     for c in 0..dim {
         next[[last, c]] = new_row[c];
     }
+    *slab = next;
+}
+
+/// Bulk-append `new_rows.nrows()` rows to `slab` in a single
+/// reallocation + memcpy. Replaces a per-row `append_row` loop —
+/// crucial for prefill where the per-row variant is quadratic
+/// (each call reallocates and copies the *entire* prior slab,
+/// so a prompt of length N does O(N²) memory traffic on the
+/// existing rows alone).
+///
+/// For a 32K-token prefill with kv_dim=512 the per-row form does
+/// ~268 GB of element copies just on the existing-row recopies;
+/// this form does ~16 MB. The end-to-end parity test
+/// `qwen35_forward_prefill_matches_per_token_loop` already
+/// confirms KV slab contents are bit-identical after the swap.
+pub(crate) fn append_rows(slab: &mut Array2<f32>, new_rows: &Array2<f32>) {
+    let dim = slab.shape()[1];
+    let n_new = new_rows.shape()[0];
+    debug_assert_eq!(new_rows.shape()[1], dim);
+    if n_new == 0 {
+        return;
+    }
+    let old_rows = slab.shape()[0];
+    let mut next = Array2::<f32>::zeros((old_rows + n_new, dim));
+    if old_rows > 0 {
+        next.slice_mut(ndarray::s![..old_rows, ..]).assign(slab);
+    }
+    next.slice_mut(ndarray::s![old_rows.., ..]).assign(new_rows);
     *slab = next;
 }
 
@@ -1206,6 +1237,60 @@ mod tests {
         // Full-attn KV slab still empty.
         let (k1, _v1) = cache.kv_layers[1].as_ref().unwrap();
         assert_eq!(k1.shape()[0], 0);
+    }
+
+    /// `append_rows` parity test: bulk append produces the exact
+    /// same slab as a per-row `append_row` loop. Locks the
+    /// optimization so future refactors can't silently break the
+    /// KV-cache layout the attention kernels expect.
+    #[test]
+    fn append_rows_matches_per_row_loop() {
+        let dim = 7usize;
+        let mut slab_loop = Array2::<f32>::zeros((0, dim));
+        let mut slab_bulk = Array2::<f32>::zeros((0, dim));
+
+        // Seed: 2 rows via the per-row form to both, then exercise
+        // both forms appending 5 more identical rows so we cover
+        // the "non-empty initial slab" case (not just cold-start).
+        let r0: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let r1: Vec<f32> = (0..dim).map(|i| (i + dim) as f32).collect();
+        append_row(&mut slab_loop, ndarray::ArrayView1::from(&r0));
+        append_row(&mut slab_loop, ndarray::ArrayView1::from(&r1));
+        append_row(&mut slab_bulk, ndarray::ArrayView1::from(&r0));
+        append_row(&mut slab_bulk, ndarray::ArrayView1::from(&r1));
+
+        let n_new = 5usize;
+        let mut new_data = Vec::with_capacity(n_new * dim);
+        for r in 0..n_new {
+            for c in 0..dim {
+                new_data.push((100 + r * dim + c) as f32);
+            }
+        }
+        let new_rows = Array2::from_shape_vec((n_new, dim), new_data).unwrap();
+
+        for r in 0..n_new {
+            append_row(&mut slab_loop, new_rows.row(r));
+        }
+        append_rows(&mut slab_bulk, &new_rows);
+
+        assert_eq!(slab_loop.shape(), slab_bulk.shape());
+        for r in 0..slab_loop.shape()[0] {
+            for c in 0..dim {
+                assert_eq!(slab_loop[[r, c]], slab_bulk[[r, c]], "row {r} col {c}");
+            }
+        }
+    }
+
+    /// Empty `new_rows` is a no-op: slab unchanged.
+    #[test]
+    fn append_rows_empty_is_noop() {
+        let dim = 4usize;
+        let initial =
+            Array2::from_shape_vec((2, dim), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+        let mut slab = initial.clone();
+        let empty = Array2::<f32>::zeros((0, dim));
+        append_rows(&mut slab, &empty);
+        assert_eq!(slab, initial);
     }
 
     #[test]
