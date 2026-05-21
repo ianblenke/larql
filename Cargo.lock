@@ -2226,6 +2226,7 @@ dependencies = [
  "cudarc",
  "half",
  "larql-models",
+ "larql-rotorquant",
  "libc",
  "memmap2",
  "metal",
