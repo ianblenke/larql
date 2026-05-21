@@ -845,6 +845,50 @@ pub fn hybrid_layer_step(
     }
 }
 
+/// Multi-position sibling of `hybrid_layer_step`. Dispatches to
+/// `qwen35_attention_block_prefill` or `deltanet_block_prefill`
+/// based on `hybrid_cache.layer_kinds[layer]`.
+///
+/// Phase 4-final wiring entry point: `qwen35_forward_prefill`
+/// calls this once per layer instead of looping over per-token
+/// `hybrid_layer_step` calls.
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_layer_prefill(
+    layer: usize,
+    x_seq: &Array2<f32>,
+    weights: &Qwen35LayerWeights,
+    dn_dims: &DeltaNetDims,
+    attn_dims: &Qwen35AttentionDims,
+    hybrid_cache: &mut crate::attention::deltanet_state::DeltaNetStateCache,
+    kv_layers: &mut [Option<(Array2<f32>, Array2<f32>)>],
+    base_pos: usize,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    layer_kinds: &[bool],
+) -> Array2<f32> {
+    debug_assert!(layer < layer_kinds.len());
+    let is_linear = layer_kinds[layer];
+    match (weights, is_linear) {
+        (Qwen35LayerWeights::Linear(w), true) => {
+            let state = hybrid_cache.layers[layer]
+                .as_mut()
+                .expect("linear-layer state should be allocated");
+            super::deltanet_block::deltanet_block_prefill(
+                x_seq, w, dn_dims, state, backend, base_pos, layer,
+            )
+        }
+        (Qwen35LayerWeights::Attention(w), false) => {
+            let kv_layer = kv_layers[layer]
+                .as_mut()
+                .expect("full-attn KV slabs should be allocated");
+            qwen35_attention_block_prefill(x_seq, w, attn_dims, kv_layer, base_pos, backend, layer)
+        }
+        _ => panic!(
+            "layer {} kind mismatch: weights and layer_kinds disagree",
+            layer
+        ),
+    }
+}
+
 #[inline]
 fn _silu(x: f32) -> f32 {
     // Kept for parity with deltanet_block::silu; not currently

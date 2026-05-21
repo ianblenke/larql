@@ -915,7 +915,7 @@ pub fn deltanet_block_step(
 ///   - per-row output values match within `1e-5` absolute,
 ///   - final `recurrent_state` and `conv_state` match within
 ///     `1e-5` absolute.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn deltanet_block_prefill(
     x_seq: &Array2<f32>,
     weights: &DeltaNetLayerWeights,
