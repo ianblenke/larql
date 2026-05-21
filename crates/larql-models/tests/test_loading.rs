@@ -1092,105 +1092,12 @@ fn f8_e8m0_bytes(n: usize) -> Vec<u8> {
     vec![127u8; n]
 }
 
-#[test]
-fn load_full_deepseek_v4_dequantises_per_expert_mxfp4() {
-    let dir = TempDir::new().unwrap();
-    // V4 detection in detect.rs requires `model_type = "deepseek_v4"`,
-    // and uses_mla() requires kv/q_lora_rank present.
-    let config = serde_json::json!({
-        "model_type": "deepseek_v4",
-        "hidden_size": 4,
-        "num_hidden_layers": 1,
-        "intermediate_size": 4,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
-        "head_dim": 2,
-        "vocab_size": 10,
-        "n_routed_experts": 1,
-        "num_experts_per_tok": 1,
-        "n_shared_experts": 0,
-        "kv_lora_rank": 4,
-        "q_lora_rank": 4,
-    });
-    // V4 strips no `model.` prefix and uses `embed.weight` + `norm.weight`
-    // (see `architectures/deepseek_v4.rs`).
-    //
-    // Per-expert MXFP4 layout: weight [out_features, packed_cols=groups*16],
-    // scale [out_features, groups]. We use out_features=2, groups=1 →
-    // packed_cols=16 → unpacked_cols=32.
-    let out_features = 2usize;
-    let groups = 1usize;
-    let packed_cols = groups * 16;
-    let weight_bytes = vec![0u8; out_features * packed_cols]; // all-zero nibbles → all-zero unpacked
-    let scale_bytes = f8_e8m0_bytes(out_features * groups);
-
-    write_model_dir_with_config(
-        dir.path(),
-        config,
-        &[
-            ("embed.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
-            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
-            // V4 doesn't necessarily have lm_head; loader falls back to embed.
-            // Per-expert MXFP4 weight + scale pair for w1 (gate_proj).
-            (
-                "layers.0.ffn.experts.0.w1.weight",
-                "I8",
-                &[out_features, packed_cols],
-                weight_bytes.clone(),
-            ),
-            (
-                "layers.0.ffn.experts.0.w1.scale",
-                "F8_E8M0",
-                &[out_features, groups],
-                scale_bytes.clone(),
-            ),
-            // Plus w2 (down) and w3 (up) — same shape.
-            (
-                "layers.0.ffn.experts.0.w2.weight",
-                "I8",
-                &[out_features, packed_cols],
-                weight_bytes.clone(),
-            ),
-            (
-                "layers.0.ffn.experts.0.w2.scale",
-                "F8_E8M0",
-                &[out_features, groups],
-                scale_bytes.clone(),
-            ),
-            (
-                "layers.0.ffn.experts.0.w3.weight",
-                "I8",
-                &[out_features, packed_cols],
-                weight_bytes,
-            ),
-            (
-                "layers.0.ffn.experts.0.w3.scale",
-                "F8_E8M0",
-                &[out_features, groups],
-                scale_bytes,
-            ),
-        ],
-    );
-
-    let weights = load_model_dir(dir.path()).expect("full V4 load");
-    // The V4 dequantiser writes the dequantised weight under the
-    // (prefix-stripped) tensor name. With V4's empty prefix list, that's
-    // exactly `layers.0.ffn.experts.0.w1.weight`.
-    assert!(
-        weights
-            .tensors
-            .contains_key("layers.0.ffn.experts.0.w1.weight"),
-        "V4 dequantiser must emit the unpacked weight; got: {:?}",
-        weights.tensors.keys().collect::<Vec<_>>()
-    );
-    let arr = weights
-        .tensors
-        .get("layers.0.ffn.experts.0.w1.weight")
-        .unwrap();
-    // Output cols = packed_cols * 2 = 32 (the dequantiser unpacks
-    // nibbles).
-    assert_eq!(arr.shape(), &[out_features, packed_cols * 2]);
-}
+// DSv4 support was reverted (see project memory `showcase_moe_models`)
+// — V4 isn't MLA so the dedicated loader path was removed. The test
+// here exercised that loader; without the implementation it fails
+// with `MissingTensor("embed_tokens.weight")` because the generic
+// loader now applies. Removing the test rather than rewriting it
+// keeps "DSv4 is gone" consistent across the codebase.
 
 #[test]
 fn load_filtered_validated_runs_with_validation() {

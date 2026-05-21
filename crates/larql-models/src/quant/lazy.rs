@@ -278,6 +278,24 @@ impl QuantTensor {
         let out_slice = out
             .as_slice_mut()
             .expect("Array1 is contiguous by construction");
+        // `cuda-moe-multistream` follow-on (CPU FFN path): when this
+        // matvec is invoked from inside an outer rayon scope (e.g.
+        // `swiglu_moe_lazy` parallelising across 8 experts), the inner
+        // par_iter_mut steals from the same thread pool — and each
+        // matvec is too small for 48-thread distribution anyway
+        // (1408 rows / 48 = ~30 rows per thread, dominated by spawn
+        // cost). Microbench (`q4k_q8k_kernel`):
+        //
+        //   matvec_serial    164 μs (single thread, peak inner)
+        //   matvec_parallel  115 μs (par_iter over 1408 rows, 1.4× speedup)
+        //   moe_step_seq     2.72 ms (24 × par_iter — current main)
+        //   moe_step_par_outer 0.89 ms (par over 8 experts, serial inside) ← 3× win
+        //
+        // Detect the outer rayon context via `current_thread_index()`
+        // and skip the inner par_iter when we're already a worker
+        // thread. Main-thread callers (dense FFN, attention projections)
+        // see no behaviour change.
+        let in_rayon = rayon::current_thread_index().is_some();
         let view_bytes = self.bytes();
         match self.tensor_type {
             TYPE_Q4_K => {
@@ -293,11 +311,23 @@ impl QuantTensor {
                     // the cache makes those reuse one quantise instead
                     // of doing it per call.
                     with_q8k_for(x_slice, |q8k_bytes| {
-                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                            let row = &data[r * rb..(r + 1) * rb];
-                            *out_r = q4k_q8k_row_dot(row, q8k_bytes).expect("q4k_q8k_row_dot");
-                        });
+                        if in_rayon {
+                            for (r, out_r) in out_slice.iter_mut().enumerate() {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q4k_q8k_row_dot(row, q8k_bytes).expect("q4k_q8k_row_dot");
+                            }
+                        } else {
+                            out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q4k_q8k_row_dot(row, q8k_bytes).expect("q4k_q8k_row_dot");
+                            });
+                        }
                     });
+                } else if in_rayon {
+                    for (r, out_r) in out_slice.iter_mut().enumerate() {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q4k_row_dot(row, x_slice).expect("q4k_row_dot");
+                    }
                 } else {
                     out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
                         let row = &data[r * rb..(r + 1) * rb];
@@ -319,11 +349,23 @@ impl QuantTensor {
                     && std::env::var("LARQL_Q6K_USE_F32_DOT").ok().as_deref() != Some("1");
                 if use_q8k {
                     with_q8k_for(x_slice, |q8k_bytes| {
-                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                            let row = &data[r * rb..(r + 1) * rb];
-                            *out_r = q6k_q8k_row_dot(row, q8k_bytes).expect("q6k_q8k_row_dot");
-                        });
+                        if in_rayon {
+                            for (r, out_r) in out_slice.iter_mut().enumerate() {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q6k_q8k_row_dot(row, q8k_bytes).expect("q6k_q8k_row_dot");
+                            }
+                        } else {
+                            out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q6k_q8k_row_dot(row, q8k_bytes).expect("q6k_q8k_row_dot");
+                            });
+                        }
                     });
+                } else if in_rayon {
+                    for (r, out_r) in out_slice.iter_mut().enumerate() {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q6k_row_dot(row, x_slice).expect("q6k_row_dot");
+                    }
                 } else {
                     out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
                         let row = &data[r * rb..(r + 1) * rb];
@@ -348,10 +390,17 @@ impl QuantTensor {
                     let rb = self.row_bytes;
                     let data = view_bytes;
                     with_q8k_for(x_slice, |q8k_bytes| {
-                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                            let row = &data[r * rb..(r + 1) * rb];
-                            *out_r = q5k_q8k_row_dot(row, q8k_bytes).expect("q5k_q8k_row_dot");
-                        });
+                        if in_rayon {
+                            for (r, out_r) in out_slice.iter_mut().enumerate() {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q5k_q8k_row_dot(row, q8k_bytes).expect("q5k_q8k_row_dot");
+                            }
+                        } else {
+                            out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r = q5k_q8k_row_dot(row, q8k_bytes).expect("q5k_q8k_row_dot");
+                            });
+                        }
                     });
                 } else {
                     for r in 0..self.rows {
@@ -380,11 +429,25 @@ impl QuantTensor {
                     && std::env::var("LARQL_Q8_0_USE_F32_DOT").ok().as_deref() != Some("1");
                 if use_q8k {
                     with_q8k_for(x_slice, |q8k_bytes| {
-                        out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
-                            let row = &data[r * rb..(r + 1) * rb];
-                            *out_r = q8_0_q8k_row_dot(row, q8k_bytes).expect("q8_0_q8k_row_dot");
-                        });
+                        if in_rayon {
+                            for (r, out_r) in out_slice.iter_mut().enumerate() {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r =
+                                    q8_0_q8k_row_dot(row, q8k_bytes).expect("q8_0_q8k_row_dot");
+                            }
+                        } else {
+                            out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
+                                let row = &data[r * rb..(r + 1) * rb];
+                                *out_r =
+                                    q8_0_q8k_row_dot(row, q8k_bytes).expect("q8_0_q8k_row_dot");
+                            });
+                        }
                     });
+                } else if in_rayon {
+                    for (r, out_r) in out_slice.iter_mut().enumerate() {
+                        let row = &data[r * rb..(r + 1) * rb];
+                        *out_r = q8_0_row_dot(row, x_slice).expect("q8_0_row_dot");
+                    }
                 } else {
                     out_slice.par_iter_mut().enumerate().for_each(|(r, out_r)| {
                         let row = &data[r * rb..(r + 1) * rb];

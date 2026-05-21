@@ -356,6 +356,7 @@ pub trait QuantMatVec {
     ///
     /// Returns `m * num_rows` f32 probs row-major, or `None` if any
     /// step fails. Default falls back to the separate calls.
+    #[allow(clippy::too_many_arguments)]
     fn q4k_matmul_softmax(
         &self,
         q4k_data: &[u8],

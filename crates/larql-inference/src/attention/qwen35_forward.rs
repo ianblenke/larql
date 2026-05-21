@@ -728,17 +728,36 @@ fn swiglu_moe_lazy(
             }
         }
     } else {
-        for (i, (_expert_id, gate_e, up_e, down_e)) in expert_slices.iter().enumerate() {
-            let y_i = swiglu_ffn_lazy(
-                x,
-                Some(gate_e),
-                Some(up_e),
-                Some(down_e),
-                &empty_2d,
-                &empty_2d,
-                &empty_2d,
-                backend,
-            );
+        // CPU-FFN path (no GPU backend, or backend declined the batched
+        // MoE call): parallelise *across* the top-K experts on rayon.
+        // Inner matvecs detect the outer rayon scope via
+        // `rayon::current_thread_index()` and skip their own par_iter
+        // — each expert thread runs its 3 matvecs serially.
+        //
+        // Microbench (`q4k_q8k_kernel::moe_step_par_outer`): 3× faster
+        // than the prior 24 × inner-par_iter pattern (2.72 ms → 0.89 ms
+        // per step). The prior PR #217 `par_iter` attempt failed
+        // because the inner par_iter was still active and the CUDA
+        // stream serialised anyway; this iteration only kicks in when
+        // there's no GPU backend (the inner par_iter is the inherited
+        // CPU path, now gated by the rayon-context check).
+        use rayon::prelude::*;
+        let per_expert: Vec<Array1<f32>> = expert_slices
+            .par_iter()
+            .map(|(_expert_id, gate_e, up_e, down_e)| {
+                swiglu_ffn_lazy(
+                    x,
+                    Some(gate_e),
+                    Some(up_e),
+                    Some(down_e),
+                    &empty_2d,
+                    &empty_2d,
+                    &empty_2d,
+                    backend,
+                )
+            })
+            .collect();
+        for (i, y_i) in per_expert.iter().enumerate() {
             let w = weights[i];
             for h in 0..hidden {
                 y_moe[h] += w * y_i[h];

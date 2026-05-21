@@ -46,6 +46,11 @@ fn f16_to_f32(bits: u16) -> f32 {
 /// Reads the llama.cpp Q6_K wire format (interleaved-stride within each
 /// 128-element half). See module docs and
 /// `larql_models::quant::ggml::dequantize_q6_k` for the layout.
+// `>> 0` in the four `qh_byte >> {0,2,4,6}` pattern below is kept for
+// regularity with the other slot extractions; rewriting to `qh_byte`
+// would obscure the four-slot symmetry. The kernel mirrors llama.cpp's
+// `dequantize_row_q6_K` layout exactly.
+#[allow(clippy::identity_op)]
 pub fn dispatch(q6k_data: &[u8], x: &[f32], num_rows: usize, hidden: usize) -> Vec<f32> {
     let superblocks = hidden / 256;
     let bytes_per_row = superblocks * Q6K_BLOCK_SIZE;

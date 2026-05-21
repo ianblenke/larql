@@ -23,9 +23,17 @@ bytemuck = "1"
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
+# Used by `q4k_q8k_kernel` bench to generate synthetic Q4_K / Q8_K
+# fixtures so the per-row dot exercises a realistic numerical range.
+rand = "0.8"
+rand_chacha = "0.3"
 
 [[bench]]
 name = "models"
+harness = false
+
+[[bench]]
+name = "q4k_q8k_kernel"
 harness = false
 
 [lints]
