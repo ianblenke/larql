@@ -173,18 +173,176 @@ pub fn qwen35_forward_prefill(
     if prompt_ids.is_empty() {
         return None;
     }
-    let mut last = None;
-    for &tok in prompt_ids {
-        last = Some(qwen35_forward_step(
-            tok,
-            weights,
+    // The batched path bypasses the per-token diagnostic dump /
+    // trace env vars (`LARQL_QWEN35_DUMP_LAYER_BOUNDARY`,
+    // `LARQL_QWEN35_TRACE`, `LARQL_QWEN35_DUMP_FINAL_BIN_DIR`,
+    // `LARQL_QWEN35_DUMP_FINAL`, `LARQL_QWEN35_DUMP_L0`). Those are
+    // per-token introspection tools; when any is set, fall back to
+    // the per-token loop so they keep working unchanged.
+    let dump_active = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY").is_ok()
+        || std::env::var("LARQL_QWEN35_TRACE").is_ok()
+        || std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR").is_ok()
+        || std::env::var("LARQL_QWEN35_DUMP_FINAL").is_ok()
+        || std::env::var("LARQL_QWEN35_DUMP_L0").is_ok();
+    if dump_active {
+        let mut last = None;
+        for &tok in prompt_ids {
+            last = Some(qwen35_forward_step(
+                tok,
+                weights,
+                dn_dims,
+                attn_dims,
+                hybrid_cache,
+                eps,
+            ));
+        }
+        return last;
+    }
+
+    use crate::attention::qwen35_block::hybrid_layer_prefill;
+    let backend = weights.backend.as_deref();
+    let n_layers = weights.layers.len();
+    debug_assert_eq!(n_layers, hybrid_cache.num_layers());
+    let hidden = dn_dims.hidden;
+    let seq_len = prompt_ids.len();
+    let base_pos = hybrid_cache.next_position;
+
+    // 1. Embed all prompt tokens into `x_seq: [seq_len, hidden]`.
+    let mut x_seq = Array2::<f32>::zeros((seq_len, hidden));
+    for (i, &token_id) in prompt_ids.iter().enumerate() {
+        let row = if let Some(qt) = weights.embed_quant.as_ref() {
+            qt.row_to_f32(token_id as usize)
+                .expect("embed_quant row_to_f32")
+        } else {
+            weights.embed.row(token_id as usize).to_owned()
+        };
+        x_seq.row_mut(i).assign(&row);
+    }
+
+    // 2. Hybrid layer stack.
+    //
+    // The block dispatch goes through `hybrid_layer_prefill` (which
+    // routes to `qwen35_attention_block_prefill` or
+    // `deltanet_block_prefill`). The FFN side branches three ways
+    // exactly like the per-token forward:
+    //   - MoE (top-K experts + optional shared) → swiglu_moe_lazy_prefill
+    //   - Lazy-quant dense → per-row swiglu_ffn_lazy
+    //   - Dense fp32 fallback → per-row swiglu_ffn
+    //
+    // `swiglu_moe_lazy_prefill` (PR #233) has a batched signature
+    // but its body is still a per-position loop — the internals
+    // follow-up will fill in the scatter-gather expert dispatch.
+    // The wiring here is what unlocks that swap.
+    //
+    // We need to mutably borrow `hybrid_cache.dn_state` and
+    // `hybrid_cache.kv_layers` separately inside `hybrid_layer_prefill`;
+    // split the borrow with destructuring so the borrow checker
+    // accepts the two `&mut`s.
+    let DeltaNetHybridCache {
+        kv_layers,
+        dn_state,
+        layer_kinds,
+        next_position: _,
+        ..
+    } = hybrid_cache;
+
+    for layer in 0..n_layers {
+        let layer_w = &weights.layers[layer];
+        let block_out = hybrid_layer_prefill(
+            layer,
+            &x_seq,
+            &layer_w.block,
             dn_dims,
             attn_dims,
-            hybrid_cache,
-            eps,
-        ));
+            dn_state,
+            kv_layers,
+            base_pos,
+            backend,
+            layer_kinds,
+        );
+        // 2b. Residual add 1 — `residual = x_seq + block_out`.
+        let residual: Array2<f32> = &x_seq + &block_out;
+        // 2c. Post-attention RMSNorm per row.
+        let mut ffn_in = Array2::<f32>::zeros((seq_len, hidden));
+        for i in 0..seq_len {
+            let row: Array1<f32> = residual.row(i).to_owned();
+            let normed = rms_norm_1d_pub(&row, &layer_w.attn_post_norm, eps);
+            ffn_in.row_mut(i).assign(&normed);
+        }
+        // 2d. SwiGLU FFN.
+        let ffn_out: Array2<f32> = if let Some(moe) = layer_w.moe.as_ref() {
+            swiglu_moe_lazy_prefill(
+                &ffn_in,
+                &moe.router,
+                &moe.gate_exps,
+                &moe.up_exps,
+                &moe.down_exps,
+                moe.shexp_gate.as_ref(),
+                moe.shexp_up.as_ref(),
+                moe.shexp_down.as_ref(),
+                moe.shexp_gate_inp.as_deref(),
+                moe.num_experts,
+                moe.top_k,
+                backend,
+            )
+        } else if layer_w.ffn_gate_quant.is_some()
+            || layer_w.ffn_up_quant.is_some()
+            || layer_w.ffn_down_quant.is_some()
+        {
+            let mut out = Array2::<f32>::zeros((seq_len, hidden));
+            for i in 0..seq_len {
+                let row: Array1<f32> = ffn_in.row(i).to_owned();
+                let y = swiglu_ffn_lazy(
+                    &row,
+                    layer_w.ffn_gate_quant.as_ref(),
+                    layer_w.ffn_up_quant.as_ref(),
+                    layer_w.ffn_down_quant.as_ref(),
+                    &layer_w.ffn_gate,
+                    &layer_w.ffn_up,
+                    &layer_w.ffn_down,
+                    backend,
+                );
+                out.row_mut(i).assign(&y);
+            }
+            out
+        } else {
+            let mut out = Array2::<f32>::zeros((seq_len, hidden));
+            for i in 0..seq_len {
+                let row: Array1<f32> = ffn_in.row(i).to_owned();
+                let y = swiglu_ffn(
+                    &row,
+                    layer_w.ffn_gate.view(),
+                    layer_w.ffn_up.view(),
+                    layer_w.ffn_down.view(),
+                );
+                out.row_mut(i).assign(&y);
+            }
+            out
+        };
+        // 2e. Residual add 2 — `x_seq = residual + ffn_out`.
+        x_seq = &residual + &ffn_out;
     }
-    last
+
+    // 3. Final RMSNorm + LM head on the last position only —
+    //    prefill returns just the logits for the next token after
+    //    the prompt, matching the per-token loop's behaviour.
+    let last_idx = seq_len - 1;
+    let last_x: Array1<f32> = x_seq.row(last_idx).to_owned();
+    let x_final = rms_norm_1d_pub(&last_x, &weights.final_norm, eps);
+    let logits = if let Some(qt) = weights.lm_head_quant.as_ref() {
+        let lm_backend = crate::attention::gpu_tier::backend_for(
+            crate::attention::gpu_tier::GpuClass::LmHead,
+            backend,
+        );
+        crate::attention::quant_dispatch::matvec_with_backend(qt, &x_final, lm_backend)
+    } else {
+        weights.lm_head.dot(&x_final)
+    };
+
+    // 4. Advance cursor by the full prompt length.
+    hybrid_cache.next_position += seq_len;
+
+    Some(logits)
 }
 
 /// One-token forward through the entire Qwen 3.6 model.
@@ -883,7 +1041,7 @@ fn swiglu_moe_lazy(
 /// safety gate: it locks the multi-position contract so the
 /// follow-up can swap the body without silently breaking shape /
 /// numerics.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn swiglu_moe_lazy_prefill(
     x_seq: &Array2<f32>,
     router: &larql_models::quant::lazy::QuantTensor,
@@ -1608,6 +1766,183 @@ mod tests {
                     e,
                 );
             }
+        }
+    }
+
+    /// Phase 4-final integration parity test:
+    /// `qwen35_forward_prefill` over a multi-token prompt must
+    /// produce the same final logits as running
+    /// `qwen35_forward_step` once per token in sequence.
+    ///
+    /// This is the integration-moment safety gate — every batched
+    /// sibling (`qwen35_attention_block_prefill`,
+    /// `swiglu_moe_lazy_prefill`, `deltanet_block_prefill`) is
+    /// individually parity-tested against its per-token version,
+    /// but the wiring that composes them needs its own end-to-end
+    /// gate. Without this test, an off-by-one in `base_pos` or a
+    /// mis-handled per-row RMSNorm could silently drift.
+    ///
+    /// Two-layer tiny model (linear + attention, dense FFN), three-
+    /// token prompt. Asserts:
+    ///   - Same final logits (within `1e-4` absolute + `1e-4 * |val|`
+    ///     relative tolerance — accumulated fp arithmetic).
+    ///   - Same `cache.next_position` after both runs.
+    ///   - Same KV-cache contents and DeltaNet state at the end.
+    #[test]
+    fn qwen35_forward_prefill_matches_per_token_loop() {
+        let dn_dims = tiny_dn_dims();
+        let attn_dims = tiny_attn_dims();
+        let hidden = dn_dims.hidden;
+        let vocab = 5;
+        let ffn_dim = 8;
+        let layer_kinds = vec![true, false];
+
+        let dn_weights = make_dn_weights(&dn_dims);
+        let attn_weights = make_attn_weights(&attn_dims);
+        let (post0, gate0, up0, down0) = make_suffix(hidden, ffn_dim);
+        let (post1, gate1, up1, down1) = make_suffix(hidden, ffn_dim);
+        let make_weights = || Qwen35Weights {
+            embed: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            embed_quant: None,
+            layers: vec![
+                Qwen35FullLayerWeights {
+                    block: Qwen35LayerWeights::Linear(dn_weights.clone()),
+                    attn_post_norm: post0.clone(),
+                    ffn_gate: gate0.clone(),
+                    ffn_up: up0.clone(),
+                    ffn_down: down0.clone(),
+                    ffn_gate_quant: None,
+                    ffn_up_quant: None,
+                    ffn_down_quant: None,
+                    moe: None,
+                },
+                Qwen35FullLayerWeights {
+                    block: Qwen35LayerWeights::Attention(attn_weights.clone()),
+                    attn_post_norm: post1.clone(),
+                    ffn_gate: gate1.clone(),
+                    ffn_up: up1.clone(),
+                    ffn_down: down1.clone(),
+                    ffn_gate_quant: None,
+                    ffn_up_quant: None,
+                    ffn_down_quant: None,
+                    moe: None,
+                },
+            ],
+            final_norm: Arc::from(vec![1.0_f32; hidden].as_slice()),
+            lm_head: Array2::from_elem((vocab, hidden), 0.5_f32).into_shared(),
+            lm_head_quant: None,
+            ffn_dim,
+            backend: None,
+        };
+
+        let prompt = [2u32, 0u32, 3u32];
+
+        // --- Reference: per-token loop ---
+        let mut ref_cache = DeltaNetHybridCache::allocate(
+            &layer_kinds,
+            attn_dims.kv_dim(),
+            dn_dims.d_conv,
+            dn_dims.conv_dim(),
+            dn_dims.head_v_dim,
+            dn_dims.n_v_heads,
+        );
+        let ref_weights = make_weights();
+        let mut ref_logits: Option<Array1<f32>> = None;
+        for &tok in &prompt {
+            ref_logits = Some(qwen35_forward_step(
+                tok,
+                &ref_weights,
+                &dn_dims,
+                &attn_dims,
+                &mut ref_cache,
+                1e-6,
+            ));
+        }
+        let ref_logits = ref_logits.expect("non-empty prompt");
+
+        // --- Impl: batched prefill ---
+        let mut got_cache = DeltaNetHybridCache::allocate(
+            &layer_kinds,
+            attn_dims.kv_dim(),
+            dn_dims.d_conv,
+            dn_dims.conv_dim(),
+            dn_dims.head_v_dim,
+            dn_dims.n_v_heads,
+        );
+        let got_weights = make_weights();
+        let got_logits = qwen35_forward_prefill(
+            &prompt,
+            &got_weights,
+            &dn_dims,
+            &attn_dims,
+            &mut got_cache,
+            1e-6,
+        )
+        .expect("non-empty prompt");
+
+        // 1. Cache cursor advanced equally.
+        assert_eq!(
+            got_cache.next_position, ref_cache.next_position,
+            "next_position drift"
+        );
+
+        // 2. Final logits parity.
+        assert_eq!(got_logits.len(), ref_logits.len());
+        for i in 0..ref_logits.len() {
+            let g = got_logits[i];
+            let r = ref_logits[i];
+            let tol = 1e-4 + 1e-4 * r.abs();
+            assert!(
+                (g - r).abs() < tol,
+                "logits[{i}] got={} ref={} tol={}",
+                g,
+                r,
+                tol,
+            );
+        }
+
+        // 3. KV cache parity for the full-attn layer.
+        let (got_k, got_v) = got_cache.kv_layers[1].as_ref().unwrap();
+        let (ref_k, ref_v) = ref_cache.kv_layers[1].as_ref().unwrap();
+        assert_eq!(got_k.shape(), ref_k.shape());
+        assert_eq!(got_v.shape(), ref_v.shape());
+        for ((g, r), name) in [(got_k, ref_k), (got_v, ref_v)]
+            .iter()
+            .zip(["K", "V"].iter())
+        {
+            for ((idx, &gv), &rv) in g.iter().enumerate().zip(r.iter()) {
+                assert!(
+                    (gv - rv).abs() < 1e-5,
+                    "{name}_cache[{idx}] got={} ref={}",
+                    gv,
+                    rv,
+                );
+            }
+        }
+
+        // 4. DeltaNet state parity for the linear layer.
+        let got_dn = got_cache.dn_state.layers[0].as_ref().unwrap();
+        let ref_dn = ref_cache.dn_state.layers[0].as_ref().unwrap();
+        for (i, (&g, &r)) in got_dn
+            .recurrent_state
+            .iter()
+            .zip(ref_dn.recurrent_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - r).abs() < 1e-5,
+                "dn recurrent[{i}] got={} ref={}",
+                g,
+                r,
+            );
+        }
+        for (i, (&g, &r)) in got_dn
+            .conv_state
+            .iter()
+            .zip(ref_dn.conv_state.iter())
+            .enumerate()
+        {
+            assert!((g - r).abs() < 1e-5, "dn conv[{i}] got={} ref={}", g, r);
         }
     }
 
