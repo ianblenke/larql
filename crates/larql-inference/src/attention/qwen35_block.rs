@@ -454,13 +454,16 @@ pub fn qwen35_attention_block_prefill(
     let proj_backend = gpu_tier::backend_for(GpuClass::AttnProj, backend);
     let attn_decode_backend = gpu_tier::backend_for(GpuClass::AttnDecode, backend);
 
-    // 1. Pre-attention RMSNorm of each row.
+    // 1. Pre-attention RMSNorm of each row — batched in-place to
+    //    avoid per-row Array1 allocations (same pattern as the
+    //    post-attention norm in `qwen35_forward_prefill`).
     let mut x_norm = Array2::<f32>::zeros((seq_len, dims.hidden));
-    for r in 0..seq_len {
-        let row = x.row(r).to_owned();
-        let n = super::deltanet_block::rms_norm_1d_pub(&row, &weights.attn_norm, dims.eps);
-        x_norm.row_mut(r).assign(&n);
-    }
+    super::deltanet_block::rms_norm_2d_into(
+        x.view(),
+        &weights.attn_norm,
+        dims.eps,
+        x_norm.view_mut(),
+    );
 
     // 2. Q/K/V projections (per-row matvec; future PR batches to matmul).
     let mut q_fused = Array2::<f32>::zeros((seq_len, dims.fused_q_dim()));
