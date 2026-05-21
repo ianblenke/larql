@@ -343,7 +343,16 @@ pub fn qwen35_attention_block_step(
             .1
             .as_slice()
             .expect("v_cache contiguous after append_row");
+        // cache_id keys the backend's per-layer device-resident KV
+        // slab. Layer index alone is sufficient: the chat route holds
+        // an exclusive write guard on the qwen35 weights for the full
+        // duration of a request (server.state::LoadedModel), so two
+        // concurrent requests don't share device state. Per-sequence
+        // resets are propagated via `DeltaNetHybridCache::reset` →
+        // `qwen35_gqa_decode_reset`.
         b.qwen35_gqa_decode_step(
+            layer as u64,
+            crate::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
             q_row.as_slice().expect("q_row contiguous"),
             k_flat,
             v_flat,
@@ -556,6 +565,25 @@ impl DeltaNetHybridCache {
         }
         self.dn_state.reset();
         self.next_position = 0;
+    }
+
+    /// Drop the GPU backend's device-resident KV slabs for every layer
+    /// in this cache. Mirrors [`Self::reset`] for the device side: the
+    /// caller (e.g. chat route between requests) calls both so neither
+    /// host nor device state leaks across sequences.
+    ///
+    /// Layer indices match the `cache_id` the backend was handed at
+    /// each `qwen35_gqa_decode_step` call.
+    pub fn reset_device_kv(&self, backend: Option<&dyn larql_compute::ComputeBackend>) {
+        let Some(b) = backend else { return };
+        for (layer, _) in self
+            .kv_layers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_some())
+        {
+            b.qwen35_gqa_decode_reset(layer as u64);
+        }
     }
 }
 
