@@ -268,13 +268,23 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     /// Returns `out[num_q_heads * head_dim]` head-major flat, or
     /// `None` to fall back to the host-side `gqa_decode_step` loop.
     ///
-    /// CUDA backend implementations should keep the K/V slabs
-    /// device-resident across calls (caching by host pointer); this
-    /// host-input signature exists so the dispatcher can hand off
-    /// without owning a device buffer abstraction yet.
+    /// `cache_id` identifies the per-layer device-resident KV slab the
+    /// backend may keep across calls — the host slab `Array2<f32>`
+    /// reallocates on every append (`Array2::zeros((N+1, dim))` +
+    /// copy), so the pointer changes per token and can't itself be the
+    /// key. Callers pass a stable id (e.g. the layer index, optionally
+    /// combined with a per-sequence salt). `max_seq` sizes the device
+    /// cache on first allocation; subsequent calls reuse it.
+    ///
+    /// The kernel writes the *new* row (last row of the host slab) to
+    /// the device cache at `pos = seq_len - 1`, so previous tokens'
+    /// device state survives across calls — no full htod per token in
+    /// steady state.
     #[allow(clippy::too_many_arguments)]
     fn qwen35_gqa_decode_step(
         &self,
+        _cache_id: u64,
+        _max_seq: usize,
         _q: &[f32],
         _k_cache: &[f32],
         _v_cache: &[f32],
@@ -285,6 +295,13 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     ) -> Option<Vec<f32>> {
         None
     }
+
+    /// Drop the device-resident KV slab for `cache_id` (if any).
+    ///
+    /// Called from `DeltaNetHybridCache::reset` so per-sequence resets
+    /// don't leak device memory across requests. Default no-op for
+    /// backends that don't keep device-resident KV.
+    fn qwen35_gqa_decode_reset(&self, _cache_id: u64) {}
 
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;

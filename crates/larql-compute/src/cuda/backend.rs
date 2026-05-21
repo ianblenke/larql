@@ -113,6 +113,32 @@ pub struct CudaBackend {
     /// every cache / scratch buffer so the captured graph has no
     /// allocations in it.
     pub(crate) spec_decode_warmup: Mutex<HashMap<SpecScratchKey, u32>>,
+    /// Per-layer device-resident K/V slabs for the Qwen 3.6 hybrid
+    /// full-attention layers. Keyed by `cache_id` (layer index passed
+    /// by `qwen35_attention_block_step`). Each slab stores K and V
+    /// in `half::f16` to match `fused_decode_attention_device_kv`'s
+    /// kernel signature, plus the host-side seq_len it's currently
+    /// caught up to so the trait method can detect a stale cache
+    /// (e.g. when the host slab was reset without `qwen35_gqa_decode_reset`
+    /// being called).
+    pub(crate) qwen35_kv_slab_cache: Mutex<HashMap<u64, Qwen35KvSlabDev>>,
+}
+
+/// Device-resident K/V cache slab for one Qwen 3.6 full-attention layer.
+///
+/// Size: `max_seq * num_kv_heads * head_dim * 2 (f16) * 2 (K and V)`.
+/// On Qwen3.6 35B-A3B (16 full-attn layers, 4 KV heads × 128 head_dim,
+/// max_seq=4096): 16 × 4 × 128 × 4096 × 2 × 2 ≈ 64 MiB total across
+/// all 16 layers.
+pub(crate) struct Qwen35KvSlabDev {
+    pub k: CudaSlice<half::f16>,
+    pub v: CudaSlice<half::f16>,
+    pub max_seq: usize,
+    pub kv_dim: usize,
+    /// seq_len the device cache is caught up to. If the next call
+    /// arrives with `host_seq_len != cached_seq_len + 1` the slab is
+    /// stale and gets re-populated from the host slab.
+    pub cached_seq_len: usize,
 }
 
 impl CudaBackend {
@@ -143,6 +169,7 @@ impl CudaBackend {
             spec_decode_scratch: Mutex::new(HashMap::new()),
             spec_decode_graph: Mutex::new(HashMap::new()),
             spec_decode_warmup: Mutex::new(HashMap::new()),
+            qwen35_kv_slab_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1097,6 +1124,142 @@ impl ComputeBackend for CudaBackend {
             block_gqa,
         )
         .ok()
+    }
+
+    fn qwen35_gqa_decode_step(
+        &self,
+        cache_id: u64,
+        max_seq: usize,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        if q.len() != q_dim
+            || k_cache.len() != seq_len * kv_dim
+            || v_cache.len() != seq_len * kv_dim
+            || seq_len == 0
+            || seq_len > max_seq
+        {
+            // Caller-supplied shape can't be served — fall back to CPU.
+            return None;
+        }
+
+        let drv = self.driver();
+        let mut cache = self.qwen35_kv_slab_cache.lock().ok()?;
+        let slab = cache.entry(cache_id).or_insert_with_key(|_| {
+            // Lazily allocate the device K/V slabs on first use. f16
+            // matches `fused_decode_attention_device_kv`'s kernel
+            // signature.
+            let cache_len = max_seq * kv_dim;
+            let k = drv
+                .stream
+                .alloc_zeros::<half::f16>(cache_len)
+                .expect("alloc qwen35_kv_slab K");
+            let v = drv
+                .stream
+                .alloc_zeros::<half::f16>(cache_len)
+                .expect("alloc qwen35_kv_slab V");
+            Qwen35KvSlabDev {
+                k,
+                v,
+                max_seq,
+                kv_dim,
+                cached_seq_len: 0,
+            }
+        });
+
+        // Re-allocate if (max_seq, kv_dim) shifted (model-swap case).
+        if slab.max_seq != max_seq || slab.kv_dim != kv_dim {
+            let cache_len = max_seq * kv_dim;
+            slab.k = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
+            slab.v = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
+            slab.max_seq = max_seq;
+            slab.kv_dim = kv_dim;
+            slab.cached_seq_len = 0;
+        }
+
+        let new_row_idx = seq_len - 1;
+        // Stale-cache repopulation: when the device cache isn't caught
+        // up to "one row before the new token", re-upload everything
+        // up to seq_len-1 as f16 then proceed normally. Avoids silent
+        // drift when the host slab was reset without a matching
+        // `qwen35_gqa_decode_reset`.
+        if slab.cached_seq_len != new_row_idx {
+            if new_row_idx > 0 {
+                let k_prev_f16: Vec<half::f16> = k_cache[..new_row_idx * kv_dim]
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect();
+                let v_prev_f16: Vec<half::f16> = v_cache[..new_row_idx * kv_dim]
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect();
+                drv.stream
+                    .memcpy_htod(&k_prev_f16, &mut slab.k.slice_mut(..k_prev_f16.len()))
+                    .ok()?;
+                drv.stream
+                    .memcpy_htod(&v_prev_f16, &mut slab.v.slice_mut(..v_prev_f16.len()))
+                    .ok()?;
+            }
+            slab.cached_seq_len = new_row_idx;
+        }
+
+        // The new K/V row (last row of host slab) is what the kernel
+        // both reads as `k_new`/`v_new` AND writes into k_cache_dev/v_cache_dev
+        // at `pos = new_row_idx`.
+        let new_k = &k_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let new_v = &v_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let q_dev = drv.device_buf_from(q).ok()?;
+        let k_new_dev = drv.device_buf_from(new_k).ok()?;
+        let v_new_dev = drv.device_buf_from(new_v).ok()?;
+
+        let scale = (head_dim as f32).powf(-0.5);
+        let opts = super::attn::FusedDecodeAttentionOpts {
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos: new_row_idx,
+            max_seq,
+            // qwen35_attention_block_step applies QK-norm and RoPE on
+            // host before reaching here, so the kernel must skip both.
+            rotary_dim: 0,
+            rope_base: 0.0,
+            eps: 0.0,
+            qk_norm_offset: 0.0,
+            attn_scale: scale,
+            softcap: 0.0,
+        };
+        let out_dev = super::attn::fused_decode_attention_device_kv(
+            self,
+            &q_dev,
+            &k_new_dev,
+            &v_new_dev,
+            &mut slab.k,
+            &mut slab.v,
+            None, // no qk-norm — host already applied
+            None,
+            opts,
+        )
+        .ok()?;
+
+        slab.cached_seq_len = seq_len;
+        // dtoh the attention output.
+        let mut out_host = vec![0.0_f32; q_dim];
+        drv.stream.memcpy_dtoh(&out_dev, &mut out_host).ok()?;
+        drv.stream.synchronize().ok()?;
+        Some(out_host)
+    }
+
+    fn qwen35_gqa_decode_reset(&self, cache_id: u64) {
+        if let Ok(mut cache) = self.qwen35_kv_slab_cache.lock() {
+            cache.remove(&cache_id);
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
