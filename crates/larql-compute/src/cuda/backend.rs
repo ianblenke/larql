@@ -1176,6 +1176,156 @@ impl ComputeBackend for CudaBackend {
         }
     }
 
+    fn qwen35_moe_ffn_batch(
+        &self,
+        x: &[f32],
+        hidden: usize,
+        ffn_dim: usize,
+        experts: &[crate::backend::MoeFfnExpert<'_>],
+    ) -> Option<Vec<Vec<f32>>> {
+        use crate::QuantFormat;
+        if x.len() != hidden || experts.is_empty() {
+            return None;
+        }
+        let drv = self.driver();
+        if drv.worker_streams.is_empty() {
+            return None;
+        }
+        // Every expert must be Q4_K or Q5_K (the only formats we have
+        // on-stream device kernels for). Mixed formats are fine — each
+        // matvec dispatches to its own kernel.
+        let supported = |f: QuantFormat| matches!(f, QuantFormat::Q4_K | QuantFormat::Q5_K);
+        if !experts
+            .iter()
+            .all(|e| supported(e.gate_format) && supported(e.up_format) && supported(e.down_format))
+        {
+            return None;
+        }
+
+        // 1. Upload x once on the default stream and pre-warm every
+        //    expert's weight cache, then sync so every worker stream
+        //    sees populated buffers. cudarc event tracking is
+        //    disabled (driver.rs:48) so cross-stream reads of
+        //    `x_dev` / weight buffers rely on this explicit sync for
+        //    ordering — without the pre-warm a worker kernel could
+        //    race with the cache-population htod on drv.stream and
+        //    read uninitialised device memory.
+        let x_dev = drv.device_buf_from(x).ok()?;
+        let prewarm = |bytes: &[u8], fmt: QuantFormat| -> Option<()> {
+            match fmt {
+                QuantFormat::Q4_K => self.arc_q4k_device_buf(bytes).ok().map(|_| ()),
+                QuantFormat::Q5_K => self.with_q5k_device_buf(bytes, |_| Ok(())).ok(),
+                _ => None,
+            }
+        };
+        for e in experts.iter() {
+            prewarm(e.gate_data, e.gate_format)?;
+            prewarm(e.up_data, e.up_format)?;
+            prewarm(e.down_data, e.down_format)?;
+        }
+        drv.sync().ok()?;
+
+        // 2. Issue each expert chain on its own worker stream. The
+        //    Q4/Q5 weight uploads cache by `DeviceBytesKey` inside the
+        //    backend's per-format mutex, so concurrent calls serialise
+        //    on first-touch but hit on subsequent same-tensor reuse —
+        //    typical MoE pattern reuses the same expert weights every
+        //    layer revisit.
+        struct WorkerResult {
+            stream: std::sync::Arc<cudarc::driver::CudaStream>,
+            down_dev: cudarc::driver::CudaSlice<f32>,
+        }
+        let dispatch = |i: usize| -> Option<WorkerResult> {
+            let expert = &experts[i];
+            let stream = drv.worker_streams[i % drv.worker_streams.len()].clone();
+            let gate_dev = match expert.gate_format {
+                QuantFormat::Q4_K => super::q4k_direct::matvec_device_on_stream(
+                    self,
+                    expert.gate_data,
+                    &x_dev,
+                    ffn_dim,
+                    hidden,
+                    &stream,
+                ),
+                QuantFormat::Q5_K => super::q5k_direct::matvec_device_on_stream(
+                    self,
+                    expert.gate_data,
+                    &x_dev,
+                    ffn_dim,
+                    hidden,
+                    &stream,
+                ),
+                _ => return None,
+            }
+            .ok()?;
+            let up_dev = match expert.up_format {
+                QuantFormat::Q4_K => super::q4k_direct::matvec_device_on_stream(
+                    self,
+                    expert.up_data,
+                    &x_dev,
+                    ffn_dim,
+                    hidden,
+                    &stream,
+                ),
+                QuantFormat::Q5_K => super::q5k_direct::matvec_device_on_stream(
+                    self,
+                    expert.up_data,
+                    &x_dev,
+                    ffn_dim,
+                    hidden,
+                    &stream,
+                ),
+                _ => return None,
+            }
+            .ok()?;
+            let inter_dev = super::elem::silu_gate_up_device_on_stream(
+                self, &gate_dev, &up_dev, ffn_dim, false, &stream,
+            )
+            .ok()?;
+            let down_dev = match expert.down_format {
+                QuantFormat::Q4_K => super::q4k_direct::matvec_device_on_stream(
+                    self,
+                    expert.down_data,
+                    &inter_dev,
+                    hidden,
+                    ffn_dim,
+                    &stream,
+                ),
+                QuantFormat::Q5_K => super::q5k_direct::matvec_device_on_stream(
+                    self,
+                    expert.down_data,
+                    &inter_dev,
+                    hidden,
+                    ffn_dim,
+                    &stream,
+                ),
+                _ => return None,
+            }
+            .ok()?;
+            Some(WorkerResult { stream, down_dev })
+        };
+
+        let mut workers = Vec::with_capacity(experts.len());
+        for i in 0..experts.len() {
+            workers.push(dispatch(i)?);
+        }
+
+        // 3. Sync each worker stream + dtoh its output. The
+        //    per-stream synchronize is what makes the result safe to
+        //    return — without event tracking cudarc won't otherwise
+        //    enforce completion before the dtoh.
+        let mut outputs = Vec::with_capacity(workers.len());
+        for w in workers {
+            w.stream.synchronize().ok()?;
+            let mut host = vec![0.0_f32; w.down_dev.len()];
+            w.stream.memcpy_dtoh(&w.down_dev, &mut host).ok()?;
+            // memcpy_dtoh on a stream is async; another sync to be safe.
+            w.stream.synchronize().ok()?;
+            outputs.push(host);
+        }
+        Some(outputs)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

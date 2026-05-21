@@ -126,6 +126,23 @@ pub(crate) fn matvec_device(
     rows: usize,
     hidden: usize,
 ) -> Result<CudaSlice<f32>, CudaInitError> {
+    let drv = backend.driver();
+    matvec_device_on_stream(backend, q4k_data, x_dev, rows, hidden, &drv.stream)
+}
+
+/// `cuda-moe-multistream`: variant of [`matvec_device`] that issues the
+/// kernel on a caller-chosen stream instead of the driver's default
+/// stream. Used by the parallel-expert MoE dispatcher so the 8 expert
+/// matvecs can overlap on the GPU. The function allocates `y_dev` on
+/// the *same* stream so cudarc's per-call alloc happens in-context.
+pub(crate) fn matvec_device_on_stream(
+    backend: &CudaBackend,
+    q4k_data: &[u8],
+    x_dev: &CudaSlice<f32>,
+    rows: usize,
+    hidden: usize,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<CudaSlice<f32>, CudaInitError> {
     if rows == 0 || hidden == 0 || x_dev.len() != hidden || !hidden.is_multiple_of(Q4K_BLOCK_ELEMS)
     {
         return Err(CudaInitError::DriverMissing(format!(
@@ -147,7 +164,11 @@ pub(crate) fn matvec_device(
 
     let drv = backend.driver();
     let func = q4k_matvec_function(drv)?;
-    let mut y_dev = drv.device_alloc_uninit(rows)?;
+    // Allocate output on the worker stream so its lifecycle is bound
+    // there. cudarc's event tracking is disabled at the context level
+    // (driver.rs:48), so this alloc creates no cross-stream dependency.
+    let mut y_dev = unsafe { stream.alloc::<f32>(rows) }
+        .map_err(|e| CudaInitError::DriverMissing(format!("alloc y_dev on stream: {e:?}")))?;
     let rows_i = rows as i32;
     let hidden_i = hidden as i32;
     let blocks_per_row_i = blocks_per_row as i32;
@@ -159,7 +180,7 @@ pub(crate) fn matvec_device(
 
     backend.with_q4k_device_buf(q4k_data, |q4k_dev| {
         unsafe {
-            drv.stream
+            stream
                 .launch_builder(func)
                 .arg(q4k_dev)
                 .arg(x_dev)

@@ -483,6 +483,21 @@ pub(crate) fn silu_gate_up_device(
     n: usize,
     gelu_tanh: bool,
 ) -> Result<CudaSlice<f32>, CudaInitError> {
+    let drv = backend.driver();
+    silu_gate_up_device_on_stream(backend, gate_dev, up_dev, n, gelu_tanh, &drv.stream)
+}
+
+/// `cuda-moe-multistream`: variant of [`silu_gate_up_device`] on a
+/// caller-chosen stream. See `q4k_direct::matvec_device_on_stream`
+/// for the cross-stream invariants.
+pub(crate) fn silu_gate_up_device_on_stream(
+    backend: &CudaBackend,
+    gate_dev: &CudaSlice<f32>,
+    up_dev: &CudaSlice<f32>,
+    n: usize,
+    gelu_tanh: bool,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<CudaSlice<f32>, CudaInitError> {
     if gate_dev.len() != n || up_dev.len() != n {
         return Err(CudaInitError::DriverMissing(format!(
             "silu_gate_up_device shape mismatch: gate={} up={} n={n}",
@@ -497,7 +512,8 @@ pub(crate) fn silu_gate_up_device(
         SILU_GATE_UP_SRC,
         "silu_gate_up_f32",
     )?;
-    let mut out = drv.device_alloc_uninit(n)?;
+    let mut out = unsafe { stream.alloc::<f32>(n) }
+        .map_err(|e| CudaInitError::DriverMissing(format!("alloc silu_out on stream: {e:?}")))?;
     let block_dim: u32 = 256;
     let cfg = LaunchConfig {
         grid_dim: ((n as u32).div_ceil(block_dim), 1, 1),
@@ -507,7 +523,7 @@ pub(crate) fn silu_gate_up_device(
     let n_i = n as i32;
     let gelu_i: i32 = if gelu_tanh { 1 } else { 0 };
     unsafe {
-        drv.stream
+        stream
             .launch_builder(func)
             .arg(gate_dev)
             .arg(up_dev)

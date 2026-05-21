@@ -643,28 +643,98 @@ fn swiglu_moe_lazy(
         d.prefetch_willneed();
     }
 
-    // Note (Phase G.2 explored 2026-05-21, reverted): tried
-    // `par_iter` across the top-K experts. Regressed throughput on
-    // both GPU FFN (12.2 → 11.1 t/s) and likely CPU FFN — each
-    // expert's internal matvec already saturates the rayon thread
-    // pool, so outer parallelism only adds work-stealing overhead.
-    // GPU FFN additionally serialises all 8 expert kernels on the
-    // single CUDA stream. Keep this loop sequential; the parallelism
-    // win lives inside `QuantTensor::matvec` already.
-    for (i, (_expert_id, gate_e, up_e, down_e)) in expert_slices.iter().enumerate() {
-        let y_i = swiglu_ffn_lazy(
-            x,
-            Some(gate_e),
-            Some(up_e),
-            Some(down_e),
-            &empty_2d,
-            &empty_2d,
-            &empty_2d,
-            backend,
-        );
-        let w = weights[i];
-        for h in 0..hidden {
-            y_moe[h] += w * y_i[h];
+    // Phase G.3 (`cuda-moe-multistream`): when the backend exposes
+    // the parallel-expert MoE dispatch, batch all top-K experts onto
+    // its worker stream pool so the 8 expert gate/up/down chains can
+    // overlap on the GPU. Falls back to the per-expert sequential
+    // loop when the backend can't serve the shape (CPU, or any expert
+    // not in Q4_K/Q5_K).
+    //
+    // History — Phase G.2 (reverted): tried `rayon::par_iter` over the
+    // experts. Regressed throughput because each expert's internal
+    // matvec already saturates the rayon pool and the single CUDA
+    // stream serialised all 8 expert kernels anyway. The multi-stream
+    // path attacks the CUDA-side bottleneck directly.
+    let batch_outputs: Option<Vec<Array1<f32>>> = match backend {
+        Some(b) => {
+            use crate::attention::quant_dispatch::ggml_type_to_quant_format;
+            // Build the per-expert weight spec for the trait method.
+            // Format may be None for tensors we don't have a quant
+            // mapping for; in that case we fall back to the sequential
+            // path uniformly.
+            let mut specs: Vec<larql_compute::MoeFfnExpert<'_>> =
+                Vec::with_capacity(expert_slices.len());
+            let mut ffn_dim_ok = None;
+            let mut all_ok = true;
+            for (_expert_id, gate_e, up_e, down_e) in expert_slices.iter() {
+                let gfmt = ggml_type_to_quant_format(gate_e.tensor_type());
+                let ufmt = ggml_type_to_quant_format(up_e.tensor_type());
+                let dfmt = ggml_type_to_quant_format(down_e.tensor_type());
+                let (Some(gf), Some(uf), Some(df)) = (gfmt, ufmt, dfmt) else {
+                    all_ok = false;
+                    break;
+                };
+                let g_rows = gate_e.shape()[0];
+                let u_rows = up_e.shape()[0];
+                if g_rows != u_rows {
+                    all_ok = false;
+                    break;
+                }
+                if let Some(prev) = ffn_dim_ok {
+                    if prev != g_rows {
+                        all_ok = false;
+                        break;
+                    }
+                } else {
+                    ffn_dim_ok = Some(g_rows);
+                }
+                specs.push(larql_compute::MoeFfnExpert {
+                    gate_data: gate_e.raw_bytes(),
+                    gate_format: gf,
+                    up_data: up_e.raw_bytes(),
+                    up_format: uf,
+                    down_data: down_e.raw_bytes(),
+                    down_format: df,
+                });
+            }
+            if all_ok {
+                if let Some(ffn_dim) = ffn_dim_ok {
+                    let x_slice = x.as_slice().expect("Array1 contiguous");
+                    b.qwen35_moe_ffn_batch(x_slice, hidden, ffn_dim, &specs)
+                        .map(|outputs| outputs.into_iter().map(Array1::from).collect())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    if let Some(per_expert) = batch_outputs {
+        for (i, y_i) in per_expert.iter().enumerate() {
+            let w = weights[i];
+            for h in 0..hidden {
+                y_moe[h] += w * y_i[h];
+            }
+        }
+    } else {
+        for (i, (_expert_id, gate_e, up_e, down_e)) in expert_slices.iter().enumerate() {
+            let y_i = swiglu_ffn_lazy(
+                x,
+                Some(gate_e),
+                Some(up_e),
+                Some(down_e),
+                &empty_2d,
+                &empty_2d,
+                &empty_2d,
+                backend,
+            );
+            let w = weights[i];
+            for h in 0..hidden {
+                y_moe[h] += w * y_i[h];
+            }
         }
     }
 

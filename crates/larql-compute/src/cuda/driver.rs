@@ -20,7 +20,25 @@ pub struct Driver {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) blas: CudaBlas,
+    /// `cuda-moe-multistream`: pool of worker streams for concurrent
+    /// per-expert MoE FFN dispatch. The Qwen3.6-35B-A3B MoE layer
+    /// activates `top_k = 8` experts per token; on the default
+    /// single-stream path each expert's gate / up / down matvecs
+    /// serialise behind the prior expert's. Issuing each expert chain
+    /// on its own stream lets the GPU interleave them when SM
+    /// occupancy permits.
+    ///
+    /// Sized to `MOE_WORKER_STREAM_COUNT` (the active expert count for
+    /// the supported models, currently 8); callers index modulo length.
+    /// Empty if the platform doesn't support multi-stream construction
+    /// — the multi-stream MoE method then falls through to the
+    /// single-stream path.
+    pub(crate) worker_streams: Vec<Arc<CudaStream>>,
 }
+
+/// Pool size for [`Driver::worker_streams`]. Matches the typical Qwen3.6
+/// MoE `top_k` so every active expert gets its own stream.
+pub(crate) const MOE_WORKER_STREAM_COUNT: usize = 8;
 
 impl Driver {
     /// Initialise on device 0. Maps cudarc errors to `CudaInitError`
@@ -52,12 +70,32 @@ impl Driver {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| CudaInitError::DriverMissing(format!("cuBLAS init: {e:?}")))?;
 
+        // `cuda-moe-multistream`: provision worker streams up front so
+        // the MoE hot path doesn't allocate during decode. A failed
+        // stream creation leaves the pool empty and the multi-stream
+        // MoE method falls back to single-stream.
+        let mut worker_streams = Vec::with_capacity(MOE_WORKER_STREAM_COUNT);
+        for _ in 0..MOE_WORKER_STREAM_COUNT {
+            match ctx.new_stream() {
+                Ok(s) => worker_streams.push(s),
+                Err(_) => {
+                    worker_streams.clear();
+                    break;
+                }
+            }
+        }
+
         // Best-effort: ensure the kernel-cache directory exists. Cache
         // failures don't block backend init — we'll just compile PTX
         // every run.
         cache::ensure_initialised(&ctx).ok();
 
-        Ok(Arc::new(Driver { ctx, stream, blas }))
+        Ok(Arc::new(Driver {
+            ctx,
+            stream,
+            blas,
+            worker_streams,
+        }))
     }
 
     /// Block until the default stream has drained. Called at the end
