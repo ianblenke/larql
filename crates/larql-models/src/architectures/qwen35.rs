@@ -617,4 +617,57 @@ mod tests {
             assert!(!arch.is_linear_attention_layer(l));
         }
     }
+
+    /// PR #201 wired the shared expert (`ffn_*_shexp.weight` + sigmoid
+    /// gate via `ffn_gate_inp_shexp.weight`). Lock in:
+    /// - MoE arches return Some(key) for all 4 shexp accessors.
+    /// - Dense arches return None (the trait default for `is_moe() ==
+    ///   false`).
+    ///
+    /// A regression that returns None for MoE drops the shared expert
+    /// silently from the FFN residual — visibly producing the
+    /// `'Hello! ****'` garbage from pre-PR-#201 Coder-Next.
+    #[test]
+    fn qwen35moe_shared_expert_keys_present_when_moe() {
+        // Use Qwen35MoeArch directly (constructed via from_config so
+        // is_moe() returns true).
+        let mut cfg = qwen35_config_27b();
+        cfg.enable_moe_block = true;
+        cfg.num_experts = Some(128);
+        cfg.num_experts_per_token = Some(8);
+        cfg.num_shared_experts = Some(1);
+        cfg.moe_intermediate_size = Some(1024);
+        let arch = Qwen35MoeArch::from_config(cfg);
+        assert!(arch.is_moe());
+        assert_eq!(
+            arch.shared_expert_gate_key(5),
+            Some("layers.5.ffn_gate_shexp.weight".into())
+        );
+        assert_eq!(
+            arch.shared_expert_up_key(5),
+            Some("layers.5.ffn_up_shexp.weight".into())
+        );
+        assert_eq!(
+            arch.shared_expert_down_key(5),
+            Some("layers.5.ffn_down_shexp.weight".into())
+        );
+        assert_eq!(
+            arch.shared_expert_gate_inp_key(5),
+            Some("layers.5.ffn_gate_inp_shexp.weight".into())
+        );
+    }
+
+    /// Dense Qwen35 (no MoE) returns None for all shexp accessors so
+    /// the FFN writer / loader / forward skip the shared-expert path
+    /// cleanly. Inherited from the trait default since `is_moe() ==
+    /// false`.
+    #[test]
+    fn qwen35_dense_shared_expert_keys_are_none() {
+        let arch = Qwen35Arch::from_config(qwen35_config_27b());
+        assert!(!arch.is_moe());
+        assert_eq!(arch.shared_expert_gate_key(0), None);
+        assert_eq!(arch.shared_expert_up_key(0), None);
+        assert_eq!(arch.shared_expert_down_key(0), None);
+        assert_eq!(arch.shared_expert_gate_inp_key(0), None);
+    }
 }
