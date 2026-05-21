@@ -11,7 +11,7 @@
 //! the math. Reference: llama.cpp `src/models/delta-net-base.cpp`
 //! function `build_delta_net_autoregressive`.
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{parallel::prelude::*, Array1, Array2, Array3, Axis};
 
 /// Single-token Gated DeltaNet recurrence step.
 ///
@@ -64,149 +64,123 @@ pub fn delta_net_step(
 
     let mut output = Array2::<f32>::zeros((s_v, h_v));
 
-    // Working buffers, allocated once per call.
-    let mut sk = vec![0.0_f32; s_v];
-    let mut d = vec![0.0_f32; s_v];
+    // Cache the env-var once before the parallel loop. The DECAY-FIRST
+    // path matches llama.cpp; `LARQL_QWEN35_PAPER_ORDER=1` reverts to
+    // textbook (paper) order for bisection only.
+    let decay_first = std::env::var("LARQL_QWEN35_PAPER_ORDER").is_err();
 
-    for h in 0..h_v {
-        // GQA broadcast pattern is **arch-dependent**:
-        //
-        // - **BLOCK** (`kh = h_v / repeat_factor`, the qwen3next style):
-        //   llama.cpp's `qwen3next.cpp::build_layer_attn_linear` repeats
-        //   the un-repeated Q/K (16 heads) by inserting a dim of 1 +
-        //   `repeat_factor` before dim 0, then reshaping back. That
-        //   produces interleaved layout `h_v = h_k * repeat_factor + r`,
-        //   so V head `h_v` reads K head `h_v / repeat_factor`.
-        //   Coder-Next + sibling qwen3next GGUFs use this.
-        //
-        // - **CYCLE** (`kh = h_v % h_k`, the qwen35moe style):
-        //   `qwen35moe.cpp::build_layer_attn_linear` uses `ggml_repeat_4d`
-        //   directly without the intermediate dim, which tiles the K
-        //   heads (V head `h_v` ↔ K head `h_v % h_k`). 35B-A3B + sibling
-        //   qwen35moe GGUFs use this.
-        //
-        // Both reduce to identity when `h_v == h_k`. Existing unit tests
-        // all use that degenerate case so the test result doesn't
-        // distinguish the two patterns.
-        //
-        // Verified 2026-05-20 (35B-A3B) via per-layer elementwise
-        // bisection: CYCLE gives cos=1.000000 on `attn_output-0` token 0
-        // (where state=0 collapses to a closed-form formula), BLOCK gives
-        // cos=0.04 (random direction). Mirrors the 2026-05-19 finding for
-        // Coder-Next where BLOCK gives cos=1.000000 and CYCLE gives
-        // cos=0.52 — the two models genuinely use different patterns.
-        let kh = if block_gqa {
+    // GQA broadcast pattern (per-arch from PR #206):
+    //   BLOCK (qwen3next, Coder-Next): kh = h_v / repeat_factor
+    //   CYCLE (qwen35moe, 35B-A3B):    kh = h_v % h_k
+    // See `delta_net_step_block_vs_cycle_diverge_when_h_v_gt_h_k` test.
+    let pick_kh = |h: usize| -> usize {
+        if block_gqa {
             h / repeat_factor
         } else {
             h % h_k
-        };
-        let g_h = log_g[h].exp();
-        let b_h = beta[h];
-
-        // Math per Yang et al. 2024 "Gated DeltaNet" paper (Eq. 6):
-        //
-        //   S_t = G_t S_{t-1} + β_t (v_t - S_{t-1}^T k_t) k_t^T
-        //   o_t = S_t^T q_t / sqrt(d_k)
-        //
-        // **CRITICAL ORDER**: the delta term `(v_t - S_{t-1}^T k_t)`
-        // uses S_{t-1} BEFORE decay, NOT the decayed state. This is
-        // load-bearing: for token 0 (S=0) the order doesn't matter,
-        // but for non-empty state the difference compounds wildly.
-        //
-        // Earlier (pre-C.5f) my code computed `sk` AFTER decay,
-        // giving `sk = g * (S^T k)` instead of `S^T k`. Token 0
-        // matched llama.cpp bit-exact but token 1+ diverged 20×.
-
-        // Algorithm order: DECAY-FIRST matching llama.cpp's
-        // `ggml_compute_forward_gated_delta_net_one_chunk`:
-        //     S_decayed = g * S_old
-        //     sk        = S_decayed^T k          (uses DECAYED state)
-        //     d         = (v - sk) * b
-        //     S_new     = S_decayed + k ⊗ d
-        //
-        // Verified C.5j via elementwise parity oracle: for token 8 (last
-        // prompt token, state accumulated from 8 prior steps), decay-first
-        // gives pearson 0.995-0.998 at every LIN layer's block_out vs
-        // llama.cpp; paper-order (Yang et al. 2024 Eq. 6, sk-before-decay,
-        // landed in C.5f) gave 0.83-0.97. Residual-stream pearson at L62:
-        // decay-first 0.9985 vs paper 0.982. The PAPER order is correct
-        // mathematically but llama.cpp's kernel does decay-first, and the
-        // model was trained / quantised with this kernel's behaviour.
-        //
-        // Set `LARQL_QWEN35_PAPER_ORDER=1` to revert to paper order for
-        // bisection. Default = decay-first.
-        let decay_first = !std::env::var("LARQL_QWEN35_PAPER_ORDER").is_ok();
-        if decay_first {
-            // 1. Decay state in place.
-            for r in 0..s_v {
-                for c in 0..s_v {
-                    state[[r, c, h]] *= g_h;
-                }
-            }
-            // 2. sk = decayed_state^T k.
-            for entry in sk.iter_mut() {
-                *entry = 0.0;
-            }
-            for r in 0..s_k {
-                let k_val = k[[r, kh]];
-                if k_val == 0.0 {
-                    continue;
-                }
-                for c in 0..s_v {
-                    sk[c] += state[[r, c, h]] * k_val;
-                }
-            }
-            // 3. d = (v - sk) * b.
-            for c in 0..s_v {
-                d[c] = (v[[c, h]] - sk[c]) * b_h;
-            }
-            // 4. state += k ⊗ d.
-            for r in 0..s_v {
-                let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
-                if k_val == 0.0 {
-                    continue;
-                }
-                for c in 0..s_v {
-                    state[[r, c, h]] += k_val * d[c];
-                }
-            }
-        } else {
-            // PAPER ORDER (default).
-            // 1. sk[c] = sum_r state_old[r, c, h] * k[r, kh] = (S_old^T k)[c].
-            for entry in sk.iter_mut() {
-                *entry = 0.0;
-            }
-            for r in 0..s_k {
-                let k_val = k[[r, kh]];
-                if k_val == 0.0 {
-                    continue;
-                }
-                for c in 0..s_v {
-                    sk[c] += state[[r, c, h]] * k_val;
-                }
-            }
-            // 2. d = (v - sk) * b (no decay factor on sk).
-            for c in 0..s_v {
-                d[c] = (v[[c, h]] - sk[c]) * b_h;
-            }
-            // 3. state = g * state + k ⊗ d (decay + outer product in one pass).
-            for r in 0..s_v {
-                let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
-                for c in 0..s_v {
-                    state[[r, c, h]] = g_h * state[[r, c, h]] + k_val * d[c];
-                }
-            }
         }
+    };
 
-        // 4. o[c, h] = sum_r state[r, c, h] * q[r, kh] * scale_q.
-        for c in 0..s_v {
-            let mut acc = 0.0_f32;
-            for r in 0..s_k {
-                acc += state[[r, c, h]] * q[[r, kh]];
+    // Parallel per-head dispatch. Each head's state slab `state[:, :, h]`
+    // and output column `output[:, h]` are touched only by one thread.
+    // The h-axis is the **innermost** in `state` (fastest-varying), so
+    // each per-head update walks the array with stride `h_v` per element
+    // — cache-unfriendly compared to an h-outermost layout, but the
+    // single-threaded baseline was already paying that cost. The
+    // parallelism alone is the win here (~4-8× on Coder-Next where
+    // h_v=32 and the CPU has 48 threads). A future layout refactor
+    // (h-outermost state) would compound.
+    //
+    // Math per Yang et al. 2024 "Gated DeltaNet" Eq. 6 with the
+    // DECAY-FIRST order from llama.cpp (verified bit-exact at L0 tok0
+    // for both arch families):
+    //   S_decayed = g * S_old
+    //   sk        = S_decayed^T k     (uses DECAYED state)
+    //   d         = (v - sk) * b
+    //   S_new     = S_decayed + k ⊗ d
+    //   o         = S_new^T q / sqrt(s_k)
+    //
+    // The paper-order variant (LARQL_QWEN35_PAPER_ORDER=1) uses
+    // sk-before-decay; kept gated as an explicit env opt-in.
+    state
+        .axis_iter_mut(Axis(2))
+        .into_par_iter()
+        .zip(output.axis_iter_mut(Axis(1)).into_par_iter())
+        .enumerate()
+        .for_each(|(h, (mut state_h, mut out_h))| {
+            // Per-thread scratch (s_v is 128 on Qwen 3.6).
+            let mut sk = vec![0.0_f32; s_v];
+            let mut d = vec![0.0_f32; s_v];
+
+            let kh = pick_kh(h);
+            let g_h = log_g[h].exp();
+            let b_h = beta[h];
+
+            if decay_first {
+                // 1. Decay state in place: S *= g.
+                state_h.mapv_inplace(|x| x * g_h);
+                // 2. sk[c] = sum_r state[r, c] * k[r, kh].
+                for s in sk.iter_mut() {
+                    *s = 0.0;
+                }
+                for r in 0..s_k {
+                    let k_val = k[[r, kh]];
+                    if k_val == 0.0 {
+                        continue;
+                    }
+                    for c in 0..s_v {
+                        sk[c] += state_h[[r, c]] * k_val;
+                    }
+                }
+                // 3. d = (v - sk) * b.
+                for c in 0..s_v {
+                    d[c] = (v[[c, h]] - sk[c]) * b_h;
+                }
+                // 4. state += k ⊗ d.
+                for r in 0..s_v {
+                    let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
+                    if k_val == 0.0 {
+                        continue;
+                    }
+                    for c in 0..s_v {
+                        state_h[[r, c]] += k_val * d[c];
+                    }
+                }
+            } else {
+                // PAPER order: sk uses pre-decay state.
+                for s in sk.iter_mut() {
+                    *s = 0.0;
+                }
+                for r in 0..s_k {
+                    let k_val = k[[r, kh]];
+                    if k_val == 0.0 {
+                        continue;
+                    }
+                    for c in 0..s_v {
+                        sk[c] += state_h[[r, c]] * k_val;
+                    }
+                }
+                for c in 0..s_v {
+                    d[c] = (v[[c, h]] - sk[c]) * b_h;
+                }
+                // state = g * state + k ⊗ d (fused decay+outer-product).
+                for r in 0..s_v {
+                    let k_val = if r < s_k { k[[r, kh]] } else { 0.0 };
+                    for c in 0..s_v {
+                        state_h[[r, c]] = g_h * state_h[[r, c]] + k_val * d[c];
+                    }
+                }
             }
-            output[[c, h]] = acc * scale_q;
-        }
-    }
+
+            // o[c] = sum_r state[r, c] * q[r, kh] * scale_q.
+            for c in 0..s_v {
+                let mut acc = 0.0_f32;
+                for r in 0..s_k {
+                    acc += state_h[[r, c]] * q[[r, kh]];
+                }
+                out_h[c] = acc * scale_q;
+            }
+        });
 
     output
 }
