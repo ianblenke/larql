@@ -726,8 +726,8 @@ mod tests {
     /// preferring `partial_rotary_factor * head_dim`.
     #[test]
     fn rotary_dim_prefers_partial_rotary_factor_over_sections() {
-        use larql_models::config::ModelConfig;
         use larql_models::architectures::qwen35::Qwen35MoeArch;
+        use larql_models::config::ModelConfig;
 
         // Mock the 35B-A3B config:
         // - head_dim = 256

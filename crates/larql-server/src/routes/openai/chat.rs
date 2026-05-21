@@ -801,10 +801,7 @@ fn run_chat_completion(
                 // device-side) returns `None` to surface the issue
                 // rather than silently re-routing through a
                 // marginally-different CPU kernel.
-                #[cfg(any(
-                    feature = "cuda",
-                    all(feature = "metal-experts", target_os = "macos")
-                ))]
+                #[cfg(any(feature = "cuda", all(feature = "metal-experts", target_os = "macos")))]
                 {
                     loaded.backend = Some(std::sync::Arc::from(
                         super::super::attention::attention_compute_backend(),
