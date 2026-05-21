@@ -316,6 +316,41 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     /// backends that don't keep device-resident KV.
     fn qwen35_gqa_decode_reset(&self, _cache_id: u64) {}
 
+    /// Phase 4b — batched-prefill GQA softmax attention over
+    /// `seq_len` positions in a single kernel call.
+    ///
+    /// Inputs are host-RoPE'd / QK-normed per position by the caller
+    /// (`qwen35_attention_block_step` host helpers — same convention
+    /// as `qwen35_gqa_decode_step`). The kernel writes K/V rows
+    /// `base_pos..base_pos + seq_len` into the device-resident
+    /// cache identified by `cache_id` (the same slab the single-step
+    /// method uses, so a subsequent decode-step call finds the
+    /// populated cache). Returns `[seq_len * num_q_heads * head_dim]`
+    /// row-major outputs.
+    ///
+    /// Default impl returns `None`. CUDA backend wraps
+    /// `cuda::attn::fused_prefill_attention_seq_device_into`. Phase 4b
+    /// ships the trait surface + CudaBackend impl + hardware smoke
+    /// test; wiring this into the qwen35 attention block's prefill
+    /// path is gated on Phase 4c/d (per-position projections / MoE /
+    /// DeltaNet recurrence batched siblings) and lands in a later PR.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_attention_prefill_batch(
+        &self,
+        _cache_id: u64,
+        _max_seq: usize,
+        _base_pos: usize,
+        _q_seq: &[f32],
+        _k_seq: &[f32],
+        _v_seq: &[f32],
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// `cuda-moe-multistream`: parallel-expert MoE FFN dispatch.
     ///
     /// Issues all `experts.len()` (top_k, typically 8) expert chains

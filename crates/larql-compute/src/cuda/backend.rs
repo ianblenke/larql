@@ -1673,6 +1673,118 @@ impl ComputeBackend for CudaBackend {
         if let Ok(mut cache) = self.qwen35_kv_slab_cache.lock() {
             cache.remove(&cache_id);
         }
+        // Also drop the iso3 slab if present so the per-sequence
+        // reset clears both code paths.
+        if let Ok(mut cache) = self.qwen35_kv_slab_cache_quant.lock() {
+            cache.remove(&cache_id);
+        }
+    }
+
+    fn qwen35_attention_prefill_batch(
+        &self,
+        cache_id: u64,
+        max_seq: usize,
+        base_pos: usize,
+        q_seq: &[f32],
+        k_seq: &[f32],
+        v_seq: &[f32],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        if q_seq.len() != seq_len * q_dim
+            || k_seq.len() != seq_len * kv_dim
+            || v_seq.len() != seq_len * kv_dim
+            || seq_len == 0
+            || base_pos + seq_len > max_seq
+        {
+            return None;
+        }
+        let drv = self.driver();
+
+        // Get/allocate the per-layer f16 KV slab — same one the
+        // single-step decode method uses, so a subsequent decode
+        // call finds the populated cache. (The iso3 path's slab
+        // is separate; Phase 4b currently wires only the f16
+        // route — iso3 prefill batching is a follow-on.)
+        let mut cache = self.qwen35_kv_slab_cache.lock().ok()?;
+        let slab = cache.entry(cache_id).or_insert_with_key(|_| {
+            let cache_len = max_seq * kv_dim;
+            let k = drv
+                .stream
+                .alloc_zeros::<half::f16>(cache_len)
+                .expect("alloc prefill K");
+            let v = drv
+                .stream
+                .alloc_zeros::<half::f16>(cache_len)
+                .expect("alloc prefill V");
+            Qwen35KvSlabDev {
+                k,
+                v,
+                max_seq,
+                kv_dim,
+                cached_seq_len: 0,
+            }
+        });
+        if slab.max_seq != max_seq || slab.kv_dim != kv_dim {
+            let cache_len = max_seq * kv_dim;
+            slab.k = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
+            slab.v = drv.stream.alloc_zeros::<half::f16>(cache_len).ok()?;
+            slab.max_seq = max_seq;
+            slab.kv_dim = kv_dim;
+            slab.cached_seq_len = 0;
+        }
+
+        // htod the per-position Q/K/V (f32 host-roped).
+        let q_dev = drv.device_buf_from(q_seq).ok()?;
+        let k_dev = drv.device_buf_from(k_seq).ok()?;
+        let v_dev = drv.device_buf_from(v_seq).ok()?;
+        let mut out_dev = drv.device_alloc_uninit(seq_len * q_dim).ok()?;
+
+        let scale = (head_dim as f32).powf(-0.5);
+        let opts = super::attn::FusedDecodeAttentionOpts {
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos: 0, // unused by the prefill kernel (it reads base_pos+sp)
+            max_seq,
+            // host pre-roped; skip RoPE in kernel (post the PR #225
+            // attn.cu fix, `rotary_dim = 0` means skip RoPE).
+            rotary_dim: 0,
+            rope_base: 0.0,
+            eps: 0.0,
+            qk_norm_offset: 0.0,
+            attn_scale: scale,
+            softcap: 0.0,
+        };
+        super::attn::fused_prefill_attention_seq_device_into(
+            self,
+            &q_dev,
+            &k_dev,
+            &v_dev,
+            &mut slab.k,
+            &mut slab.v,
+            None, // no qk-norm — host already applied
+            None,
+            &mut out_dev,
+            base_pos,
+            seq_len,
+            opts,
+        )
+        .ok()?;
+
+        // Advance the slab's cached_seq_len to reflect newly-written
+        // rows so a follow-on single-step decode call lands at the
+        // right offset.
+        slab.cached_seq_len = base_pos + seq_len;
+
+        let mut out_host = vec![0.0_f32; seq_len * q_dim];
+        drv.stream.memcpy_dtoh(&out_dev, &mut out_host).ok()?;
+        drv.stream.synchronize().ok()?;
+        Some(out_host)
     }
 
     fn qwen35_moe_ffn_batch(
