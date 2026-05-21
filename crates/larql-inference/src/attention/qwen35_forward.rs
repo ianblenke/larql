@@ -137,6 +137,56 @@ pub struct Qwen35Weights {
     pub backend: Option<std::sync::Arc<dyn larql_compute::ComputeBackend>>,
 }
 
+/// Batched prefill — process `prompt_ids` end-to-end through the
+/// model, returning the logits for the **last** prompt token (the
+/// first decode-step input). Mutates `hybrid_cache` exactly as if
+/// `qwen35_forward_step` had been called once per token.
+///
+/// **Phase 4a infrastructure** (long-context arc, batched-prefill
+/// sub-arc): this function exists to give downstream batching kernels
+/// a single insertion point. The current body is the
+/// straightforward per-token loop — bit-equivalent to the prior
+/// inline loop in `qwen35_generate_with_sampling`. Subsequent PRs
+/// in the arc replace this body with kernels that process N
+/// positions per call:
+///
+/// - **4b**: batched full-attn prefill via the existing
+///   `fused_prefill_attention_seq_device_into` CUDA kernel
+///   (already in `cuda::attn`, just needs host plumbing).
+/// - **4c**: batched MoE FFN router + expert dispatch (route N
+///   tokens, bucket by expert, batched matmul per non-empty
+///   bucket).
+/// - **4d**: batched DeltaNet recurrence (chunked prefix-scan on
+///   the recurrent state; needs new CUDA kernel work).
+///
+/// The single-token `qwen35_forward_step` stays as the decode-step
+/// entry point — decode is fundamentally sequential (each token
+/// depends on the last one's logits).
+pub fn qwen35_forward_prefill(
+    prompt_ids: &[u32],
+    weights: &Qwen35Weights,
+    dn_dims: &DeltaNetDims,
+    attn_dims: &Qwen35AttentionDims,
+    hybrid_cache: &mut DeltaNetHybridCache,
+    eps: f32,
+) -> Option<Array1<f32>> {
+    if prompt_ids.is_empty() {
+        return None;
+    }
+    let mut last = None;
+    for &tok in prompt_ids {
+        last = Some(qwen35_forward_step(
+            tok,
+            weights,
+            dn_dims,
+            attn_dims,
+            hybrid_cache,
+            eps,
+        ));
+    }
+    last
+}
+
 /// One-token forward through the entire Qwen 3.6 model.
 ///
 /// Returns the logits `[vocab]` for the next token after the input.
