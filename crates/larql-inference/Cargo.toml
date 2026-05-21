@@ -29,7 +29,7 @@ memmap2 = "0.9"
 libc = "0.2"
 
 # Matrix ops (BLAS-accelerated)
-ndarray = { version = "0.16", features = ["blas"] }
+ndarray = { version = "0.16", features = ["blas", "rayon"] }
 
 # Parallelism for the walk loop (per-feature work is embarrassingly parallel).
 rayon = "1.10"
