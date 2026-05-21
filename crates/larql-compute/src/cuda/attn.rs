@@ -271,8 +271,13 @@ extern "C" __global__ void fused_decode_attention_f32(
     // loop below previously recomputed it per `(j, d)` — with
     // n_ctx ≈ 25 active threads and head_dim = 256 that's ~6 400
     // redundant trig triples per Q head per layer call. Hoist:
-    int rdim_pre = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
-    int hdim_pre = rdim_pre / 2;
+    //
+    // `rotary_dim == 0` now means **skip RoPE entirely** (no rotation,
+    // pass Q/K through unchanged). Previously upgraded to head_dim
+    // (which silently rotated EVERY dim — wrong for callers that
+    // already RoPE'd on host, e.g. Qwen 3.6's qwen35_gqa_decode_step).
+    int rdim_pre = min(rotary_dim, head_dim);
+    int hdim_pre = (rdim_pre > 0) ? rdim_pre / 2 : 1;
     for (int d = tid; d < head_dim; d += bdim) {
         float qv = q_head[d];
         if (use_qk_norm) qv *= q_inv * (q_norm[d] + qk_norm_offset);
@@ -306,8 +311,9 @@ extern "C" __global__ void fused_decode_attention_f32(
             // Compute the rotated current key directly so the append
             // path does not need an extra per-block scratch vector.
             float k_rot;
-            int rdim = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
-            int hdim = rdim / 2;
+            // See rdim_pre above — `rotary_dim == 0` skips RoPE.
+            int rdim = min(rotary_dim, head_dim);
+            int hdim = (rdim > 0) ? rdim / 2 : 1;
             if (d < rdim) {
                 int pair = d % hdim;
                 bool imag = d >= hdim;
@@ -341,7 +347,8 @@ extern "C" __global__ void fused_decode_attention_f32(
 
             float kv;
             if (j == pos) {
-                int rdim = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
+                // See rdim_pre above — `rotary_dim == 0` skips RoPE.
+                int rdim = min(rotary_dim, head_dim);
                 if (d < rdim) {
                     int hdim = rdim / 2;
                     int pair = d % hdim;
@@ -476,8 +483,9 @@ extern "C" __global__ void kv_cache_write_seq_f32(
     }
     float k_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
 
-    int rdim = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
-    int hdim = rdim / 2;
+    // See FUSED_DECODE_ATTN_SRC: `rotary_dim == 0` means skip RoPE.
+    int rdim = min(rotary_dim, head_dim);
+    int hdim = (rdim > 0) ? rdim / 2 : 1;
     for (int d = tid; d < head_dim; d += bdim) {
         float k_rot;
         if (d < rdim) {
@@ -572,8 +580,9 @@ extern "C" __global__ void fused_prefill_attention_f32(
     float q_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
 
     // Pre-rotate Q once (depends only on `pos`, not on `j`).
-    int rdim_pre = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
-    int hdim_pre = rdim_pre / 2;
+    // See FUSED_DECODE_ATTN_SRC: `rotary_dim == 0` means skip RoPE.
+    int rdim_pre = min(rotary_dim, head_dim);
+    int hdim_pre = (rdim_pre > 0) ? rdim_pre / 2 : 1;
     for (int d = tid; d < head_dim; d += bdim) {
         float qv = q_head[d];
         if (use_qk_norm) qv *= q_inv * (q_norm[d] + qk_norm_offset);
@@ -729,8 +738,9 @@ extern "C" __global__ void fused_prefill_attention_tree_mask_f32(
     }
     float q_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
 
-    int rdim_pre = (rotary_dim == 0) ? head_dim : min(rotary_dim, head_dim);
-    int hdim_pre = rdim_pre / 2;
+    // See FUSED_DECODE_ATTN_SRC: `rotary_dim == 0` means skip RoPE.
+    int rdim_pre = min(rotary_dim, head_dim);
+    int hdim_pre = (rdim_pre > 0) ? rdim_pre / 2 : 1;
     for (int d = tid; d < head_dim; d += bdim) {
         float qv = q_head[d];
         if (use_qk_norm) qv *= q_inv * (q_norm[d] + qk_norm_offset);
