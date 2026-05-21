@@ -256,6 +256,36 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         None
     }
 
+    /// Optional Qwen 3.6 single-step GQA softmax attention.
+    ///
+    /// Caller has already projected + normed + roped a single new Q
+    /// (`q[num_q_heads * head_dim]`) and appended the new K/V row to
+    /// the cumulative cache slabs (`k_cache[seq_len, num_kv_heads *
+    /// head_dim]`, `v_cache[seq_len, ...]`). The kernel computes
+    /// stable softmax(Q·K^T) · V per head with GQA repeat-interleave
+    /// (`Q head h` reads `KV head h / (num_q_heads / num_kv_heads)`).
+    ///
+    /// Returns `out[num_q_heads * head_dim]` head-major flat, or
+    /// `None` to fall back to the host-side `gqa_decode_step` loop.
+    ///
+    /// CUDA backend implementations should keep the K/V slabs
+    /// device-resident across calls (caching by host pointer); this
+    /// host-input signature exists so the dispatcher can hand off
+    /// without owning a device buffer abstraction yet.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_gqa_decode_step(
+        &self,
+        _q: &[f32],
+        _k_cache: &[f32],
+        _v_cache: &[f32],
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 }

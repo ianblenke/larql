@@ -323,20 +323,58 @@ pub fn qwen35_attention_block_step(
     append_row(&mut kv_layer.1, v_2d_in.row(0));
 
     // 7. GQA softmax attention — single-row Q, cumulative K/V.
-    //    The existing `gqa::gqa_attention` requires Q, K, V to share
-    //    the same row count (used by prefill); for autoregressive
-    //    decode we do a focused single-row scan here.
+    //    Routed through `qwen35_gqa_decode_step` when the backend
+    //    implements it (CUDA: fused softmax + GEMV); falls back to the
+    //    host-side single-row scan otherwise. The dispatch site is
+    //    gated by `GpuClass::AttnDecode` so the env var
+    //    `LARQL_QWEN35_GPU_NO_ATTN_DECODE=1` forces CPU even with a
+    //    GPU backend attached — useful for bisecting which class
+    //    actually moves tok/s vs VRAM.
     let q_row = q_roped.row(0).to_owned();
     let scale = (dims.head_dim as f64).powf(-0.5);
-    let attn_out_1d = gqa_decode_step(
-        &q_row,
-        &kv_layer.0,
-        &kv_layer.1,
-        dims.n_head,
-        dims.n_head_kv,
-        dims.head_dim,
-        scale,
-    );
+    let attn_decode_backend = gpu_tier::backend_for(GpuClass::AttnDecode, backend);
+    let attn_out_1d = if let Some(b) = attn_decode_backend {
+        let seq_len = kv_layer.0.shape()[0];
+        let k_flat = kv_layer
+            .0
+            .as_slice()
+            .expect("k_cache contiguous after append_row");
+        let v_flat = kv_layer
+            .1
+            .as_slice()
+            .expect("v_cache contiguous after append_row");
+        b.qwen35_gqa_decode_step(
+            q_row.as_slice().expect("q_row contiguous"),
+            k_flat,
+            v_flat,
+            dims.n_head,
+            dims.n_head_kv,
+            dims.head_dim,
+            seq_len,
+        )
+        .map(ndarray::Array1::from)
+        .unwrap_or_else(|| {
+            gqa_decode_step(
+                &q_row,
+                &kv_layer.0,
+                &kv_layer.1,
+                dims.n_head,
+                dims.n_head_kv,
+                dims.head_dim,
+                scale,
+            )
+        })
+    } else {
+        gqa_decode_step(
+            &q_row,
+            &kv_layer.0,
+            &kv_layer.1,
+            dims.n_head,
+            dims.n_head_kv,
+            dims.head_dim,
+            scale,
+        )
+    };
     dump_fa("fa_attn_pregate", attn_out_1d.as_slice().unwrap_or(&[]));
     // Wrap back into 1-row matrix to reuse the C.3 gate-apply helper.
     let mut attn_out = attn_out_1d
