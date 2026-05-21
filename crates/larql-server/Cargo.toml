@@ -43,6 +43,11 @@ prost = "0.13"
 async-stream = "0.3"
 futures = "0.3"
 rayon = "1.10"
+# Used by `configure_rayon_threads` to pick physical-core count over
+# SMT-logical count for the rayon global pool — memory-bound matvec
+# kernels regress with sibling SMT threads competing for the same
+# L1/L2 cache.
+num_cpus = "1.16"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
