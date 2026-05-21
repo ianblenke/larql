@@ -655,13 +655,21 @@ fn swiglu_moe_lazy(
     // matvec already saturates the rayon pool and the single CUDA
     // stream serialised all 8 expert kernels anyway. The multi-stream
     // path attacks the CUDA-side bottleneck directly.
+    // Note (explored 2026-05-21, reverted): tried batching the shared
+    // always-on expert as a 9th slot in the same `qwen35_moe_ffn_batch`
+    // call so it could overlap on its own CUDA worker stream alongside
+    // the top-K experts. Output collapsed to a single `"` token
+    // greedy-decode loop with VRAM 9.2 GiB vs the 11.0 GiB baseline,
+    // suggesting the weight cache state was somehow off when the
+    // shared expert's tensor bytes joined the batch (the per-expert
+    // slices vs the standalone shared tensor may key-collide in the
+    // content-fingerprint cache, or another subtle issue). Left as a
+    // future investigation; the shared expert still runs through the
+    // sequential `swiglu_ffn_lazy` path below — that's only a few ms
+    // per layer and the +18% MoE batch win (PR #218) already lands.
     let batch_outputs: Option<Vec<Array1<f32>>> = match backend {
         Some(b) => {
             use crate::attention::quant_dispatch::ggml_type_to_quant_format;
-            // Build the per-expert weight spec for the trait method.
-            // Format may be None for tensors we don't have a quant
-            // mapping for; in that case we fall back to the sequential
-            // path uniformly.
             let mut specs: Vec<larql_compute::MoeFfnExpert<'_>> =
                 Vec::with_capacity(expert_slices.len());
             let mut ffn_dim_ok = None;
@@ -752,6 +760,7 @@ fn swiglu_moe_lazy(
     //    over-amplified contribution into the residual every layer,
     //    producing visible token-distribution noise on Qwen3-Coder-
     //    Next greedy completions (verified empirically).
+    //
     if let (Some(g), Some(u), Some(d)) = (shexp_gate, shexp_up, shexp_down) {
         let y_shared = swiglu_ffn_lazy(
             x,
