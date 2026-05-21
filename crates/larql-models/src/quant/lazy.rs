@@ -184,11 +184,18 @@ impl QuantTensor {
     /// before per-expert dispatch in `swiglu_moe_lazy` so the next
     /// expert's pages arrive while the current expert is computing.
     pub fn prefetch_willneed(&self) {
+        // `memmap2::Advice` is gated on `cfg(unix)` — the `madvise`
+        // syscall has no Windows equivalent. On non-unix the prefetch
+        // is a no-op; mmap pages will fault in on first access as
+        // usual, just without the asynchronous hint.
+        #[cfg(unix)]
         if let QuantBacking::Mmap(mmap) = &self.data {
             // `advise_range` clips to page boundaries internally on
             // memmap2 0.9+. Ignore errors — prefetch is a hint.
             let _ = mmap.advise_range(memmap2::Advice::WillNeed, self.byte_offset, self.byte_len);
         }
+        #[cfg(not(unix))]
+        let _ = &self.data;
     }
 
     /// Per-expert 2D slice of a 3D-packed MoE weight tensor.

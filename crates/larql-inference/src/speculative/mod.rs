@@ -240,11 +240,19 @@ pub fn enabled() -> bool {
 mod tests {
     use super::*;
 
+    /// `LARQL_SPECULATIVE_DECODE` is process-global, so the four
+    /// {unset, "0", "1", "true"} cases must run sequentially. cargo
+    /// runs unit tests in parallel by default; splitting these into
+    /// separate `#[test]`s previously raced and intermittently
+    /// failed CI ("env_one_enables_spec_path: assertion failed:
+    /// enabled()" — another test's `remove_var` raced with the
+    /// `set_var` here). Consolidated into one test that the cargo
+    /// test runner serialises trivially.
     #[test]
-    fn unset_env_uses_legacy_path() {
-        // SAFETY: tests in this file are not run in parallel with
-        // anything that mutates the same var (no other code in this
-        // crate reads LARQL_SPECULATIVE_DECODE).
+    fn env_var_drives_spec_path() {
+        // SAFETY: this is the only test in the crate that mutates
+        // LARQL_SPECULATIVE_DECODE, and it owns the var for its full
+        // body — no race with `enabled()` readers elsewhere.
         unsafe {
             env::remove_var("LARQL_SPECULATIVE_DECODE");
         }
@@ -252,36 +260,22 @@ mod tests {
             !enabled(),
             "unset LARQL_SPECULATIVE_DECODE must disable spec path"
         );
-    }
 
-    #[test]
-    fn env_zero_uses_legacy_path() {
         unsafe {
             env::set_var("LARQL_SPECULATIVE_DECODE", "0");
         }
-        assert!(!enabled());
-        unsafe {
-            env::remove_var("LARQL_SPECULATIVE_DECODE");
-        }
-    }
+        assert!(!enabled(), "\"0\" must disable spec path");
 
-    #[test]
-    fn env_one_enables_spec_path() {
         unsafe {
             env::set_var("LARQL_SPECULATIVE_DECODE", "1");
         }
-        assert!(enabled());
-        unsafe {
-            env::remove_var("LARQL_SPECULATIVE_DECODE");
-        }
-    }
+        assert!(enabled(), "\"1\" must enable spec path");
 
-    #[test]
-    fn env_garbage_uses_legacy_path() {
         unsafe {
             env::set_var("LARQL_SPECULATIVE_DECODE", "true");
         }
-        assert!(!enabled());
+        assert!(!enabled(), "non-\"1\" string must disable spec path");
+
         unsafe {
             env::remove_var("LARQL_SPECULATIVE_DECODE");
         }

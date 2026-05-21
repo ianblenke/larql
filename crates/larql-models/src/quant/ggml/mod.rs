@@ -472,16 +472,22 @@ mod tests {
 
     #[test]
     fn q5_0_mixed() {
-        // scale=2.0, high_bits=0x00000001 (bit 0 set), quants[0]=0x53
-        // element 0: lo4=3, hi1=bit0=1, combined=3|16=19, value=(19-16)*2=6.0
-        // element 1: lo4=5, hi1=bit1=0, combined=5, value=(5-16)*2=-22.0
+        // Q5_0 layout: 16 byte slots hold two 4-bit lanes each — lo
+        // nibbles emit to output positions [0..16), hi nibbles to
+        // [16..32). They do NOT interleave (lo0, hi0, lo1, hi1, ...);
+        // see the doc on `dequantize_q5_0`.
+        //
+        // scale=2.0, high_bits=0x00000001 (bit 0 set), quants[0]=0x53.
+        // For j=0: lo4=3, hi4=5, lo_hi1=bit0=1, hi_hi1=bit16=0,
+        //         lo_combined=3|16=19 → out[0]  = (19-16)*2 =   6.0
+        //         hi_combined=5       → out[16] = ( 5-16)*2 = -22.0
         let mut block = vec![0x00, 0x40]; // f16 2.0
         block.extend_from_slice(&0x00000001u32.to_le_bytes()); // high bits
         block.push(0x53); // quants[0]: lo=3, hi=5
         block.extend_from_slice(&[0x00; 15]); // rest zero
         let result = dequantize_q5_0(&block, 32).unwrap();
         assert!((result[0] - 6.0).abs() < 0.01);
-        assert!((result[1] - (-22.0)).abs() < 0.01);
+        assert!((result[16] - (-22.0)).abs() < 0.01);
     }
 
     #[test]
