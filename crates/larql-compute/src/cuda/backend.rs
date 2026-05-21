@@ -212,9 +212,10 @@ impl CudaBackend {
             }
         }
         let arc = Arc::new(self.drv.device_u8_buf_from(host)?);
-        let mut cache = self.q8_0_byte_device_cache.lock().map_err(|_| {
-            CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into())
-        })?;
+        let mut cache = self
+            .q8_0_byte_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("q8_0 byte device cache poisoned".into()))?;
         let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
         let arc_clone = Arc::clone(entry);
         drop(cache);

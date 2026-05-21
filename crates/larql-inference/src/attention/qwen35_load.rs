@@ -1953,7 +1953,7 @@ mod tests {
         );
         // Check: is lm_head == embed (tied)?
         let embed_cow = weights.embed.as_array();
-        let embed: &ndarray::ArcArray2<f32> = &*embed_cow;
+        let embed: &ndarray::ArcArray2<f32> = &embed_cow;
         eprintln!(
             "lm_head shape: {:?}  embed shape: {:?}",
             lm_head.shape(),
@@ -2040,7 +2040,7 @@ mod tests {
         let weights = larql_models::load_gguf(std::path::Path::new(&path)).expect("load_gguf");
         let lm_head = &weights.lm_head;
         let embed_cow = weights.embed.as_array();
-        let embed: &ndarray::ArcArray2<f32> = &*embed_cow;
+        let embed: &ndarray::ArcArray2<f32> = &embed_cow;
         let vocab = lm_head.shape()[0];
         let hidden = lm_head.shape()[1];
         eprintln!(

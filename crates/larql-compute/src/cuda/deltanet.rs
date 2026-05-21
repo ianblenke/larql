@@ -740,8 +740,10 @@ mod tests {
             }
         }
 
-        let out = deltanet_step(&backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v, true)
-            .expect("cuda deltanet");
+        let out = deltanet_step(
+            &backend, &q, &k, &v, &log_g, &beta, &mut state, s, h_k, h_v, true,
+        )
+        .expect("cuda deltanet");
         for i in 0..out.len() {
             assert!((out[i] - expected[i]).abs() < 1e-5, "out[{i}]");
         }

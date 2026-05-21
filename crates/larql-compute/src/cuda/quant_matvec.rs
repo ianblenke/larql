@@ -119,7 +119,11 @@ impl QuantMatVec for CudaBackend {
         if x.len() != hidden {
             return None;
         }
-        if std::env::var("LARQL_CUDA_Q8_0_HOST_DEQUANT").ok().as_deref() != Some("1") {
+        if std::env::var("LARQL_CUDA_Q8_0_HOST_DEQUANT")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
             if let Ok(out) = q8_0_direct::matvec(self, q8_0_data, x, num_rows, hidden) {
                 return Some(out);
             }

@@ -389,6 +389,10 @@ fn activate(gate: &[f32], up: &[f32], activation: Activation) -> Vec<f32> {
                     0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044_715 * g * g * g)).tanh())
                 }
                 Activation::Silu => g / (1.0 + (-g).exp()),
+                // CUDA decode path mirrors the Metal path: callers gate
+                // GeluExact / ReLU off before reaching this hot loop —
+                // no kernel exists for them on either GPU backend.
+                Activation::GeluExact | Activation::ReLU => unreachable!(),
             };
             a * u
         })
