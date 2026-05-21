@@ -50,14 +50,24 @@ pub fn apply_rope_partial_at(
         .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
         .collect();
 
+    // cos/sin only depend on (pos, i), not on h — precompute once
+    // per row to avoid recomputing the same trig values `num_heads`
+    // times. Qwen3.6 has num_heads=16 → 16× speedup on this hot
+    // inner loop during prefill. (cos/sin is ~10 ns each; for a
+    // 32K-token prefill that's seconds of redundant trig across
+    // the 32 per-layer RoPE calls.)
+    let mut trig: Vec<(f32, f32)> = Vec::with_capacity(half_rotary);
     for row in 0..seq_len {
         let pos = position_offset + row;
+        trig.clear();
+        for i in 0..half_rotary {
+            let theta = pos as f64 * inv_freq[i];
+            trig.push((theta.cos() as f32, theta.sin() as f32));
+        }
         for h in 0..num_heads {
             let offset = h * head_dim;
             for i in 0..half_rotary {
-                let theta = pos as f64 * inv_freq[i];
-                let cos_t = theta.cos() as f32;
-                let sin_t = theta.sin() as f32;
+                let (cos_t, sin_t) = trig[i];
 
                 let x0 = x[[row, offset + i]];
                 let x1 = x[[row, offset + half_rotary + i]];
