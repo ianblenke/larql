@@ -103,3 +103,14 @@ debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+# Release profile tuned for the FFN-dominated decode path. The default
+# release profile leaves LTO off and uses 16 codegen units, which
+# prevents the inliner from crossing CGU boundaries — and our hottest
+# code (Q4_K × Q8_K row dot, called 24 × per token on the CPU FFN
+# path) lives in a different crate (`larql-models`) than its primary
+# call site (`larql-inference`). Cross-crate inlining of the kernel
+# is exactly what LTO unlocks.
+#
+# Trade-off: link time goes from ~30 s to several minutes. Acceptable
+# for release-class builds; dev/test profiles unchanged.
