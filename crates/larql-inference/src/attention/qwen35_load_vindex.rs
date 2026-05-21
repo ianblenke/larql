@@ -675,13 +675,15 @@ pub fn qwen35_generate_with_sampling(
     // Prefill — only the last token's logits matter for the first
     // decode step. Earlier tokens advance the cache (KV slabs +
     // DeltaNet recurrent state).
+    // Phase 4a (long-context arc, batched-prefill sub-arc): the
+    // prefill loop is now routed through `qwen35_forward_prefill`,
+    // a single insertion point that future PRs will replace with
+    // batched-kernel implementations. Today it's bit-equivalent to
+    // the prior inline per-token loop.
     let prefill_start = Instant::now();
-    let mut last_logits = None;
-    for &tok in prompt_ids {
-        last_logits = Some(qwen35_forward_step(
-            tok, weights, &dn_dims, &attn_dims, &mut cache, eps,
-        ));
-    }
+    let mut last_logits = crate::attention::qwen35_forward::qwen35_forward_prefill(
+        prompt_ids, weights, &dn_dims, &attn_dims, &mut cache, eps,
+    );
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut sampler = Sampler::new(sampling);
