@@ -364,6 +364,22 @@ impl QuantTensor {
 
     /// `M @ x` where `M` is this tensor (`[rows, cols]`) and `x` is
     /// a column vector (`[cols]`). Returns `[rows]`.
+
+    /// Public accessor for the bytes view — used by cross-expert MoE
+    /// batching in `larql_inference` which needs to peek per-row at
+    /// multiple tensors' bytes without going through `matvec`.
+    #[inline]
+    pub fn raw_bytes_view(&self) -> &[u8] {
+        self.bytes()
+    }
+
+    /// Bytes per row (== `tensor_data_size(type, cols)`). Public so
+    /// the cross-expert MoE batching can compute row offsets.
+    #[inline]
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
     pub fn matvec(&self, x: &Array1<f32>) -> Result<Array1<f32>, ModelError> {
         if x.len() != self.cols {
             return Err(ModelError::Parse(format!(
