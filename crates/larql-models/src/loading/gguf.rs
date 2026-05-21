@@ -2252,4 +2252,97 @@ mod tests {
     }
 
     // Dequant tests are in format::quant::ggml::tests
+
+    /// Lock in the interleaved-per-k_head convention from PR #207.
+    ///
+    /// llama.cpp's qwen3next interpretation of `mixed_ba = ssm_ba @ x` is
+    /// `reshape_4d(., 4, num_k_heads, ...)` with dim 0 inner = 4 = 2β + 2α
+    /// per k-head. Beta extracts the first 2 of each 4-tuple, alpha the
+    /// next 2 — i.e., rows `{0,1,4,5,8,9,...}` for β and `{2,3,6,7,10,11,...}`
+    /// for α. The previously-shipped "first half = β, second half = α"
+    /// gave cos≈0.16 vs llama at L0 tok0. This test constructs a
+    /// 4-rows-per-2-k-heads matrix with distinct row markers so the
+    /// split is unambiguous — any future regression that reverts to
+    /// row-halves or flips polarity will fail here.
+    #[test]
+    fn split_fused_ssm_ba_takes_interleaved_rows_per_k_head() {
+        use ndarray::Array2;
+        let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+        // ssm_ba shape: 2 * num_v_heads × hidden. Use num_v_heads = 4,
+        // hidden = 3, so the matrix has 8 rows (= 2 * 4) and the 4-tuple
+        // groups are (0,1,2,3) and (4,5,6,7) for the 2 k-heads.
+        // Row marker = row index → easy to read in assertions.
+        let mut rows = Vec::with_capacity(8 * 3);
+        for r in 0..8 {
+            for _ in 0..3 {
+                rows.push(r as f32);
+            }
+        }
+        let fused = Array2::from_shape_vec((8, 3), rows).unwrap().into_shared();
+        tensors.insert("layers.0.ssm_ba.weight".to_string(), fused);
+
+        split_fused_ssm_ba(&mut tensors);
+
+        // Original key is removed.
+        assert!(!tensors.contains_key("layers.0.ssm_ba.weight"));
+        let beta = tensors
+            .get("layers.0.ssm_beta.weight")
+            .expect("β split missing");
+        let alpha = tensors
+            .get("layers.0.ssm_alpha.weight")
+            .expect("α split missing");
+        assert_eq!(beta.shape(), &[4, 3], "β shape");
+        assert_eq!(alpha.shape(), &[4, 3], "α shape");
+
+        // β rows: take the first 2 of each pair-of-4 → rows {0,1,4,5}.
+        // α rows: take the next 2 of each pair-of-4 → rows {2,3,6,7}.
+        // The marker on row R is the value R; check the first column.
+        let beta_markers: Vec<f32> = (0..4).map(|h_v| beta[[h_v, 0]]).collect();
+        let alpha_markers: Vec<f32> = (0..4).map(|h_v| alpha[[h_v, 0]]).collect();
+        assert_eq!(
+            beta_markers,
+            vec![0.0, 1.0, 4.0, 5.0],
+            "β should be rows {{0,1,4,5}} (interleaved-per-k_head). first-half split would give {{0,1,2,3}}",
+        );
+        assert_eq!(
+            alpha_markers,
+            vec![2.0, 3.0, 6.0, 7.0],
+            "α should be rows {{2,3,6,7}}. first-half split would give {{4,5,6,7}}",
+        );
+    }
+
+    /// `LARQL_QWEN3NEXT_SSM_BA_AB=1` flips β and α roles. Confirms the
+    /// escape-hatch env var still works after PR #207's rewrite.
+    #[test]
+    fn split_fused_ssm_ba_ab_first_env_swaps_roles() {
+        use ndarray::Array2;
+        // Set the env var for this test only.
+        // SAFETY: tests in this module aren't run in parallel that share env state.
+        std::env::set_var("LARQL_QWEN3NEXT_SSM_BA_AB", "1");
+
+        let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
+        let mut rows = Vec::with_capacity(8 * 3);
+        for r in 0..8 {
+            for _ in 0..3 {
+                rows.push(r as f32);
+            }
+        }
+        let fused = Array2::from_shape_vec((8, 3), rows).unwrap().into_shared();
+        tensors.insert("layers.0.ssm_ba.weight".to_string(), fused);
+
+        split_fused_ssm_ba(&mut tensors);
+        std::env::remove_var("LARQL_QWEN3NEXT_SSM_BA_AB");
+
+        // With ab_first=1: β takes rows {2,3,6,7}, α takes rows {0,1,4,5}.
+        let beta = tensors.get("layers.0.ssm_beta.weight").unwrap();
+        let alpha = tensors.get("layers.0.ssm_alpha.weight").unwrap();
+        assert_eq!(
+            (0..4).map(|h_v| beta[[h_v, 0]]).collect::<Vec<f32>>(),
+            vec![2.0, 3.0, 6.0, 7.0],
+        );
+        assert_eq!(
+            (0..4).map(|h_v| alpha[[h_v, 0]]).collect::<Vec<f32>>(),
+            vec![0.0, 1.0, 4.0, 5.0],
+        );
+    }
 }
