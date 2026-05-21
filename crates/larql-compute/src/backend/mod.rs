@@ -30,6 +30,19 @@ pub use helpers::{dot_proj_gpu, matmul_gpu};
 pub use matmul::{MatMul, MatMulOp};
 pub use quant_matvec::QuantMatVec;
 
+/// `cuda-moe-multistream`: per-expert weight spec passed to
+/// [`ComputeBackend::qwen35_moe_ffn_batch`]. Borrowed bytes — the
+/// underlying `QuantTensor::raw_bytes()` views live for the duration
+/// of the request via the model's Arc'd weights.
+pub struct MoeFfnExpert<'a> {
+    pub gate_data: &'a [u8],
+    pub gate_format: crate::QuantFormat,
+    pub up_data: &'a [u8],
+    pub up_format: crate::QuantFormat,
+    pub down_data: &'a [u8],
+    pub down_format: crate::QuantFormat,
+}
+
 /// Hardware compute backend — the umbrella trait every caller binds.
 ///
 /// Combines [`MatMul`] + [`QuantMatVec`] + [`DecodeBackend`] plus
@@ -302,6 +315,36 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     /// don't leak device memory across requests. Default no-op for
     /// backends that don't keep device-resident KV.
     fn qwen35_gqa_decode_reset(&self, _cache_id: u64) {}
+
+    /// `cuda-moe-multistream`: parallel-expert MoE FFN dispatch.
+    ///
+    /// Issues all `experts.len()` (top_k, typically 8) expert chains
+    /// concurrently on a pool of worker streams instead of serialising
+    /// them on the default stream. Each expert is the standard
+    /// SwiGLU triple — `gate @ x → silu(gate) * (up @ x) → down @ inter`
+    /// — but the per-expert kernels overlap on the GPU when SM
+    /// occupancy permits.
+    ///
+    /// Each `experts[i]` carries the gate/up/down quantised bytes +
+    /// format + row count for one expert. All experts must share the
+    /// same `hidden` (== input dim) and `ffn_dim` (gate/up output
+    /// rows; down's input dim). The kernel does NOT apply the routing
+    /// weights — the caller multiplies each returned output by its
+    /// router-weight before summing.
+    ///
+    /// Returns one `Vec<f32>` of length `hidden` per expert (the
+    /// `down @ inter` result, ready for weighted accumulation). `None`
+    /// means the backend can't serve this shape; callers fall back to
+    /// per-expert sequential dispatch via `swiglu_ffn_lazy`.
+    fn qwen35_moe_ffn_batch(
+        &self,
+        _x: &[f32],
+        _hidden: usize,
+        _ffn_dim: usize,
+        _experts: &[crate::backend::MoeFfnExpert<'_>],
+    ) -> Option<Vec<Vec<f32>>> {
+        None
+    }
 
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;

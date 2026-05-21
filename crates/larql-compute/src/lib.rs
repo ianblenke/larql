@@ -84,7 +84,7 @@ pub use pipeline::{
 
 pub use backend::{
     dot_proj_gpu, matmul_gpu, Capability, ComputeBackend, DecodeBackend, MatMul, MatMulOp,
-    QuantMatVec,
+    MoeFfnExpert, QuantMatVec,
 };
 
 /// Bring every backend sub-trait into scope at once.
