@@ -741,6 +741,16 @@ fn swiglu_moe_lazy(
         // stream serialised anyway; this iteration only kicks in when
         // there's no GPU backend (the inner par_iter is the inherited
         // CPU path, now gated by the rayon-context check).
+        // Cross-expert batching (par over `(expert × row)` pairs)
+        // explored 2026-05-21 and reverted: hardware bench showed it
+        // matches the par-outer pattern at ~10.2 t/s (no measurable
+        // gain). The workload is already memory-bandwidth-saturated
+        // with 8 expert workers on the 24-core Threadripper PRO —
+        // adding more parallel work items doesn't unlock more
+        // bandwidth, and rayon overhead per row-dot work item eats
+        // any compute headroom. Kept the `cpu_moe_ffn_batched` helper
+        // for the future (might help on bigger CCX-per-socket parts)
+        // but not active. See the function's body for the design.
         use rayon::prelude::*;
         let per_expert: Vec<Array1<f32>> = expert_slices
             .par_iter()
@@ -806,6 +816,145 @@ fn swiglu_moe_lazy(
     y_moe
 }
 
+/// Cross-expert batched CPU MoE FFN. Replaces the per-expert
+/// `swiglu_ffn_lazy` loop with two big par_iter passes — one over
+/// `(expert × ffn_row)` for fused gate+up+silu, one over
+/// `(expert × hidden_row)` for the down matvec. Distributes work
+/// across all rayon threads (24 physical cores on the bench host)
+/// instead of letting 16 of them sit idle while 8 expert workers
+/// each chew through their own matvec.
+///
+/// Hardware bench (2026-05-21, Threadripper PRO 5965WX): matched
+/// the par-outer pattern at ~10.2 t/s — **no measurable gain**.
+/// The workload is already memory-bandwidth-saturated with 8 expert
+/// workers, and rayon's per-work-item overhead eats any compute
+/// headroom from finer-grained parallelism. Function kept as
+/// dead code so future bench on bigger CCX-per-socket parts can
+/// retry without re-deriving the design.
+///
+/// Returns `Some(weighted_sum [hidden])` (already softmax-weighted
+/// per expert) when every expert's gate/up/down is a supported
+/// quant format (Q4_K / Q5_K / Q8_0) with matching shape and the
+/// activation length is a Q8_K multiple of 256. `None` falls back
+/// to the per-expert par-outer loop.
+#[allow(dead_code)]
+fn cpu_moe_ffn_batched(
+    expert_slices: &[(
+        usize,
+        larql_models::quant::lazy::QuantTensor,
+        larql_models::quant::lazy::QuantTensor,
+        larql_models::quant::lazy::QuantTensor,
+    )],
+    x: &Array1<f32>,
+    weights: &[f32],
+    hidden: usize,
+) -> Option<Vec<f32>> {
+    use larql_models::quant::ggml::{
+        q4k_q8k_row_dot, q5k_q8k_row_dot, q8_0_q8k_row_dot, quantize_to_q8_k,
+    };
+    use rayon::prelude::*;
+
+    if expert_slices.is_empty() {
+        return None;
+    }
+    let n_experts = expert_slices.len();
+    let ffn_dim = expert_slices[0].1.shape()[0];
+    let cols = expert_slices[0].1.shape()[1];
+    if cols != hidden || !hidden.is_multiple_of(256) {
+        return None;
+    }
+    // All experts must share gate/up/down shapes, row_bytes, and
+    // tensor_type. (Real Qwen MoE GGUFs satisfy this — same dtype
+    // across the 3D expert axis.)
+    let g_type = expert_slices[0].1.tensor_type();
+    let u_type = expert_slices[0].2.tensor_type();
+    let d_type = expert_slices[0].3.tensor_type();
+    let g_rb = expert_slices[0].1.row_bytes();
+    let u_rb = expert_slices[0].2.row_bytes();
+    let d_rb = expert_slices[0].3.row_bytes();
+    for e in expert_slices.iter() {
+        if e.1.shape() != [ffn_dim, hidden]
+            || e.2.shape() != [ffn_dim, hidden]
+            || e.3.shape() != [hidden, ffn_dim]
+            || e.1.tensor_type() != g_type
+            || e.2.tensor_type() != u_type
+            || e.3.tensor_type() != d_type
+        {
+            return None;
+        }
+    }
+
+    // Type→row-dot function pointer. Bail to per-expert fallback for
+    // any unsupported format.
+    type RowDot = fn(&[u8], &[u8]) -> Result<f32, larql_models::ModelError>;
+    let pick = |t: u32| -> Option<RowDot> {
+        match t {
+            larql_models::quant::ggml::TYPE_Q4_K => Some(q4k_q8k_row_dot as RowDot),
+            larql_models::quant::ggml::TYPE_Q5_K => Some(q5k_q8k_row_dot as RowDot),
+            larql_models::quant::ggml::TYPE_Q8_0 => Some(q8_0_q8k_row_dot as RowDot),
+            _ => None,
+        }
+    };
+    let g_dot = pick(g_type)?;
+    let u_dot = pick(u_type)?;
+    let d_dot = pick(d_type)?;
+
+    // Phase 0: pre-quantise x once into Q8_K bytes. Same Q8_K is
+    // used by every expert's gate AND up matvec.
+    let x_slice = x.as_slice()?;
+    let q8k_x = quantize_to_q8_k(x_slice);
+
+    // Phase 1: cross-expert gate+up+silu, fully parallel over
+    // `n_experts * ffn_dim` work items. Each work item reads one
+    // row of gate bytes, one row of up bytes, and the shared Q8_K
+    // activation slice — all hot in L1.
+    #[inline(always)]
+    fn silu(g: f32) -> f32 {
+        g / (1.0 + (-g).exp())
+    }
+    let mut inters: Vec<f32> = vec![0.0_f32; n_experts * ffn_dim];
+    inters.par_iter_mut().enumerate().for_each(|(idx, slot)| {
+        let e = idx / ffn_dim;
+        let r = idx % ffn_dim;
+        let gate_bytes = expert_slices[e].1.raw_bytes_view();
+        let up_bytes = expert_slices[e].2.raw_bytes_view();
+        let g_row = &gate_bytes[r * g_rb..(r + 1) * g_rb];
+        let u_row = &up_bytes[r * u_rb..(r + 1) * u_rb];
+        let g = g_dot(g_row, &q8k_x).expect("gate row_dot");
+        let u = u_dot(u_row, &q8k_x).expect("up row_dot");
+        *slot = silu(g) * u;
+    });
+
+    // Phase 2: per-expert Q8_K of its intermediate, plus down
+    // matvec parallel over `n_experts * hidden` work items.
+    let q8k_inters: Vec<Vec<u8>> = (0..n_experts)
+        .map(|e| {
+            let inter_slice = &inters[e * ffn_dim..(e + 1) * ffn_dim];
+            quantize_to_q8_k(inter_slice)
+        })
+        .collect();
+    let mut outputs: Vec<f32> = vec![0.0_f32; n_experts * hidden];
+    outputs.par_iter_mut().enumerate().for_each(|(idx, slot)| {
+        let e = idx / hidden;
+        let r = idx % hidden;
+        let down_bytes = expert_slices[e].3.raw_bytes_view();
+        let row = &down_bytes[r * d_rb..(r + 1) * d_rb];
+        *slot = d_dot(row, &q8k_inters[e]).expect("down row_dot");
+    });
+
+    // Phase 3: weighted sum into a [hidden] vector. Sequential —
+    // n_experts × hidden is small.
+    let mut y = vec![0.0_f32; hidden];
+    for e in 0..n_experts {
+        let w = weights[e];
+        let base = e * hidden;
+        for h in 0..hidden {
+            y[h] += w * outputs[base + h];
+        }
+    }
+    Some(y)
+}
+
 fn swiglu_ffn_lazy(
     x: &Array1<f32>,
     gate_q: Option<&larql_models::quant::lazy::QuantTensor>,
@@ -866,52 +1015,74 @@ fn swiglu_ffn_lazy(
         }
     }
 
-    let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
-        let paired = match (backend, gate_q, up_q) {
-            (Some(b), Some(gq), Some(uq)) => {
-                let gfmt = ggml_type_to_quant_format(gq.tensor_type());
-                let ufmt = ggml_type_to_quant_format(uq.tensor_type());
-                if matches!(gfmt, Some(QuantFormat::Q4_K))
-                    && matches!(ufmt, Some(QuantFormat::Q4_K))
-                {
-                    let x_slice = x.as_slice().expect("Array1 contiguous");
-                    let g_shape = gq.shape();
-                    let u_shape = uq.shape();
-                    b.qwen35_paired_q4k_matvec(
-                        gq.raw_bytes(),
-                        g_shape[0],
-                        uq.raw_bytes(),
-                        u_shape[0],
-                        x_slice,
-                        g_shape[1],
-                    )
-                } else {
-                    None
-                }
-            }
+    // Fused (gate, up, SwiGLU) CPU path — when backend is absent
+    // (CPU-FFN mode), gate_q and up_q have matching shape/format, and
+    // the activation is Q8_K-compatible (cols multiple of 256). One
+    // row-loop pass over gate+up+silu instead of three sequential
+    // passes — fewer intermediate allocations and better L1/L2
+    // residency (gate row, up row, x-Q8K all hot per iteration vs
+    // gate-all-rows then up-all-rows).
+    let fused = if backend.is_none() {
+        match (gate_q, up_q) {
+            (Some(gq), Some(uq)) => time_section!(
+                FFN_GATE_UP_PAIR,
+                gq.fused_gate_up_silu(uq, x).ok().flatten()
+            ),
             _ => None,
-        };
-        if let Some((gv, uv)) = paired {
-            (Array1::from(gv), Array1::from(uv))
-        } else {
-            let g = match gate_q {
-                Some(q) => matvec_with_backend(q, x, backend),
-                None => gate_dense.dot(x),
-            };
-            let u = match up_q {
-                Some(q) => matvec_with_backend(q, x, backend),
-                None => up_dense.dot(x),
-            };
-            (g, u)
         }
-    });
-    let inter = time_section!(FFN_SILU_LOOP, {
-        let mut inter = Array1::<f32>::zeros(g.len());
-        for i in 0..g.len() {
-            inter[i] = (g[i] * sigmoid(g[i])) * u[i];
-        }
-        inter
-    });
+    } else {
+        None
+    };
+    let inter = if let Some(inter_fused) = fused {
+        inter_fused
+    } else {
+        let (g, u) = time_section!(FFN_GATE_UP_PAIR, {
+            let paired = match (backend, gate_q, up_q) {
+                (Some(b), Some(gq), Some(uq)) => {
+                    let gfmt = ggml_type_to_quant_format(gq.tensor_type());
+                    let ufmt = ggml_type_to_quant_format(uq.tensor_type());
+                    if matches!(gfmt, Some(QuantFormat::Q4_K))
+                        && matches!(ufmt, Some(QuantFormat::Q4_K))
+                    {
+                        let x_slice = x.as_slice().expect("Array1 contiguous");
+                        let g_shape = gq.shape();
+                        let u_shape = uq.shape();
+                        b.qwen35_paired_q4k_matvec(
+                            gq.raw_bytes(),
+                            g_shape[0],
+                            uq.raw_bytes(),
+                            u_shape[0],
+                            x_slice,
+                            g_shape[1],
+                        )
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some((gv, uv)) = paired {
+                (Array1::from(gv), Array1::from(uv))
+            } else {
+                let g = match gate_q {
+                    Some(q) => matvec_with_backend(q, x, backend),
+                    None => gate_dense.dot(x),
+                };
+                let u = match up_q {
+                    Some(q) => matvec_with_backend(q, x, backend),
+                    None => up_dense.dot(x),
+                };
+                (g, u)
+            }
+        });
+        time_section!(FFN_SILU_LOOP, {
+            let mut inter = Array1::<f32>::zeros(g.len());
+            for i in 0..g.len() {
+                inter[i] = (g[i] * sigmoid(g[i])) * u[i];
+            }
+            inter
+        })
+    };
     time_section!(
         FFN_DOWN,
         match down_q {

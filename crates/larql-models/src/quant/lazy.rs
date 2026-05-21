@@ -261,8 +261,125 @@ impl QuantTensor {
         self.tensor_type
     }
 
+    /// Fused (gate, up, SwiGLU) — `silu(self @ x) * (up @ x)` produced
+    /// in a single row-loop pass. Skips the two intermediate
+    /// `Array1<f32>` allocations (gate and up outputs) and the
+    /// element-wise silu loop that follows separate matvec calls.
+    ///
+    /// Both tensors must share `rows`, `cols`, and `tensor_type`. When
+    /// they don't, returns `None` so the caller can fall back to two
+    /// separate `matvec` calls + a host-side silu loop.
+    ///
+    /// Cache locality win: per-row work touches gate row bytes, up row
+    /// bytes, and the cached Q8_K activation slice. All three fit in
+    /// L1; the prior pattern processed gate output for ALL rows
+    /// before touching any up rows, evicting gate rows from L2 by the
+    /// time the up matvec ran. Microbench gain TBD.
+    pub fn fused_gate_up_silu(
+        &self,
+        up: &QuantTensor,
+        x: &Array1<f32>,
+    ) -> Result<Option<Array1<f32>>, ModelError> {
+        if self.rows != up.rows
+            || self.cols != up.cols
+            || self.tensor_type != up.tensor_type
+            || self.row_bytes != up.row_bytes
+        {
+            return Ok(None);
+        }
+        if x.len() != self.cols {
+            return Err(ModelError::Parse(format!(
+                "QuantTensor::fused_gate_up_silu: x len {} != cols {}",
+                x.len(),
+                self.cols,
+            )));
+        }
+        let x_slice = x
+            .as_slice()
+            .ok_or_else(|| ModelError::Parse("fused: x must be contiguous".into()))?;
+        // Only Q4_K / Q5_K / Q8_0 with x.len() % 256 == 0 — the Q8_K
+        // pre-quantised activation path. The other formats fall
+        // through (caller drops back to separate matvec calls).
+        if !x_slice.len().is_multiple_of(256) {
+            return Ok(None);
+        }
+
+        let in_rayon = rayon::current_thread_index().is_some();
+        let rb = self.row_bytes;
+        let gate_bytes = self.bytes();
+        let up_bytes = up.bytes();
+        let mut inter = vec![0.0_f32; self.rows];
+
+        // silu(g) = g * sigmoid(g) = g / (1 + e^-g)
+        #[inline(always)]
+        fn silu(g: f32) -> f32 {
+            g / (1.0 + (-g).exp())
+        }
+
+        let result = with_q8k_for(x_slice, |q8k_bytes| -> Result<(), ModelError> {
+            macro_rules! fuse_loop {
+                ($dot:expr) => {
+                    if in_rayon {
+                        for (r, out) in inter.iter_mut().enumerate() {
+                            let g_row = &gate_bytes[r * rb..(r + 1) * rb];
+                            let u_row = &up_bytes[r * rb..(r + 1) * rb];
+                            let g = $dot(g_row, q8k_bytes)?;
+                            let u = $dot(u_row, q8k_bytes)?;
+                            *out = silu(g) * u;
+                        }
+                    } else {
+                        use rayon::prelude::*;
+                        let res: Result<Vec<()>, ModelError> = inter
+                            .par_iter_mut()
+                            .enumerate()
+                            .map(|(r, out)| {
+                                let g_row = &gate_bytes[r * rb..(r + 1) * rb];
+                                let u_row = &up_bytes[r * rb..(r + 1) * rb];
+                                let g = $dot(g_row, q8k_bytes)?;
+                                let u = $dot(u_row, q8k_bytes)?;
+                                *out = silu(g) * u;
+                                Ok(())
+                            })
+                            .collect();
+                        res?;
+                    }
+                };
+            }
+            match self.tensor_type {
+                TYPE_Q4_K => fuse_loop!(q4k_q8k_row_dot),
+                TYPE_Q5_K => fuse_loop!(q5k_q8k_row_dot),
+                TYPE_Q8_0 => fuse_loop!(q8_0_q8k_row_dot),
+                _ => return Err(ModelError::Parse("fused: unsupported tensor_type".into())),
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => Ok(Some(Array1::from(inter))),
+            Err(e) if matches!(&e, ModelError::Parse(s) if s.contains("unsupported tensor_type")) => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// `M @ x` where `M` is this tensor (`[rows, cols]`) and `x` is
     /// a column vector (`[cols]`). Returns `[rows]`.
+
+    /// Public accessor for the bytes view — used by cross-expert MoE
+    /// batching in `larql_inference` which needs to peek per-row at
+    /// multiple tensors' bytes without going through `matvec`.
+    #[inline]
+    pub fn raw_bytes_view(&self) -> &[u8] {
+        self.bytes()
+    }
+
+    /// Bytes per row (== `tensor_data_size(type, cols)`). Public so
+    /// the cross-expert MoE batching can compute row offsets.
+    #[inline]
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
     pub fn matvec(&self, x: &Array1<f32>) -> Result<Array1<f32>, ModelError> {
         if x.len() != self.cols {
             return Err(ModelError::Parse(format!(
