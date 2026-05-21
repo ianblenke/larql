@@ -1181,6 +1181,10 @@ const Q6K_BLOCK_BYTES: usize = larql_models::quant::ggml::Q6_K_BLOCK_BYTES;
 
 /// Scalar reference: Q6_K weights × Q8_K activation matvec.
 /// Reads the llama.cpp Q6_K wire format directly.
+///
+/// `>> 0` in the four `qh_byte >> {0,2,4,6}` extractions is kept for
+/// regularity with the other 2-bit slots.
+#[allow(clippy::identity_op)]
 pub fn q6k_q8k_matvec_scalar(
     out: &mut [f32],
     q8k_x: &Q8KActivation,
@@ -1378,6 +1382,12 @@ pub fn q6k_q8k_matvec_neon(
 /// [`q6k_q8k_matvec_avx2`] for rayon dispatch over rows.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+// The `for g in 0..4 { q6_stride[g] ... q8_ptr.add(... + g * 32) }` loop
+// also uses `g` as a stride multiplier for sibling pointer arithmetic,
+// so `iter().enumerate()` would force splitting the body across two
+// bindings to no benefit. The fixed array makes the bounds trivially
+// known to the compiler.
+#[allow(clippy::needless_range_loop)]
 unsafe fn compute_row_q6k_avx2(
     out_r: &mut f32,
     r: usize,
