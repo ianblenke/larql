@@ -865,8 +865,16 @@ impl CudaBackend {
         if !kv_dim.is_multiple_of(CUDA_BLOCK_ELEMENTS) {
             return None;
         }
-        let new_row_idx = seq_len - 1;
         let drv = self.driver();
+        // `LARQL_QWEN35_KV_PRESEED=N` debug knob — see the f16 path
+        // in `qwen35_gqa_decode_step` for the rationale. On Iso3 the
+        // preseed rows are all-zero packed bytes (from `alloc_zeros`).
+        let preseed_n = std::env::var("LARQL_QWEN35_KV_PRESEED")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(max_seq.saturating_sub(seq_len));
+        let new_row_idx = preseed_n + (seq_len - 1);
 
         // Get/allocate the per-layer compressed slab.
         let packed_row_bytes = quantized_device_len_bytes(KvFormat::Iso3, kv_dim).ok()?;
@@ -903,12 +911,20 @@ impl CudaBackend {
             slab.cached_seq_len = 0;
         }
 
-        // Stale-cache repopulation: compress all prior rows. Same
-        // logic as the f16 slab path but f16-then-compress instead
-        // of just-htod-f16.
+        // Preseed bookkeeping: if `preseed_n` is set and this is the
+        // first call, mark the leading rows as cached (their packed
+        // bytes are zeros from `alloc_zeros` — fine for bench).
+        if slab.cached_seq_len == 0 && preseed_n > 0 {
+            slab.cached_seq_len = preseed_n;
+        }
+
+        // Stale-cache repopulation: compress all prior REAL rows
+        // (after the preseed). With preseed=0 this matches the
+        // original logic exactly.
         if slab.cached_seq_len != new_row_idx {
-            if new_row_idx > 0 {
-                let prev_elements = new_row_idx * kv_dim;
+            let host_prev = seq_len - 1;
+            if host_prev > 0 {
+                let prev_elements = host_prev * kv_dim;
                 let k_prev_f16: Vec<half::f16> = k_cache[..prev_elements]
                     .iter()
                     .map(|&v| half::f16::from_f32(v))
@@ -923,9 +939,14 @@ impl CudaBackend {
                 let stream = drv.stream.clone();
                 let rq_stream =
                     unsafe { RqStream::from_raw(stream.cu_stream() as *mut std::ffi::c_void) };
+                let dst_byte_offset = preseed_n * packed_row_bytes;
+                let dst_byte_len = host_prev * packed_row_bytes;
                 {
                     let (src_ptr, _g1) = k_prev_dev.device_ptr(&stream);
-                    let (dst_ptr, _g2) = slab.codes_k.device_ptr_mut(&stream);
+                    let mut k_window = slab
+                        .codes_k
+                        .slice_mut(dst_byte_offset..dst_byte_offset + dst_byte_len);
+                    let (dst_ptr, _g2) = k_window.device_ptr_mut(&stream);
                     unsafe {
                         copy_f16_to_quantized_device(
                             KvFormat::Iso3,
@@ -939,7 +960,10 @@ impl CudaBackend {
                 }
                 {
                     let (src_ptr, _g1) = v_prev_dev.device_ptr(&stream);
-                    let (dst_ptr, _g2) = slab.codes_v.device_ptr_mut(&stream);
+                    let mut v_window = slab
+                        .codes_v
+                        .slice_mut(dst_byte_offset..dst_byte_offset + dst_byte_len);
+                    let (dst_ptr, _g2) = v_window.device_ptr_mut(&stream);
                     unsafe {
                         copy_f16_to_quantized_device(
                             KvFormat::Iso3,
@@ -959,13 +983,12 @@ impl CudaBackend {
         // offset `new_row_idx * packed_row_bytes`.
         {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
-            let new_k_f16: Vec<half::f16> = k_cache
-                [new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim]
+            let host_new = seq_len - 1;
+            let new_k_f16: Vec<half::f16> = k_cache[host_new * kv_dim..(host_new + 1) * kv_dim]
                 .iter()
                 .map(|&v| half::f16::from_f32(v))
                 .collect();
-            let new_v_f16: Vec<half::f16> = v_cache
-                [new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim]
+            let new_v_f16: Vec<half::f16> = v_cache[host_new * kv_dim..(host_new + 1) * kv_dim]
                 .iter()
                 .map(|&v| half::f16::from_f32(v))
                 .collect();
@@ -1010,15 +1033,15 @@ impl CudaBackend {
                 .ok()?;
             }
         }
-        slab.cached_seq_len = seq_len;
+        slab.cached_seq_len = new_row_idx + 1;
 
-        // Dequant `seq_len` rows to f32 scratch, then convert to f16
-        // K/V scratches for the existing attention kernel. The f16
-        // scratches are sized to exactly `max_seq * kv_dim` each —
-        // they're transient per-layer, written-and-immediately-read
-        // by one kernel call.
+        // Dequant all `new_row_idx + 1` rows (= preseed_n + seq_len)
+        // to f32 scratch, then convert to f16 K/V scratches for the
+        // existing attention kernel. The f16 scratches are sized to
+        // `max_seq * kv_dim` each — they're transient per-layer,
+        // written-and-immediately-read by one kernel call.
         let scratch_elements = max_seq * kv_dim;
-        let dequant_elements = seq_len * kv_dim;
+        let dequant_elements = (new_row_idx + 1) * kv_dim;
         let mut f32_scratch_lock = self.qwen35_kv_dequant_f32_scratch.lock().ok()?;
         let mut f16_k_lock = self.qwen35_kv_dequant_f16_k_scratch.lock().ok()?;
         let mut f16_v_lock = self.qwen35_kv_dequant_f16_v_scratch.lock().ok()?;
@@ -1093,8 +1116,9 @@ impl CudaBackend {
         // scratches. The kernel will *also* write the new K/V row
         // into the scratches at `pos` — harmless since the scratches
         // are transient.
-        let new_k = &k_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
-        let new_v = &v_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let host_new = seq_len - 1;
+        let new_k = &k_cache[host_new * kv_dim..(host_new + 1) * kv_dim];
+        let new_v = &v_cache[host_new * kv_dim..(host_new + 1) * kv_dim];
         let q_dev = drv.device_buf_from(q).ok()?;
         let k_new_dev = drv.device_buf_from(new_k).ok()?;
         let v_new_dev = drv.device_buf_from(new_v).ok()?;
@@ -1542,34 +1566,66 @@ impl ComputeBackend for CudaBackend {
             slab.cached_seq_len = 0;
         }
 
-        let new_row_idx = seq_len - 1;
-        // Stale-cache repopulation: when the device cache isn't
-        // caught up to "one row before the new token", re-upload
-        // everything up to seq_len-1 as f16 then proceed. Avoids
-        // silent drift when the host slab was reset without a
-        // matching `qwen35_gqa_decode_reset`.
-        if slab.cached_seq_len != new_row_idx {
-            if new_row_idx > 0 {
-                let k_prev_f16: Vec<half::f16> = k_cache[..new_row_idx * kv_dim]
+        // `LARQL_QWEN35_KV_PRESEED=N` debug knob: on first allocation
+        // of this layer's slab, treat positions [0, N) as if they
+        // were populated by a prior prefill. The cache contents are
+        // whatever `alloc_zeros` produced (all f16 zeros) — output
+        // won't be coherent but VRAM peak + per-token wall time are
+        // measured under the long-context pressure they'd see with
+        // a real 32K/128K prefill. Lets the bench harness validate
+        // the architectural VRAM savings without paying for the
+        // ~37 min/data-point prefill at 32K (or ~2.5 hr at 128K).
+        let preseed_n = std::env::var("LARQL_QWEN35_KV_PRESEED")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(max_seq.saturating_sub(seq_len));
+        if slab.cached_seq_len == 0 && preseed_n > 0 {
+            // Zeros already populated by `alloc_zeros`. Just mark the
+            // device cache as containing `preseed_n` rows so the
+            // attention kernel reads them.
+            slab.cached_seq_len = preseed_n;
+        }
+        let effective_new_row_idx = preseed_n + (seq_len - 1);
+
+        // Stale-cache repopulation: same idea as before, but
+        // accounting for the preseed offset (rows 0..preseed_n are
+        // already considered cached; only rows >= preseed_n need
+        // host data uploaded).
+        if slab.cached_seq_len != effective_new_row_idx {
+            let host_prev = seq_len - 1;
+            if host_prev > 0 {
+                let k_prev_f16: Vec<half::f16> = k_cache[..host_prev * kv_dim]
                     .iter()
                     .map(|&v| half::f16::from_f32(v))
                     .collect();
-                let v_prev_f16: Vec<half::f16> = v_cache[..new_row_idx * kv_dim]
+                let v_prev_f16: Vec<half::f16> = v_cache[..host_prev * kv_dim]
                     .iter()
                     .map(|&v| half::f16::from_f32(v))
                     .collect();
+                let off_elements = preseed_n * kv_dim;
                 drv.stream
-                    .memcpy_htod(&k_prev_f16, &mut slab.k.slice_mut(..k_prev_f16.len()))
+                    .memcpy_htod(
+                        &k_prev_f16,
+                        &mut slab
+                            .k
+                            .slice_mut(off_elements..off_elements + k_prev_f16.len()),
+                    )
                     .ok()?;
                 drv.stream
-                    .memcpy_htod(&v_prev_f16, &mut slab.v.slice_mut(..v_prev_f16.len()))
+                    .memcpy_htod(
+                        &v_prev_f16,
+                        &mut slab
+                            .v
+                            .slice_mut(off_elements..off_elements + v_prev_f16.len()),
+                    )
                     .ok()?;
             }
-            slab.cached_seq_len = new_row_idx;
+            slab.cached_seq_len = effective_new_row_idx;
         }
 
-        let new_k = &k_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
-        let new_v = &v_cache[new_row_idx * kv_dim..(new_row_idx + 1) * kv_dim];
+        let new_k = &k_cache[(seq_len - 1) * kv_dim..seq_len * kv_dim];
+        let new_v = &v_cache[(seq_len - 1) * kv_dim..seq_len * kv_dim];
         let q_dev = drv.device_buf_from(q).ok()?;
         let k_new_dev = drv.device_buf_from(new_k).ok()?;
         let v_new_dev = drv.device_buf_from(new_v).ok()?;
@@ -1579,7 +1635,7 @@ impl ComputeBackend for CudaBackend {
             num_q_heads,
             num_kv_heads,
             head_dim,
-            pos: new_row_idx,
+            pos: effective_new_row_idx,
             max_seq,
             // qwen35_attention_block_step applies QK-norm + RoPE on
             // host before reaching here; passing `rotary_dim = 0`
@@ -1606,7 +1662,7 @@ impl ComputeBackend for CudaBackend {
         )
         .ok()?;
 
-        slab.cached_seq_len = seq_len;
+        slab.cached_seq_len = effective_new_row_idx + 1;
         let mut out_host = vec![0.0_f32; q_dim];
         drv.stream.memcpy_dtoh(&out_dev, &mut out_host).ok()?;
         drv.stream.synchronize().ok()?;
