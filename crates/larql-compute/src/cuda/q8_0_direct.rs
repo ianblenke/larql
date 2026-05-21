@@ -107,10 +107,7 @@ pub(crate) fn matvec_device(
     rows: usize,
     hidden: usize,
 ) -> Result<CudaSlice<f32>, CudaInitError> {
-    if rows == 0
-        || hidden == 0
-        || x_dev.len() != hidden
-        || !hidden.is_multiple_of(Q8_0_BLOCK_ELEMS)
+    if rows == 0 || hidden == 0 || x_dev.len() != hidden || !hidden.is_multiple_of(Q8_0_BLOCK_ELEMS)
     {
         return Err(CudaInitError::DriverMissing(format!(
             "invalid q8_0 matvec shape rows={rows} hidden={hidden} x_len={}",
@@ -169,11 +166,7 @@ pub(crate) fn matvec(
     rows: usize,
     hidden: usize,
 ) -> Result<Vec<f32>, CudaInitError> {
-    if rows == 0
-        || hidden == 0
-        || x.len() != hidden
-        || !hidden.is_multiple_of(Q8_0_BLOCK_ELEMS)
-    {
+    if rows == 0 || hidden == 0 || x.len() != hidden || !hidden.is_multiple_of(Q8_0_BLOCK_ELEMS) {
         return Err(CudaInitError::DriverMissing(format!(
             "invalid q8_0 matvec shape rows={rows} hidden={hidden} x_len={}",
             x.len()
