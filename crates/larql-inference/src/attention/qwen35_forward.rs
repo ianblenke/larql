@@ -179,11 +179,16 @@ pub fn qwen35_forward_prefill(
     // `LARQL_QWEN35_DUMP_FINAL`, `LARQL_QWEN35_DUMP_L0`). Those are
     // per-token introspection tools; when any is set, fall back to
     // the per-token loop so they keep working unchanged.
+    //
+    // `LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1` is the dedicated A/B
+    // switch — set it to force the per-token loop without enabling
+    // any diagnostic side-effects, for benching batched vs fallback.
     let dump_active = std::env::var("LARQL_QWEN35_DUMP_LAYER_BOUNDARY").is_ok()
         || std::env::var("LARQL_QWEN35_TRACE").is_ok()
         || std::env::var("LARQL_QWEN35_DUMP_FINAL_BIN_DIR").is_ok()
         || std::env::var("LARQL_QWEN35_DUMP_FINAL").is_ok()
-        || std::env::var("LARQL_QWEN35_DUMP_L0").is_ok();
+        || std::env::var("LARQL_QWEN35_DUMP_L0").is_ok()
+        || std::env::var("LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL").is_ok();
     if dump_active {
         let mut last = None;
         for &tok in prompt_ids {

@@ -803,9 +803,17 @@ fn run_chat_completion(
                 // marginally-different CPU kernel.
                 #[cfg(any(feature = "cuda", all(feature = "metal-experts", target_os = "macos")))]
                 {
-                    loaded.backend = Some(std::sync::Arc::from(
-                        super::super::attention::attention_compute_backend(),
-                    ));
+                    // `LARQL_QWEN35_NO_BACKEND=1` skips backend attach
+                    // so the CPU-side batched-prefill matmul gates
+                    // (`backend.is_none()`) in qwen35_block /
+                    // deltanet_block fire. Useful for benching the
+                    // Phase 4 batched matmul work from a cuda-built
+                    // binary, and for production CPU-only deployments.
+                    if std::env::var("LARQL_QWEN35_NO_BACKEND").is_err() {
+                        loaded.backend = Some(std::sync::Arc::from(
+                            super::super::attention::attention_compute_backend(),
+                        ));
+                    }
                 }
                 let arc = std::sync::Arc::new(loaded);
                 // OnceLock semantics: first writer wins; if a parallel
