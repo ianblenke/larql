@@ -499,6 +499,13 @@ impl GgufFile {
             "phi" | "phi2" | "phi3" => "phi",
             "gpt2" => "gpt2",
             "deepseek" | "deepseek2" => "deepseek_v2",
+            // DSv4 reconsidered 2026-05-22 (PR #186 revert undone) — full
+            // build in progress across multiple PRs. For now we recognise
+            // the arch so config-routing can fan out to the new forward
+            // path as each stage lands; chat handler returns a clear
+            // "implementation in progress" error until Stage 8 wires the
+            // forward end-to-end.
+            "deepseek4" | "deepseekv4" | "deepseek_v4" => "deepseek_v4",
             other => other,
         };
 

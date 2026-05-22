@@ -754,6 +754,19 @@ fn run_chat_completion(
     // Gated-DeltaNet + full-attention MoE family as Qwen 3.6; routes
     // through the same generate driver.
     let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe" | "qwen3next");
+    // DeepSeek V4 Flash — Stage 1 arch detection landed; forward path
+    // arrives in stages 2-8. Return a clear error instead of
+    // silently routing to the generic fallback (which would produce
+    // garbled output, the failure mode PR #186 originally reverted
+    // to avoid).
+    if arch_family == "deepseek_v4" {
+        return Err(ServerError::Internal(format!(
+            "DeepSeek V4 Flash architecture (arch `{arch_family}`) detected. \
+             larql's V4 forward path is in progress (stages 2-8 of the \
+             rebuild reconsidering PR #186's revert). Inference is not \
+             yet available; use llama.cpp PR #23122 in the meantime."
+        )));
+    }
     if is_qwen35 && constrained_schema.is_some() {
         return Err(ServerError::Internal(format!(
             "/v1/chat/completions with response_format/tools is not yet wired \
