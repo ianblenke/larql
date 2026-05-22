@@ -13,6 +13,7 @@ pub mod deltanet_recurrence;
 pub mod deltanet_state;
 pub mod dsv4_grouped_o_proj;
 pub mod dsv4_mhc;
+pub mod dsv4_moe_ops;
 pub mod fine_profile;
 pub mod gpu;
 pub mod gpu_tier;

@@ -24276,6 +24276,78 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::clamped_swiglu_applies_clamp_then_swiglu",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 220,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::clamped_swiglu_row_matches_2d_on_single_row",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 271,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::clamped_swiglu_unclamped_matches_standard_when_limit_zero",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 246,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::hash_route_basic_lookup",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 158,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::sqrt_softplus_finite_at_extremes",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 201,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::sqrt_softplus_matches_naive_for_moderate_values",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 180,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::clamped_swiglu_applies_clamp_then_swiglu",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 220,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::clamped_swiglu_row_matches_2d_on_single_row",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 271,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::clamped_swiglu_unclamped_matches_standard_when_limit_zero",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 246,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::hash_route_basic_lookup",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 158,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::sqrt_softplus_finite_at_extremes",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 201,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_ops::tests::sqrt_softplus_matches_naive_for_moderate_values",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_ops.rs",
+      "line": 180,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::gpu::q4_attention_proj_works_with_cpu_backend_at_aligned_dims",
       "file": "crates/larql-inference/src/attention/gpu.rs",
       "line": 453,
