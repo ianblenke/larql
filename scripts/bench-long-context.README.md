@@ -175,14 +175,18 @@ batched-over-per-token win comes from the rest of Phase 4
 PR #237 RoPE hoisting, PR #238 batched RMSNorm), which all
 compound now that the shmem cliff is gone.
 
-### Full scaling curve post #248 (96 KB dynamic shmem opt-in)
+### Full scaling curve post #252-#255 (FA-v1 tiled-scores kernels)
 
 After #248 set `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` to
-96 KB on the attention kernels, prefill at >11K tokens no longer
-hits the default ~48 KB per-block cap. Max n_ctx per launch is now
-~24K (`96·1024 / 4 − scratch − head_dim`).
+96 KB, the shmem-by-n_ctx kernels could handle up to ~24K per
+launch. #252-#255 then added FA-v1 tiled variants of all four
+attention launch paths (decode + prefill + tree-mask + legacy),
+streaming the K cache in TILE_K=1024 chunks with fixed ~6 KB
+shmem — lifting the per-launch cap to whatever the cache slab
+holds.
 
-Full f16 batched-prefill curve at `max_seq=20000`:
+Full f16 batched-prefill curve (max_seq=20000 for ≤17K, max_seq
+sized to fit prompt for larger):
 
 | N tok | wall_s | per-tok |
 |---|---|---|
@@ -192,12 +196,18 @@ Full f16 batched-prefill curve at `max_seq=20000`:
 | 8831 | 369.7s | 41.9 ms |
 | 13245 | 557.2s | 42.1 ms |
 | 17658 | 752.8s | 42.6 ms |
+| 21555 | 920.5s | 42.7 ms |
+| 25864 | 1111.5s | 43.0 ms |
+| **34485** | **1511.7s (25.2 min)** | **43.8 ms** |
 
-**42 ms/tok holds across a 32× context range (557 → 17658
-tokens)** — the kernels actually scale linearly within the opt-in
-shmem budget, no occupancy or memory-bandwidth wall up to 17K.
-This is the headline scaling result from the Phase 4 + Step B +
-shmem fix + dynamic-shmem-opt-in landed across #246/#247/#248.
+**43 ms/tok holds across a 62× context range** (557 → 34485
+tokens) — the tiled kernels scale linearly with zero per-token
+overhead vs the non-tiled path at small N. The 34485-token
+data point is **real Qwen3.6-35B-A3B 32K-class prefill running
+in session-scale time** (25 min) — the original Phase 4 target
+finally hit. This is the headline scaling result from the
+Phase 4 + Step B + shmem fix + dynamic-shmem-opt-in +
+tiled-scores arc landed across #246/#247/#248/#252/#253/#254/#255.
 
 ### iso3 vs f16 at 17K (Phase 3 value-prop check)
 
