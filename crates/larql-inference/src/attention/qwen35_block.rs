@@ -466,28 +466,29 @@ pub fn qwen35_attention_block_prefill(
     );
 
     // 2. Q/K/V projections — batched matmul instead of per-row
-    //    matvec. The matmul path quantises all `seq_len` activations
-    //    to Q8_K once (Q4_K/Q5_K/Q6_K/Q8_0) and reads each weight
-    //    row across each rayon worker's slice of activations.
-    //    For seq_len >> num_cores (e.g. 32K prefill on 24 cores → 1.3K
-    //    rows per thread), each weight row stays hot in the worker's
-    //    L2/L3 between activations — weight bandwidth drops from
-    //    `seq_len × W_bytes` to roughly `cores × W_bytes`. The
-    //    `_ = proj_backend` line silences the unused-var lint until
-    //    the GPU batched matmul path lands (follow-up PR).
-    let _ = proj_backend; // kept for future GPU batched matmul path
+    //    matvec. Routes through `matmul_with_backend`: when a GPU
+    //    backend is attached, Q4_K projections dispatch to
+    //    `gemm_proj_seq` (cached f16 dequant + cuBLAS hgemm tensor
+    //    cores); otherwise the CPU `QuantTensor::matmul` runs, which
+    //    quantises all `seq_len` activations to Q8_K once and reads
+    //    each weight row across each rayon worker's slice of
+    //    activations. For seq_len >> num_cores (e.g. 32K prefill on
+    //    24 cores → 1.3K rows per thread), each weight row stays hot
+    //    in the worker's L2/L3 between activations — weight bandwidth
+    //    drops from `seq_len × W_bytes` to roughly `cores × W_bytes`.
+    use crate::attention::quant_dispatch::matmul_with_backend;
     let q_fused = if let Some(q) = weights.attn_q_quant.as_ref() {
-        q.matmul(&x_norm).expect("attn_q matmul")
+        matmul_with_backend(q, &x_norm, proj_backend)
     } else {
         x_norm.dot(&weights.attn_q.t())
     };
     let k_full = if let Some(q) = weights.attn_k_quant.as_ref() {
-        q.matmul(&x_norm).expect("attn_k matmul")
+        matmul_with_backend(q, &x_norm, proj_backend)
     } else {
         x_norm.dot(&weights.attn_k.t())
     };
     let v_full = if let Some(q) = weights.attn_v_quant.as_ref() {
-        q.matmul(&x_norm).expect("attn_v matmul")
+        matmul_with_backend(q, &x_norm, proj_backend)
     } else {
         x_norm.dot(&weights.attn_v.t())
     };
@@ -597,9 +598,9 @@ pub fn qwen35_attention_block_prefill(
     apply_q_gate(&mut attn_out_seq, &gate_2d);
 
     // 9. Output projection — batched matmul (same shape rationale
-    //    as steps 2's projections; same L3-reuse win).
+    //    as step 2's projections; same L3-reuse / cuBLAS hgemm win).
     let out = if let Some(q) = weights.attn_output_quant.as_ref() {
-        q.matmul(&attn_out_seq).expect("attn_output matmul")
+        matmul_with_backend(q, &attn_out_seq, proj_backend)
     } else {
         attn_out_seq.dot(&weights.attn_output.t())
     };

@@ -999,14 +999,22 @@ pub fn deltanet_block_prefill(
     // pre-recurrent linear ops — none depend on prior state, so
     // they batch cleanly across the full prompt.
     //
-    // CPU mode only: when a backend is attached, the per-token
-    // matvec path can dispatch the paired Q4_K GPU kernel
-    // (`qwen35_paired_q4k_matvec`), so we keep the per-row form
-    // there to preserve GPU acceleration. Same pattern as PR #241.
+    // Step B (Phase 4e follow-up): the prior `backend.is_none()` gate
+    // here was a defensive hold against routing batched matmul through
+    // the GPU backend that lacked a batched-matmul kernel. With
+    // `matmul_with_backend` now routing Q4_K through `gemm_proj_seq`
+    // (cuBLAS hgemm on cached f16 dequant), the GPU path produces a
+    // batched matmul too — so the gate is dropped. Per-class GPU
+    // residency for the projection matmuls is filtered through
+    // `gpu_tier::backend_for(DnProj, ...)` so
+    // `LARQL_QWEN35_GPU_NO_DN_PROJ=1` still pushes them back to CPU.
     let batched_projections =
-        backend.is_none() && weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
+        weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
     let batched_ssm_out = batched_projections && weights.ssm_out_quant.is_some();
 
+    use crate::attention::gpu_tier::{self as dn_gpu_tier, GpuClass as DnGpuClass};
+    use crate::attention::quant_dispatch::matmul_with_backend;
+    let proj_backend = dn_gpu_tier::backend_for(DnGpuClass::DnProj, backend);
     if batched_projections {
         // 1. Batched pre-mixer RMSNorm of x_seq.
         let mut x_norm_all = Array2::<f32>::zeros((seq_len, hidden));
@@ -1019,11 +1027,11 @@ pub fn deltanet_block_prefill(
 
         // 2. Batched qkv_mixed = attn_qkv @ x_norm.
         let qkv_q = weights.attn_qkv_quant.as_ref().unwrap();
-        let qkv_all = qkv_q.matmul(&x_norm_all).expect("attn_qkv matmul");
+        let qkv_all = matmul_with_backend(qkv_q, &x_norm_all, proj_backend);
 
         // 3. Batched z = attn_gate @ x_norm.
         let gate_q = weights.attn_gate_quant.as_ref().unwrap();
-        let z_all = gate_q.matmul(&x_norm_all).expect("attn_gate matmul");
+        let z_all = matmul_with_backend(gate_q, &x_norm_all, proj_backend);
 
         // 4. Per-position recurrent inner — uses pre-computed
         //    projections so the per-row block_step skips its own
@@ -1066,7 +1074,7 @@ pub fn deltanet_block_prefill(
         //    32K = 288 GB. Matmul form: cores × 9 MB ≈ 216 MB.
         if let Some(o_seq) = o_seq {
             let ssm_q = weights.ssm_out_quant.as_ref().unwrap();
-            let block_out_seq = ssm_q.matmul(&o_seq).expect("ssm_out matmul");
+            let block_out_seq = matmul_with_backend(ssm_q, &o_seq, proj_backend);
             out.assign(&block_out_seq);
         }
     } else {
@@ -1502,8 +1510,7 @@ mod tests {
 
     /// Phase 4d-internals + ssm_out parity gate: when ALL three
     /// projection quants (attn_qkv, attn_gate, ssm_out) are
-    /// present and `backend.is_none()`,
-    /// `deltanet_block_prefill` should:
+    /// present, `deltanet_block_prefill` should:
     ///   1. Batch RMSNorm + attn_qkv + attn_gate upfront.
     ///   2. Loop the recurrent inner with `skip_ssm_out = true`,
     ///      collecting per-position `o_flat`s.
