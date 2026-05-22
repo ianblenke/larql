@@ -22430,13 +22430,13 @@
     {
       "fqn": "larql_compute::cuda::attn::tree_mask_tests::tree_mask_linear_chain_bit_exact_vs_causal",
       "file": "crates/larql-compute/src/cuda/attn.rs",
-      "line": 2609,
+      "line": 2630,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::attn::tree_mask_tests::tree_mask_sibling_no_leak",
       "file": "crates/larql-compute/src/cuda/attn.rs",
-      "line": 2701,
+      "line": 2722,
       "crate": "larql_compute"
     },
     {
