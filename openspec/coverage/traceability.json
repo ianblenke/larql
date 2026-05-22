@@ -24180,6 +24180,42 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::dsv4_flash_shape_smoke",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 229,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::identity_a_identity_b_passes_through_when_dims_match",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 120,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::per_group_sum_then_select_routes_groups_correctly",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 176,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::tests::dsv4_flash_shape_smoke",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 229,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::tests::identity_a_identity_b_passes_through_when_dims_match",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 120,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_grouped_o_proj::tests::per_group_sum_then_select_routes_groups_correctly",
+      "file": "crates/larql-inference/src/attention/dsv4_grouped_o_proj.rs",
+      "line": 176,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::dsv4_mhc::expand_identity_comb_no_post_recovers_residual",
       "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
       "line": 286,
