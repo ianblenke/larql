@@ -550,6 +550,13 @@ pub fn deltanet_block_step_with_optional_projections(
     };
     if let Some(o_flat_vec) = post_proj {
         let o_flat = Array1::from(o_flat_vec);
+        // Honour the batched-prefill exit point: when the outer
+        // caller is collecting `o_flat`s for a batched `ssm_out`
+        // matmul, return the unprojected `o_flat` (shape [value_dim])
+        // instead of running ssm_out here.
+        if skip_ssm_out {
+            return o_flat;
+        }
         let block_out = if let Some(q) = weights.ssm_out_quant.as_ref() {
             matvec_with_backend(q, &o_flat, dn_proj_backend)
         } else {
@@ -661,6 +668,14 @@ pub fn deltanet_block_step_with_optional_projections(
                 o_flat[c] *= silu(z[c]);
             }
         });
+        // Honour the batched-prefill exit point: when the outer
+        // caller is collecting `o_flat`s for a batched `ssm_out`
+        // matmul (set by `deltanet_block_prefill`'s batched branch),
+        // return the unprojected `o_flat` (shape [value_dim]) instead
+        // of running ssm_out per-position.
+        if skip_ssm_out {
+            return o_flat;
+        }
         let block_out = time_section!(
             DN_SSM_OUT,
             if let Some(q) = weights.ssm_out_quant.as_ref() {
