@@ -374,9 +374,9 @@ pub fn qwen35_attention_block_step(
         .map(ndarray::Array1::from)
         .unwrap_or_else(|| {
             gqa_decode_step(
-                &q_row,
-                &kv_layer.0,
-                &kv_layer.1,
+                q_row.view(),
+                kv_layer.0.view(),
+                kv_layer.1.view(),
                 dims.n_head,
                 dims.n_head_kv,
                 dims.head_dim,
@@ -385,9 +385,9 @@ pub fn qwen35_attention_block_step(
         })
     } else {
         gqa_decode_step(
-            &q_row,
-            &kv_layer.0,
-            &kv_layer.1,
+            q_row.view(),
+            kv_layer.0.view(),
+            kv_layer.1.view(),
             dims.n_head,
             dims.n_head_kv,
             dims.head_dim,
@@ -576,20 +576,31 @@ pub fn qwen35_attention_block_prefill(
         // gqa_decode_step against the (now-populated) host slabs.
         // The slabs were appended row-by-row above; for row `r` the
         // cache spans positions [0, base_pos + r + 1).
-        for r in 0..seq_len {
-            let cache_end = base_pos + r + 1;
-            let k_view = kv_layer.0.slice(ndarray::s![..cache_end, ..]).to_owned();
-            let v_view = kv_layer.1.slice(ndarray::s![..cache_end, ..]).to_owned();
-            let q_row = q_roped.row(r).to_owned();
-            let out_row = gqa_decode_step(
-                &q_row,
-                &k_view,
-                &v_view,
-                dims.n_head,
-                dims.n_head_kv,
-                dims.head_dim,
-                scale,
-            );
+        //
+        // Rows are independent — parallelise across `r` with rayon.
+        // The CPU fit at 2K+ tokens has the O(N²) attention term
+        // already dominating wall time; even at smaller seq_len the
+        // per-row cost is large enough that rayon overhead is
+        // negligible. Views (zero-copy slices into the shared K/V
+        // slab) replace the prior per-row `.to_owned()` — saves
+        // O(seq_len × cache_size) transient allocations.
+        use rayon::prelude::*;
+        let out_rows: Vec<Array1<f32>> = (0..seq_len)
+            .into_par_iter()
+            .map(|r| {
+                let cache_end = base_pos + r + 1;
+                gqa_decode_step(
+                    q_roped.row(r),
+                    kv_layer.0.slice(ndarray::s![..cache_end, ..]),
+                    kv_layer.1.slice(ndarray::s![..cache_end, ..]),
+                    dims.n_head,
+                    dims.n_head_kv,
+                    dims.head_dim,
+                    scale,
+                )
+            })
+            .collect();
+        for (r, out_row) in out_rows.into_iter().enumerate() {
             attn_out_seq.row_mut(r).assign(&out_row);
         }
     }
@@ -619,12 +630,16 @@ pub fn qwen35_attention_block_prefill(
 ///
 /// Returns `[num_q * head_dim]`.
 ///
+/// Takes views so the prefill fallback caller (which slices the cumulative
+/// cache per row) can pass zero-copy slices instead of paying for a
+/// per-row `.to_owned()`. Existing decode-step callers pass `.view()`.
+///
 /// Per-head loop with stable softmax (subtract row max before exp).
 /// The KV-head index for Q head `h` is `h / reps` (repeat-interleave).
 fn gqa_decode_step(
-    q: &Array1<f32>,
-    k_cache: &Array2<f32>,
-    v_cache: &Array2<f32>,
+    q: ndarray::ArrayView1<f32>,
+    k_cache: ndarray::ArrayView2<f32>,
+    v_cache: ndarray::ArrayView2<f32>,
     num_q: usize,
     num_kv: usize,
     head_dim: usize,
