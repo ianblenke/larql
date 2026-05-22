@@ -1338,6 +1338,212 @@ extern "C" __global__ void fused_prefill_attention_tree_mask_f32(
 }
 "#;
 
+/// FlashAttention v1-style tiled variant of
+/// `fused_prefill_attention_tree_mask_f32`. Same FA-v1 pattern as
+/// `FUSED_PREFILL_ATTN_TILED_SRC` (#253) with the additional
+/// per-position ancestor-mask check that gates score computation
+/// for in-tree positions j ∈ [base_pos, base_pos + sp].
+///
+/// Used by `fused_prefill_attention_tree_seq_device_into_pos_dev`
+/// when per-block n_ctx > 16384 (the same threshold as the linear
+/// prefill dispatch).
+const FUSED_PREFILL_ATTN_TREE_TILED_SRC: &str = r#"
+#define NEG_INF (__int_as_float(0xff800000))
+
+__device__ float ld_kvc_pft(const unsigned short* p) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(p[0]));
+    return f;
+}
+
+#define TILE_K 1024
+
+extern "C" __global__ void fused_prefill_attention_tree_mask_tiled_f32(
+    const float* q_seq,
+    const unsigned short* k_cache,
+    const unsigned short* v_cache,
+    const float* q_norm,
+    float* out_seq,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* base_pos_dev,
+    const unsigned long long* ancestors_dev,
+    int seq_len,
+    int max_seq,
+    int rotary_dim,
+    float rope_base,
+    float eps,
+    float qk_norm_offset,
+    float attn_scale,
+    float softcap,
+    int use_qk_norm
+) {
+    int qh = blockIdx.x;
+    int sp = blockIdx.y;
+    if (qh >= num_q_heads || sp >= seq_len) return;
+    int base_pos = (*base_pos_dev);
+    int pos = base_pos + sp;
+    if (pos >= max_seq) return;
+
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    extern __shared__ float smem[];
+    float* tile_scores = smem;                    // [TILE_K]
+    float* scratch     = smem + TILE_K;           // [bdim]
+    float* q_rot       = smem + TILE_K + bdim;    // [head_dim]
+
+    int group = max(1, num_q_heads / max(1, num_kv_heads));
+    int kvh = min(num_kv_heads - 1, qh / group);
+    const float* q_head = q_seq + (size_t)(sp * num_q_heads + qh) * head_dim;
+
+    // ── 1. Q-norm ──────────────────────────────────────────────────
+    float q_ss = 0.f;
+    for (int d = tid; d < head_dim; d += bdim) {
+        float qv = q_head[d];
+        q_ss += qv * qv;
+    }
+    scratch[tid] = q_ss;
+    __syncthreads();
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float q_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
+
+    // ── 2. Pre-rotate Q ───────────────────────────────────────────
+    int rdim_pre = min(rotary_dim, head_dim);
+    int hdim_pre = (rdim_pre > 0) ? rdim_pre / 2 : 1;
+    for (int d = tid; d < head_dim; d += bdim) {
+        float qv = q_head[d];
+        if (use_qk_norm) qv *= q_inv * (q_norm[d] + qk_norm_offset);
+        if (d < rdim_pre) {
+            int pair = d % hdim_pre;
+            bool imag = d >= hdim_pre;
+            float re = q_head[pair];
+            float im = q_head[pair + hdim_pre];
+            if (use_qk_norm) {
+                re *= q_inv * (q_norm[pair]            + qk_norm_offset);
+                im *= q_inv * (q_norm[pair + hdim_pre] + qk_norm_offset);
+            }
+            float freq  = 1.0f / __powf(rope_base, (float)(2 * pair) / (float)rdim_pre);
+            float angle = (float)pos * freq;
+            float c = __cosf(angle);
+            float s = __sinf(angle);
+            qv = imag ? (re * s + im * c) : (re * c - im * s);
+        }
+        q_rot[d] = qv;
+    }
+    __syncthreads();
+
+    // ── 3. Tiled streaming softmax + V output (FA v1 + tree mask) ──
+    int n_ctx = pos + 1;
+    int num_tiles = (n_ctx + TILE_K - 1) / TILE_K;
+    unsigned long long anc = ancestors_dev[sp];
+
+    int my_d = (tid < head_dim) ? tid : -1;
+
+    float m_state = NEG_INF;
+    float l_state = 0.f;
+    float my_acc = 0.f;
+
+    for (int t = 0; t < num_tiles; t++) {
+        int t_start = t * TILE_K;
+        int t_end   = min(t_start + TILE_K, n_ctx);
+        int tile_size = t_end - t_start;
+
+        // 1. Score (with tree-mask) this tile.
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            int j = t_start + j_local;
+            // History positions (j < base_pos) are always allowed.
+            // In-tree positions filtered by ancestor bitset.
+            bool allow = true;
+            if (j >= base_pos) {
+                int bit = j - base_pos;
+                allow = ((anc >> bit) & 1ULL) != 0ULL;
+            }
+            if (!allow) {
+                tile_scores[j_local] = NEG_INF;
+                continue;
+            }
+            float dot = 0.f;
+            for (int di = 0; di < head_dim; di++) {
+                float qv = q_rot[di];
+                float kv = ld_kvc_pft(k_cache + ((size_t)j * num_kv_heads + kvh) * head_dim + di);
+                dot += qv * kv;
+            }
+            float logit = dot * attn_scale;
+            if (softcap > 0.f) logit = softcap * tanhf(logit / softcap);
+            tile_scores[j_local] = logit;
+        }
+        __syncthreads();
+
+        // 2. Reduce tile_max.
+        float my_tile_max = NEG_INF;
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            my_tile_max = fmaxf(my_tile_max, tile_scores[j_local]);
+        }
+        scratch[tid] = my_tile_max;
+        __syncthreads();
+        for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float tile_max = scratch[0];
+
+        // 3. Update running max + rescale factor. If the whole tile
+        //    was masked (tile_max == NEG_INF), skip the rescale (no
+        //    new contribution) — m_state and acc stay as-is.
+        if (tile_max == NEG_INF) {
+            __syncthreads();
+            continue;
+        }
+        float new_m = fmaxf(m_state, tile_max);
+        float rescale = (m_state == NEG_INF) ? 0.f : __expf(m_state - new_m);
+
+        // 4. Convert tile_scores to exp(score - new_m). NEG_INF
+        //    scores produce 0 — safe to include in tile_l sum.
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            tile_scores[j_local] = __expf(tile_scores[j_local] - new_m);
+        }
+        __syncthreads();
+
+        // 5. Reduce tile_l.
+        float my_tile_l = 0.f;
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            my_tile_l += tile_scores[j_local];
+        }
+        scratch[tid] = my_tile_l;
+        __syncthreads();
+        for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] += scratch[tid + stride];
+            __syncthreads();
+        }
+        float tile_l_total = scratch[0];
+
+        // 6. Update running l.
+        l_state = l_state * rescale + tile_l_total;
+
+        // 7. Update this thread's acc.
+        if (my_d >= 0) {
+            my_acc *= rescale;
+            for (int j_local = 0; j_local < tile_size; j_local++) {
+                int j = t_start + j_local;
+                float vv = ld_kvc_pft(v_cache + ((size_t)j * num_kv_heads + kvh) * head_dim + my_d);
+                my_acc += tile_scores[j_local] * vv;
+            }
+        }
+
+        m_state = new_m;
+        __syncthreads();
+    }
+
+    if (my_d >= 0) {
+        out_seq[(size_t)(sp * num_q_heads + qh) * head_dim + my_d] = my_acc / l_state;
+    }
+}
+"#;
+
 /// Lazily-loaded softmax module + function. cudarc's `CudaContext` is
 /// `Send + Sync`; `OnceLock` gives us thread-safe one-time init.
 static SOFTMAX_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = OnceLock::new();
@@ -1353,6 +1559,8 @@ static FUSED_PREFILL_ATTN_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFuncti
 static FUSED_PREFILL_ATTN_TILED_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
     OnceLock::new();
 static FUSED_PREFILL_ATTN_TREE_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
+    OnceLock::new();
+static FUSED_PREFILL_ATTN_TREE_TILED_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
     OnceLock::new();
 
 fn softmax_function(drv: &Driver) -> Result<&'static CudaFunction, CudaInitError> {
@@ -2490,6 +2698,42 @@ fn fused_prefill_attention_tree_function(
     Ok(f)
 }
 
+/// FlashAttention v1-style tiled variant of
+/// [`fused_prefill_attention_tree_function`]. Same ABI; streams K
+/// cache in TILE_K=1024 chunks instead of materialising
+/// `scores[0..n_ctx]` in shmem. Used by the tree-mask prefill
+/// dispatch when per-block n_ctx > 16384.
+fn fused_prefill_attention_tree_tiled_function(
+    drv: &Driver,
+) -> Result<&'static CudaFunction, CudaInitError> {
+    if let Some((_, f)) = FUSED_PREFILL_ATTN_TREE_TILED_FUNC.get() {
+        return Ok(f);
+    }
+    let opts = CompileOptions {
+        use_fast_math: Some(true),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(FUSED_PREFILL_ATTN_TREE_TILED_SRC, opts).map_err(|e| {
+        CudaInitError::DriverMissing(format!(
+            "nvrtc compile fused_prefill_attn_tree_tiled: {e:?}"
+        ))
+    })?;
+    let module = drv.ctx.load_module(ptx).map_err(|e| {
+        CudaInitError::DriverMissing(format!("load fused_prefill_attn_tree_tiled module: {e:?}"))
+    })?;
+    let func = module
+        .load_function("fused_prefill_attention_tree_mask_tiled_f32")
+        .map_err(|e| {
+            CudaInitError::DriverMissing(format!(
+                "load fused_prefill_attn_tree_tiled function: {e:?}"
+            ))
+        })?;
+    opt_in_dynamic_shmem(&func, "fused_prefill_attention_tree_mask_tiled_f32")?;
+    let _ = FUSED_PREFILL_ATTN_TREE_TILED_FUNC.set((module, func));
+    let (_, f) = FUSED_PREFILL_ATTN_TREE_TILED_FUNC.get().unwrap();
+    Ok(f)
+}
+
 /// Pre-allocated-output variant: writes the attention output into the
 /// caller-supplied `out_seq` (must have at least `seq_len * q_dim`
 /// elements). Same contract / kernel launches as
@@ -2834,7 +3078,16 @@ pub fn fused_prefill_attention_tree_seq_device_into_pos_dev(
 
     let drv = backend.driver();
     let func_kv = kv_cache_write_seq_function(drv)?;
-    let func_attn = fused_prefill_attention_tree_function(drv)?;
+    // cuda-prefill-tree-tiled-dispatch: route to the FA-v1 tree-mask
+    // tiled kernel when per-block n_ctx > 16384. Same threshold as
+    // the linear prefill dispatch (see fused_prefill_attention_launch_pos_dev).
+    let max_seq_i = (opts.pos + seq_len) as i32;
+    let use_tiled = max_seq_i > NON_TILED_PREFILL_ATTN_N_CTX_MAX;
+    let func_attn = if use_tiled {
+        fused_prefill_attention_tree_tiled_function(drv)?
+    } else {
+        fused_prefill_attention_tree_function(drv)?
+    };
     let q_norm_arc = backend.arc_norm_device_buf(q_norm)?;
     let k_norm_arc = backend.arc_norm_device_buf(k_norm)?;
 
@@ -2847,10 +3100,6 @@ pub fn fused_prefill_attention_tree_seq_device_into_pos_dev(
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
     let seq_len_i = seq_len as i32;
-    // cuda-prefill-shmem-fix (tree variant): same as the linear
-    // pos_dev variant — drives both this fn's attn-kernel shmem
-    // and the kernel `max_seq` arg from the actual n_ctx.
-    let max_seq_i = (opts.pos + seq_len) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -2884,15 +3133,18 @@ pub fn fused_prefill_attention_tree_seq_device_into_pos_dev(
     }
 
     let block_dim_attn: u32 = 256;
+    // Tiled kernel: fixed (TILE_K + bdim + head_dim) shmem.
+    // Non-tiled kernel: (n_ctx + bdim + head_dim) per PR #246's
+    // shmem-by-n_ctx fix.
+    let shmem_slots = if use_tiled {
+        FUSED_PREFILL_ATTN_TILED_TILE_K + block_dim_attn as usize + opts.head_dim
+    } else {
+        max_seq_i as usize + block_dim_attn as usize + opts.head_dim
+    };
     let cfg_attn = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, seq_len as u32, 1),
         block_dim: (block_dim_attn, 1, 1),
-        // cuda-prefill-shmem-fix: size shmem from `max_seq_i` (set
-        // above to opts.pos + seq_len or base_pos + seq_len) rather
-        // than `opts.max_seq` slab capacity. Matches PR #246's fix
-        // for the launch helper.
-        shared_mem_bytes: ((max_seq_i as usize + block_dim_attn as usize + opts.head_dim)
-            * std::mem::size_of::<f32>()) as u32,
+        shared_mem_bytes: (shmem_slots * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
 
