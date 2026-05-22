@@ -427,6 +427,322 @@ extern "C" __global__ void fused_decode_attention_f32(
 }
 "#;
 
+/// FlashAttention v1-style tiled decode-attention kernel.
+///
+/// Same semantics as `fused_decode_attention_f32` above, but the
+/// score/softmax/output loop streams the K cache in TILE_K-sized
+/// tiles instead of materialising `scores[0..n_ctx]` in shmem. Per
+/// thread: running `(m, l, acc_d)` state (FA v1 online softmax).
+/// One thread owns one output dim across the tile loop.
+///
+/// Unlocks `n_ctx > 24K` per launch — the
+/// `fused_decode_attention_f32` kernel's shmem grows linearly with
+/// n_ctx, so 24K is the practical cap on Ada (96 KB dynamic shmem
+/// budget). The tiled kernel has a fixed shmem footprint
+/// independent of n_ctx: TILE_K + bdim + head_dim slots ≈ 6 KB at
+/// TILE_K=1024 / bdim=256 / head_dim=128.
+///
+/// Tradeoff: per-tile rescale of `(l, acc_d)` adds ~2 multiplies +
+/// 1 exp per tile per thread. At n_ctx ≤ 24K (32-tile sweep) that
+/// overhead is negligible vs the dominant per-token Q·K compute.
+/// Smaller n_ctx workloads can still use the non-tiled kernel — the
+/// dispatch chooses tiled when the non-tiled shmem would exceed the
+/// 96 KB opt-in budget.
+const FUSED_DECODE_ATTN_TILED_SRC: &str = r#"
+#define NEG_INF (__int_as_float(0xff800000))
+
+__device__ float ld_kvcache(const unsigned short* p) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(p[0]));
+    return f;
+}
+__device__ void st_kvcache(unsigned short* p, float v) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    p[0] = h;
+}
+
+// Tile size in K-cache rows. Must satisfy:
+//   - TILE_K >= blockDim.x (so each thread covers ≥ 1 score per tile)
+//   - shmem(TILE_K + bdim + head_dim) * 4 ≤ 96 KB opt-in
+// At bdim=256 / head_dim=128: max TILE_K ≈ 24K, but we pick 1024 to
+// keep the inner score loop short and the rescale frequent enough
+// that no single tile dominates wall time.
+#define TILE_K 1024
+
+extern "C" __global__ void fused_decode_attention_tiled_f32(
+    const float* q,
+    const float* k_new,
+    const float* v_new,
+    unsigned short* k_cache,
+    unsigned short* v_cache,
+    const float* q_norm,
+    const float* k_norm,
+    float* out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* pos_dev,
+    int max_seq,
+    int rotary_dim,
+    float rope_base,
+    float eps,
+    float qk_norm_offset,
+    float attn_scale,
+    float softcap,
+    int use_qk_norm,
+    int d_split
+) {
+    int pos = *pos_dev;
+    int qh = blockIdx.x;
+    int dchunk = blockIdx.y;
+    if (qh >= num_q_heads || dchunk >= d_split || pos >= max_seq) return;
+    int d_per_chunk = head_dim / d_split;
+    int d_start = dchunk * d_per_chunk;
+    int d_end   = d_start + d_per_chunk;
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    extern __shared__ float smem[];
+    float* tile_scores = smem;                    // [TILE_K]
+    float* scratch     = smem + TILE_K;           // [bdim]
+    float* q_rot       = smem + TILE_K + bdim;    // [head_dim]
+
+    int group = max(1, num_q_heads / max(1, num_kv_heads));
+    int kvh = min(num_kv_heads - 1, qh / group);
+    const float* q_head = q + (size_t)qh * head_dim;
+    const float* k_head = k_new + (size_t)kvh * head_dim;
+    const float* v_head = v_new + (size_t)kvh * head_dim;
+
+    // ── 1. QK-norm: rsqrt(mean(q^2)+eps), rsqrt(mean(k^2)+eps) ─────
+    float q_ss = 0.f;
+    float k_ss = 0.f;
+    for (int d = tid; d < head_dim; d += bdim) {
+        float qv = q_head[d];
+        float kv = k_head[d];
+        q_ss += qv * qv;
+        k_ss += kv * kv;
+    }
+    scratch[tid] = q_ss;
+    __syncthreads();
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float q_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
+
+    scratch[tid] = k_ss;
+    __syncthreads();
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float k_inv = rsqrtf(scratch[0] / (float)head_dim + eps);
+
+    // ── 2. Pre-rotate Q once ──────────────────────────────────────
+    int rdim_pre = min(rotary_dim, head_dim);
+    int hdim_pre = (rdim_pre > 0) ? rdim_pre / 2 : 1;
+    for (int d = tid; d < head_dim; d += bdim) {
+        float qv = q_head[d];
+        if (use_qk_norm) qv *= q_inv * (q_norm[d] + qk_norm_offset);
+        if (d < rdim_pre) {
+            int pair = d % hdim_pre;
+            bool imag = d >= hdim_pre;
+            float re = q_head[pair];
+            float im = q_head[pair + hdim_pre];
+            if (use_qk_norm) {
+                re *= q_inv * (q_norm[pair]            + qk_norm_offset);
+                im *= q_inv * (q_norm[pair + hdim_pre] + qk_norm_offset);
+            }
+            float freq  = 1.0f / __powf(rope_base, (float)(2 * pair) / (float)rdim_pre);
+            float angle = (float)pos * freq;
+            float c = __cosf(angle);
+            float s = __sinf(angle);
+            qv = imag ? (re * s + im * c) : (re * c - im * s);
+        }
+        q_rot[d] = qv;
+    }
+    __syncthreads();
+
+    // ── 3. Write current K/V to cache (gated to one Q head + dchunk 0)
+    if ((qh % group) == 0 && dchunk == 0) {
+        for (int d = tid; d < head_dim; d += bdim) {
+            float kv = k_head[d];
+            if (use_qk_norm) kv *= k_inv * (k_norm[d] + qk_norm_offset);
+            float k_rot;
+            int rdim = min(rotary_dim, head_dim);
+            int hdim = (rdim > 0) ? rdim / 2 : 1;
+            if (d < rdim) {
+                int pair = d % hdim;
+                bool imag = d >= hdim;
+                float re = k_head[pair];
+                float im = k_head[pair + hdim];
+                if (use_qk_norm) {
+                    re *= k_inv * (k_norm[pair] + qk_norm_offset);
+                    im *= k_inv * (k_norm[pair + hdim] + qk_norm_offset);
+                }
+                float freq = 1.0f / __powf(rope_base, (float)(2 * pair) / (float)rdim);
+                float angle = (float)pos * freq;
+                float c = __cosf(angle);
+                float s = __sinf(angle);
+                k_rot = imag ? (re * s + im * c) : (re * c - im * s);
+            } else {
+                k_rot = kv;
+            }
+            size_t idx = ((size_t)pos * num_kv_heads + kvh) * head_dim + d;
+            st_kvcache(k_cache + idx, k_rot);
+            st_kvcache(v_cache + idx, v_head[d]);
+        }
+    }
+    __syncthreads();
+
+    // ── 4. Tiled streaming softmax + V output ─────────────────────
+    //
+    // CRITICAL: all threads must reach every `__syncthreads()` in
+    // lockstep. The tile loop is therefore the OUTERMOST construct;
+    // the d-loop (per-thread output-dim assignment) lives inside.
+    // Threads beyond d_per_chunk participate in the shared score +
+    // reduction phases but skip the per-d acc accumulation.
+    //
+    // Per-thread state (all threads):
+    //   m_state — running max of (s · attn_scale) (uniform across threads
+    //             via per-tile scratch broadcast)
+    //   l_state — running sum of exp(s - m_state) (likewise uniform)
+    //   my_acc  — per-thread output for this thread's assigned d
+    //   my_d    — this thread's output dim, or -1 if none
+    //
+    // For each tile of K positions [t_start .. t_end):
+    //   1. All threads cooperatively score the tile into tile_scores[]
+    //   2. Reduce tile_max
+    //   3. new_m = max(m_state, tile_max); rescale = exp(m_state - new_m)
+    //   4. Overwrite tile_scores[j] := exp(tile_scores[j] - new_m)
+    //   5. Reduce tile_l = sum(tile_scores) over the tile
+    //   6. l_state = l_state * rescale + tile_l
+    //   7. Threads with my_d ≥ 0: my_acc = my_acc * rescale +
+    //      sum_j tile_scores[j] * V[j][my_d]
+    //   8. m_state = new_m
+    // Final: out[my_d] = my_acc / l_state (only threads with my_d ≥ 0)
+
+    int n_ctx = pos + 1;
+    int num_tiles = (n_ctx + TILE_K - 1) / TILE_K;
+
+    int my_d_candidate = tid + d_start;
+    int my_d = (my_d_candidate < d_end) ? my_d_candidate : -1;
+
+    float m_state = NEG_INF;
+    float l_state = 0.f;
+    float my_acc = 0.f;
+
+    for (int t = 0; t < num_tiles; t++) {
+        int t_start = t * TILE_K;
+        int t_end   = min(t_start + TILE_K, n_ctx);
+        int tile_size = t_end - t_start;
+
+        // 1. Score this tile. All threads cooperate.
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            int j = t_start + j_local;
+            float dot = 0.f;
+            for (int di = 0; di < head_dim; di++) {
+                float qv = q_rot[di];
+                float kv;
+                if (j == pos) {
+                    // Re-rotate K at `pos` on-the-fly to match the
+                    // non-tiled kernel's `j == pos` branch.
+                    int rdim = min(rotary_dim, head_dim);
+                    if (di < rdim) {
+                        int hdim = rdim / 2;
+                        int pair = di % hdim;
+                        bool imag = di >= hdim;
+                        float re = k_head[pair];
+                        float im = k_head[pair + hdim];
+                        if (use_qk_norm) {
+                            re *= k_inv * (k_norm[pair] + qk_norm_offset);
+                            im *= k_inv * (k_norm[pair + hdim] + qk_norm_offset);
+                        }
+                        float freq = 1.0f / __powf(rope_base, (float)(2 * pair) / (float)rdim);
+                        float angle = (float)pos * freq;
+                        float c = __cosf(angle);
+                        float s = __sinf(angle);
+                        kv = imag ? (re * s + im * c) : (re * c - im * s);
+                    } else {
+                        kv = k_head[di];
+                        if (use_qk_norm) kv *= k_inv * (k_norm[di] + qk_norm_offset);
+                    }
+                } else {
+                    kv = ld_kvcache(k_cache + ((size_t)j * num_kv_heads + kvh) * head_dim + di);
+                }
+                dot += qv * kv;
+            }
+            float logit = dot * attn_scale;
+            if (softcap > 0.f) logit = softcap * tanhf(logit / softcap);
+            tile_scores[j_local] = logit;
+        }
+        __syncthreads();
+
+        // 2. Reduce tile_max.
+        float my_tile_max = NEG_INF;
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            my_tile_max = fmaxf(my_tile_max, tile_scores[j_local]);
+        }
+        scratch[tid] = my_tile_max;
+        __syncthreads();
+        for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float tile_max = scratch[0];
+
+        // 3. Update running max + rescale factor.
+        float new_m = fmaxf(m_state, tile_max);
+        float rescale = (m_state == NEG_INF) ? 0.f : __expf(m_state - new_m);
+
+        // 4. Convert tile_scores to exp(score - new_m). Reuses the
+        //    same shmem region — saves a second pass later.
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            tile_scores[j_local] = __expf(tile_scores[j_local] - new_m);
+        }
+        __syncthreads();
+
+        // 5. Reduce sum(exp(score-new_m)) for this tile.
+        float my_tile_l = 0.f;
+        for (int j_local = tid; j_local < tile_size; j_local += bdim) {
+            my_tile_l += tile_scores[j_local];
+        }
+        scratch[tid] = my_tile_l;
+        __syncthreads();
+        for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] += scratch[tid + stride];
+            __syncthreads();
+        }
+        float tile_l_total = scratch[0];
+
+        // 6. Update running l.
+        l_state = l_state * rescale + tile_l_total;
+
+        // 7. Update this thread's acc (only if my_d is valid).
+        if (my_d >= 0) {
+            my_acc *= rescale;
+            for (int j_local = 0; j_local < tile_size; j_local++) {
+                int j = t_start + j_local;
+                float vv = (j == pos)
+                    ? v_head[my_d]
+                    : ld_kvcache(v_cache + ((size_t)j * num_kv_heads + kvh) * head_dim + my_d);
+                my_acc += tile_scores[j_local] * vv;
+            }
+        }
+
+        // 8. Advance running max.
+        m_state = new_m;
+
+        // Sync before the next tile reuses tile_scores / scratch.
+        __syncthreads();
+    }
+
+    if (my_d >= 0) {
+        out[(size_t)qh * head_dim + my_d] = my_acc / l_state;
+    }
+}
+"#;
+
 /// Batched-prefill K/V cache writer. One CUDA block per
 /// `(seq_pos, kv_head)` pair; rotates K with RoPE (and optional
 /// QK-norm) and writes to `k_cache[base_pos + sp, kvh, :]`. V is a
@@ -839,6 +1155,8 @@ static SOFTMAX_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = Once
 static QKV_RMS_PROJ_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> = OnceLock::new();
 static FUSED_DECODE_ATTN_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
     OnceLock::new();
+static FUSED_DECODE_ATTN_TILED_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
+    OnceLock::new();
 static KV_CACHE_WRITE_SEQ_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
     OnceLock::new();
 static FUSED_PREFILL_ATTN_FUNC: OnceLock<(std::sync::Arc<CudaModule>, CudaFunction)> =
@@ -989,6 +1307,55 @@ fn fused_decode_attention_function(drv: &Driver) -> Result<&'static CudaFunction
     let (_, f) = FUSED_DECODE_ATTN_FUNC.get().unwrap();
     Ok(f)
 }
+
+/// FlashAttention v1-style tiled variant of
+/// [`fused_decode_attention_function`]. Same kernel ABI; streams
+/// the K cache in TILE_K (1024) chunks instead of materialising
+/// `scores[0..n_ctx]` in shmem. Used when n_ctx > ~24K would
+/// overflow the 96 KB dynamic-shmem opt-in budget of the non-tiled
+/// kernel.
+fn fused_decode_attention_tiled_function(
+    drv: &Driver,
+) -> Result<&'static CudaFunction, CudaInitError> {
+    if let Some((_, f)) = FUSED_DECODE_ATTN_TILED_FUNC.get() {
+        return Ok(f);
+    }
+    let opts = CompileOptions {
+        use_fast_math: Some(true),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(FUSED_DECODE_ATTN_TILED_SRC, opts).map_err(|e| {
+        CudaInitError::DriverMissing(format!("nvrtc compile fused_decode_attention_tiled: {e:?}"))
+    })?;
+    let module = drv.ctx.load_module(ptx).map_err(|e| {
+        CudaInitError::DriverMissing(format!("load fused_decode_attention_tiled module: {e:?}"))
+    })?;
+    let func = module
+        .load_function("fused_decode_attention_tiled_f32")
+        .map_err(|e| {
+            CudaInitError::DriverMissing(format!(
+                "load fused_decode_attention_tiled function: {e:?}"
+            ))
+        })?;
+    opt_in_dynamic_shmem(&func, "fused_decode_attention_tiled_f32")?;
+    let _ = FUSED_DECODE_ATTN_TILED_FUNC.set((module, func));
+    let (_, f) = FUSED_DECODE_ATTN_TILED_FUNC.get().unwrap();
+    Ok(f)
+}
+
+/// Tile size used by the tiled-scores kernel. Must match the
+/// `#define TILE_K` in `FUSED_DECODE_ATTN_TILED_SRC` — host uses it
+/// to size the shmem allocation.
+const FUSED_DECODE_ATTN_TILED_TILE_K: usize = 1024;
+
+/// `n_ctx` (= pos+1) above which the tiled kernel becomes
+/// preferable to the non-tiled kernel. The non-tiled kernel stores
+/// `n_ctx` f32 scores in shmem; at `MAX_DYNAMIC_SHMEM_BYTES = 96
+/// KB` with scratch + q_rot overhead, the practical ceiling is
+/// ~24K. Use 16K as a conservative dispatch threshold: below it,
+/// the non-tiled kernel is faster (simpler control flow, no
+/// per-tile rescale), and at/above it we route to tiled.
+const NON_TILED_DECODE_ATTN_N_CTX_MAX: usize = 16384;
 
 /// Optional per-call attention knobs. The kernel folds these in.
 #[derive(Clone, Copy, Debug)]
@@ -1316,7 +1683,19 @@ pub fn fused_decode_attention_device_kv(
     };
 
     let drv = backend.driver();
-    let func = fused_decode_attention_function(drv)?;
+    // cuda-decode-tiled-dispatch: route to the FA-v1 tiled kernel
+    // when n_ctx > 16K. The non-tiled kernel's shmem is linear in
+    // n_ctx (~24K max at 96 KB opt-in); the tiled kernel uses a
+    // fixed 6 KB regardless of n_ctx. 16K threshold leaves the
+    // non-tiled path on its fastest operating point (it has simpler
+    // control flow than the tiled streaming pattern).
+    let n_ctx = opts.pos + 1;
+    let use_tiled = n_ctx > NON_TILED_DECODE_ATTN_N_CTX_MAX;
+    let func = if use_tiled {
+        fused_decode_attention_tiled_function(drv)?
+    } else {
+        fused_decode_attention_function(drv)?
+    };
     let q_norm_dev = drv.device_buf_from(q_norm)?;
     let k_norm_dev = drv.device_buf_from(k_norm)?;
     let mut out_dev = drv.device_alloc_uninit(q_dim)?;
@@ -1328,28 +1707,33 @@ pub fn fused_decode_attention_device_kv(
 
     let block_dim: u32 = 256;
     let d_split_i = choose_attn_d_split(opts.num_q_heads, opts.head_dim);
+    // Tiled kernel: fixed shmem footprint (TILE_K + bdim + head_dim).
+    // Non-tiled kernel: shmem grows with n_ctx (n_ctx + bdim + head_dim).
+    // See PR #246 for the non-tiled shmem-by-n_ctx fix.
+    let shmem_slots = if use_tiled {
+        FUSED_DECODE_ATTN_TILED_TILE_K + block_dim as usize + opts.head_dim
+    } else {
+        n_ctx + block_dim as usize + opts.head_dim
+    };
     let cfg = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, d_split_i as u32, 1),
         block_dim: (block_dim, 1, 1),
-        // cuda-decode-shmem-fix: shmem holds `n_ctx = pos+1` score
-        // slots, not the slab capacity. Allocating `max_seq` slots
-        // forces ~80 KB shmem at max_seq=20000 and drops RTX 4090
-        // occupancy from ~3 blocks/SM to 1 block/SM — a 3-4×
-        // wall-time hit that doesn't track actual cached context.
-        // The kernel arg `max_seq` (set below) is updated to match
-        // so the kernel's scratch / q_rot offsets and the
-        // (now-redundant) NEG_INF tail-fill loop stay consistent.
-        shared_mem_bytes: ((opts.pos + 1 + block_dim as usize + opts.head_dim)
-            * std::mem::size_of::<f32>()) as u32,
+        shared_mem_bytes: (shmem_slots * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
-    // cuda-decode-shmem-fix: kernel `max_seq` arg drives the shmem
-    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
-    // loop. Both should track the *current* n_ctx (= pos+1), not the
-    // slab capacity — see the shared_mem_bytes comment above.
-    let max_seq_i = (opts.pos + 1) as i32;
+    // Non-tiled kernel uses max_seq for the shmem layout offset
+    // (PR #246 made it track n_ctx). The tiled kernel doesn't use
+    // max_seq for shmem layout (its scratch/q_rot offsets are at
+    // fixed TILE_K + bdim), but the bounds check `pos >= max_seq`
+    // still uses it — pass the slab capacity so the check matches
+    // the cache slab's actual capacity.
+    let max_seq_i = if use_tiled {
+        opts.max_seq as i32
+    } else {
+        n_ctx as i32
+    };
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
