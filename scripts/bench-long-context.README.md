@@ -175,6 +175,31 @@ batched-over-per-token win comes from the rest of Phase 4
 PR #237 RoPE hoisting, PR #238 batched RMSNorm), which all
 compound now that the shmem cliff is gone.
 
+### 16K-token unlock (post #248 96 KB dynamic shmem opt-in)
+
+After #248 set `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` to
+96 KB on the attention kernels, prefill at >11K tokens no longer
+hits the default ~48 KB per-block cap. Max n_ctx per launch is now
+~24K (`96·1024 / 4 − scratch − head_dim`).
+
+| N prompt tok | f16 wall_s | iso3 wall_s | f16 VRAM | iso3 VRAM | Δ VRAM |
+|---|---|---|---|---|---|
+| 17658 | **752.8s** | **748.9s** | 21284 MiB | 21412 MiB | +128 MiB |
+
+**42 ms/tok holds flat from 4K → 17K** — same per-token rate as the
+4419-tok bench above, so the kernels actually scale within the
+opt-in shmem budget.
+
+iso3 vs f16 at 16K: throughput equal (within 0.5%), VRAM essentially
+matched (128 MiB iso3 *over* f16 — within the noise band of lazy
+expert-touch ordering). The Phase 3 thesis that iso3 saves VRAM
+only materialises at 32K+ max_seq where the KV slab dominates over
+expert weights; at 16K, the workload is still expert-weight bound,
+so iso3's KV-cache compression doesn't show in peak VRAM.
+
+Output coherent in both modes (`"It appears that your message
+consists of..."`).
+
 ### CPU-only mode (LARQL_QWEN35_NO_BACKEND=1, where Phase 4 actually fires)
 
 | N prompt tok | batched wall_s | per-token wall_s | speedup |
@@ -217,25 +242,29 @@ the actual delivered value of PRs #239-#244 on CPU.
 
 ### Implications for the roadmap
 
-- **The shmem fix is the standout win**: 4.88× per-token / 6.72×
-  batched at 4419 tok / max_seq=20000. Long-context value-prop now
-  scales without paying the occupancy cliff.
+- **Three landed fixes compound**: PR #246 (shmem-by-n_ctx), PR #247
+  (same fix on spec-decode variants), PR #248 (96 KB dynamic shmem
+  opt-in). Together they unlock prefill up to ~24K tokens per launch
+  at the flat 42 ms/tok rate.
 - **Step B's wall-time delta is ~0%** at the sizes tested — the GPU
   matmul wasn't the bottleneck. The routing fix is still correct
   (avoids host-side CPU matmul work for cuda-attached backends) but
   doesn't unblock the next 2× win.
-- **Apply the shmem fix to the tree-spec-decode prefill variants**
-  (`fused_prefill_attention_seq_device_into_pos_dev`,
-  `fused_prefill_attention_tree_seq_device_into_pos_dev`) — they
-  still allocate shmem from `opts.max_seq`. Spec-decode is not on
-  the main prefill path so the fix wasn't critical, but the same
-  4× speedup applies there. Caller needs to provide a host-side
-  upper bound for `n_ctx_max` since base_pos lives on device only.
-- **32K prefill is now session-scale**: at the 4419-tok rate of
-  ~42 ms/tok batched, a 32K prefill projects to ~22 minutes; 64K
-  to ~45 min (subject to O(N²) attention scaling above ~8K). The
-  preseed bench is no longer the only viable VRAM-bench tool —
-  real long-context prefills are now feasible to run.
+- **32K+ in a single launch needs a tiled-scores rework.** At 32K
+  tokens, shmem would need (32K + 256 + 128) × 4 ≈ 130 KB, over the
+  100 KB Ada cap. Plumbing scores into global memory and streaming
+  through shmem in tiles is the architectural unblock. Substantial
+  CUDA work — separate arc.
+- **Iso3's value-prop is still pending hardware confirmation at
+  32K+.** At 16K the workload is expert-weight bound (VRAM ~21 GB
+  is mostly lazy-loaded experts), so iso3 vs f16 looks flat. Need
+  32K+ tests to see the predicted ~700 MiB savings, but those need
+  the tiled-scores rework first.
+- **Attention-scan optimisation is the next CPU bottleneck** — at
+  2212 tokens the attention O(N²) term is already ~half of CPU
+  batched wall-time. A CPU rayon-parallel attention scan that
+  matches `fused_prefill_attention_seq` would unlock more for the
+  CPU-only path.
 
 ### Bench env switches added this session
 
