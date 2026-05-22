@@ -246,6 +246,13 @@ pub fn qwen35_forward_prefill(
         ..
     } = hybrid_cache;
 
+    // Hoist the FFN-norm scratch buffer outside the layer loop:
+    // `rms_norm_2d_into` overwrites every element each iteration, so
+    // reusing a single allocation saves `n_layers` fresh Array2
+    // allocations per prefill (each [seq_len, hidden] = 256 MB at
+    // 32K × 2048).
+    let mut ffn_in = Array2::<f32>::zeros((seq_len, hidden));
+
     for layer in 0..n_layers {
         let layer_w = &weights.layers[layer];
         let block_out = hybrid_layer_prefill(
@@ -260,13 +267,13 @@ pub fn qwen35_forward_prefill(
             backend,
             layer_kinds,
         );
-        // 2b. Residual add 1 — `residual = x_seq + block_out`.
-        let residual: Array2<f32> = &x_seq + &block_out;
-        // 2c. Post-attention RMSNorm — batched-in-place to avoid
-        //     per-row Array1 allocations (~64 GB of intermediate
-        //     allocate-then-copy traffic over a 32K × 40-layer
-        //     prefill; pure overhead, no compute change).
-        let mut ffn_in = Array2::<f32>::zeros((seq_len, hidden));
+        // 2b. Residual add 1: move `block_out` into `residual` and
+        //     accumulate `x_seq` in place. Saves an Array2 alloc per
+        //     layer vs `let residual = &x_seq + &block_out`.
+        let mut residual = block_out;
+        residual += &x_seq;
+        // 2c. Post-attention RMSNorm — batched-in-place into the
+        //     hoisted `ffn_in` scratch.
         crate::attention::deltanet_block::rms_norm_2d_into(
             residual.view(),
             &layer_w.attn_post_norm,
@@ -323,8 +330,12 @@ pub fn qwen35_forward_prefill(
             }
             out
         };
-        // 2e. Residual add 2 — `x_seq = residual + ffn_out`.
-        x_seq = &residual + &ffn_out;
+        // 2e. Residual add 2: move `ffn_out` into `x_seq` and add
+        //     `residual` in place. Saves another Array2 alloc vs
+        //     `x_seq = &residual + &ffn_out`.
+        let mut new_x = ffn_out;
+        new_x += &residual;
+        x_seq = new_x;
     }
 
     // 3. Final RMSNorm + LM head on the last position only —
