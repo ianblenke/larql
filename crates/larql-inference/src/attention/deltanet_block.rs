@@ -177,6 +177,40 @@ pub fn deltanet_block_step(
     sequence_pos: usize,
     layer: usize,
 ) -> Array1<f32> {
+    deltanet_block_step_with_optional_projections(
+        x,
+        weights,
+        dims,
+        state,
+        backend,
+        sequence_pos,
+        layer,
+        None,
+        None,
+    )
+}
+
+/// Same body as `deltanet_block_step` but with the option to
+/// pass pre-computed projections (`qkv_mixed`, `z`). When both
+/// are `Some`, the function skips its own RMSNorm + projection
+/// step entirely — used by `deltanet_block_prefill` to batch
+/// the projections into one matmul each across all prompt
+/// positions instead of `seq_len` separate matvecs.
+///
+/// When either is `None`, projections are computed as in the
+/// single-token path (the per-row decode call site).
+#[allow(clippy::too_many_arguments)]
+pub fn deltanet_block_step_with_optional_projections(
+    x: &Array1<f32>,
+    weights: &DeltaNetLayerWeights,
+    dims: &DeltaNetDims,
+    state: &mut DeltaNetLayerState,
+    backend: Option<&dyn larql_compute::ComputeBackend>,
+    sequence_pos: usize,
+    layer: usize,
+    precomputed_qkv: Option<&[f32]>,
+    precomputed_z: Option<&[f32]>,
+) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
     if weights.attn_qkv_quant.is_none() {
@@ -292,24 +326,37 @@ pub fn deltanet_block_step(
         }
         _ => None,
     };
-    let (qkv_mixed, z) = time_section!(
-        DN_QKV_GATE_PAIR,
-        if let Some((qkv_out, gate_out)) = paired {
-            (Array1::from(qkv_out), Array1::from(gate_out))
-        } else {
-            let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
-                matvec_with_backend(q, &x_norm, dn_proj_backend)
-            } else {
-                weights.attn_qkv.dot(&x_norm)
-            };
-            let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
-                matvec_with_backend(q, &x_norm, dn_proj_backend)
-            } else {
-                weights.attn_gate.dot(&x_norm)
-            };
-            (qkv_mixed, z)
+    let (qkv_mixed, z) = match (precomputed_qkv, precomputed_z) {
+        (Some(qkv_slice), Some(z_slice)) => {
+            // Pre-computed by the batched-matmul path in
+            // `deltanet_block_prefill`. Skip the per-row projection
+            // (incl. the paired Q4_K GPU dispatch). Diagnostics that
+            // referenced `qkv_mixed` / `z` still work; `x_norm`-based
+            // diagnostics still see the per-row x_norm computed above.
+            (
+                Array1::from(qkv_slice.to_vec()),
+                Array1::from(z_slice.to_vec()),
+            )
         }
-    );
+        _ => time_section!(
+            DN_QKV_GATE_PAIR,
+            if let Some((qkv_out, gate_out)) = paired {
+                (Array1::from(qkv_out), Array1::from(gate_out))
+            } else {
+                let qkv_mixed = if let Some(q) = weights.attn_qkv_quant.as_ref() {
+                    matvec_with_backend(q, &x_norm, dn_proj_backend)
+                } else {
+                    weights.attn_qkv.dot(&x_norm)
+                };
+                let z = if let Some(q) = weights.attn_gate_quant.as_ref() {
+                    matvec_with_backend(q, &x_norm, dn_proj_backend)
+                } else {
+                    weights.attn_gate.dot(&x_norm)
+                };
+                (qkv_mixed, z)
+            }
+        ),
+    };
     dump_subop("dn_qkv_mixed", qkv_mixed.as_slice().unwrap_or(&[]));
     dump_subop("dn_z_gate", z.as_slice().unwrap_or(&[]));
     // Diagnostic: qkv_mixed has ~1-4% per-element noise vs llama.cpp
@@ -928,10 +975,66 @@ pub fn deltanet_block_prefill(
     let seq_len = x_seq.nrows();
     let hidden = x_seq.ncols();
     let mut out = Array2::<f32>::zeros((seq_len, hidden));
-    for i in 0..seq_len {
-        let x_row: Array1<f32> = x_seq.row(i).to_owned();
-        let y = deltanet_block_step(&x_row, weights, dims, state, backend, base_pos + i, layer);
-        out.row_mut(i).assign(&y);
+    if seq_len == 0 {
+        return out;
+    }
+
+    // Phase 4d-internals: batched projections for the linear-
+    // attention block. RMSNorm + attn_qkv + attn_gate are the
+    // pre-recurrent linear ops — none depend on prior state, so
+    // they batch cleanly across the full prompt.
+    //
+    // CPU mode only: when a backend is attached, the per-token
+    // matvec path can dispatch the paired Q4_K GPU kernel
+    // (`qwen35_paired_q4k_matvec`), so we keep the per-row form
+    // there to preserve GPU acceleration. Same pattern as PR #241.
+    let batched_projections =
+        backend.is_none() && weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
+
+    if batched_projections {
+        // 1. Batched pre-mixer RMSNorm of x_seq.
+        let mut x_norm_all = Array2::<f32>::zeros((seq_len, hidden));
+        crate::attention::deltanet_block::rms_norm_2d_into(
+            x_seq.view(),
+            &weights.attn_norm,
+            dims.eps,
+            x_norm_all.view_mut(),
+        );
+
+        // 2. Batched qkv_mixed = attn_qkv @ x_norm.
+        let qkv_q = weights.attn_qkv_quant.as_ref().unwrap();
+        let qkv_all = qkv_q.matmul(&x_norm_all).expect("attn_qkv matmul");
+
+        // 3. Batched z = attn_gate @ x_norm.
+        let gate_q = weights.attn_gate_quant.as_ref().unwrap();
+        let z_all = gate_q.matmul(&x_norm_all).expect("attn_gate matmul");
+
+        // 4. Per-position recurrent inner — uses pre-computed
+        //    projections so the per-row block_step skips its own
+        //    RMSNorm + projection step.
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let qkv_row: Array1<f32> = qkv_all.row(i).to_owned();
+            let z_row: Array1<f32> = z_all.row(i).to_owned();
+            let y = deltanet_block_step_with_optional_projections(
+                &x_row,
+                weights,
+                dims,
+                state,
+                backend,
+                base_pos + i,
+                layer,
+                qkv_row.as_slice(),
+                z_row.as_slice(),
+            );
+            out.row_mut(i).assign(&y);
+        }
+    } else {
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let y = deltanet_block_step(&x_row, weights, dims, state, backend, base_pos + i, layer);
+            out.row_mut(i).assign(&y);
+        }
     }
     out
 }
@@ -1257,6 +1360,104 @@ mod tests {
             state_mass_after_2 >= state_mass_after_1 - 1e-5,
             "state mass shrank without decay: {state_mass_after_1} → {state_mass_after_2}"
         );
+    }
+
+    /// Phase 4d-internals parity gate: the `batched_projections`
+    /// branch of `deltanet_block_prefill` (CPU + quantised QKV/gate)
+    /// must produce the same output as the per-row reference. With
+    /// `from_f32_rows` the `QuantTensor::matmul` fast path falls
+    /// through to per-row `matvec`, so this test exercises the
+    /// wrapper logic that splits projections out of
+    /// `deltanet_block_step_with_optional_projections`.
+    #[test]
+    fn deltanet_block_prefill_batched_projections_matches_per_position_loop() {
+        use larql_models::quant::lazy::QuantTensor;
+        let dims = make_tiny_dims();
+        let conv_dim = dims.conv_dim();
+        let value_dim = dims.value_dim();
+
+        // Build weights with attn_qkv_quant / attn_gate_quant SET so
+        // the batched_projections branch fires.
+        let attn_qkv_dense = Array2::from_elem((conv_dim, dims.hidden), 0.1_f32).into_shared();
+        let attn_gate_dense = Array2::from_elem((value_dim, dims.hidden), 0.1_f32).into_shared();
+        let attn_qkv_quant = QuantTensor::from_f32_rows(
+            conv_dim,
+            dims.hidden,
+            &vec![0.1_f32; conv_dim * dims.hidden],
+        );
+        let attn_gate_quant = QuantTensor::from_f32_rows(
+            value_dim,
+            dims.hidden,
+            &vec![0.1_f32; value_dim * dims.hidden],
+        );
+
+        let weights = DeltaNetLayerWeights {
+            attn_norm: Arc::from(vec![1.0_f32; dims.hidden].as_slice()),
+            attn_qkv: attn_qkv_dense,
+            attn_gate: attn_gate_dense,
+            ssm_conv1d: Array2::from_elem((dims.d_conv, conv_dim), 0.5_f32).into_shared(),
+            ssm_dt: Arc::from(vec![0.0_f32; dims.n_v_heads].as_slice()),
+            ssm_a: Arc::from(vec![-0.5_f32; dims.n_v_heads].as_slice()),
+            ssm_beta: Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32).into_shared(),
+            ssm_alpha: Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32).into_shared(),
+            ssm_norm: Arc::from(vec![1.0_f32; dims.head_v_dim].as_slice()),
+            ssm_out: Array2::from_elem((dims.hidden, value_dim), 0.5_f32).into_shared(),
+            attn_qkv_quant: Some(attn_qkv_quant),
+            attn_gate_quant: Some(attn_gate_quant),
+            ssm_out_quant: None,
+        };
+
+        let seq_len = 3usize;
+        let x_seq_data = vec![
+            1.0_f32, 0.5, -0.25, 0.75, 0.5, 0.5, 0.5, 0.5, -0.25, 0.75, 1.0, -0.5,
+        ];
+        let x_seq = Array2::from_shape_vec((seq_len, dims.hidden), x_seq_data).unwrap();
+
+        // Reference: per-position loop (forces the same code path
+        // via the else branch of `batched_projections`).
+        let mut ref_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let mut expected = Array2::<f32>::zeros((seq_len, dims.hidden));
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let y = deltanet_block_step(&x_row, &weights, &dims, &mut ref_state, None, i, 0);
+            expected.row_mut(i).assign(&y);
+        }
+
+        // Impl: batched (backend = None + both quant tensors set
+        // → batched_projections branch fires).
+        let mut got_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let got = deltanet_block_prefill(&x_seq, &weights, &dims, &mut got_state, None, 0, 0);
+
+        for i in 0..seq_len {
+            for h in 0..dims.hidden {
+                let g = got[[i, h]];
+                let e = expected[[i, h]];
+                assert!(
+                    (g - e).abs() < 1e-4,
+                    "dn_prefill_batched[{i},{h}] got={} expected={}",
+                    g,
+                    e,
+                );
+            }
+        }
+
+        // Final state must match too — recurrent inner consumed the
+        // pre-computed projections in the same order.
+        for (i, (&g, &e)) in got_state
+            .recurrent_state
+            .iter()
+            .zip(ref_state.recurrent_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "recurrent_state[{i}] got={} expected={}",
+                g,
+                e,
+            );
+        }
     }
 
     /// Phase 4d-scaffold parity test: `deltanet_block_prefill` over
