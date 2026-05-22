@@ -187,6 +187,7 @@ pub fn deltanet_block_step(
         layer,
         None,
         None,
+        false,
     )
 }
 
@@ -210,6 +211,12 @@ pub fn deltanet_block_step_with_optional_projections(
     layer: usize,
     precomputed_qkv: Option<&[f32]>,
     precomputed_z: Option<&[f32]>,
+    // When `true`, skip the final `ssm_out` projection and return
+    // `o_flat` (shape `[value_dim]`) instead of `block_out` (shape
+    // `[hidden]`). Used by `deltanet_block_prefill`'s batched
+    // branch to collect per-position `o_flat`s then run one batched
+    // `ssm_out.matmul()` instead of `seq_len` separate matvecs.
+    skip_ssm_out: bool,
 ) -> Array1<f32> {
     debug_assert_eq!(x.len(), dims.hidden);
     debug_assert_eq!(weights.attn_norm.len(), dims.hidden);
@@ -895,6 +902,14 @@ pub fn deltanet_block_step_with_optional_projections(
         );
     }
 
+    // Batched-prefill exit point: return o_flat (shape [value_dim])
+    // so `deltanet_block_prefill` can run one ssm_out.matmul()
+    // across all `seq_len` o_flats instead of `seq_len` separate
+    // matvecs.
+    if skip_ssm_out {
+        return o_flat;
+    }
+
     // 9. Output projection (matvec).
     let block_out = time_section!(
         DN_SSM_OUT,
@@ -990,6 +1005,7 @@ pub fn deltanet_block_prefill(
     // there to preserve GPU acceleration. Same pattern as PR #241.
     let batched_projections =
         backend.is_none() && weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
+    let batched_ssm_out = batched_projections && weights.ssm_out_quant.is_some();
 
     if batched_projections {
         // 1. Batched pre-mixer RMSNorm of x_seq.
@@ -1011,7 +1027,16 @@ pub fn deltanet_block_prefill(
 
         // 4. Per-position recurrent inner — uses pre-computed
         //    projections so the per-row block_step skips its own
-        //    RMSNorm + projection step.
+        //    RMSNorm + projection step. When `batched_ssm_out` is
+        //    enabled the inner also skips the final ssm_out matvec
+        //    and returns `o_flat` (shape [value_dim]); we collect
+        //    those rows into `o_seq` for one batched matmul below.
+        let value_dim = dims.value_dim();
+        let mut o_seq: Option<Array2<f32>> = if batched_ssm_out {
+            Some(Array2::<f32>::zeros((seq_len, value_dim)))
+        } else {
+            None
+        };
         for i in 0..seq_len {
             let x_row: Array1<f32> = x_seq.row(i).to_owned();
             let qkv_row: Array1<f32> = qkv_all.row(i).to_owned();
@@ -1026,8 +1051,23 @@ pub fn deltanet_block_prefill(
                 layer,
                 qkv_row.as_slice(),
                 z_row.as_slice(),
+                batched_ssm_out,
             );
-            out.row_mut(i).assign(&y);
+            if let Some(ref mut buf) = o_seq {
+                buf.row_mut(i).assign(&y);
+            } else {
+                out.row_mut(i).assign(&y);
+            }
+        }
+
+        // 5. Batched ssm_out projection (when enabled). For
+        //    Qwen3.6 35B-A3B: ssm_out `[hidden=2048, value_dim=6144]`
+        //    Q4_K (~9 MB). Per-row form: seq_len × 9 MB reads at
+        //    32K = 288 GB. Matmul form: cores × 9 MB ≈ 216 MB.
+        if let Some(o_seq) = o_seq {
+            let ssm_q = weights.ssm_out_quant.as_ref().unwrap();
+            let block_out_seq = ssm_q.matmul(&o_seq).expect("ssm_out matmul");
+            out.assign(&block_out_seq);
         }
     } else {
         for i in 0..seq_len {
@@ -1453,6 +1493,117 @@ mod tests {
         {
             assert!(
                 (g - e).abs() < 1e-4,
+                "recurrent_state[{i}] got={} expected={}",
+                g,
+                e,
+            );
+        }
+    }
+
+    /// Phase 4d-internals + ssm_out parity gate: when ALL three
+    /// projection quants (attn_qkv, attn_gate, ssm_out) are
+    /// present and `backend.is_none()`,
+    /// `deltanet_block_prefill` should:
+    ///   1. Batch RMSNorm + attn_qkv + attn_gate upfront.
+    ///   2. Loop the recurrent inner with `skip_ssm_out = true`,
+    ///      collecting per-position `o_flat`s.
+    ///   3. Run ONE batched `ssm_out.matmul()` at the end.
+    ///
+    /// Output must match the per-row reference. Tolerance is
+    /// `< 1e-4` (fp accumulation order in matmul vs per-row
+    /// matvec drifts slightly; same gate as the projections-only
+    /// test).
+    #[test]
+    fn deltanet_block_prefill_batched_ssm_out_matches_per_position_loop() {
+        use larql_models::quant::lazy::QuantTensor;
+        let dims = make_tiny_dims();
+        let conv_dim = dims.conv_dim();
+        let value_dim = dims.value_dim();
+
+        let attn_qkv_dense = Array2::from_elem((conv_dim, dims.hidden), 0.1_f32).into_shared();
+        let attn_gate_dense = Array2::from_elem((value_dim, dims.hidden), 0.1_f32).into_shared();
+        let ssm_out_dense = Array2::from_elem((dims.hidden, value_dim), 0.5_f32).into_shared();
+        let attn_qkv_quant = QuantTensor::from_f32_rows(
+            conv_dim,
+            dims.hidden,
+            &vec![0.1_f32; conv_dim * dims.hidden],
+        );
+        let attn_gate_quant = QuantTensor::from_f32_rows(
+            value_dim,
+            dims.hidden,
+            &vec![0.1_f32; value_dim * dims.hidden],
+        );
+        let ssm_out_quant = QuantTensor::from_f32_rows(
+            dims.hidden,
+            value_dim,
+            &vec![0.5_f32; dims.hidden * value_dim],
+        );
+
+        let weights = DeltaNetLayerWeights {
+            attn_norm: Arc::from(vec![1.0_f32; dims.hidden].as_slice()),
+            attn_qkv: attn_qkv_dense,
+            attn_gate: attn_gate_dense,
+            ssm_conv1d: Array2::from_elem((dims.d_conv, conv_dim), 0.5_f32).into_shared(),
+            ssm_dt: Arc::from(vec![0.0_f32; dims.n_v_heads].as_slice()),
+            ssm_a: Arc::from(vec![-0.5_f32; dims.n_v_heads].as_slice()),
+            ssm_beta: Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32).into_shared(),
+            ssm_alpha: Array2::from_elem((dims.n_v_heads, dims.hidden), 0.1_f32).into_shared(),
+            ssm_norm: Arc::from(vec![1.0_f32; dims.head_v_dim].as_slice()),
+            ssm_out: ssm_out_dense,
+            attn_qkv_quant: Some(attn_qkv_quant),
+            attn_gate_quant: Some(attn_gate_quant),
+            ssm_out_quant: Some(ssm_out_quant),
+        };
+
+        let seq_len = 3usize;
+        let x_seq_data = vec![
+            1.0_f32, 0.5, -0.25, 0.75, 0.5, 0.5, 0.5, 0.5, -0.25, 0.75, 1.0, -0.5,
+        ];
+        let x_seq = Array2::from_shape_vec((seq_len, dims.hidden), x_seq_data).unwrap();
+
+        // Reference: per-position loop with the same quantised
+        // weights (forces the `else` branch via no-quant path
+        // would be wrong — we want the SAME weights, just the
+        // per-row code).
+        let mut ref_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let mut expected = Array2::<f32>::zeros((seq_len, dims.hidden));
+        for i in 0..seq_len {
+            let x_row: Array1<f32> = x_seq.row(i).to_owned();
+            let y = deltanet_block_step(&x_row, &weights, &dims, &mut ref_state, None, i, 0);
+            expected.row_mut(i).assign(&y);
+        }
+
+        // Impl: batched (backend = None + all three quants set
+        // → batched_projections AND batched_ssm_out both fire).
+        let mut got_state =
+            DeltaNetLayerState::allocate(dims.d_conv, conv_dim, dims.head_v_dim, dims.n_v_heads);
+        let got = deltanet_block_prefill(&x_seq, &weights, &dims, &mut got_state, None, 0, 0);
+
+        for i in 0..seq_len {
+            for h in 0..dims.hidden {
+                let g = got[[i, h]];
+                let e = expected[[i, h]];
+                assert!(
+                    (g - e).abs() < 1e-4,
+                    "dn_prefill_batched_ssm_out[{i},{h}] got={} expected={}",
+                    g,
+                    e,
+                );
+            }
+        }
+
+        // Recurrent state should be bit-identical (recurrent inner
+        // doesn't touch ssm_out, so the batched vs per-row order
+        // only differs in the post-recurrent projection).
+        for (i, (&g, &e)) in got_state
+            .recurrent_state
+            .iter()
+            .zip(ref_state.recurrent_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (g - e).abs() < 1e-5,
                 "recurrent_state[{i}] got={} expected={}",
                 g,
                 e,
