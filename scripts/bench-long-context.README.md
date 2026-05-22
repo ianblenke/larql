@@ -209,21 +209,33 @@ finally hit. This is the headline scaling result from the
 Phase 4 + Step B + shmem fix + dynamic-shmem-opt-in +
 tiled-scores arc landed across #246/#247/#248/#252/#253/#254/#255.
 
-### iso3 vs f16 at 17K (Phase 3 value-prop check)
+### iso3 vs f16 (Phase 3 value-prop check)
 
 | N prompt tok | f16 wall_s | iso3 wall_s | f16 VRAM | iso3 VRAM | Δ VRAM |
 |---|---|---|---|---|---|
-| 17658 | **752.8s** | **748.9s** | 21284 MiB | 21412 MiB | +128 MiB |
+| 17658 (max_seq=20000) | 752.8s | 748.9s | 21284 MiB | 21412 MiB | +128 MiB |
+| **34485 (max_seq=36000)** | **1511.7s** | **1496.4s** | **22180 MiB** | **22436 MiB** | **+256 MiB** |
 
-iso3 vs f16 at 16K: throughput equal (within 0.5%), VRAM essentially
-matched (128 MiB iso3 *over* f16 — within the noise band of lazy
-expert-touch ordering). The Phase 3 thesis that iso3 saves VRAM
-only materialises at 32K+ max_seq where the KV slab dominates over
-expert weights; at 16K, the workload is still expert-weight bound,
-so iso3's KV-cache compression doesn't show in peak VRAM.
+**Iso3 does not show measurable VRAM savings at peak**, even at 32K
+where the README projected ~700 MiB of slab-level compression.
+Throughput is parity across both scales (within 1%). The slab
+compression IS happening at the kernel level (iso3 codes
+~225 MiB vs f16 ~1152 MiB at max_seq=36000 = ~900 MiB design
+delta), but **lazy expert-load variance dominates the measured peak**:
+each unique expert touched is ~140 MB Q4_K, and 5-10 experts'
+worth of difference between runs (~700-1400 MiB) is larger than
+the slab-level compression delta.
 
-Output coherent in both modes (`"It appears that your message
-consists of..."`).
+Methodology limitation. The slab-level win can be measured with
+the preseed methodology (`bench-preseed.md`) which synthetically
+populates the cache without running lazy weight loading — earlier
+recorded a clean 480 MiB iso3 savings at max_seq=40000 on that
+methodology. The lazy-load methodology used here is the wrong
+microscope for the Phase 3 thesis at the operating points where
+expert touch dominates.
+
+Output coherent in both modes (`"The text you provided..."` at
+34K, `"It appears that your message consists of..."` at 17K).
 
 ### CPU-only mode (LARQL_QWEN35_NO_BACKEND=1, where Phase 4 actually fires)
 
