@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::architectures::deepseek::DeepSeekArch;
+use crate::architectures::deepseek_v4::DeepSeekV4Arch;
 use crate::architectures::gemma2::Gemma2Arch;
 use crate::architectures::gemma3::Gemma3Arch;
 use crate::architectures::gemma4::Gemma4Arch;
@@ -99,14 +100,20 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "qwen3next" | "qwen3_next" => Box::new(Qwen35MoeArch::from_config(model_config)),
         // Qwen family (dense and MoE share same keys)
         t if t.starts_with("qwen") => Box::new(QwenArch::from_config(model_config)),
-        // DeepSeek family (MoE + MLA) — V2 / V3 only. DeepSeek V4
-        // Flash uses a hybrid attention design (sliding-window +
-        // CSA + HCA + Manifold-Constrained Hyper-Connections +
-        // grouped output projection + hash-routed MoE bootstrap)
-        // that this codebase does NOT implement. Loading a
-        // `general.architecture = "deepseek4"` GGUF here will fall
-        // through to the generic fallback below; do not expect
-        // working inference.
+        // DeepSeek V4 Flash — hybrid CSA + HCA + mHC architecture.
+        // Stage 1: arch detection only; forward path lands across
+        // stages 2-8. Loading a DSv4 GGUF and attempting inference
+        // returns a clear "DSv4 forward not yet implemented" error
+        // from the chat handler — not silent garbage like the
+        // pre-PR-#186 state.
+        //
+        // DSv4-specific arms come first so they don't get caught by
+        // the generic "starts_with deepseek" route to DeepSeekArch
+        // (which is V2/V3 MLA — wrong shape for V4).
+        "deepseek_v4" | "deepseek4" | "deepseekv4" => {
+            Box::new(DeepSeekV4Arch::from_config(model_config))
+        }
+        // DeepSeek family (MoE + MLA) — V2 / V3.
         t if t.starts_with("deepseek") => Box::new(DeepSeekArch::from_config(model_config)),
         // StarCoder 2
         "starcoder2" => Box::new(StarCoder2Arch::from_config(model_config)),
