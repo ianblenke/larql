@@ -24180,6 +24180,66 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_mhc::expand_identity_comb_no_post_recovers_residual",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 286,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::expand_zero_comb_unit_post_broadcasts_block_out",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 327,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::mhc_pre_block_post_pipeline_shapes_and_finite",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 401,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::split_sinkhorn_produces_in_range_pre_post",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 359,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::tests::expand_identity_comb_no_post_recovers_residual",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 286,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::tests::expand_zero_comb_unit_post_broadcasts_block_out",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 327,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::tests::mhc_pre_block_post_pipeline_shapes_and_finite",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 401,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::tests::split_sinkhorn_produces_in_range_pre_post",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 359,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::tests::weighted_sum_one_hot_selects_stream",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 260,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc::weighted_sum_one_hot_selects_stream",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc.rs",
+      "line": 260,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::gpu::q4_attention_proj_works_with_cpu_backend_at_aligned_dims",
       "file": "crates/larql-inference/src/attention/gpu.rs",
       "line": 453,
