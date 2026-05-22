@@ -114,22 +114,51 @@ enabling any diagnostic dumping. `LARQL_QWEN35_NO_BACKEND=1` (added
 this session) skips the unconditional CudaBackend attach in the chat
 handler so the batched-matmul path's `backend.is_none()` gate fires.
 
-### GPU mode (LARQL_QWEN35_GPU=1, hybrid GPU attention + projections)
+### GPU mode pre-Step-B (LARQL_QWEN35_GPU=1, hybrid GPU attention + projections)
+
+| N prompt tok | batched wall_s |
+|---|---|
+| 557 | 37.7 |
+| 1110 | 104.8 |
+
+Captured before Step B routed Q4_K matmul through the GPU
+backend. The batched-matmul path (PRs #239-#244) was gated
+`backend.is_none()` in both `qwen35_attention_block_prefill` and
+`deltanet_block_prefill`, so a cuda-attached backend fell back to
+per-row matvec dispatch.
+
+### GPU mode post-Step-B (current binary)
+
+Step B added `matmul_with_backend` routing Q4_K through
+`backend.q4k_matmul → gemm_proj_seq` (cached f16 dequant + cuBLAS
+hgemm) and dropped the `backend.is_none()` gates in
+`qwen35_attention_block_prefill` (Q/K/V/O projections) and
+`deltanet_block_prefill` (attn_qkv / attn_gate / ssm_out).
 
 | N prompt tok | batched wall_s | per-token wall_s | speedup |
 |---|---|---|---|
-| 557 | 37.7 | n/a | — |
-| 1110 | 104.8 | n/a | — |
+| 557  | 37.3   | 45.2   | **1.17×** |
+| 1110 | 103.8  | 120.7  | **1.14×** |
+| 4419 | 1234   | 1416   | **1.13×** |
 
-**No improvement vs the pre-Phase-4 GPU per-token bench above** (67-94
-ms/tok matches the 67 ms/tok at 4419 tok captured earlier). The
-batched-matmul path (PRs #239-#244) is gated `backend.is_none()` in
-both `qwen35_attention_block_prefill` and `deltanet_block_prefill`,
-so a cuda-attached backend falls back to per-row matvec dispatch.
-The batched *attention* kernel (PR #231) does run but its wall-time
-contribution at these sizes is dwarfed by kernel-launch + matvec
-dispatch overhead. **GPU users see no Phase 4 prefill speedup until
-Step B (GPU `quant_matmul` kernel) lands.**
+**Phase 4 + Step B delivers a real 13-17% GPU prefill speedup over
+the per-token loop across all sizes tested**, sustained as N grows.
+This is the production-deployment number.
+
+**Step B itself delivered ~0% incremental win over pre-Step-B
+batched** — the matmul wasn't actually the GPU bottleneck. The 557
+post-Step-B (37.3s) is statistically identical to pre-Step-B (37.7s).
+The 13-17% win comes from the rest of Phase 4: PR #231 batched
+attention kernel, PR #236 bulk KV append, PR #237 RoPE hoisting,
+PR #238 batched RMSNorm, etc.
+
+**Unexplained ~4× absolute regression** vs the pre-Phase-4 README
+baseline above (4419 tok at 296.1s = 67 ms/tok). Both batched and
+per-token current-binary measurements are ~4× slower than the
+README's per-token rate. Possible suspects: PRs #201-#211
+(Qwen35MoE structural fixes, 2026-05-20) added overhead, or
+`LARQL_QWEN35_KV_MAX_SEQ=20000` vs the README's `8192` triggers a
+different code path. Filed as follow-up.
 
 ### CPU-only mode (LARQL_QWEN35_NO_BACKEND=1, where Phase 4 actually fires)
 
@@ -173,17 +202,23 @@ the actual delivered value of PRs #239-#244 on CPU.
 
 ### Implications for the roadmap
 
-- **Step B (GPU `quant_matmul`) becomes more urgent** — without it,
-  GPU users see zero Phase 4 prefill speedup, even though PRs #230,
-  #231, #235, #236 (the GPU-side parts) all landed.
+- **Step B's wall-time delta is ~0%** at the sizes tested — the GPU
+  matmul wasn't the bottleneck. The routing fix is still correct (it
+  closes a gap and avoids host-side CPU matmul work) but doesn't
+  unblock the next 2× win.
+- **Investigate the ~4× regression vs the May-21 README baseline.**
+  Bisect: probably one of the Qwen35MoE structural fixes (PRs
+  #201-#211, 2026-05-20). Could also be a layer-graph or dispatch
+  change. If recoverable, this is a much bigger win than any Phase 4
+  internals work.
 - **Attention-scan optimisation is the next CPU bottleneck** — at
   2212 tokens the attention O(N²) term is already ~half of
   batched wall-time. A CPU rayon-parallel attention scan that
   matches `fused_prefill_attention_seq` would unlock more.
-- **The 32K+ value-prop bench is still preseed-only** — until Step
-  B and a CPU attention scan land, real 32K prefill is hours not
-  minutes. `LARQL_QWEN35_KV_PRESEED` from bench-preseed.md remains
-  the right tool for VRAM bench.
+- **The 32K+ value-prop bench is still preseed-only** — real 32K
+  prefill at the current 280 ms/tok GPU rate is ~2.5 hours.
+  `LARQL_QWEN35_KV_PRESEED` from `bench-preseed.md` remains the right
+  tool for VRAM bench.
 
 ### Bench env switches added this session
 
@@ -194,6 +229,27 @@ the actual delivered value of PRs #239-#244 on CPU.
   skips the unconditional CudaBackend attach in
   `chat.rs::handle_chat_completions`. Lets the CPU batched-matmul
   gates (`backend.is_none()`) fire from a cuda-built binary.
+
+### Step B routing summary
+
+- `matmul_with_backend` added in `quant_dispatch.rs` (mirrors
+  `matvec_with_backend`). Q4_K → `backend.q4k_matmul`; other formats
+  fall through to `QuantTensor::matmul` (CPU).
+- Call sites updated: 4 in `qwen35_attention_block_prefill`
+  (Q/K/V/O) and 3 in `deltanet_block_prefill` batched branch
+  (attn_qkv / attn_gate / ssm_out). `backend.is_none()` gate
+  dropped in DeltaNet.
+- MoE scatter-gather left on CPU intentionally — GPU MoE uses
+  `qwen35_moe_ffn_batch` which batches 8 experts per call. A
+  scatter-gather variant for GPU needs separate measurement.
+- Bug fixed during Step B: GPU fused recurrence paths in
+  `deltanet_block_step_with_optional_projections` (the
+  `LARQL_QWEN35_E6A_FUSED` path and the default `fused_o_normed`
+  path) returned `block_out [hidden]` regardless of
+  `skip_ssm_out`. Now honour the flag and return `o_flat
+  [value_dim]` when the caller is batching the ssm_out matmul.
+  Surfaced because pre-Step-B `batched_ssm_out` was gated
+  `backend.is_none()` and never fired in GPU mode.
 
 ### Reproducing
 
@@ -211,8 +267,19 @@ LARQL_QWEN35_NO_BACKEND=1 LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1 \
   ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
   --port 8181
 
+# GPU batched (Step B path — production deployment)
+LARQL_QWEN35_GPU=1 LARQL_QWEN35_KV_MAX_SEQ=20000 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
+# GPU per-token (baseline for A/B)
+LARQL_QWEN35_GPU=1 LARQL_QWEN35_KV_MAX_SEQ=20000 \
+  LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
 # Drive the bench
-LARQL_BENCH_TARGETS=256,512,1024,2048 LARQL_BENCH_DECODE=4 \
+LARQL_BENCH_TARGETS=512,1024,4096 LARQL_BENCH_DECODE=4 \
   LARQL_BENCH_HTTP_TIMEOUT=3600 \
   python3 scripts/bench-long-context.py <mode_label>
 ```
