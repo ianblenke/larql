@@ -239,6 +239,8 @@ Output coherent in both modes (`"The text you provided..."` at
 
 ### CPU-only mode (LARQL_QWEN35_NO_BACKEND=1, where Phase 4 actually fires)
 
+Pre-#259 (sequential attention scan):
+
 | N prompt tok | batched wall_s | per-token wall_s | speedup |
 |---|---|---|---|
 | 281  | 42.5  | 58.1  | 1.37× |
@@ -254,10 +256,23 @@ MoE-routing + DeltaNet-conv1d sequential cost — projection-bandwidth
 amortisation only addresses the O(N) "everything else" term.
 
 Curve fit on the batched data: `T(N) ≈ 0.130·N + 5.70e-5·N²` (s).
-Extrapolated to 32K: ~18 hours. **CPU-only is not the deployment
-mode** — this measurement isolates the landed Phase 4 work, but the
-production hybrid path (GPU attn + CPU FFN) needs Step B before
-prefill becomes session-scale.
+The `5.70e-5·N²` term was attention scan dominating; addressed by #259.
+
+Post-#259 (rayon-parallel attention scan):
+
+| N prompt tok | batched wall_s | Δ vs pre-#259 |
+|---|---|---|
+| 1110 | **153.8** | **−55s (1.36× faster)** |
+| 2212 | **316.6** | **−250s (1.79× faster)** |
+
+Parallelising the O(N²) attention scan across 24 cores delivers a
+speedup that **grows with N** — the larger the context, the more
+attention work to parallelise relative to the O(N) projection term.
+At 2K context the wall-time saving is half the total prior wall time.
+
+**CPU-only is still not the deployment mode** — production runs
+hybrid GPU attn + CPU FFN — but the CPU-only path is now more
+useful for any debugging / no-GPU benching scenario.
 
 ### Why the bandwidth math overpredicted
 
