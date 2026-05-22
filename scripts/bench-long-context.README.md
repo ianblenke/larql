@@ -104,3 +104,199 @@ For now: the bench script + 4K results document infrastructure
 correctness; the architectural projection above documents the design
 target. Phase 4 will add either of the above acceleration paths to
 make the value-prop bench session-scale.
+
+## Phase 4e on-hardware results captured 2026-05-21 (RTX 4090 + Threadripper PRO 5965WX, Qwen3.6-35B-A3B-vindex-v10)
+
+End-to-end wall-time A/B of the Phase 4 batched-prefill arc
+(PRs #230-#245) vs the per-token fallback. `LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1`
+forces `qwen35_forward_prefill` into its per-token loop without
+enabling any diagnostic dumping. `LARQL_QWEN35_NO_BACKEND=1` (added
+this session) skips the unconditional CudaBackend attach in the chat
+handler so the batched-matmul path's `backend.is_none()` gate fires.
+
+### GPU mode pre-Step-B (LARQL_QWEN35_GPU=1, hybrid GPU attention + projections)
+
+| N prompt tok | batched wall_s |
+|---|---|
+| 557 | 37.7 |
+| 1110 | 104.8 |
+
+Captured before Step B routed Q4_K matmul through the GPU
+backend. The batched-matmul path (PRs #239-#244) was gated
+`backend.is_none()` in both `qwen35_attention_block_prefill` and
+`deltanet_block_prefill`, so a cuda-attached backend fell back to
+per-row matvec dispatch.
+
+### GPU mode post-Step-B + shmem fix (current binary, max_seq=20000)
+
+Step B added `matmul_with_backend` routing Q4_K through
+`backend.q4k_matmul → gemm_proj_seq` (cached f16 dequant + cuBLAS
+hgemm) and dropped the `backend.is_none()` gates in
+`qwen35_attention_block_prefill` and `deltanet_block_prefill`.
+
+The "4× regression" originally flagged here turned out to be an
+RTX 4090 shmem-occupancy bug in the attention kernels (decode-attn
+and prefill-attn): both sized shared memory by `opts.max_seq` (the
+slab capacity) instead of `opts.pos + 1` (the actual cached
+context). At `max_seq=20000`, that's 80 KB shmem per block — over
+the 48 KB sweet-spot for 3 blocks/SM on Ada — dropping to 1 block/SM
+for a ~4× wall-time hit independent of actual context length.
+
+The fix tracks `n_ctx` for both shmem allocation and the kernel
+`max_seq` arg. Final numbers at `max_seq=20000`:
+
+| N prompt tok | batched | per-token | batched speedup |
+|---|---|---|---|
+| 557  | **24.3s**  | 45.2s   | 1.86× |
+| 1110 | **45.4s**  | 61.2s   | 1.35× |
+| 4419 | **183.7s** | 290.0s  | 1.58× |
+
+**Phase 4 + Step B + shmem fix delivers a real 1.35-1.86× GPU
+prefill speedup over the per-token loop, sustained as N grows.**
+This is the production-deployment number.
+
+The pre-Phase-4 README baseline above (4419 tok at 296.1s =
+67 ms/tok at max_seq=8192) was sidestepping the shmem cliff by
+using a smaller max_seq. With the fix applied, the same workload
+at max_seq=20000 runs in 183.7s — a **1.61× absolute improvement
+over the pre-Phase-4 baseline** with 2.4× more KV cache headroom.
+
+Decomposition of the wins:
+- Per-token at max_seq=20000: 1416s pre-shmem-fix → 290s post-fix
+  (4.88× from shmem alone)
+- Batched at max_seq=20000: 1234s pre-Step-B → 1234s post-Step-B
+  → 183.7s post-shmem-fix (6.72× from shmem; Step B routing itself
+  contributed ~0% incrementally on top, see below)
+
+Step B routing (matmul through GPU) alone delivered ~0% wall-time
+improvement — the matmul wasn't the bottleneck. The 1.35-1.58×
+batched-over-per-token win comes from the rest of Phase 4
+(PR #231 batched attention kernel, PR #236 bulk KV append,
+PR #237 RoPE hoisting, PR #238 batched RMSNorm), which all
+compound now that the shmem cliff is gone.
+
+### CPU-only mode (LARQL_QWEN35_NO_BACKEND=1, where Phase 4 actually fires)
+
+| N prompt tok | batched wall_s | per-token wall_s | speedup |
+|---|---|---|---|
+| 281  | 42.5  | 58.1  | 1.37× |
+| 557  | 90.0  | 463.6 | — *(per-token hit lazy expert load mid-bench)* |
+| 1110 | 208.8 | 417.2 | **2.00×** |
+| 2212 | 566.2 | 681.9 | 1.20× |
+
+The 1110-token row is the most reliable A/B (post-cache-warm in both
+modes). **Phase 4 batched matmul delivers a 2× wall-time speedup at
+1K context on CPU-only mode.** Speedup decreases with N because both
+modes share the same attention O(N²) scan and the same per-position
+MoE-routing + DeltaNet-conv1d sequential cost — projection-bandwidth
+amortisation only addresses the O(N) "everything else" term.
+
+Curve fit on the batched data: `T(N) ≈ 0.130·N + 5.70e-5·N²` (s).
+Extrapolated to 32K: ~18 hours. **CPU-only is not the deployment
+mode** — this measurement isolates the landed Phase 4 work, but the
+production hybrid path (GPU attn + CPU FFN) needs Step B before
+prefill becomes session-scale.
+
+### Why the bandwidth math overpredicted
+
+RESUME_PROMPT's headline was "~40 TB → ~135 GB across the full flow
+(~300×)" of projection-bandwidth reduction at 32K. That number is
+real for the *weight-read* traffic, but the wall-time speedup is
+capped by whatever bottleneck remains after bandwidth is fixed:
+
+- **Attention O(N²)** scan — same code in both modes, dominates at large N
+- **MoE per-token top-K routing** — inherently sequential, scales O(N)
+- **DeltaNet conv1d state update** — inherently sequential, scales O(N)
+- **CPU memory bandwidth saturation** — projections share the same
+  DDR4 channels as activations / cache / KV
+
+Phase 4 amortised projection bandwidth from `40 TB` of weight reads
+down to `135 GB`, but the *remaining* work (attention, MoE, DeltaNet
+recurrence) was the throttle the whole time. 2× wall-time at 1K is
+the actual delivered value of PRs #239-#244 on CPU.
+
+### Implications for the roadmap
+
+- **The shmem fix is the standout win**: 4.88× per-token / 6.72×
+  batched at 4419 tok / max_seq=20000. Long-context value-prop now
+  scales without paying the occupancy cliff.
+- **Step B's wall-time delta is ~0%** at the sizes tested — the GPU
+  matmul wasn't the bottleneck. The routing fix is still correct
+  (avoids host-side CPU matmul work for cuda-attached backends) but
+  doesn't unblock the next 2× win.
+- **Apply the shmem fix to the tree-spec-decode prefill variants**
+  (`fused_prefill_attention_seq_device_into_pos_dev`,
+  `fused_prefill_attention_tree_seq_device_into_pos_dev`) — they
+  still allocate shmem from `opts.max_seq`. Spec-decode is not on
+  the main prefill path so the fix wasn't critical, but the same
+  4× speedup applies there. Caller needs to provide a host-side
+  upper bound for `n_ctx_max` since base_pos lives on device only.
+- **32K prefill is now session-scale**: at the 4419-tok rate of
+  ~42 ms/tok batched, a 32K prefill projects to ~22 minutes; 64K
+  to ~45 min (subject to O(N²) attention scaling above ~8K). The
+  preseed bench is no longer the only viable VRAM-bench tool —
+  real long-context prefills are now feasible to run.
+
+### Bench env switches added this session
+
+- `LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1` — forces
+  `qwen35_forward_prefill` into its per-token loop. Cleaner A/B
+  switch than piggybacking on a diagnostic dump var.
+- `LARQL_QWEN35_NO_BACKEND=1` — when built with `--features cuda`,
+  skips the unconditional CudaBackend attach in
+  `chat.rs::handle_chat_completions`. Lets the CPU batched-matmul
+  gates (`backend.is_none()`) fire from a cuda-built binary.
+
+### Step B routing summary
+
+- `matmul_with_backend` added in `quant_dispatch.rs` (mirrors
+  `matvec_with_backend`). Q4_K → `backend.q4k_matmul`; other formats
+  fall through to `QuantTensor::matmul` (CPU).
+- Call sites updated: 4 in `qwen35_attention_block_prefill`
+  (Q/K/V/O) and 3 in `deltanet_block_prefill` batched branch
+  (attn_qkv / attn_gate / ssm_out). `backend.is_none()` gate
+  dropped in DeltaNet.
+- MoE scatter-gather left on CPU intentionally — GPU MoE uses
+  `qwen35_moe_ffn_batch` which batches 8 experts per call. A
+  scatter-gather variant for GPU needs separate measurement.
+- Bug fixed during Step B: GPU fused recurrence paths in
+  `deltanet_block_step_with_optional_projections` (the
+  `LARQL_QWEN35_E6A_FUSED` path and the default `fused_o_normed`
+  path) returned `block_out [hidden]` regardless of
+  `skip_ssm_out`. Now honour the flag and return `o_flat
+  [value_dim]` when the caller is batching the ssm_out matmul.
+  Surfaced because pre-Step-B `batched_ssm_out` was gated
+  `backend.is_none()` and never fired in GPU mode.
+
+### Reproducing
+
+```bash
+# Build (cuda enabled — for the GPU run)
+cargo build --release --bin larql-server --features cuda
+
+# CPU batched
+LARQL_QWEN35_NO_BACKEND=1 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
+# CPU per-token (separate run, restart server)
+LARQL_QWEN35_NO_BACKEND=1 LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
+# GPU batched (Step B path — production deployment)
+LARQL_QWEN35_GPU=1 LARQL_QWEN35_KV_MAX_SEQ=20000 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
+# GPU per-token (baseline for A/B)
+LARQL_QWEN35_GPU=1 LARQL_QWEN35_KV_MAX_SEQ=20000 \
+  LARQL_QWEN35_FORCE_PER_TOKEN_PREFILL=1 \
+  ./target/release/larql-server /tank/ai/Qwen/Qwen3.6-35B-A3B-vindex-v10 \
+  --port 8181
+
+# Drive the bench
+LARQL_BENCH_TARGETS=512,1024,4096 LARQL_BENCH_DECODE=4 \
+  LARQL_BENCH_HTTP_TIMEOUT=3600 \
+  python3 scripts/bench-long-context.py <mode_label>
+```

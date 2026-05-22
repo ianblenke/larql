@@ -1164,13 +1164,25 @@ pub fn fused_decode_attention(
     let cfg = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, d_split_i as u32, 1),
         block_dim: (block_dim, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim as usize + opts.head_dim)
+        // cuda-decode-shmem-fix: shmem holds `n_ctx = pos+1` score
+        // slots, not the slab capacity. Allocating `max_seq` slots
+        // forces ~80 KB shmem at max_seq=20000 and drops RTX 4090
+        // occupancy from ~3 blocks/SM to 1 block/SM — a 3-4×
+        // wall-time hit that doesn't track actual cached context.
+        // The kernel arg `max_seq` (set below) is updated to match
+        // so the kernel's scratch / q_rot offsets and the
+        // (now-redundant) NEG_INF tail-fill loop stay consistent.
+        shared_mem_bytes: ((opts.pos + 1 + block_dim as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-decode-shmem-fix: kernel `max_seq` arg drives the shmem
+    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
+    // loop. Both should track the *current* n_ctx (= pos+1), not the
+    // slab capacity — see the shared_mem_bytes comment above.
+    let max_seq_i = (opts.pos + 1) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -1291,13 +1303,25 @@ pub fn fused_decode_attention_device_kv(
     let cfg = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, d_split_i as u32, 1),
         block_dim: (block_dim, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim as usize + opts.head_dim)
+        // cuda-decode-shmem-fix: shmem holds `n_ctx = pos+1` score
+        // slots, not the slab capacity. Allocating `max_seq` slots
+        // forces ~80 KB shmem at max_seq=20000 and drops RTX 4090
+        // occupancy from ~3 blocks/SM to 1 block/SM — a 3-4×
+        // wall-time hit that doesn't track actual cached context.
+        // The kernel arg `max_seq` (set below) is updated to match
+        // so the kernel's scratch / q_rot offsets and the
+        // (now-redundant) NEG_INF tail-fill loop stay consistent.
+        shared_mem_bytes: ((opts.pos + 1 + block_dim as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-decode-shmem-fix: kernel `max_seq` arg drives the shmem
+    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
+    // loop. Both should track the *current* n_ctx (= pos+1), not the
+    // slab capacity — see the shared_mem_bytes comment above.
+    let max_seq_i = (opts.pos + 1) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -1390,13 +1414,25 @@ pub fn fused_decode_attention_device_kv_into(
     let cfg = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, d_split_i as u32, 1),
         block_dim: (block_dim, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim as usize + opts.head_dim)
+        // cuda-decode-shmem-fix: shmem holds `n_ctx = pos+1` score
+        // slots, not the slab capacity. Allocating `max_seq` slots
+        // forces ~80 KB shmem at max_seq=20000 and drops RTX 4090
+        // occupancy from ~3 blocks/SM to 1 block/SM — a 3-4×
+        // wall-time hit that doesn't track actual cached context.
+        // The kernel arg `max_seq` (set below) is updated to match
+        // so the kernel's scratch / q_rot offsets and the
+        // (now-redundant) NEG_INF tail-fill loop stay consistent.
+        shared_mem_bytes: ((opts.pos + 1 + block_dim as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-decode-shmem-fix: kernel `max_seq` arg drives the shmem
+    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
+    // loop. Both should track the *current* n_ctx (= pos+1), not the
+    // slab capacity — see the shared_mem_bytes comment above.
+    let max_seq_i = (opts.pos + 1) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -1512,13 +1548,25 @@ pub fn fused_decode_attention_device(
     let cfg = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, d_split_i as u32, 1),
         block_dim: (block_dim, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim as usize + opts.head_dim)
+        // cuda-decode-shmem-fix: shmem holds `n_ctx = pos+1` score
+        // slots, not the slab capacity. Allocating `max_seq` slots
+        // forces ~80 KB shmem at max_seq=20000 and drops RTX 4090
+        // occupancy from ~3 blocks/SM to 1 block/SM — a 3-4×
+        // wall-time hit that doesn't track actual cached context.
+        // The kernel arg `max_seq` (set below) is updated to match
+        // so the kernel's scratch / q_rot offsets and the
+        // (now-redundant) NEG_INF tail-fill loop stay consistent.
+        shared_mem_bytes: ((opts.pos + 1 + block_dim as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-decode-shmem-fix: kernel `max_seq` arg drives the shmem
+    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
+    // loop. Both should track the *current* n_ctx (= pos+1), not the
+    // slab capacity — see the shared_mem_bytes comment above.
+    let max_seq_i = (opts.pos + 1) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -1898,7 +1946,13 @@ pub fn fused_prefill_attention_seq_device_into(
         .clone_htod(&[base_pos_i])
         .map_err(|e| CudaInitError::DriverMissing(format!("clone_htod base_pos: {e:?}")))?;
     let seq_len_i = seq_len as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-prefill-shmem-fix: kernel `max_seq` arg drives shmem
+    // offset for scratch/q_rot and bounds the NEG_INF tail-fill
+    // loop. Use the actual max n_ctx (= base_pos + seq_len) so the
+    // launch helper's shmem allocation tracks real work, not slab
+    // capacity. The kernel's `pos >= max_seq` bounds check stays
+    // safe because `pos = base_pos + sp` and `sp < seq_len`.
+    let max_seq_i = (base_pos + seq_len) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -2264,7 +2318,12 @@ fn fused_prefill_attention_launch_pos_dev(
     let cfg_attn = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, seq_len as u32, 1),
         block_dim: (block_dim_attn, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim_attn as usize + opts.head_dim)
+        // cuda-prefill-shmem-fix: size shmem from the kernel arg
+        // `max_seq_i` (which callers can shrink to `base_pos+seq_len`)
+        // instead of the slab capacity `opts.max_seq`. See the
+        // matching fix in `fused_decode_attention_device_kv` for the
+        // RTX 4090 occupancy story.
+        shared_mem_bytes: ((max_seq_i as usize + block_dim_attn as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;

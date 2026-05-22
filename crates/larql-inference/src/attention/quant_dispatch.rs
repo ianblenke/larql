@@ -15,7 +15,7 @@ use larql_compute::ComputeBackend;
 use larql_compute::QuantFormat;
 use larql_models::quant::ggml::{TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0};
 use larql_models::quant::lazy::QuantTensor;
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 
 /// Map a GGML tensor type id to the corresponding
 /// `larql_compute::QuantFormat`. Returns `None` for unsupported
@@ -80,6 +80,48 @@ pub fn matvec_with_backend(
     qt.matvec(x).expect("QuantTensor::matvec CPU fallback")
 }
 
+/// Phase 4 Step B: backend-aware batched matmul dispatch.
+///
+/// `out[seq_len, N] = X[seq_len, K] · W[N, K].T` where `qt` is
+/// `[rows=N, cols=K]`. Routes to the GPU backend's `q4k_matmul`
+/// (cuBLAS hgemm on cached f16 dequant) when available; falls back
+/// to `QuantTensor::matmul` (rayon CPU batched matmul) otherwise.
+///
+/// Today only Q4_K is GPU-accelerated; Q5_K / Q6_K / Q8_0 fall
+/// through to CPU. The non-Q4_K paths can be added by extending
+/// `QuantMatVec` with `q5k_matmul` etc., mirroring the matvec
+/// trait's per-format methods.
+pub fn matmul_with_backend(
+    qt: &QuantTensor,
+    x_seq: &Array2<f32>,
+    backend: Option<&dyn ComputeBackend>,
+) -> Array2<f32> {
+    let shape = qt.shape();
+    let rows = shape[0];
+    let cols = shape[1];
+    let seq_len = x_seq.shape()[0];
+
+    // GPU fast path: Q4_K via backend.q4k_matmul, which for seq_len>1
+    // routes through gemm_proj_seq (cached f16 dequant + cuBLAS hgemm).
+    // For seq_len=1 the backend delegates to q4k_matvec internally.
+    if let Some(b) = backend {
+        if let Some(format) = ggml_type_to_quant_format(qt.tensor_type()) {
+            if format == QuantFormat::Q4_K && seq_len > 0 {
+                let bytes = qt.raw_bytes();
+                let x_slice = x_seq.as_slice().expect("Array2 contiguous");
+                if let Some(out) = b.q4k_matmul(bytes, x_slice, rows, cols, seq_len) {
+                    return Array2::from_shape_vec((seq_len, rows), out)
+                        .expect("q4k_matmul output shape");
+                }
+            }
+            // Other formats: no GPU matmul today. Fall through.
+        }
+    }
+
+    // CPU fallback — `QuantTensor::matmul` (PR #239).
+    qt.matmul(x_seq).expect("QuantTensor::matmul CPU fallback")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +145,35 @@ mod tests {
                 cpu[r],
                 dispatched[r],
             );
+        }
+    }
+
+    /// `matmul_with_backend` with `backend=None` must produce the same
+    /// output as `QuantTensor::matmul` directly. Pin so the dispatch
+    /// wrapper's shape plumbing doesn't drift.
+    #[test]
+    fn matmul_no_backend_falls_back_to_cpu_matmul() {
+        let rows = 4;
+        let cols = 8;
+        let seq_len = 3;
+        let weight_vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.05).collect();
+        let qt = QuantTensor::from_f32_rows(rows, cols, &weight_vals);
+        let x_vals: Vec<f32> = (0..seq_len * cols)
+            .map(|i| (i as f32) * 0.01 - 0.1)
+            .collect();
+        let x_seq = Array2::from_shape_vec((seq_len, cols), x_vals).unwrap();
+        let cpu = qt.matmul(&x_seq).unwrap();
+        let dispatched = matmul_with_backend(&qt, &x_seq, None);
+        assert_eq!(cpu.shape(), dispatched.shape());
+        for i in 0..seq_len {
+            for j in 0..rows {
+                assert!(
+                    (cpu[[i, j]] - dispatched[[i, j]]).abs() < 1e-6,
+                    "[{i}, {j}]: cpu={} dispatched={}",
+                    cpu[[i, j]],
+                    dispatched[[i, j]],
+                );
+            }
         }
     }
 }

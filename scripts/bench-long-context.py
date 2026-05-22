@@ -44,11 +44,16 @@ import urllib.request
 PORT = int(os.environ.get("LARQL_BENCH_PORT", "8181"))
 URL = f"http://localhost:{PORT}/v1/chat/completions"
 MODEL = os.environ.get("LARQL_BENCH_MODEL", "Qwen3.6-35B-A3B")
-DECODE_TOKENS = 32
+DECODE_TOKENS = int(os.environ.get("LARQL_BENCH_DECODE", "32"))
+HTTP_TIMEOUT = float(os.environ.get("LARQL_BENCH_HTTP_TIMEOUT", "600"))
 
 # Target prompt token counts. Qwen tokeniser averages ~3.5 chars/tok
 # on lorem-style English, so we send char counts close to 3.5×.
-PROMPT_TARGETS = [128, 2048, 4096]
+# Override with `LARQL_BENCH_TARGETS=32000,64000,128000`.
+_DEFAULT_TARGETS = "128,2048,4096"
+PROMPT_TARGETS = [
+    int(x) for x in os.environ.get("LARQL_BENCH_TARGETS", _DEFAULT_TARGETS).split(",") if x
+]
 
 LOREM = (
     "The quick brown fox jumps over the lazy dog. "
@@ -99,7 +104,7 @@ def make_prompt_chars(target_chars):
     return out[:target_chars]
 
 
-def call(prompt_chars, decode_tokens=DECODE_TOKENS, timeout=600):
+def call(prompt_chars, decode_tokens=DECODE_TOKENS, timeout=HTTP_TIMEOUT):
     """POST a chat completion. Return (data, elapsed_s)."""
     body = json.dumps(
         {

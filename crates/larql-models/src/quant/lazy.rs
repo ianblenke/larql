@@ -362,9 +362,6 @@ impl QuantTensor {
         }
     }
 
-    /// `M @ x` where `M` is this tensor (`[rows, cols]`) and `x` is
-    /// a column vector (`[cols]`). Returns `[rows]`.
-
     /// Public accessor for the bytes view — used by cross-expert MoE
     /// batching in `larql_inference` which needs to peek per-row at
     /// multiple tensors' bytes without going through `matvec`.
