@@ -1105,22 +1105,39 @@ fn swiglu_moe_lazy_prefill(
     top_k: usize,
     backend: Option<&dyn larql_compute::ComputeBackend>,
 ) -> Array2<f32> {
+    // CPU mode (no GPU backend): use scatter-gather. Per-expert
+    // SwiGLU runs as one batched matmul against the gathered
+    // bucket of positions that picked it, instead of `bucket_size`
+    // separate matvecs. Same L3-reuse argument as PR #239's
+    // attention projections but with per-position routing.
+    //
+    // GPU mode: preserve the existing per-row loop, which
+    // dispatches the 8-expert MoE batched kernel
+    // (`qwen35_moe_ffn_batch`) per token. Scatter-gather would
+    // bypass that GPU kernel, regressing the CUDA path.
+    if backend.is_none() {
+        return swiglu_moe_lazy_prefill_scatter_gather(
+            x_seq,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp_gate,
+            shexp_up,
+            shexp_down,
+            shexp_gate_inp,
+            num_experts,
+            top_k,
+        );
+    }
+
     let seq_len = x_seq.nrows();
     let hidden = x_seq.ncols();
     let mut out = Array2::<f32>::zeros((seq_len, hidden));
 
-    // Batched router: one `router.matmul(x_seq)` matmul replaces
-    // `seq_len` separate per-row router matvecs. Same L3-reuse win
-    // as PR #239's attention projections — each rayon worker pulls
-    // the router weight matrix into cache once and reuses it across
-    // its slice of positions. For Qwen3.6 35B-A3B router is small
-    // (`[128 experts, 2048 hidden]` Q4_K, ~0.5 MB) so the bandwidth
-    // win is modest, but kernel-launch amortisation is real and
-    // this lays the path for the per-expert SwiGLU batching that
-    // will follow (Phase 4c-internals proper).
-    //
-    // Falls back to per-token router matvec when matmul errors
-    // (currently never; defensive).
+    // Batched router (CPU matmul, but cheap and uniform across
+    // backends). Each per-row call inside the loop then skips its
+    // own router matvec via `swiglu_moe_lazy_with_optional_logits`.
     let precomputed_logits: Option<Array2<f32>> = router.matmul(x_seq).ok();
 
     for i in 0..seq_len {
@@ -1142,6 +1159,216 @@ fn swiglu_moe_lazy_prefill(
             num_experts,
             top_k,
             backend,
+        );
+        out.row_mut(i).assign(&y);
+    }
+    out
+}
+
+/// CPU-mode scatter-gather MoE for prefill.
+///
+/// The classical MoE batching pattern: for each unique expert
+/// picked by the per-position top-K, gather the activations of
+/// the positions that picked it into a contiguous bucket and
+/// run ONE batched SwiGLU on that bucket (gate/up/down each as
+/// a single `QuantTensor::matmul` call). Outputs scatter back to
+/// `y_moe` with the routing weights.
+///
+/// For Qwen3.6 35B-A3B (num_experts=128, top_k=8) at 32K prefill,
+/// each expert gets ~2K positions on average. Per-expert gate
+/// `[ffn_dim=512, hidden=2048]` Q4_K (~0.6 MB) is read once per
+/// rayon worker per bucket instead of `bucket_size` times in the
+/// per-row form — the same L3-reuse win as the attention
+/// projections, applied per-expert.
+///
+/// Parity vs the per-row reference is approximate (not bit-equal)
+/// because the order of partial sums in `y_moe[s, h]` differs:
+/// per-row visits experts in top-K rank order; scatter-gather
+/// visits them in expert-id order. Floating-point addition is
+/// associative-up-to-rounding so per-element drift is bounded.
+/// The parity test `swiglu_moe_lazy_prefill_matches_per_position_loop`
+/// allows `1e-4` relative tolerance.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_moe_lazy_prefill_scatter_gather(
+    x_seq: &Array2<f32>,
+    router: &larql_models::quant::lazy::QuantTensor,
+    gate_exps: &larql_models::quant::lazy::QuantTensor,
+    up_exps: &larql_models::quant::lazy::QuantTensor,
+    down_exps: &larql_models::quant::lazy::QuantTensor,
+    shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_gate_inp: Option<&[f32]>,
+    num_experts: usize,
+    top_k: usize,
+) -> Array2<f32> {
+    let seq_len = x_seq.nrows();
+    let hidden = x_seq.ncols();
+    let mut y_moe = Array2::<f32>::zeros((seq_len, hidden));
+    if seq_len == 0 {
+        return y_moe;
+    }
+
+    // Step 1: batched router → [seq_len, num_experts].
+    let logits_all = match router.matmul(x_seq) {
+        Ok(l) => l,
+        Err(_) => {
+            // Defensive: fall back to per-row router (shouldn't
+            // happen given matmul's fallback covers all formats).
+            return swiglu_moe_lazy_prefill_per_row(
+                x_seq,
+                router,
+                gate_exps,
+                up_exps,
+                down_exps,
+                shexp_gate,
+                shexp_up,
+                shexp_down,
+                shexp_gate_inp,
+                num_experts,
+                top_k,
+            );
+        }
+    };
+
+    // Step 2: per-position top-K + bucketing.
+    // Each bucket entry is `(position, routing_weight)`.
+    let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_experts];
+    for s in 0..seq_len {
+        let logits_row = logits_all.row(s);
+        let mut idx_logit: Vec<(usize, f32)> = logits_row
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        idx_logit.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<(usize, f32)> = idx_logit.into_iter().take(top_k).collect();
+        let max_logit = top
+            .iter()
+            .map(|&(_, l)| l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = top.iter().map(|&(_, l)| (l - max_logit).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        for (i, &(expert_id, _)) in top.iter().enumerate() {
+            let w = exps[i] / sum_exp;
+            buckets[expert_id].push((s, w));
+        }
+    }
+
+    // Step 3: per-expert batched SwiGLU.
+    for (expert_id, positions) in buckets.iter().enumerate() {
+        if positions.is_empty() {
+            continue;
+        }
+        let gate_e = gate_exps
+            .expert_slice(expert_id, num_experts)
+            .expect("gate_exps expert_slice");
+        let up_e = up_exps
+            .expert_slice(expert_id, num_experts)
+            .expect("up_exps expert_slice");
+        let down_e = down_exps
+            .expert_slice(expert_id, num_experts)
+            .expect("down_exps expert_slice");
+
+        // Gather: build [bucket_size, hidden] from x_seq.
+        let bucket_size = positions.len();
+        let mut bucket_x = Array2::<f32>::zeros((bucket_size, hidden));
+        for (b, &(s, _)) in positions.iter().enumerate() {
+            bucket_x.row_mut(b).assign(&x_seq.row(s));
+        }
+
+        // Three batched matmuls: gate, up, down.
+        let g = gate_e.matmul(&bucket_x).expect("gate_e matmul");
+        let u = up_e.matmul(&bucket_x).expect("up_e matmul");
+
+        // SiLU(g) * u — elementwise [bucket_size, ffn_dim].
+        let ffn_dim = g.ncols();
+        let mut inter = Array2::<f32>::zeros((bucket_size, ffn_dim));
+        for b in 0..bucket_size {
+            for j in 0..ffn_dim {
+                let gv = g[[b, j]];
+                let uv = u[[b, j]];
+                inter[[b, j]] = (gv * sigmoid(gv)) * uv;
+            }
+        }
+
+        let d = down_e.matmul(&inter).expect("down_e matmul"); // [bucket_size, hidden]
+
+        // Scatter: weighted accumulate into y_moe.
+        for (b, &(s, w)) in positions.iter().enumerate() {
+            for h in 0..hidden {
+                y_moe[[s, h]] += w * d[[b, h]];
+            }
+        }
+    }
+
+    // Step 4: shared expert (always-on, optionally sigmoid-gated).
+    if let (Some(sg), Some(su), Some(sd)) = (shexp_gate, shexp_up, shexp_down) {
+        let g = sg.matmul(x_seq).expect("shexp_gate matmul");
+        let u = su.matmul(x_seq).expect("shexp_up matmul");
+        let ffn_dim = g.ncols();
+        let mut inter = Array2::<f32>::zeros((seq_len, ffn_dim));
+        for s in 0..seq_len {
+            for j in 0..ffn_dim {
+                let gv = g[[s, j]];
+                let uv = u[[s, j]];
+                inter[[s, j]] = (gv * sigmoid(gv)) * uv;
+            }
+        }
+        let d = sd.matmul(&inter).expect("shexp_down matmul");
+        // Per-position sigmoid gate scalar.
+        for s in 0..seq_len {
+            let gate_scalar = match shexp_gate_inp {
+                Some(w) => {
+                    let dot: f32 = x_seq.row(s).iter().zip(w.iter()).map(|(a, b)| a * b).sum();
+                    1.0 / (1.0 + (-dot).exp())
+                }
+                None => 1.0,
+            };
+            for h in 0..hidden {
+                y_moe[[s, h]] += gate_scalar * d[[s, h]];
+            }
+        }
+    }
+
+    y_moe
+}
+
+/// Per-row reference path retained as the fallback when matmul
+/// errors (defensive — currently unreachable since `matmul` has
+/// its own per-row fallback).
+#[allow(clippy::too_many_arguments)]
+fn swiglu_moe_lazy_prefill_per_row(
+    x_seq: &Array2<f32>,
+    router: &larql_models::quant::lazy::QuantTensor,
+    gate_exps: &larql_models::quant::lazy::QuantTensor,
+    up_exps: &larql_models::quant::lazy::QuantTensor,
+    down_exps: &larql_models::quant::lazy::QuantTensor,
+    shexp_gate: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_up: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_down: Option<&larql_models::quant::lazy::QuantTensor>,
+    shexp_gate_inp: Option<&[f32]>,
+    num_experts: usize,
+    top_k: usize,
+) -> Array2<f32> {
+    let seq_len = x_seq.nrows();
+    let hidden = x_seq.ncols();
+    let mut out = Array2::<f32>::zeros((seq_len, hidden));
+    for i in 0..seq_len {
+        let x_row: Array1<f32> = x_seq.row(i).to_owned();
+        let y = swiglu_moe_lazy(
+            &x_row,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            shexp_gate,
+            shexp_up,
+            shexp_down,
+            shexp_gate_inp,
+            num_experts,
+            top_k,
+            None,
         );
         out.row_mut(i).assign(&y);
     }
