@@ -175,20 +175,35 @@ batched-over-per-token win comes from the rest of Phase 4
 PR #237 RoPE hoisting, PR #238 batched RMSNorm), which all
 compound now that the shmem cliff is gone.
 
-### 16K-token unlock (post #248 96 KB dynamic shmem opt-in)
+### Full scaling curve post #248 (96 KB dynamic shmem opt-in)
 
 After #248 set `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` to
 96 KB on the attention kernels, prefill at >11K tokens no longer
 hits the default ~48 KB per-block cap. Max n_ctx per launch is now
 ~24K (`96·1024 / 4 − scratch − head_dim`).
 
+Full f16 batched-prefill curve at `max_seq=20000`:
+
+| N tok | wall_s | per-tok |
+|---|---|---|
+| 557 | 24.3s | 43.6 ms |
+| 1110 | 45.4s | 40.9 ms |
+| 4419 | 183.7s | 41.6 ms |
+| 8831 | 369.7s | 41.9 ms |
+| 13245 | 557.2s | 42.1 ms |
+| 17658 | 752.8s | 42.6 ms |
+
+**42 ms/tok holds across a 32× context range (557 → 17658
+tokens)** — the kernels actually scale linearly within the opt-in
+shmem budget, no occupancy or memory-bandwidth wall up to 17K.
+This is the headline scaling result from the Phase 4 + Step B +
+shmem fix + dynamic-shmem-opt-in landed across #246/#247/#248.
+
+### iso3 vs f16 at 17K (Phase 3 value-prop check)
+
 | N prompt tok | f16 wall_s | iso3 wall_s | f16 VRAM | iso3 VRAM | Δ VRAM |
 |---|---|---|---|---|---|
 | 17658 | **752.8s** | **748.9s** | 21284 MiB | 21412 MiB | +128 MiB |
-
-**42 ms/tok holds flat from 4K → 17K** — same per-token rate as the
-4419-tok bench above, so the kernels actually scale within the
-opt-in shmem budget.
 
 iso3 vs f16 at 16K: throughput equal (within 0.5%), VRAM essentially
 matched (128 MiB iso3 *over* f16 — within the noise band of lazy
