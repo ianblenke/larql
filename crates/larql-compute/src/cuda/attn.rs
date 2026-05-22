@@ -12,6 +12,7 @@ use cudarc::cublas::{
     sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T},
     Gemm, GemmConfig,
 };
+use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda-oxide")]
 use cudarc::nvrtc::Ptx;
@@ -933,6 +934,32 @@ pub(crate) fn choose_attn_d_split(num_q_heads: usize, head_dim: usize) -> i32 {
     }
 }
 
+/// Opt into the architecture's larger dynamic shared-memory budget
+/// for the attention kernels. Default per-block shmem cap is ~48 KB
+/// across CCs, but Ampere (164 KB), Ada (100 KB), and Hopper (228 KB)
+/// all support more with this opt-in. Set 96 KB — fits on every
+/// SM 7.0+ architecture and lets the post-PR-#246 n_ctx-sized shmem
+/// scale to ~24K-token prefills in a single launch.
+///
+/// 96 KB → max n_ctx ≈ (96·1024 / 4 − 256 − 128) ≈ 24,184 slots,
+/// which covers the 16K/24K targets the long-context bench wants.
+/// Past that the kernel returns `cudaErrorInvalidValue` on launch
+/// and the caller falls back; production users running 32K+ will
+/// need a tiled-scores rework.
+const MAX_DYNAMIC_SHMEM_BYTES: i32 = 96 * 1024;
+
+fn opt_in_dynamic_shmem(func: &CudaFunction, kernel: &str) -> Result<(), CudaInitError> {
+    func.set_attribute(
+        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        MAX_DYNAMIC_SHMEM_BYTES,
+    )
+    .map_err(|e| {
+        CudaInitError::DriverMissing(format!(
+            "set MAX_DYNAMIC_SHARED_SIZE_BYTES on {kernel}: {e:?}"
+        ))
+    })
+}
+
 fn fused_decode_attention_function(drv: &Driver) -> Result<&'static CudaFunction, CudaInitError> {
     if let Some((_, f)) = FUSED_DECODE_ATTN_FUNC.get() {
         return Ok(f);
@@ -957,6 +984,7 @@ fn fused_decode_attention_function(drv: &Driver) -> Result<&'static CudaFunction
         .map_err(|e| {
             CudaInitError::DriverMissing(format!("load fused attention function: {e:?}"))
         })?;
+    opt_in_dynamic_shmem(&func, "fused_decode_attention_f32")?;
     let _ = FUSED_DECODE_ATTN_FUNC.set((module, func));
     let (_, f) = FUSED_DECODE_ATTN_FUNC.get().unwrap();
     Ok(f)
@@ -1806,6 +1834,7 @@ fn fused_prefill_attention_function(drv: &Driver) -> Result<&'static CudaFunctio
         .map_err(|e| {
             CudaInitError::DriverMissing(format!("load fused_prefill_attention function: {e:?}"))
         })?;
+    opt_in_dynamic_shmem(&func, "fused_prefill_attention_f32")?;
     let _ = FUSED_PREFILL_ATTN_FUNC.set((module, func));
     let (_, f) = FUSED_PREFILL_ATTN_FUNC.get().unwrap();
     Ok(f)
@@ -1832,6 +1861,7 @@ fn fused_prefill_attention_tree_function(
         .map_err(|e| {
             CudaInitError::DriverMissing(format!("load fused_prefill_attn_tree function: {e:?}"))
         })?;
+    opt_in_dynamic_shmem(&func, "fused_prefill_attention_tree_mask_f32")?;
     let _ = FUSED_PREFILL_ATTN_TREE_FUNC.set((module, func));
     let (_, f) = FUSED_PREFILL_ATTN_TREE_FUNC.get().unwrap();
     Ok(f)
