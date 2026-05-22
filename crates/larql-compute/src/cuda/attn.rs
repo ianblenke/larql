@@ -3362,7 +3362,18 @@ pub fn fused_prefill_attention_seq_device(
 
     let drv = backend.driver();
     let func_kv = kv_cache_write_seq_function(drv)?;
-    let func_attn = fused_prefill_attention_function(drv)?;
+    // cuda-prefill-tiled-dispatch (legacy): same threshold + tiled
+    // routing as the non-pos_dev variant — see #253. Caller has
+    // base_pos host-side, so max_seq_i = base_pos + seq_len is
+    // computed below before this dispatch needs it... actually
+    // it's computed at line ~3392. Re-compute here for the dispatch.
+    let max_seq_i_for_dispatch = (base_pos + seq_len) as i32;
+    let use_tiled = max_seq_i_for_dispatch > NON_TILED_PREFILL_ATTN_N_CTX_MAX;
+    let func_attn = if use_tiled {
+        fused_prefill_attention_tiled_function(drv)?
+    } else {
+        fused_prefill_attention_function(drv)?
+    };
     let q_norm_dev = drv.device_buf_from(q_norm)?;
     let k_norm_dev = drv.device_buf_from(k_norm)?;
     let mut out_seq = drv.device_alloc_uninit(seq_len * q_dim)?;
@@ -3418,15 +3429,17 @@ pub fn fused_prefill_attention_seq_device(
     }
 
     let block_dim_attn: u32 = 256;
+    // Tiled: fixed (TILE_K + bdim + head_dim).
+    // Non-tiled: (n_ctx + bdim + head_dim) — PR #246 shmem-by-n_ctx fix.
+    let shmem_slots = if use_tiled {
+        FUSED_PREFILL_ATTN_TILED_TILE_K + block_dim_attn as usize + opts.head_dim
+    } else {
+        max_seq_i as usize + block_dim_attn as usize + opts.head_dim
+    };
     let cfg_attn = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, seq_len as u32, 1),
         block_dim: (block_dim_attn, 1, 1),
-        // cuda-prefill-shmem-fix: size shmem from `max_seq_i` (set
-        // above to opts.pos + seq_len or base_pos + seq_len) rather
-        // than `opts.max_seq` slab capacity. Matches PR #246's fix
-        // for the launch helper.
-        shared_mem_bytes: ((max_seq_i as usize + block_dim_attn as usize + opts.head_dim)
-            * std::mem::size_of::<f32>()) as u32,
+        shared_mem_bytes: (shmem_slots * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
 
