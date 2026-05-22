@@ -1255,46 +1255,68 @@ fn swiglu_moe_lazy_prefill_scatter_gather(
         }
     }
 
-    // Step 3: per-expert batched SwiGLU.
-    for (expert_id, positions) in buckets.iter().enumerate() {
-        if positions.is_empty() {
-            continue;
-        }
-        let gate_e = gate_exps
-            .expert_slice(expert_id, num_experts)
-            .expect("gate_exps expert_slice");
-        let up_e = up_exps
-            .expert_slice(expert_id, num_experts)
-            .expect("up_exps expert_slice");
-        let down_e = down_exps
-            .expert_slice(expert_id, num_experts)
-            .expect("down_exps expert_slice");
+    // Step 3: per-expert batched SwiGLU. Parallelise across
+    // experts — the gather + 3 matmuls per expert are independent
+    // until the scatter step (which writes to shared `y_moe` and
+    // stays sequential). `QuantTensor::matmul` detects the outer
+    // rayon scope via `current_thread_index()` and falls back to
+    // serial inner iteration, so nested-rayon contention is
+    // avoided.
+    //
+    // For Qwen3.6 35B-A3B (128 experts) on a 24-core machine,
+    // each worker handles ~5-6 experts serially; their per-expert
+    // working set (~3 × 0.6 MB = ~1.8 MB) is well within per-core
+    // L2 (~1 MB) / shared L3 (~32+ MB). The gather + matmul +
+    // intermediate compute parallelism is what's new here vs
+    // PR #241's sequential expert loop.
+    use rayon::prelude::*;
+    let per_expert_outputs: Vec<(usize, Array2<f32>)> = buckets
+        .par_iter()
+        .enumerate()
+        .filter(|(_, positions)| !positions.is_empty())
+        .map(|(expert_id, positions)| {
+            let gate_e = gate_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("gate_exps expert_slice");
+            let up_e = up_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("up_exps expert_slice");
+            let down_e = down_exps
+                .expert_slice(expert_id, num_experts)
+                .expect("down_exps expert_slice");
 
-        // Gather: build [bucket_size, hidden] from x_seq.
-        let bucket_size = positions.len();
-        let mut bucket_x = Array2::<f32>::zeros((bucket_size, hidden));
-        for (b, &(s, _)) in positions.iter().enumerate() {
-            bucket_x.row_mut(b).assign(&x_seq.row(s));
-        }
-
-        // Three batched matmuls: gate, up, down.
-        let g = gate_e.matmul(&bucket_x).expect("gate_e matmul");
-        let u = up_e.matmul(&bucket_x).expect("up_e matmul");
-
-        // SiLU(g) * u — elementwise [bucket_size, ffn_dim].
-        let ffn_dim = g.ncols();
-        let mut inter = Array2::<f32>::zeros((bucket_size, ffn_dim));
-        for b in 0..bucket_size {
-            for j in 0..ffn_dim {
-                let gv = g[[b, j]];
-                let uv = u[[b, j]];
-                inter[[b, j]] = (gv * sigmoid(gv)) * uv;
+            // Gather: build [bucket_size, hidden] from x_seq.
+            let bucket_size = positions.len();
+            let mut bucket_x = Array2::<f32>::zeros((bucket_size, hidden));
+            for (b, &(s, _)) in positions.iter().enumerate() {
+                bucket_x.row_mut(b).assign(&x_seq.row(s));
             }
-        }
 
-        let d = down_e.matmul(&inter).expect("down_e matmul"); // [bucket_size, hidden]
+            // Three batched matmuls: gate, up, down.
+            let g = gate_e.matmul(&bucket_x).expect("gate_e matmul");
+            let u = up_e.matmul(&bucket_x).expect("up_e matmul");
 
-        // Scatter: weighted accumulate into y_moe.
+            // SiLU(g) * u — elementwise [bucket_size, ffn_dim].
+            let ffn_dim = g.ncols();
+            let mut inter = Array2::<f32>::zeros((bucket_size, ffn_dim));
+            for b in 0..bucket_size {
+                for j in 0..ffn_dim {
+                    let gv = g[[b, j]];
+                    let uv = u[[b, j]];
+                    inter[[b, j]] = (gv * sigmoid(gv)) * uv;
+                }
+            }
+
+            let d = down_e.matmul(&inter).expect("down_e matmul"); // [bucket_size, hidden]
+            (expert_id, d)
+        })
+        .collect();
+
+    // Sequential scatter: each position can receive contributions
+    // from up to `top_k` experts; using `+=` here on `y_moe`
+    // requires exclusive access to avoid write races.
+    for (expert_id, d) in per_expert_outputs.iter() {
+        let positions = &buckets[*expert_id];
         for (b, &(s, w)) in positions.iter().enumerate() {
             for h in 0..hidden {
                 y_moe[[s, h]] += w * d[[b, h]];
