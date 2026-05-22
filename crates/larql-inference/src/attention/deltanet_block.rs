@@ -1023,8 +1023,7 @@ pub fn deltanet_block_prefill(
     // residency for the projection matmuls is filtered through
     // `gpu_tier::backend_for(DnProj, ...)` so
     // `LARQL_QWEN35_GPU_NO_DN_PROJ=1` still pushes them back to CPU.
-    let batched_projections =
-        weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
+    let batched_projections = weights.attn_qkv_quant.is_some() && weights.attn_gate_quant.is_some();
     let batched_ssm_out = batched_projections && weights.ssm_out_quant.is_some();
 
     use crate::attention::gpu_tier::{self as dn_gpu_tier, GpuClass as DnGpuClass};

@@ -158,7 +158,9 @@ mod tests {
         let seq_len = 3;
         let weight_vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.05).collect();
         let qt = QuantTensor::from_f32_rows(rows, cols, &weight_vals);
-        let x_vals: Vec<f32> = (0..seq_len * cols).map(|i| (i as f32) * 0.01 - 0.1).collect();
+        let x_vals: Vec<f32> = (0..seq_len * cols)
+            .map(|i| (i as f32) * 0.01 - 0.1)
+            .collect();
         let x_seq = Array2::from_shape_vec((seq_len, cols), x_vals).unwrap();
         let cpu = qt.matmul(&x_seq).unwrap();
         let dispatched = matmul_with_backend(&qt, &x_seq, None);
