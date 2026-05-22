@@ -2061,7 +2061,13 @@ pub fn fused_prefill_attention_seq_device_into_pos_dev(
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
     let seq_len_i = seq_len as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-prefill-shmem-fix: same as the non-pos-dev variant — the
+    // launch helper sizes shmem from `max_seq_i`. Use the actual max
+    // n_ctx (= opts.pos + seq_len, where opts.pos is the host-side
+    // base_pos hint set by the caller in decode.rs) so shmem tracks
+    // real work, not the slab capacity. PR #246 fixed this for the
+    // non-spec-decode path; this is the spec-decode follow-up.
+    let max_seq_i = (opts.pos + seq_len) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -2188,7 +2194,10 @@ pub fn fused_prefill_attention_tree_seq_device_into_pos_dev(
     let num_kv_heads_i = opts.num_kv_heads as i32;
     let head_dim_i = opts.head_dim as i32;
     let seq_len_i = seq_len as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-prefill-shmem-fix (tree variant): same as the linear
+    // pos_dev variant — drives both this fn's attn-kernel shmem
+    // and the kernel `max_seq` arg from the actual n_ctx.
+    let max_seq_i = (opts.pos + seq_len) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -2225,7 +2234,11 @@ pub fn fused_prefill_attention_tree_seq_device_into_pos_dev(
     let cfg_attn = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, seq_len as u32, 1),
         block_dim: (block_dim_attn, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim_attn as usize + opts.head_dim)
+        // cuda-prefill-shmem-fix: size shmem from `max_seq_i` (set
+        // above to opts.pos + seq_len or base_pos + seq_len) rather
+        // than `opts.max_seq` slab capacity. Matches PR #246's fix
+        // for the launch helper.
+        shared_mem_bytes: ((max_seq_i as usize + block_dim_attn as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
@@ -2453,7 +2466,11 @@ pub fn fused_prefill_attention_seq_device(
         .clone_htod(&[base_pos_i])
         .map_err(|e| CudaInitError::DriverMissing(format!("clone_htod base_pos: {e:?}")))?;
     let seq_len_i = seq_len as i32;
-    let max_seq_i = opts.max_seq as i32;
+    // cuda-prefill-shmem-fix (legacy variant): drive shmem and the
+    // kernel `max_seq` arg from the actual n_ctx (base_pos + seq_len)
+    // rather than slab capacity. Same fix as PR #246's non-pos-dev
+    // variant — legacy variant takes base_pos as a direct usize arg.
+    let max_seq_i = (base_pos + seq_len) as i32;
     let rotary_dim_i = opts.rotary_dim as i32;
     let use_qk_norm_i = if use_qk_norm { 1_i32 } else { 0_i32 };
 
@@ -2485,7 +2502,11 @@ pub fn fused_prefill_attention_seq_device(
     let cfg_attn = LaunchConfig {
         grid_dim: (opts.num_q_heads as u32, seq_len as u32, 1),
         block_dim: (block_dim_attn, 1, 1),
-        shared_mem_bytes: ((opts.max_seq + block_dim_attn as usize + opts.head_dim)
+        // cuda-prefill-shmem-fix: size shmem from `max_seq_i` (set
+        // above to opts.pos + seq_len or base_pos + seq_len) rather
+        // than `opts.max_seq` slab capacity. Matches PR #246's fix
+        // for the launch helper.
+        shared_mem_bytes: ((max_seq_i as usize + block_dim_attn as usize + opts.head_dim)
             * std::mem::size_of::<f32>()) as u32,
     };
     let num_q_heads_i = opts.num_q_heads as i32;
