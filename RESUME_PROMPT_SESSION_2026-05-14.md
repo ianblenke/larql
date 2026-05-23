@@ -3,13 +3,14 @@
 > Sibling to the GPU-arc `RESUME_PROMPT.md`. The work captured here is
 > orthogonal: it cleaned up CI debt, unblocked the bench measurement
 > that #127 had been blocking, and traced the bench-output gibberish
-> end-to-end. Net status: **V_proj corruption already fixed in current
-> code** — the symptom is from stale May-7 vindexes; re-extracting
-> produces a vindex that correctly emits `"Paris"` as token 1 vs the
-> Gemma 3 4B Q4_K_M GGUF. A **secondary token-N divergence** (tokens
-> 2+ drift after a bit-correct token 1) remains, plus a side bug in
-> `convert gguf-to-vindex --quant q4k` that writes empty
-> `gate_vectors.bin`. See "Correctness arc" below.
+> end-to-end. **The real bug**: `predict_q4k_hidden` is a silent no-op
+> on Gemma 3 4B — every layer's `run_layer_with_ffn_with_cache`
+> returns `None`, so the residual stream stays at the input embedding
+> through all 34 layers. The bit-exact V_proj match and the apparent
+> "Paris" token 1 are both red herrings (V is correct because the
+> writer is correct; "Paris" emerges by accident from
+> `lm_head @ embed("is")` cosine geometry). See "Correctness arc"
+> below for the full evidence chain.
 
 ## What landed today
 
@@ -102,29 +103,74 @@ levels. The April 16 vindex was extracted with a buggy older writer; the
 fix is **just re-extract** — no source-code change needed.
 
 The smoke test on the fresh vindex (`/v1/chat/completions` on `"The
-capital of France is"`) now emits **`"Paris"`** as the first generated
-token with logprob -0.0008 (~99.9% confidence) — matches the
-llama.cpp ground truth exactly.
+capital of France is"`) emits `"Paris"` as the first generated token
+with logprob -0.0008. **But this is a coincidence**, not a correctness
+win — see below.
 
-**Two follow-on bugs surfaced during the diagnostic**:
+**The real root cause** — found by running the user's staged
+`test_gemma3_layer_health.rs` against the fresh vindex on 2026-05-22/23:
 
-1. **Token-N divergence (token 1 correct, tokens 2+ drift)**. After
-   `"Paris"`, the model emits `" pessoal", " pohod", "அச்ச", "澼"` —
-   confident (logprobs -0.008 to -0.6) but wrong. This is the same
-   pattern session-12 chased on Qwen3.6: PR #81 (`token-0 bit-exact
-   but token-1+ diverges 20×`) → the C.5e-C.5j arc (sk computation
-   order, head-major flatten, multi-layer recurrence drift, decay-
-   first DeltaNet). Gemma 3 4B has no DeltaNet but the divergence
-   shape rhymes — likely some per-token state in the CPU Q4K decode
-   loop isn't being reset cleanly between autoregressive steps, OR
-   numerical drift compounds through the no-KV-cache O(N²) replay.
+> All 35 per-layer dump files (`cpu_h_embed.f32` + `cpu_layer_00.f32`
+> … `cpu_layer_33.f32`) have **identical MD5 hashes**. Layer-by-layer
+> stats are bit-exact: mean=-0.0186, std=1.035, max_abs=29.25 for
+> every single layer.
+
+The forward pass on `predict_q4k_hidden` is a **silent no-op**.
+Looking at the loop body in
+`crates/larql-inference/src/vindex/q4k_forward/hidden.rs` ~line 240:
+
+```rust
+} else if let Some((h_new, _, kv_out)) = run_layer_with_ffn_with_cache(
+    weights, &h, layer, ffn_backend, false, ple_inputs.get(layer),
+    shared_kv, kv_cache.as_deref_mut(), Some(index),
+) {
+    h = h_new;
+    if let Some(kv) = kv_out {
+        shared_kv_cache.insert(layer, kv);
+    }
+}
+```
+
+When `run_layer_with_ffn_with_cache` returns `None`, `h` is never
+reassigned. That's exactly what's happening: every layer silently
+returns `None`, the residual stream stays at the input embedding all
+the way through layer 33, and `lm_head @ embed(last_prompt_token)`
+gets argmaxed.
+
+**Why "Paris" emerged**: the last prompt token is `"is"`. With tied
+embed/lm_head matrices, `lm_head @ embed("is")` reduces to inner
+products against all embedding rows — and `embed("Paris") · embed("is")`
+is high because "is Paris" co-occurs frequently in training. That's
+the accident.
+
+**Why tokens 2-5 are gibberish**: after emitting "Paris", the model
+re-runs forward on `"...France is Paris"`. With forward still a
+no-op, lm_head argmax on `embed("Paris")` returns *whatever's nearest
+to "Paris" in cosine space* — which happens to be Portuguese
+`"pessoal"`, Czech/Slovak `"pohod"`, Tamil `"அச்ச"`, Chinese `"澼"`.
+This isn't a "model drift after first token"; it's the same no-op
+forward seeing a different last-prompt-token each step.
+
+**Why every layer returns None** is the open question. Likely
+candidate: `run_attention_block_with_kv_out_with_cache` at
+`crates/larql-inference/src/attention/block.rs:81` propagates `?` on
+some optional lookup that doesn't resolve on the Gemma 3 4B fresh
+vindex — possibly an attention key like `attn_q_norm` or `attn_k_norm`
+that the new vindex format doesn't materialize, or an `insert_q4k_layer_tensors`
+side-effect that the test path doesn't trigger.
+
+**Two side bugs surfaced during the diagnostic**:
+
+1. **Token-N apparent divergence is illusory** — same forward no-op
+   bug as token 1. Don't waste time on session-12-style residual diff
+   diagnostics; fix the layer no-op first.
 
 2. **`larql convert gguf-to-vindex --quant q4k` writes empty
    `gate_vectors.bin`**. The convert path's gate KNN write step
-   silently produces a 0-byte file, so the inference forward later
-   panics in `predict/honest.rs:247:92` (unwrap on None). The
-   safetensors `extract --quant q4k` path is unaffected (writes
-   gate_vectors.bin correctly).
+   silently produces a 0-byte file, so inference forward panics in
+   `predict/honest.rs:247:92` (unwrap on None). Separate bug from
+   the layer no-op above. Safetensors `extract --quant q4k` path is
+   unaffected (writes gate_vectors.bin correctly).
 
 ### What's already in flight
 
@@ -148,16 +194,16 @@ the working tree (parallel session on 2026-05-22):
 
 In order of impact:
 
-1. **Investigate token-N divergence on Gemma 3 4B.** Token 1 is
-   bit-correct against llama.cpp; tokens 2+ drift. Mirror session-12's
-   C.5e-style diagnostic on Qwen3.6: dump per-layer residuals for
-   tokens 1 and 2 from both larql and llama.cpp (via
-   `llama-eval-callback` with `LLAMA_DUMP_BIN_DIR`), find the layer
-   where the divergence first exceeds Q6_K rounding noise. The CPU
-   Q4K decode path is `generate_via_cpu_q4k` →
-   `crates/larql-inference/src/vindex/q4k_forward/hidden.rs::predict_q4k_hidden`.
-   The user's staged `test_gemma3_layer_health.rs` and
-   `profile_4b_decode.rs` are likely already set up for this.
+1. **Fix the layer no-op in `predict_q4k_hidden`** (THE gating bug).
+   Find why every call to `run_layer_with_ffn_with_cache` returns
+   `None` on the Gemma 3 4B fresh vindex. The propagation chain is
+   `run_layer_with_ffn_with_cache` → `run_attention_block_with_kv_out_with_cache`
+   (uses `?`) → some optional lookup inside. Suspect attention-key
+   resolution: the attn manifest has `q_proj/k_proj/v_proj/o_proj`
+   but the loader's lookup might be using a different key naming
+   (e.g., expecting `Gemma3Arch::attn_q_key(layer)` to produce a
+   different prefix). Easy bisection: instrument `block.rs:81` with
+   `eprintln!` before each `?` to find which `?` fires.
 
 2. **Fix the convert path's empty `gate_vectors.bin`.** The
    `larql convert gguf-to-vindex --quant q4k` flow writes a 0-byte
@@ -170,27 +216,26 @@ In order of impact:
 3. **Replace the May 7 broken vindex with the fresh one.** The May
    7 `output/gemma-3-4b-it-vindex` is structurally broken and should
    not be used. `output/gemma-3-4b-it-vindex-fresh` is the correct
-   one to bench against.
+   one to bench against, *once the layer no-op is fixed*.
 
-4. **Re-run the 0.106 tok/s perf measurement on the fresh vindex.**
-   The original number was on the broken vindex; on `-fresh` the
-   timing should be similar (decode arithmetic doesn't change) but
-   now correctness is established for token 1, so the perf gap
-   diagnosis stands on solid ground.
+4. **Re-run the 0.106 tok/s perf measurement** after #1 lands. The
+   existing number is on a no-op forward and means nothing.
 
 ## Open arcs from here
 
 In order of impact:
 
-1. **Token-N divergence on Gemma 3 4B** — token 1 = "Paris" (correct)
-   but tokens 2-5 drift into multilingual gibberish. Same shape as
-   session-12's C.5e–C.5j arc on Qwen3.6. See "Correctness arc"
-   above for the diagnostic path. **Gates the bench head-to-head —
-   any perf number on the current vindex is meaningless until this
-   lands.**
+1. **Forward layer no-op on Gemma 3 4B** — `predict_q4k_hidden`'s
+   per-layer loop silently returns `None` from
+   `run_layer_with_ffn_with_cache`, leaving residual=embed through
+   all 34 layers. The "Paris" token-1 emission is an embedding-
+   similarity coincidence, not a correctness signal. See
+   "Correctness arc" above for evidence + bisection path.
+   **Gates the bench head-to-head — any perf number on the current
+   vindex is meaningless until this lands.**
 
-2. **CPU Q4K KV cache** — the 153× perf win, *once token-N
-   divergence is fixed*. Wire a KV cache through
+2. **CPU Q4K KV cache** — the 153× perf win, *once the layer no-op
+   is fixed*. Wire a KV cache through
    `crates/larql-inference/src/vindex/q4k_forward/hidden.rs` and
    its attention block. Metal already has it
    (`DecodeBackend::decode_token` + `populate_kv_layer` +
@@ -254,34 +299,41 @@ In order of impact:
 
 ## Quick start prompt for a fresh session
 
-The highest-leverage opening is now the token-N divergence
-investigation. V_proj is fixed (re-extracted vindexes emit `"Paris"`
-correctly as token 1) — the open bug is that tokens 2+ drift.
+The highest-leverage opening is the forward-layer no-op bug — that's
+the actual root cause of every gibberish symptom in this arc.
 
 > Read RESUME_PROMPT_SESSION_2026-05-14.md, specifically the
-> "Correctness arc" section. Status: V_proj corruption is fixed in
-> current code (verified bit-exact on the fresh vindex), and
-> `/v1/chat/completions` on `output/gemma-3-4b-it-vindex-fresh` with
-> prompt `"The capital of France is"` now emits `"Paris"` as token 1
-> (lp -0.0008, matches llama.cpp). But tokens 2-5 drift into
-> multilingual gibberish: `Paris pessoal pohod அச்ச 澼`.
+> "Correctness arc" section. The diagnostic ran end-to-end on
+> 2026-05-22/23. Net finding: every call to
+> `run_layer_with_ffn_with_cache` returns `None` on the Gemma 3 4B
+> fresh vindex, so `predict_q4k_hidden`'s residual stream stays at
+> the input embedding through all 34 layers. Evidence: all 35
+> `cpu_h_embed.f32` + `cpu_layer_NN.f32` dumps from
+> `test_gemma3_layer_health` are bit-identical (same MD5). The
+> "Paris" emission at token 1 is an embedding-similarity coincidence
+> from tied embed/lm_head matrices.
 >
-> Investigate the token-N divergence. The user has
-> `test_gemma3_layer_health.rs` and `profile_4b_decode.rs` staged
-> for per-layer health probes. Mirror session-12's C.5e–C.5j
-> approach on Qwen3.6: dump per-layer residuals from both larql and
-> llama.cpp (via `llama-eval-callback` with `LLAMA_DUMP_BIN_DIR`
-> in `~/3rd-party/llama.cpp/`), find the layer where divergence
-> first exceeds Q6_K rounding noise. The CPU Q4K decode path is
-> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs::predict_q4k_hidden`.
+> Bisect why every layer returns None. The propagation chain:
+> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs` line ~240
+> → `crates/larql-inference/src/forward/layer.rs::run_layer_with_ffn_with_cache`
+> (line 184) → `crates/larql-inference/src/attention/block.rs::run_attention_block_with_kv_out_with_cache`
+> (line 81). Each function uses `?` to propagate `None` from an
+> optional lookup. Likely suspect: some attention key resolution
+> against the vindex manifest (q_proj/k_proj/v_proj/o_proj are in
+> the manifest, but a missing `attn_q_norm`/`attn_k_norm` or a
+> missing `insert_q4k_layer_tensors` side-effect could be the
+> culprit). Easy bisection: `eprintln!` before every `?` in
+> `block.rs:81`'s body.
 >
 > Verify after fix:
 >
-> 1. Token 1 still emits `"Paris"` (don't regress!).
-> 2. Tokens 2-5 are now coherent English (currently
->    `" pessoal", " pohod", "அச்ச", "澼"`).
-> 3. Re-run the bench measurement on the fresh vindex — the 0.106
->    tok/s number was on the May-7 broken vindex.
+> 1. `test_gemma3_layer_health` shows per-layer stats *differ*
+>    (currently all 34 are bit-identical).
+> 2. `/v1/chat/completions` on `output/gemma-3-4b-it-vindex-fresh`
+>    with `"The capital of France is"` emits coherent English
+>    starting from token 1 (currently emits `"Paris"` by accident,
+>    then `" pessoal" " pohod" "அச்ச" "澼"`).
+> 3. Re-run the bench measurement once the forward is real.
 
 Or for the CPU KV cache arc:
 
