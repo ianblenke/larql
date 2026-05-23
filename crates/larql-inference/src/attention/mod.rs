@@ -21,6 +21,7 @@ pub mod dsv4_ffn_block;
 pub mod dsv4_fp8_kv;
 pub mod dsv4_gguf_reader;
 pub mod dsv4_grouped_o_proj;
+pub mod dsv4_hyperparams_load;
 pub mod dsv4_indexer;
 pub mod dsv4_masked_attn;
 pub mod dsv4_mhc;
