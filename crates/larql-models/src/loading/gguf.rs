@@ -214,6 +214,14 @@ impl GgufTensorInfo {
     pub fn shard_idx(&self) -> usize {
         self.shard_idx
     }
+    /// Tensor data offset relative to the owning shard's data section
+    /// start. Combine with [`GgufFile::shard_data_offset`] to get the
+    /// absolute byte offset within the shard file. Exposed so external
+    /// callers can do targeted random-access reads (the DSv4 per-layer
+    /// loader uses this for selective tensor reads).
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
