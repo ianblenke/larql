@@ -61,6 +61,7 @@ impl DsV4Hyperparams {
             rope_mode: self.rope_mode,
             window_size: self.window_size,
             norm_eps: self.norm_eps,
+            yarn: None,
         }
     }
 }

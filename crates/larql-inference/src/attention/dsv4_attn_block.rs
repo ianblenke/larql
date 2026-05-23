@@ -69,10 +69,17 @@ pub struct DsV4AttnBlockParams {
     pub o_lora_rank: usize,
     /// Number of rotated tail dims (the rest are nope).
     pub n_rot: usize,
+    /// RoPE frequency base. Used as-is when `yarn` is `None`.
     pub rope_base: f64,
     pub rope_mode: DsV4RopeMode,
     pub window_size: usize,
     pub norm_eps: f32,
+    /// Optional YARN scaling config. When `Some(_)`, the rope-tail
+    /// calls dispatch to [`super::dsv4_rope_tail_yarn::dsv4_rope_tail_yarn`]
+    /// and the `rope_base` field is shadowed by `yarn.freq_base`.
+    /// Dispatch wiring lands in a follow-up; this field is plumbing
+    /// for now.
+    pub yarn: Option<super::dsv4_yarn_config::DsV4RopeYarnConfig>,
 }
 
 /// Run the DSv4 `compress_ratio == 0` attention block on a single-stream
@@ -263,6 +270,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 16,
             norm_eps: 1e-5,
+            yarn: None,
         };
 
         let n_tokens = 5;
@@ -334,6 +342,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 8,
             norm_eps: 1e-5,
+            yarn: None,
         };
 
         let n_tokens = 3;
@@ -418,6 +427,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 8,
             norm_eps: 1e-5,
+            yarn: None,
         };
         let group_heads = p.n_head / p.n_groups;
         let group_dim = p.head_dim * group_heads;

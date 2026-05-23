@@ -159,6 +159,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 4,
             norm_eps: 1e-5,
+            yarn: None,
         };
         let attn_norm = vec![1.0_f32; 16];
         let wq_a = Array2::<f32>::zeros((4, 16));
@@ -222,6 +223,7 @@ mod tests {
             rope_mode,
             window_size,
             norm_eps,
+            yarn: None,
         };
 
         let attn_norm = vec![1.0_f32; n_embd];
@@ -362,6 +364,7 @@ mod tests {
             rope_mode,
             window_size,
             norm_eps,
+            yarn: None,
         };
         let comp_p = CompressorParams {
             head_dim,
