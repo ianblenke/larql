@@ -2260,6 +2260,19 @@ mod tests {
 
     // Dequant tests are in format::quant::ggml::tests
 
+    /// Serialise the two `split_fused_ssm_ba` tests that mutate
+    /// `LARQL_QWEN3NEXT_SSM_BA_AB`. Without this lock, parallel test
+    /// execution lets the env mutation in `..ab_first_env_swaps_roles`
+    /// race the env read in `..interleaved_rows_per_k_head` and the
+    /// interleaved test sees the flipped convention. Pre-existing bug
+    /// surfaced intermittently on Ubuntu CI.
+    fn ssm_ba_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Lock in the interleaved-per-k_head convention from PR #207.
     ///
     /// llama.cpp's qwen3next interpretation of `mixed_ba = ssm_ba @ x` is
@@ -2273,6 +2286,10 @@ mod tests {
     /// row-halves or flips polarity will fail here.
     #[test]
     fn split_fused_ssm_ba_takes_interleaved_rows_per_k_head() {
+        let _guard = ssm_ba_env_lock();
+        // SAFETY: the lock above prevents the sibling test from racing
+        // this read of LARQL_QWEN3NEXT_SSM_BA_AB.
+        unsafe { std::env::remove_var("LARQL_QWEN3NEXT_SSM_BA_AB") };
         use ndarray::Array2;
         let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
         // ssm_ba shape: 2 * num_v_heads × hidden. Use num_v_heads = 4,
@@ -2322,10 +2339,12 @@ mod tests {
     /// escape-hatch env var still works after PR #207's rewrite.
     #[test]
     fn split_fused_ssm_ba_ab_first_env_swaps_roles() {
+        let _guard = ssm_ba_env_lock();
         use ndarray::Array2;
-        // Set the env var for this test only.
-        // SAFETY: tests in this module aren't run in parallel that share env state.
-        std::env::set_var("LARQL_QWEN3NEXT_SSM_BA_AB", "1");
+        // SAFETY: the lock above serialises this test with the sibling
+        // that reads the same env var; no other code in the test binary
+        // touches LARQL_QWEN3NEXT_SSM_BA_AB.
+        unsafe { std::env::set_var("LARQL_QWEN3NEXT_SSM_BA_AB", "1") };
 
         let mut tensors: HashMap<String, crate::WeightArray> = HashMap::new();
         let mut rows = Vec::with_capacity(8 * 3);
@@ -2338,7 +2357,8 @@ mod tests {
         tensors.insert("layers.0.ssm_ba.weight".to_string(), fused);
 
         split_fused_ssm_ba(&mut tensors);
-        std::env::remove_var("LARQL_QWEN3NEXT_SSM_BA_AB");
+        // SAFETY: see set_var above — serialised by ssm_ba_env_lock().
+        unsafe { std::env::remove_var("LARQL_QWEN3NEXT_SSM_BA_AB") };
 
         // With ab_first=1: β takes rows {2,3,6,7}, α takes rows {0,1,4,5}.
         let beta = tensors.get("layers.0.ssm_beta.weight").unwrap();
