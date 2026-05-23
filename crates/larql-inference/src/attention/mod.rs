@@ -13,6 +13,7 @@ pub mod deltanet_recurrence;
 pub mod deltanet_state;
 pub mod dsv4_attn_block;
 pub mod dsv4_attn_block_compress;
+pub mod dsv4_attn_block_indexer;
 pub mod dsv4_compressor;
 pub mod dsv4_compressor_prefill;
 pub mod dsv4_fp8_kv;
