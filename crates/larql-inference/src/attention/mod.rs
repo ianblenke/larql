@@ -38,6 +38,7 @@ pub mod dsv4_rope_tail;
 pub mod dsv4_storage;
 pub mod dsv4_storage_build;
 pub mod dsv4_swa;
+pub mod dsv4_yarn_config;
 pub mod fine_profile;
 pub mod gpu;
 pub mod gpu_tier;
