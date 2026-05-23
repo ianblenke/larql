@@ -16,6 +16,7 @@ pub mod dsv4_compressor;
 pub mod dsv4_compressor_prefill;
 pub mod dsv4_fp8_kv;
 pub mod dsv4_grouped_o_proj;
+pub mod dsv4_indexer;
 pub mod dsv4_mhc;
 pub mod dsv4_moe_ops;
 pub mod dsv4_rope_tail;
