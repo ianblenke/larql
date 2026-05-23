@@ -957,7 +957,7 @@ pub fn deltanet_block_step_with_optional_projections(
 /// PR #232), `swiglu_moe_lazy_prefill` (4c-scaffold, PR #233), and
 /// this function — share the same multi-position signature shape:
 ///
-/// ```rust
+/// ```text
 /// pub fn deltanet_block_prefill(
 ///     x_seq: &Array2<f32>,
 ///     weights, dims,
