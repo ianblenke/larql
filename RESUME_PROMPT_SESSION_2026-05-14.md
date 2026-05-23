@@ -2,9 +2,10 @@
 
 > Sibling to the GPU-arc `RESUME_PROMPT.md`. The work captured here is
 > orthogonal: it cleaned up CI debt, unblocked the bench measurement
-> that #127 had been blocking, and surfaced one unverified correctness
-> hypothesis (vocab/forward-pass) worth investigating before any
-> further bench claims.
+> that #127 had been blocking, and surfaced a **confirmed correctness
+> bug** that gates any further bench claims — Gemma 3 4B's V_proj
+> weight is corrupted during extraction (Q6_K layout bug in the
+> V-slot writer). See "Confirmed correctness bug" below.
 
 ## What landed today
 
@@ -54,69 +55,106 @@ user-visible speedup.
 See `openspec/changes/bench-vs-llama-cpp-end-to-end-blockers/proposal.md`
 for the full diagnosis and the "HUNG → measurable" transition.
 
-## ⚠ Unverified correctness gap — vocab mismatch hypothesis
+## ⚠ Confirmed correctness bug — V_proj corrupted during extraction
 
 **The 0.106 tok/s number measures throughput, not correctness.** Output
 samples from the run:
 
 - Warmup ("hi", `max_tokens=1`) → `"ům"`
 - 32-token bench → `" Wndې...DeutschesYaml RemLaravel铎 XNUMX∂</ிறு ดู DBHelper..."`
+- 5-token `/v1/chat/completions` ("The capital of France is", greedy):
+  `" ekonomi", "ítja", "óln", "闆", " berlang"`
 - `larql run` direct (no server, earlier in the session) → `"tragedy"`
 
-This is **incoherent**, not just slow. A correct-but-slow forward pass
-should produce coherent text at low tok/s, not multilingual gibberish.
-The output pattern (English-looking tokens like "Wnd", "Tale",
-"Linux" intermixed with Devanagari/Arabic/CJK characters) is
-consistent with a **vocab mismatch** — the model emitting plausibly-
-ranked token *ids* that decode to the wrong *strings*.
+This is **incoherent**, not just slow. Originally hypothesised as a
+vocab mismatch, but the diagnostic checklist ran end-to-end on
+2026-05-22 and proved otherwise — the bug is in extraction, not the
+tokenizer.
 
-The hypothesis was identified in this session but **not investigated**.
-The decode-speed work I documented above is independent of whether the
-output is correct — but any further bench claim, perf chart, or
-"close the gap" PR should validate correctness first.
+### Diagnostic — what's known
 
-### Diagnostic checklist
+| Layer | Status | Evidence |
+|---|---|---|
+| Tokenizer | ✓ healthy | Round-trip on `output/gemma-3-4b-it-vindex/tokenizer.json`: `<bos>=2`, `<start_of_turn>=105`, `<end_of_turn>=106`, vocab size 262145, `"France"` → `[2, 31756]` → `"<bos>France"`. Standard Gemma 3 layout. |
+| GGUF model file | ✓ healthy | `llama-cli` on `output/gguf-cache/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf` with prompt `"The capital of France is"` → emits **`"Paris! 🇫🇷"`**. Same Q4_K_M file the vindex was extracted from. |
+| larql forward pass on this vindex | ✗ broken | Multilingual gibberish from token 0 across every prompt tried. |
+| **V_proj weight in vindex vs GGUF** | ✗ **structurally wrong** | `test_gemma3_v_proj_source_compare` (run 2026-05-22): max abs diff `0.266`, relative max diff **14.86×**, mean abs value of GGUF V_proj only `0.018`. Not quantization rounding — wrong layout or wrong dequant. |
 
-1. **Tokenizer audit.** Compare `output/gemma-3-4b-it-vindex/tokenizer.json`
-   against the canonical Gemma 3 4B tokenizer:
-   - vocab size matches (262208 expected)
-   - special-token IDs match (`<bos>`, `<eos>`, `<start_of_turn>`,
-     `<end_of_turn>`)
-   - first ~100 vocab entries decode identically
-2. **Token-ID parity vs llama.cpp.** Run the same prompt through
-   `llama.cpp` and `larql` and compare the emitted token *IDs* (not
-   the decoded strings) step-by-step:
-   - IDs identical, strings differ → tokenizer mismatch (vocab issue)
-   - IDs differ → forward-pass correctness bug (algorithmic, kernel,
-     or weight load)
-3. **Smoke test on a known-good vindex.** Try
-   `output/gemma-3-1b-it-vindex` (smaller, same family) — does it
-   also produce gibberish? If yes, the bug is family-wide; if no,
-   it's specific to the 4b extraction.
-4. **Compare against `extract` output.** The Gemma 3 4B vindex was
-   extracted at some earlier date with some specific `larql extract`
-   invocation. If we can re-extract from scratch with the current
-   tooling and the output changes, the bug is in extraction; if not,
-   it's in inference.
+### Diagnosis
+
+**Extraction of V_proj (Q6_K leg in the Q4_K_M mix) corrupts the
+weight.** Every attention head's V output is therefore wrong, the
+residual stream is poisoned by layer 1, and 34 layers later the
+lm_head argmax lands on gibberish IDs.
+
+Likely root cause: **Q6_K layout bug in the V-slot writer at
+`crates/larql-vindex/src/format/weights/write_q4k/attn.rs`**. Same
+class of bug as PR #83 in the session-12 arc — sequential vs
+interleaved Q6_K layout. Session-12's fix targeted `lm_head` (which
+also uses Q6_K); the attn-V slot wasn't updated. Both use the same
+`quantize_q6_k` writer; the difference is likely on the read side
+or in the per-row pad/stride handling.
+
+### What's already in flight
+
+The user has these diagnostic test files staged but uncommitted in
+the working tree (parallel session on 2026-05-22):
+
+- `crates/larql-inference/tests/test_gemma3_v_proj_source_compare.rs` —
+  the test that produced the 14.86× ratio above.
+- `crates/larql-inference/tests/test_gemma3_wv_dump.rs` — per-layer V
+  dump for visual inspection.
+- `crates/larql-inference/tests/test_v_proj_writer_roundtrip.rs` —
+  isolates the writer's own round-trip behaviour.
+- `crates/larql-inference/tests/test_q6k_roundtrip.rs` — Q6_K
+  dequant/requant round-trip at the kernel level.
+- `crates/larql-inference/tests/test_gemma3_layer_health.rs` and
+  `profile_4b_decode.rs` — per-layer norm/health probes.
+
+**Don't disturb those files** — the next session continues this arc.
+
+### Recommended next step
+
+Run `test_v_proj_writer_roundtrip` and `test_q6k_roundtrip` first to
+isolate which side of the Q6_K boundary is at fault (writer's
+quantize, reader's dequantize, or padding/stride). Then patch
+`crates/larql-vindex/src/format/weights/write_q4k/attn.rs`'s V slot
+to mirror PR #83's lm_head interleave layout. After re-extracting
+the vindex:
+
+1. `test_gemma3_v_proj_source_compare` should show max abs diff ≪ 0.01
+   (target: within 4× of `quantize_q6_k`'s known per-block rounding,
+   i.e. roughly `4 * 2^-6 * mean_abs ≈ 0.001` for this tensor).
+2. `/v1/chat/completions` on the re-extracted vindex with `"The
+   capital of France is"` should emit `"Paris"` as token 1.
+
+The 0.106 tok/s perf measurement **must be re-run after the
+correctness fix lands** — the existing number is on a broken vindex
+and means nothing as a head-to-head against llama.cpp.
 
 ### Why this matters
 
 The whole point of the bench-vs-llama.cpp arc is a head-to-head perf
 claim. A number that's both 153× slow AND outputting gibberish is two
-unrelated problems wearing one face. Fix correctness first, then the
-perf-gap diagnosis (`O(N²)` no-KV-cache) stands on solid ground.
+unrelated problems wearing one face. The V_proj fix is **gating**:
+without it, the perf-gap diagnosis (`O(N²)` no-KV-cache) is correct
+but academic, because nothing the model emits is meaningful.
 
 ## Open arcs from here
 
 In order of impact:
 
-1. **Verify correctness on Gemma 3 4B** (the diagnostic checklist
-   above). Cheap and gating — should be the next 30 min of work
-   before any further bench effort.
+1. **Fix V_proj extraction** (Q6_K layout bug in the V-slot writer
+   at `crates/larql-vindex/src/format/weights/write_q4k/attn.rs`).
+   See the "Confirmed correctness bug" section above for diagnosis,
+   evidence, and step-by-step fix path. **Gates everything else —
+   any perf number on the current vindex is meaningless until this
+   lands.**
 
-2. **CPU Q4K KV cache** — the 153× perf win. Wire a KV cache
-   through `crates/larql-inference/src/vindex/q4k_forward/hidden.rs`
-   and its attention block. Metal already has it
+2. **CPU Q4K KV cache** — the 153× perf win, *once V_proj is
+   fixed*. Wire a KV cache through
+   `crates/larql-inference/src/vindex/q4k_forward/hidden.rs` and
+   its attention block. Metal already has it
    (`DecodeBackend::decode_token` + `populate_kv_layer` +
    `truncate_kv_cache`); CPU just doesn't use it. Probably 2-3
    focused PRs. Expected: ~10× speedup, closer to llama.cpp CPU.
@@ -178,19 +216,32 @@ In order of impact:
 
 ## Quick start prompt for a fresh session
 
-If the next session picks up where today ended, the highest-leverage
-opening is the correctness check — diagnostic checklist above,
-specifically step 2 (token-ID parity vs llama.cpp). A reasonable
-opening prompt:
+The highest-leverage opening is the correctness fix — the V_proj
+extraction bug is now diagnosed and gating. A reasonable opening
+prompt:
 
-> Read RESUME_PROMPT_SESSION_2026-05-14.md. The 0.106 tok/s bench
-> number locked in today (Gemma 3 4B Q4_K via `/v1/chat/completions`)
-> measures throughput, but output samples were incoherent — could be
-> a vocab mismatch or a forward-pass correctness bug. Run the
-> diagnostic checklist in that file's "Unverified correctness gap"
-> section: tokenizer audit → token-ID parity vs llama.cpp on the
-> same prompt → smoke test the 1B / 270M variants. Report findings
-> in under 200 words; don't fix anything yet — diagnose first.
+> Read RESUME_PROMPT_SESSION_2026-05-14.md, specifically the
+> "Confirmed correctness bug — V_proj corrupted during extraction"
+> section. The diagnosis is: `test_gemma3_v_proj_source_compare`
+> shows 14.86× relative max diff between V_proj as loaded from the
+> Gemma 3 4B GGUF vs as loaded from the larql vindex — extraction is
+> corrupting the V projection's Q6_K leg.
+>
+> Run `test_v_proj_writer_roundtrip` and `test_q6k_roundtrip` first
+> (both already staged in `crates/larql-inference/tests/`) to bisect
+> which side of the Q6_K boundary fails — writer's quantize,
+> reader's dequantize, or the per-row pad/stride handling. Then
+> patch the V slot in
+> `crates/larql-vindex/src/format/weights/write_q4k/attn.rs`
+> mirroring PR #83's lm_head interleave fix. Re-extract the
+> Gemma 3 4B vindex and verify:
+>
+> 1. `test_gemma3_v_proj_source_compare` shows max abs diff ≪ 0.01.
+> 2. `/v1/chat/completions` on the re-extracted vindex with `"The
+>    capital of France is"` emits `"Paris"` as token 1 (currently
+>    emits `" ekonomi"`).
+> 3. Re-run the bench measurement — the 0.106 tok/s number was on a
+>    broken vindex and means nothing as a head-to-head.
 
 Or for the CPU KV cache arc:
 
