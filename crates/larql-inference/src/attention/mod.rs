@@ -24,6 +24,7 @@ pub mod dsv4_indexer;
 pub mod dsv4_masked_attn;
 pub mod dsv4_mhc;
 pub mod dsv4_moe_ops;
+pub mod dsv4_moe_routing;
 pub mod dsv4_rope_tail;
 pub mod dsv4_storage;
 pub mod dsv4_storage_build;
