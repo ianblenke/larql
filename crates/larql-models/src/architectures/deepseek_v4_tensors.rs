@@ -10,13 +10,24 @@
 //! calls per layer).
 //!
 //! Naming convention follows llama.cpp's `LLM_TENSOR_FOO_BAR →
-//! "blk.%d.foo_bar"` (or `"foo_bar"` for non-layered tensors). The
-//! DSv4-specific tensor name strings aren't in the local llama.cpp
-//! checkout's `LLM_TENSOR_NAMES` table yet — the PR may extend it
-//! before merge — so a few of the compressor/HC names are inferred
-//! from the enum naming. If a real DSv4 GGUF uses a different string
-//! for a given tensor, it's a per-entry override in [`tensor_name_of`]
-//! rather than a structural change to the schema.
+//! "blk.%d.foo_bar"` (or `"foo_bar"` for non-layered tensors).
+//!
+//! ## Calibration (2026-05-23)
+//! Schema corrected against the real `DeepSeek-V4-Flash-Q4_K_M.gguf`
+//! artifact (172 GB, 43 layers). Notable deviations from the speculative
+//! initial draft:
+//! - `attn_compress_*` (not `attn_compressor_*`)
+//! - `indexer.compress_*` (dotted, not `indexer_compressor_*`)
+//! - `attn_kv_latent` (not `attn_kv`)
+//! - `attn_output_a/b` (not `attn_out_a/b`)
+//! - `hc_head_*` for the output bookend (not `output_hc_*`)
+//! - Several tensors carry **no `.weight` suffix**: `attn_sinks`,
+//!   `attn_compress_ape`, `indexer.compress_ape`, `hc_attn_*`,
+//!   `hc_ffn_*`, `hc_head_*`, `exp_probs_b`, `ffn_gate_tid2eid`.
+//! - `exp_probs_b` (drop `ffn_` prefix and `.bias` suffix).
+//!
+//! See `crates/larql-models/examples/dsv4_inspect.rs` for the inspector
+//! that produced these corrections.
 //!
 //! ## Tensors per layer
 //! - Attention:
@@ -49,6 +60,20 @@
 //!   at the head)
 
 use std::fmt;
+
+/// Suffix carried by a GGUF tensor name. Most weights end in `.weight`,
+/// a few end in `.bias`, and some DSv4 tensors carry **no suffix at
+/// all** (e.g. `blk.0.attn_sinks`, `blk.0.hc_attn_fn`). The schema
+/// tracks the suffix per kind so the formatter / parser produce and
+/// accept the right strings.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TensorSuffix {
+    Weight,
+    Bias,
+    /// No suffix — the name is just `blk.N.stem` (per-layer) or
+    /// `stem` (global).
+    None,
+}
 
 /// Kind of DSv4 tensor — covers every weight the reference forward
 /// path consumes. Variants are split into per-layer (require a layer
@@ -126,40 +151,43 @@ impl DsV4TensorKind {
             DsV4TensorKind::TokenEmbd => "token_embd",
             DsV4TensorKind::OutputNorm => "output_norm",
             DsV4TensorKind::Output => "output",
-            DsV4TensorKind::OutputHcBase => "output_hc_base",
-            DsV4TensorKind::OutputHcFn => "output_hc_fn",
-            DsV4TensorKind::OutputHcScale => "output_hc_scale",
+            // Output mHC bookend: actual GGUF uses "hc_head_*" (not "output_hc_*").
+            DsV4TensorKind::OutputHcBase => "hc_head_base",
+            DsV4TensorKind::OutputHcFn => "hc_head_fn",
+            DsV4TensorKind::OutputHcScale => "hc_head_scale",
             DsV4TensorKind::AttnNorm => "attn_norm",
             DsV4TensorKind::AttnQA => "attn_q_a",
             DsV4TensorKind::AttnQANorm => "attn_q_a_norm",
             DsV4TensorKind::AttnQB => "attn_q_b",
-            DsV4TensorKind::AttnKv => "attn_kv",
+            // Real GGUF name: "attn_kv_latent" (not "attn_kv").
+            DsV4TensorKind::AttnKv => "attn_kv_latent",
             DsV4TensorKind::AttnKvANorm => "attn_kv_a_norm",
             DsV4TensorKind::AttnSinks => "attn_sinks",
-            DsV4TensorKind::AttnOutA => "attn_out_a",
-            DsV4TensorKind::AttnOutB => "attn_out_b",
+            // Real GGUF names: "attn_output_a/b" (not "attn_out_a/b").
+            DsV4TensorKind::AttnOutA => "attn_output_a",
+            DsV4TensorKind::AttnOutB => "attn_output_b",
             DsV4TensorKind::HcAttnBase => "hc_attn_base",
             DsV4TensorKind::HcAttnFn => "hc_attn_fn",
             DsV4TensorKind::HcAttnScale => "hc_attn_scale",
             DsV4TensorKind::HcFfnBase => "hc_ffn_base",
             DsV4TensorKind::HcFfnFn => "hc_ffn_fn",
             DsV4TensorKind::HcFfnScale => "hc_ffn_scale",
-            DsV4TensorKind::AttnCompressorKv => "attn_compressor_kv",
-            DsV4TensorKind::AttnCompressorGate => "attn_compressor_gate",
-            DsV4TensorKind::AttnCompressorApe => "attn_compressor_ape",
-            DsV4TensorKind::AttnCompressorNorm => "attn_compressor_norm",
-            DsV4TensorKind::IndexerCompressorKv => "indexer_compressor_kv",
-            DsV4TensorKind::IndexerCompressorGate => "indexer_compressor_gate",
-            DsV4TensorKind::IndexerCompressorApe => "indexer_compressor_ape",
-            DsV4TensorKind::IndexerCompressorNorm => "indexer_compressor_norm",
-            // The two existing indexer tensors that ARE in the local
-            // llama-arch.cpp use the "indexer.attn_q_b" / "indexer.proj"
-            // dotted form — pin that here to match the actual GGUFs.
+            // Real GGUF names: "attn_compress_*" (not "attn_compressor_*").
+            DsV4TensorKind::AttnCompressorKv => "attn_compress_kv",
+            DsV4TensorKind::AttnCompressorGate => "attn_compress_gate",
+            DsV4TensorKind::AttnCompressorApe => "attn_compress_ape",
+            DsV4TensorKind::AttnCompressorNorm => "attn_compress_norm",
+            // Real GGUF names: "indexer.compress_*" (dotted, no "or").
+            DsV4TensorKind::IndexerCompressorKv => "indexer.compress_kv",
+            DsV4TensorKind::IndexerCompressorGate => "indexer.compress_gate",
+            DsV4TensorKind::IndexerCompressorApe => "indexer.compress_ape",
+            DsV4TensorKind::IndexerCompressorNorm => "indexer.compress_norm",
             DsV4TensorKind::IndexerAttnQB => "indexer.attn_q_b",
             DsV4TensorKind::IndexerProj => "indexer.proj",
             DsV4TensorKind::FfnNorm => "ffn_norm",
             DsV4TensorKind::FfnGateInp => "ffn_gate_inp",
-            DsV4TensorKind::FfnExpProbsB => "ffn_exp_probs_b",
+            // Real GGUF name: "exp_probs_b" (no "ffn_" prefix).
+            DsV4TensorKind::FfnExpProbsB => "exp_probs_b",
             DsV4TensorKind::FfnGateTid2Eid => "ffn_gate_tid2eid",
             DsV4TensorKind::FfnGateExps => "ffn_gate_exps",
             DsV4TensorKind::FfnDownExps => "ffn_down_exps",
@@ -170,19 +198,29 @@ impl DsV4TensorKind {
         }
     }
 
-    /// True iff this is a `.bias` tensor (`ffn_exp_probs_b`) rather than
-    /// a `.weight`. The DSv4 schema is almost all `.weight`; only the
-    /// expert-prob bias is the exception.
-    pub fn is_bias(self) -> bool {
-        matches!(self, DsV4TensorKind::FfnExpProbsB)
-    }
-
-    /// `.weight` / `.bias` suffix the loader should look for.
-    pub fn suffix(self) -> &'static str {
-        if self.is_bias() {
-            "bias"
-        } else {
-            "weight"
+    /// GGUF tensor-name suffix carried by this kind. Most tensors are
+    /// `.weight`; a few DSv4-specific ones carry **no suffix** (see
+    /// [`TensorSuffix::None`]). The DSv4 GGUF format doesn't currently
+    /// produce any `.bias` tensors — `exp_probs_b` was speculative;
+    /// the real artifact stores it as just `blk.N.exp_probs_b`.
+    pub fn tensor_suffix(self) -> TensorSuffix {
+        match self {
+            // No-suffix variants observed in DeepSeek-V4-Flash GGUF.
+            DsV4TensorKind::AttnSinks
+            | DsV4TensorKind::AttnCompressorApe
+            | DsV4TensorKind::IndexerCompressorApe
+            | DsV4TensorKind::HcAttnBase
+            | DsV4TensorKind::HcAttnFn
+            | DsV4TensorKind::HcAttnScale
+            | DsV4TensorKind::HcFfnBase
+            | DsV4TensorKind::HcFfnFn
+            | DsV4TensorKind::HcFfnScale
+            | DsV4TensorKind::OutputHcBase
+            | DsV4TensorKind::OutputHcFn
+            | DsV4TensorKind::OutputHcScale
+            | DsV4TensorKind::FfnExpProbsB
+            | DsV4TensorKind::FfnGateTid2Eid => TensorSuffix::None,
+            _ => TensorSuffix::Weight,
         }
     }
 }
@@ -196,15 +234,20 @@ impl fmt::Display for DsV4TensorKind {
 /// Build the GGUF tensor name for a `(kind, layer_index)` pair.
 ///
 /// For global tensors `layer_index` is ignored. For per-layer tensors,
-/// the form is `"blk.{layer_index}.{stem}.{suffix}"`. For global, it's
-/// `"{stem}.{suffix}"`.
+/// the form is `"blk.{layer_index}.{stem}[.{suffix}]"`. For global, it's
+/// `"{stem}[.{suffix}]"`. Suffix is omitted when
+/// `tensor_suffix() == TensorSuffix::None`.
 pub fn tensor_name_of(kind: DsV4TensorKind, layer_index: usize) -> String {
     let stem = kind.stem();
-    let suffix = kind.suffix();
+    let suffix_str = match kind.tensor_suffix() {
+        TensorSuffix::Weight => ".weight",
+        TensorSuffix::Bias => ".bias",
+        TensorSuffix::None => "",
+    };
     if kind.is_per_layer() {
-        format!("blk.{layer_index}.{stem}.{suffix}")
+        format!("blk.{layer_index}.{stem}{suffix_str}")
     } else {
-        format!("{stem}.{suffix}")
+        format!("{stem}{suffix_str}")
     }
 }
 
@@ -214,29 +257,51 @@ pub fn tensor_name_of(kind: DsV4TensorKind, layer_index: usize) -> String {
 /// Returns `None` for names that don't fit the DSv4 pattern (e.g.
 /// tensors from a different architecture).
 pub fn try_parse_name(name: &str) -> Option<(DsV4TensorKind, Option<usize>)> {
-    // Strip the suffix.
-    let (head, suffix) = name.rsplit_once('.')?;
-    if suffix != "weight" && suffix != "bias" {
-        return None;
-    }
-
-    // Per-layer? "blk.N.<stem>"
-    if let Some(rest) = head.strip_prefix("blk.") {
-        let (idx_str, stem) = rest.split_once('.')?;
-        let layer: usize = idx_str.parse().ok()?;
-        let kind = kind_from_stem(stem)?;
-        if !kind.is_per_layer() {
+    // Try with a .weight / .bias suffix first; if that fails, accept
+    // a no-suffix form (for the DSv4 tensors that omit it).
+    let parse = |head: &str, expect_kind: Option<DsV4TensorKind>| {
+        if let Some(rest) = head.strip_prefix("blk.") {
+            let (idx_str, stem) = rest.split_once('.')?;
+            let layer: usize = idx_str.parse().ok()?;
+            let kind = kind_from_stem(stem)?;
+            if !kind.is_per_layer() {
+                return None;
+            }
+            if let Some(ek) = expect_kind {
+                if kind != ek {
+                    return None;
+                }
+            }
+            return Some((kind, Some(layer)));
+        }
+        let kind = kind_from_stem(head)?;
+        if kind.is_per_layer() {
             return None;
         }
-        return Some((kind, Some(layer)));
-    }
+        if let Some(ek) = expect_kind {
+            if kind != ek {
+                return None;
+            }
+        }
+        Some((kind, None))
+    };
 
-    // Global tensor.
-    let kind = kind_from_stem(head)?;
-    if kind.is_per_layer() {
-        return None;
+    if let Some((head, suffix)) = name.rsplit_once('.') {
+        if suffix == "weight" || suffix == "bias" {
+            if let Some((kind, layer)) = parse(head, None) {
+                let want = match kind.tensor_suffix() {
+                    TensorSuffix::Weight => suffix == "weight",
+                    TensorSuffix::Bias => suffix == "bias",
+                    TensorSuffix::None => false,
+                };
+                if want {
+                    return Some((kind, layer));
+                }
+            }
+        }
     }
-    Some((kind, None))
+    // Fall through: no-suffix form.
+    parse(name, None).filter(|(k, _)| k.tensor_suffix() == TensorSuffix::None)
 }
 
 fn kind_from_stem(stem: &str) -> Option<DsV4TensorKind> {
@@ -245,37 +310,37 @@ fn kind_from_stem(stem: &str) -> Option<DsV4TensorKind> {
         "token_embd" => TokenEmbd,
         "output_norm" => OutputNorm,
         "output" => Output,
-        "output_hc_base" => OutputHcBase,
-        "output_hc_fn" => OutputHcFn,
-        "output_hc_scale" => OutputHcScale,
+        "hc_head_base" => OutputHcBase,
+        "hc_head_fn" => OutputHcFn,
+        "hc_head_scale" => OutputHcScale,
         "attn_norm" => AttnNorm,
         "attn_q_a" => AttnQA,
         "attn_q_a_norm" => AttnQANorm,
         "attn_q_b" => AttnQB,
-        "attn_kv" => AttnKv,
+        "attn_kv_latent" => AttnKv,
         "attn_kv_a_norm" => AttnKvANorm,
         "attn_sinks" => AttnSinks,
-        "attn_out_a" => AttnOutA,
-        "attn_out_b" => AttnOutB,
+        "attn_output_a" => AttnOutA,
+        "attn_output_b" => AttnOutB,
         "hc_attn_base" => HcAttnBase,
         "hc_attn_fn" => HcAttnFn,
         "hc_attn_scale" => HcAttnScale,
         "hc_ffn_base" => HcFfnBase,
         "hc_ffn_fn" => HcFfnFn,
         "hc_ffn_scale" => HcFfnScale,
-        "attn_compressor_kv" => AttnCompressorKv,
-        "attn_compressor_gate" => AttnCompressorGate,
-        "attn_compressor_ape" => AttnCompressorApe,
-        "attn_compressor_norm" => AttnCompressorNorm,
-        "indexer_compressor_kv" => IndexerCompressorKv,
-        "indexer_compressor_gate" => IndexerCompressorGate,
-        "indexer_compressor_ape" => IndexerCompressorApe,
-        "indexer_compressor_norm" => IndexerCompressorNorm,
+        "attn_compress_kv" => AttnCompressorKv,
+        "attn_compress_gate" => AttnCompressorGate,
+        "attn_compress_ape" => AttnCompressorApe,
+        "attn_compress_norm" => AttnCompressorNorm,
+        "indexer.compress_kv" => IndexerCompressorKv,
+        "indexer.compress_gate" => IndexerCompressorGate,
+        "indexer.compress_ape" => IndexerCompressorApe,
+        "indexer.compress_norm" => IndexerCompressorNorm,
         "indexer.attn_q_b" => IndexerAttnQB,
         "indexer.proj" => IndexerProj,
         "ffn_norm" => FfnNorm,
         "ffn_gate_inp" => FfnGateInp,
-        "ffn_exp_probs_b" => FfnExpProbsB,
+        "exp_probs_b" => FfnExpProbsB,
         "ffn_gate_tid2eid" => FfnGateTid2Eid,
         "ffn_gate_exps" => FfnGateExps,
         "ffn_down_exps" => FfnDownExps,
@@ -363,17 +428,63 @@ mod tests {
             tensor_name_of(DsV4TensorKind::TokenEmbd, 0),
             "token_embd.weight"
         );
+        // OutputHcFn has TensorSuffix::None and uses the "hc_head_*" stem.
         assert_eq!(
             tensor_name_of(DsV4TensorKind::OutputHcFn, 999),
-            "output_hc_fn.weight"
+            "hc_head_fn"
         );
     }
 
+    /// `exp_probs_b` carries no suffix in the real GGUF.
     #[test]
-    fn ffn_exp_probs_b_uses_bias_suffix() {
+    fn exp_probs_b_has_no_suffix() {
         assert_eq!(
             tensor_name_of(DsV4TensorKind::FfnExpProbsB, 3),
-            "blk.3.ffn_exp_probs_b.bias"
+            "blk.3.exp_probs_b"
+        );
+        assert_eq!(
+            DsV4TensorKind::FfnExpProbsB.tensor_suffix(),
+            TensorSuffix::None
+        );
+    }
+
+    /// Several mHC/sinks/ape tensors carry no `.weight` suffix.
+    #[test]
+    fn no_suffix_variants_format_without_dot_weight() {
+        for (kind, expected) in [
+            (DsV4TensorKind::AttnSinks, "blk.5.attn_sinks"),
+            (DsV4TensorKind::HcAttnFn, "blk.5.hc_attn_fn"),
+            (DsV4TensorKind::HcFfnScale, "blk.5.hc_ffn_scale"),
+            (DsV4TensorKind::AttnCompressorApe, "blk.5.attn_compress_ape"),
+            (
+                DsV4TensorKind::IndexerCompressorApe,
+                "blk.5.indexer.compress_ape",
+            ),
+            (DsV4TensorKind::FfnGateTid2Eid, "blk.5.ffn_gate_tid2eid"),
+        ] {
+            assert_eq!(tensor_name_of(kind, 5), expected, "kind={kind:?}");
+            assert_eq!(kind.tensor_suffix(), TensorSuffix::None);
+        }
+    }
+
+    /// Renamed kinds use the calibrated names from the real DSv4 GGUF.
+    #[test]
+    fn renamed_kinds_match_real_gguf() {
+        assert_eq!(
+            tensor_name_of(DsV4TensorKind::AttnKv, 7),
+            "blk.7.attn_kv_latent.weight"
+        );
+        assert_eq!(
+            tensor_name_of(DsV4TensorKind::AttnOutA, 7),
+            "blk.7.attn_output_a.weight"
+        );
+        assert_eq!(
+            tensor_name_of(DsV4TensorKind::AttnCompressorKv, 7),
+            "blk.7.attn_compress_kv.weight"
+        );
+        assert_eq!(
+            tensor_name_of(DsV4TensorKind::IndexerCompressorGate, 7),
+            "blk.7.indexer.compress_gate.weight"
         );
     }
 

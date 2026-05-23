@@ -145,13 +145,12 @@ mod tests {
         assert!(out.contains_key(&DsV4TensorKind::IndexerProj));
     }
 
+    /// `exp_probs_b` carries no suffix in the real DSv4 GGUF (the
+    /// schema was speculative in initial draft — calibrated 2026-05-23).
     #[test]
-    fn rekey_handles_bias_suffix() {
+    fn rekey_handles_no_suffix_exp_probs_b() {
         let mut raw: HashMap<String, Vec<f32>> = HashMap::new();
-        raw.insert(
-            "blk.2.ffn_exp_probs_b.bias".to_string(),
-            vec![1.0, 2.0, 3.0],
-        );
+        raw.insert("blk.2.exp_probs_b".to_string(), vec![1.0, 2.0, 3.0]);
         let out = rekey_dsv4_layer_tensors(raw, 2);
         assert_eq!(out.len(), 1);
         assert_eq!(
