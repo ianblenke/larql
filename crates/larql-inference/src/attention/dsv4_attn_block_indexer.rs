@@ -1,0 +1,534 @@
+//! DeepSeek V4 attention block — `compress_ratio == 4`, indexer path.
+//!
+//! Sibling to:
+//! - [`super::dsv4_attn_block::dsv4_attn_block_no_compress`] (compress_ratio=0)
+//! - [`super::dsv4_attn_block_compress::dsv4_attn_block_compress_no_indexer`] (compress_ratio!=4)
+//!
+//! For `compress_ratio == 4`, DSv4 adds a **second** smaller compressor
+//! (the "indexer") whose output drives a top-k sparse-attention mask
+//! over the main compressed positions. Per-token, only the top-k
+//! compressed positions ranked by the indexer survive the mask; the
+//! rest are -∞.
+//!
+//! Pipeline:
+//!
+//! 1. Pre-norm → cur
+//! 2. Q low-rank → qr (shared with the indexer), then up + per-head
+//!    norm + tail-RoPE
+//! 3. Raw KV low-rank + tail-RoPE + FP8
+//! 4. Main compressor → main_kv_comp (head_dim) + FP8
+//! 5. **Indexer compressor** → index_kv (indexer_head_size, smaller)
+//! 6. **Indexer scores** via [`dsv4_build_indexer_scores_prefill`] using
+//!    `(x, qr, index_kv)` and the indexer's per-head wq_b/wproj weights.
+//!    Mask the scores with a causal "chunk c visible iff fully past"
+//!    pattern.
+//! 7. **Argsort top-k** on the indexer scores
+//! 8. **Sparse compressed mask** via
+//!    [`dsv4_build_compressed_mask_from_topk`]
+//! 9. **Raw-window mask** over the raw KV portion (causal + sliding-window)
+//! 10. Concat raw-window mask + sparse compressed mask along columns
+//!     → `(n_tokens, n_tokens + n_comp)` full attention mask
+//! 11. Concat raw KV + main compressed KV → combined K=V
+//! 12. Masked MQA + grouped o-proj
+//!
+//! Reference: llama.cpp PR #23122 `src/models/deepseek4.cpp:1230-1308`
+//! (the `if (compress_ratio == 4)` indexer branch).
+
+use ndarray::{s, Array2, ArrayView2};
+
+use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights};
+use super::dsv4_compressor_prefill::{
+    build_compressor_prefill, CompressorParams, CompressorWeights,
+};
+use super::dsv4_fp8_kv::fp8_kv_quantize;
+use super::dsv4_grouped_o_proj::grouped_o_proj;
+use super::dsv4_indexer::{
+    argsort_top_k, build_compressed_mask_from_topk, build_indexer_scores_prefill, IndexerParams,
+    IndexerWeights,
+};
+use super::dsv4_masked_attn::dsv4_masked_attn;
+use super::dsv4_rope_tail::dsv4_rope_tail;
+
+/// Combined weights for the HCA-with-indexer block.
+#[derive(Clone, Copy)]
+pub struct DsV4AttnBlockIndexerWeights<'a> {
+    /// Standard attention weights (Wq_a, Wq_b, Wkv, Wo_a, Wo_b, etc.).
+    pub attn: DsV4AttnBlockWeights<'a>,
+    /// Main compressor (full head_dim, compress_ratio=4, coff=2).
+    pub compressor: CompressorWeights<'a>,
+    /// Indexer compressor (indexer_head_size, compress_ratio=4, coff=2).
+    pub indexer_compressor: CompressorWeights<'a>,
+    /// Indexer score weights (wq_b, wproj).
+    pub indexer: IndexerWeights<'a>,
+}
+
+/// Combined params for the HCA-with-indexer block.
+#[derive(Clone, Copy, Debug)]
+pub struct DsV4AttnBlockIndexerParams {
+    pub attn: DsV4AttnBlockParams,
+    pub compressor: CompressorParams,
+    pub indexer_compressor: CompressorParams,
+    pub indexer: IndexerParams,
+    pub top_k: usize,
+}
+
+/// Run the HCA-with-indexer attention block. Requires
+/// `compress_ratio == 4` on both compressors and `top_k > 0`.
+pub fn dsv4_attn_block_compress_with_indexer(
+    x: ArrayView2<f32>,
+    w: &DsV4AttnBlockIndexerWeights,
+    p: &DsV4AttnBlockIndexerParams,
+    position_offset: usize,
+) -> Array2<f32> {
+    let n_tokens = x.shape()[0];
+    assert_eq!(x.shape(), &[n_tokens, p.attn.n_embd]);
+    assert_eq!(
+        p.compressor.compress_ratio, 4,
+        "indexer path requires compress_ratio = 4 on main compressor"
+    );
+    assert_eq!(
+        p.indexer_compressor.compress_ratio, 4,
+        "indexer path requires compress_ratio = 4 on indexer compressor"
+    );
+    assert_eq!(
+        p.attn.head_dim, p.compressor.head_dim,
+        "attn and main-compressor head_dim must match"
+    );
+    assert_eq!(
+        p.attn.n_embd, p.compressor.n_embd,
+        "attn and main-compressor n_embd must match"
+    );
+    assert_eq!(
+        p.indexer_compressor.head_dim, p.indexer.n_index_head_size,
+        "indexer_compressor head_dim must equal indexer.n_index_head_size"
+    );
+    assert!(p.top_k > 0, "top_k must be > 0");
+
+    // 1. attn_norm.
+    let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
+
+    // 2. Q low-rank: qr is shared with the indexer.
+    let qr = matmul_x_wt(cur.view(), w.attn.wq_a);
+    let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
+    let q = matmul_x_wt(qr.view(), w.attn.wq_b);
+    let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
+    let q = dsv4_rope_tail(
+        &q,
+        p.attn.n_head,
+        p.attn.head_dim,
+        p.attn.n_rot,
+        p.attn.rope_base,
+        p.attn.rope_mode,
+        false,
+        position_offset,
+    );
+
+    // 3. Raw KV low-rank.
+    let kv_raw = matmul_x_wt(cur.view(), w.attn.wkv);
+    let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
+    let kv_raw = dsv4_rope_tail(
+        &kv_raw,
+        1,
+        p.attn.head_dim,
+        p.attn.n_rot,
+        p.attn.rope_base,
+        p.attn.rope_mode,
+        false,
+        position_offset,
+    );
+    let kv_raw = fp8_kv_quantize(kv_raw.view(), p.attn.n_rot);
+
+    // 4. Main compressed KV.
+    let kv_comp_pre = build_compressor_prefill(cur.view(), &w.compressor, &p.compressor);
+    let kv_comp = fp8_kv_quantize(kv_comp_pre.view(), p.attn.n_rot);
+    let n_comp = kv_comp.shape()[0];
+
+    // 5. Indexer compressed KV (smaller head_dim = indexer_head_size).
+    //    No FP8 quant — the indexer uses lower-precision math anyway via
+    //    the scaled per-head weights, and the reference doesn't quant
+    //    the indexer's KV.
+    let index_kv =
+        build_compressor_prefill(cur.view(), &w.indexer_compressor, &p.indexer_compressor);
+    assert_eq!(
+        index_kv.shape(),
+        &[n_comp, p.indexer.n_index_head_size],
+        "indexer_compressor should produce n_comp rows of indexer_head_size dim"
+    );
+
+    // 6. Indexer scores with a per-(token, comp) causal mask.
+    let indexer_causal_mask = build_indexer_causal_mask(
+        n_tokens,
+        n_comp,
+        position_offset,
+        p.compressor.compress_ratio,
+    );
+    let index_scores = build_indexer_scores_prefill(
+        x,
+        qr.view(),
+        index_kv.view(),
+        indexer_causal_mask.view(),
+        &w.indexer,
+        &p.indexer,
+    );
+
+    // 7. Argsort top-k.
+    let top_k = p.top_k.min(n_comp);
+    let topk = argsort_top_k(index_scores.view(), top_k);
+
+    // 8. Sparse compressed mask `(n_tokens, n_comp)`.
+    let comp_mask = build_compressed_mask_from_topk(index_scores.view(), topk.view());
+
+    // 9. Raw-window mask `(n_tokens, n_tokens)`.
+    let raw_mask = build_raw_window_mask(n_tokens, position_offset, p.attn.window_size);
+
+    // 10. Concat: `(n_tokens, n_tokens + n_comp)`.
+    let mut full_mask = Array2::<f32>::zeros((n_tokens, n_tokens + n_comp));
+    full_mask.slice_mut(s![.., ..n_tokens]).assign(&raw_mask);
+    full_mask.slice_mut(s![.., n_tokens..]).assign(&comp_mask);
+
+    // 11. Concat raw + compressed K/V along the n_kv axis.
+    let mut kv_cat = Array2::<f32>::zeros((n_tokens + n_comp, p.attn.head_dim));
+    kv_cat.slice_mut(s![..n_tokens, ..]).assign(&kv_raw);
+    kv_cat.slice_mut(s![n_tokens.., ..]).assign(&kv_comp);
+
+    // 12. Masked MQA.
+    let scale = 1.0 / (p.attn.head_dim as f32).sqrt();
+    let o = dsv4_masked_attn(
+        q.view(),
+        kv_cat.view(),
+        kv_cat.view(),
+        full_mask.view(),
+        p.attn.n_head,
+        p.attn.head_dim,
+        w.attn.attn_sinks,
+        scale,
+    );
+
+    grouped_o_proj(
+        o.view(),
+        w.attn.wo_a,
+        w.attn.wo_b,
+        p.attn.n_head,
+        p.attn.head_dim,
+        p.attn.n_groups,
+        p.attn.o_lora_rank,
+    )
+}
+
+/// Build the `(n_tokens, n_comp)` causal mask used by the indexer:
+/// query at absolute position `p_t` sees compressed chunk c iff
+/// `(c + 1) * ratio <= p_t + 1`.
+pub fn build_indexer_causal_mask(
+    n_tokens: usize,
+    n_comp: usize,
+    position_offset: usize,
+    compress_ratio: usize,
+) -> Array2<f32> {
+    let mut m = Array2::<f32>::from_elem((n_tokens, n_comp), f32::NEG_INFINITY);
+    for t in 0..n_tokens {
+        let abs_pos = position_offset + t;
+        let c_visible = (abs_pos + 1) / compress_ratio;
+        for c in 0..c_visible.min(n_comp) {
+            m[[t, c]] = 0.0;
+        }
+    }
+    m
+}
+
+/// Build the `(n_tokens, n_tokens)` causal sliding-window mask over the
+/// raw KV portion of the attention.
+pub fn build_raw_window_mask(
+    n_tokens: usize,
+    position_offset: usize,
+    window_size: usize,
+) -> Array2<f32> {
+    let mut m = Array2::<f32>::from_elem((n_tokens, n_tokens), f32::NEG_INFINITY);
+    for t in 0..n_tokens {
+        let abs_pos = position_offset + t;
+        let j_lo = abs_pos.saturating_sub(window_size - 1);
+        let j_hi = abs_pos;
+        for j in j_lo..=j_hi.min(n_tokens - 1) {
+            m[[t, j]] = 0.0;
+        }
+    }
+    m
+}
+
+// ── Shared helpers (mirrors `dsv4_attn_block.rs`) ────────────────────
+
+fn rms_norm_2d(x: ArrayView2<f32>, weight: &[f32], eps: f32) -> Array2<f32> {
+    let n_rows = x.shape()[0];
+    let n_dims = x.shape()[1];
+    assert_eq!(weight.len(), n_dims);
+    let mut out = Array2::<f32>::zeros((n_rows, n_dims));
+    for t in 0..n_rows {
+        let mut sumsq = 0.0_f32;
+        for d in 0..n_dims {
+            let v = x[[t, d]];
+            sumsq += v * v;
+        }
+        let inv = 1.0 / (sumsq / n_dims as f32 + eps).sqrt();
+        for d in 0..n_dims {
+            out[[t, d]] = x[[t, d]] * inv * weight[d];
+        }
+    }
+    out
+}
+
+fn rms_norm_per_head(x: ArrayView2<f32>, n_head: usize, head_dim: usize, eps: f32) -> Array2<f32> {
+    let n_tokens = x.shape()[0];
+    assert_eq!(x.shape(), &[n_tokens, n_head * head_dim]);
+    let mut out = Array2::<f32>::zeros((n_tokens, n_head * head_dim));
+    for t in 0..n_tokens {
+        for h in 0..n_head {
+            let off = h * head_dim;
+            let mut sumsq = 0.0_f32;
+            for d in 0..head_dim {
+                let v = x[[t, off + d]];
+                sumsq += v * v;
+            }
+            let inv = 1.0 / (sumsq / head_dim as f32 + eps).sqrt();
+            for d in 0..head_dim {
+                out[[t, off + d]] = x[[t, off + d]] * inv;
+            }
+        }
+    }
+    out
+}
+
+fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
+    let n_tokens = x.shape()[0];
+    let n_in = x.shape()[1];
+    let n_out = w.shape()[0];
+    assert_eq!(w.shape()[1], n_in);
+    let mut out = Array2::<f32>::zeros((n_tokens, n_out));
+    for t in 0..n_tokens {
+        for k in 0..n_out {
+            let mut acc = 0.0_f32;
+            for j in 0..n_in {
+                acc += x[[t, j]] * w[[k, j]];
+            }
+            out[[t, k]] = acc;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::dsv4_rope_tail::DsV4RopeMode;
+    use super::*;
+    use ndarray::{Array1, Array3};
+
+    /// Smoke: full indexer-path block with compress_ratio=4 produces
+    /// finite, non-trivial output. Verifies the entire 12-step pipeline
+    /// composes without shape/type errors.
+    #[test]
+    fn block_with_indexer_smoke() {
+        let n_tokens = 16; // n_comp = 4 with ratio=4
+        let n_embd = 64;
+        let n_head = 4;
+        let head_dim = 64; // n_nope = 64, n_rot = 0
+        let q_lora_rank = 16;
+        let n_groups = 2;
+        let o_lora_rank = 8;
+        let indexer_head_size = 16;
+        let n_index_head = 2;
+        let top_k = 2;
+
+        let attn_p = DsV4AttnBlockParams {
+            n_embd,
+            n_head,
+            head_dim,
+            q_lora_rank,
+            n_groups,
+            o_lora_rank,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            window_size: 8,
+            norm_eps: 1e-5,
+        };
+        let comp_p = CompressorParams {
+            head_dim,
+            n_embd,
+            compress_ratio: 4,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let idx_comp_p = CompressorParams {
+            head_dim: indexer_head_size,
+            n_embd,
+            compress_ratio: 4,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let idx_p = IndexerParams {
+            n_embd,
+            q_lora_rank,
+            n_index_head,
+            n_index_head_size: indexer_head_size,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+        };
+        let p = DsV4AttnBlockIndexerParams {
+            attn: attn_p,
+            compressor: comp_p,
+            indexer_compressor: idx_comp_p,
+            indexer: idx_p,
+            top_k,
+        };
+
+        // ── Weights ──
+        let group_heads = n_head / n_groups;
+        let group_dim = head_dim * group_heads;
+        let low_dim = o_lora_rank * n_groups;
+
+        let attn_norm = vec![1.0_f32; n_embd];
+        let wq_a = Array2::<f32>::from_shape_fn((q_lora_rank, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.01).sin()
+        });
+        let q_a_norm = vec![1.0_f32; q_lora_rank];
+        let wq_b = Array2::<f32>::from_shape_fn((n_head * head_dim, q_lora_rank), |(i, j)| {
+            ((i + j) as f32 * 0.013).cos() * 0.1
+        });
+        let wkv = Array2::<f32>::from_shape_fn((head_dim, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.007).sin() * 0.05
+        });
+        let kv_a_norm = vec![1.0_f32; head_dim];
+        let wo_a = Array3::<f32>::from_shape_fn((n_groups, o_lora_rank, group_dim), |(g, r, j)| {
+            ((g + r + j) as f32 * 0.005).cos() * 0.05
+        });
+        let wo_b = Array2::<f32>::from_shape_fn((n_embd, low_dim), |(i, j)| {
+            ((i + j) as f32 * 0.011).sin() * 0.1
+        });
+        let attn_sinks = Array1::<f32>::from_elem(n_head, -1.0);
+
+        // Main compressor (coff=2 for compress_ratio=4): n_kv = 2 * head_dim
+        let main_n_kv = 2 * head_dim;
+        let comp_wkv = Array2::<f32>::from_shape_fn((main_n_kv, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.013).cos() * 0.05
+        });
+        let comp_wgate = Array2::<f32>::from_shape_fn((main_n_kv, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.017).sin() * 0.05
+        });
+        let comp_ape = Array2::<f32>::from_shape_fn((4, main_n_kv), |(r, k)| {
+            ((r + k) as f32 * 0.03).sin() * 0.05
+        });
+        let comp_norm = vec![1.0_f32; head_dim];
+
+        // Indexer compressor (coff=2 for compress_ratio=4): n_kv = 2 * indexer_head_size
+        let idx_n_kv = 2 * indexer_head_size;
+        let idx_comp_wkv = Array2::<f32>::from_shape_fn((idx_n_kv, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.014).cos() * 0.05
+        });
+        let idx_comp_wgate = Array2::<f32>::from_shape_fn((idx_n_kv, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.016).sin() * 0.05
+        });
+        let idx_comp_ape = Array2::<f32>::from_shape_fn((4, idx_n_kv), |(r, k)| {
+            ((r + k) as f32 * 0.025).sin() * 0.05
+        });
+        let idx_comp_norm = vec![1.0_f32; indexer_head_size];
+
+        // Indexer score weights
+        let idx_wq_b = Array2::<f32>::from_shape_fn(
+            (n_index_head * indexer_head_size, q_lora_rank),
+            |(i, j)| ((i + j) as f32 * 0.011).sin() * 0.1,
+        );
+        let idx_wproj = Array2::<f32>::from_shape_fn((n_index_head, n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.012).cos() * 0.1
+        });
+
+        let w = DsV4AttnBlockIndexerWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+            indexer_compressor: CompressorWeights {
+                wkv: idx_comp_wkv.view(),
+                wgate: idx_comp_wgate.view(),
+                ape: idx_comp_ape.view(),
+                norm: &idx_comp_norm,
+            },
+            indexer: IndexerWeights {
+                wq_b: idx_wq_b.view(),
+                wproj: idx_wproj.view(),
+            },
+        };
+
+        let x = Array2::<f32>::from_shape_fn((n_tokens, n_embd), |(t, d)| {
+            ((t * 7 + d) as f32 * 0.013).sin()
+        });
+        let out = dsv4_attn_block_compress_with_indexer(x.view(), &w, &p, 0);
+        assert_eq!(out.shape(), &[n_tokens, n_embd]);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
+        let total: f32 = out.iter().map(|v| v.abs()).sum();
+        assert!(total > 1e-3, "output collapsed (sum={total})");
+    }
+
+    /// Indexer causal mask: token t sees compressed chunk c iff
+    /// `(c+1)*ratio <= t+1`.
+    #[test]
+    fn indexer_causal_mask_structure() {
+        let m = build_indexer_causal_mask(8, 4, 0, 4);
+        assert_eq!(m.shape(), &[8, 4]);
+        // Token 0..2 (abs_pos 0..2): c_visible = (abs_pos+1)/4 = 0 →
+        // no compressed visible.
+        for t in 0..3 {
+            for c in 0..4 {
+                assert_eq!(m[[t, c]], f32::NEG_INFINITY, "t={t} c={c} should be -∞");
+            }
+        }
+        // Token 3..6 (abs_pos 3..6): c_visible = 1 → chunk 0 visible.
+        for t in 3..7 {
+            assert_eq!(m[[t, 0]], 0.0, "t={t} c=0 should be 0");
+            for c in 1..4 {
+                assert_eq!(m[[t, c]], f32::NEG_INFINITY, "t={t} c={c} should be -∞");
+            }
+        }
+        // Token 7 (abs_pos 7): c_visible = 8/4 = 2 → chunks 0, 1 visible.
+        assert_eq!(m[[7, 0]], 0.0);
+        assert_eq!(m[[7, 1]], 0.0);
+        for c in 2..4 {
+            assert_eq!(m[[7, c]], f32::NEG_INFINITY);
+        }
+    }
+
+    /// Raw-window mask: standard causal + sliding window over the
+    /// raw KV positions.
+    #[test]
+    fn raw_window_mask_structure() {
+        let m = build_raw_window_mask(6, 0, 3);
+        assert_eq!(m.shape(), &[6, 6]);
+        // Token 0: only j=0 allowed.
+        assert_eq!(m[[0, 0]], 0.0);
+        for j in 1..6 {
+            assert_eq!(m[[0, j]], f32::NEG_INFINITY);
+        }
+        // Token 5: window [3, 4, 5] allowed; [0, 1, 2] disallowed.
+        for j in 0..3 {
+            assert_eq!(m[[5, j]], f32::NEG_INFINITY);
+        }
+        for j in 3..=5 {
+            assert_eq!(m[[5, j]], 0.0);
+        }
+    }
+}
