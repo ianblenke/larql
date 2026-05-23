@@ -24,7 +24,7 @@ use larql_models::architectures::deepseek_v4_tensors::{
 };
 use larql_models::detect::ModelError;
 use larql_models::loading::gguf::GgufFile;
-use larql_models::quant::ggml::{dequantize, tensor_data_size};
+use larql_models::quant::ggml::{dequantize, is_integer_type, tensor_data_size};
 
 /// Re-key a generic `(raw_gguf_name → Vec<f32>)` map by
 /// `DsV4TensorKind` for a given `layer_index`.
@@ -78,12 +78,18 @@ pub fn read_dsv4_layer_tensors_from_gguf(
     }
 
     // For each matching tensor in the GGUF, read its bytes + dequantize.
+    // Integer-typed tensors (e.g. `ffn_gate_tid2eid` is I32) have no
+    // meaningful f32 dequantization — they're routing tables consumed
+    // elsewhere. Skip them here; future code can read them separately.
     let mut out: HashMap<DsV4TensorKind, Vec<f32>> = HashMap::new();
     let mut shard_files: HashMap<usize, File> = HashMap::new();
     for info in &gguf.tensor_infos {
         let Some(&kind) = want.get(info.name()) else {
             continue;
         };
+        if is_integer_type(info.tensor_type()) {
+            continue;
+        }
         let shard_idx = info.shard_idx();
         let abs_offset = gguf
             .shard_data_offset(info)

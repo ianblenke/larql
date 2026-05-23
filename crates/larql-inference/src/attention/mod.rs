@@ -19,6 +19,7 @@ pub mod dsv4_compressor;
 pub mod dsv4_compressor_prefill;
 pub mod dsv4_ffn_block;
 pub mod dsv4_fp8_kv;
+pub mod dsv4_full_loader;
 pub mod dsv4_gguf_reader;
 pub mod dsv4_grouped_o_proj;
 pub mod dsv4_hyperparams_load;
