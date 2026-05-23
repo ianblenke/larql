@@ -27,8 +27,54 @@
 
 use ndarray::Array2;
 
-use super::dsv4_rope_tail::DsV4RopeMode;
+use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
 use super::dsv4_yarn_config::{DsV4RopeYarnConfig, RopeScalingType};
+
+/// Dispatch tail-RoPE based on whether YARN is configured for this layer.
+///
+/// `Some(yarn)` → routes to [`dsv4_rope_tail_yarn`] with the layer's
+/// YARN config (the `rope_base` argument is shadowed by
+/// `yarn.freq_base`).
+/// `None` → routes to plain [`super::dsv4_rope_tail::dsv4_rope_tail`].
+///
+/// Used by the per-layer attention blocks (Stages 8a, 8f, 8g) to
+/// transparently switch between vanilla RoPE and YARN-extended RoPE
+/// without duplicating the call-site machinery.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_tail_dispatch(
+    x: &Array2<f32>,
+    num_heads: usize,
+    head_dim: usize,
+    n_rot: usize,
+    rope_base: f64,
+    rope_mode: DsV4RopeMode,
+    yarn: Option<&DsV4RopeYarnConfig>,
+    inverse: bool,
+    position_offset: usize,
+) -> Array2<f32> {
+    match yarn {
+        Some(cfg) => dsv4_rope_tail_yarn(
+            x,
+            num_heads,
+            head_dim,
+            n_rot,
+            cfg,
+            rope_mode,
+            inverse,
+            position_offset,
+        ),
+        None => dsv4_rope_tail(
+            x,
+            num_heads,
+            head_dim,
+            n_rot,
+            rope_base,
+            rope_mode,
+            inverse,
+            position_offset,
+        ),
+    }
+}
 
 /// YARN-aware tail-RoPE.
 ///

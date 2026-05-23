@@ -30,7 +30,8 @@ use ndarray::{Array2, ArrayView1, ArrayView2, ArrayView3};
 
 use super::dsv4_fp8_kv::fp8_kv_quantize;
 use super::dsv4_grouped_o_proj::grouped_o_proj;
-use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
+use super::dsv4_rope_tail::DsV4RopeMode;
+use super::dsv4_rope_tail_yarn::rope_tail_dispatch;
 use super::dsv4_swa::dsv4_sliding_window_attn;
 
 /// Per-layer DSv4 attention weights — references-only, so callers can
@@ -110,13 +111,14 @@ pub fn dsv4_attn_block_no_compress(
     //    per-head RMSNorm (no learned weight) on each (token, head)
     //    n_embd_head_k vector — apply BEFORE tail-RoPE.
     let q = rms_norm_per_head(q.view(), p.n_head, p.head_dim, p.norm_eps);
-    let q = dsv4_rope_tail(
+    let q = rope_tail_dispatch(
         &q,
         p.n_head,
         p.head_dim,
         p.n_rot,
         p.rope_base,
         p.rope_mode,
+        p.yarn.as_ref(),
         false,
         position_offset,
     );
@@ -126,13 +128,14 @@ pub fn dsv4_attn_block_no_compress(
     let kv = matmul_x_wt(cur.view(), w.wkv);
     let kv = rms_norm_2d(kv.view(), w.kv_a_norm, p.norm_eps);
     //    tail-RoPE — reshape view (n_tokens, head_dim) treated as 1 head.
-    let kv = dsv4_rope_tail(
+    let kv = rope_tail_dispatch(
         &kv,
         1,
         p.head_dim,
         p.n_rot,
         p.rope_base,
         p.rope_mode,
+        p.yarn.as_ref(),
         false,
         position_offset,
     );
