@@ -24,6 +24,7 @@ pub mod dsv4_grouped_o_proj;
 pub mod dsv4_indexer;
 pub mod dsv4_masked_attn;
 pub mod dsv4_mhc;
+pub mod dsv4_mhc_bookend;
 pub mod dsv4_moe_dispatch;
 pub mod dsv4_moe_ops;
 pub mod dsv4_moe_routing;
