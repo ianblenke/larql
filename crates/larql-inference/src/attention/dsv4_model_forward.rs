@@ -351,6 +351,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 8,
             norm_eps: 1e-5,
+            yarn: None,
         };
         let hc_dim = n_hc * n_embd;
         let hc_mix = (2 + n_hc) * n_hc;

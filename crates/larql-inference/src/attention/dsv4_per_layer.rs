@@ -154,6 +154,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 8,
             norm_eps: 1e-5,
+            yarn: None,
         };
 
         // ── mHC weights (separate for attn / FFN bookends) ──

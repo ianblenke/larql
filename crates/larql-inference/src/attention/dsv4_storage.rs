@@ -196,6 +196,7 @@ mod tests {
             rope_mode: DsV4RopeMode::Neox,
             window_size: 8,
             norm_eps: 1e-5,
+            yarn: None,
         };
         DsV4LayerWeightStorage {
             attn_norm: vec![1.0; n_embd],

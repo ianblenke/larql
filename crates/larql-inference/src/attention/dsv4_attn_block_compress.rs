@@ -364,6 +364,7 @@ mod tests {
                 rope_mode,
                 window_size,
                 norm_eps,
+                yarn: None,
             },
             compressor: CompressorParams {
                 head_dim,
