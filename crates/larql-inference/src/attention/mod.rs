@@ -25,6 +25,7 @@ pub mod dsv4_mhc;
 pub mod dsv4_moe_ops;
 pub mod dsv4_rope_tail;
 pub mod dsv4_storage;
+pub mod dsv4_storage_build;
 pub mod dsv4_swa;
 pub mod fine_profile;
 pub mod gpu;
