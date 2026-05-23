@@ -3,14 +3,16 @@
 > Sibling to the GPU-arc `RESUME_PROMPT.md`. The work captured here is
 > orthogonal: it cleaned up CI debt, unblocked the bench measurement
 > that #127 had been blocking, and traced the bench-output gibberish
-> end-to-end. **The real bug**: `predict_q4k_hidden` is a silent no-op
-> on Gemma 3 4B — every layer's `run_layer_with_ffn_with_cache`
-> returns `None`, so the residual stream stays at the input embedding
-> through all 34 layers. The bit-exact V_proj match and the apparent
-> "Paris" token 1 are both red herrings (V is correct because the
-> writer is correct; "Paris" emerges by accident from
-> `lm_head @ embed("is")` cosine geometry). See "Correctness arc"
-> below for the full evidence chain.
+> end-to-end. **The real bug**: `predict_q4k_hidden`'s
+> `direct_all_layers` optimization (in
+> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs:186-198`)
+> skips `insert_q4k_layer_tensors` on Gemma 3 4B; the direct path
+> needs a `kv_cache` to engage; both callers (`predict_q4k` and the
+> test harness) pass `None`; `block.rs:96` falls back to
+> `weights.tensors`, which is now empty; attention returns `None`;
+> forward is a no-op. **One-line fix candidate**: have `predict_q4k`
+> allocate and pass a fresh `KvCache`. See "Correctness arc" below
+> for full evidence + three fix options.
 
 ## What landed today
 
@@ -151,13 +153,100 @@ to "Paris" in cosine space* — which happens to be Portuguese
 This isn't a "model drift after first token"; it's the same no-op
 forward seeing a different last-prompt-token each step.
 
-**Why every layer returns None** is the open question. Likely
-candidate: `run_attention_block_with_kv_out_with_cache` at
-`crates/larql-inference/src/attention/block.rs:81` propagates `?` on
-some optional lookup that doesn't resolve on the Gemma 3 4B fresh
-vindex — possibly an attention key like `attn_q_norm` or `attn_k_norm`
-that the new vindex format doesn't materialize, or an `insert_q4k_layer_tensors`
-side-effect that the test path doesn't trigger.
+**Why every layer returns None** — root cause identified on
+2026-05-23:
+
+The bug is the interaction between an over-eager skip optimization
+in `predict_q4k_hidden` and a caller-side contract that isn't
+documented.
+
+`crates/larql-inference/src/vindex/q4k_forward/hidden.rs:186-198`:
+
+```rust
+let direct_all_layers = !arch_pre.is_hybrid_moe()
+    && h.shape()[1].is_multiple_of(256)
+    && q_dim_pre.is_multiple_of(256)
+    && !(0..num_layers).any(|l| arch_pre.kv_shared_source_layer(l).is_some());
+
+for layer in 0..num_layers {
+    let inserted = if direct_all_layers {
+        Vec::new()                                                     // skip f32 dequant
+    } else {
+        insert_q4k_layer_tensors(weights, index, layer)
+            .unwrap_or_else(|err| panic!("{err}"))
+    };
+    ...
+}
+```
+
+Gemma 3 4B satisfies all four conditions (`is_hybrid_moe=false`,
+`hidden=2560 % 256 == 0`, `q_dim=8*128=1024 % 256 == 0`, no KV
+sharing across layers). So `direct_all_layers = true` and
+`insert_q4k_layer_tensors` is **skipped**. The optimization comment
+at line 173-185 says this is safe "when the layer can fully run
+through the direct Q4_K × Q8_K paths" — but it depends on the
+caller passing a `kv_cache`.
+
+`crates/larql-inference/src/attention/block.rs:96`:
+
+```rust
+let Some(cache) = kv_cache else {
+    return run_attention_block_with_kv_out(
+        weights, h, layer, capture_attention, shared_kv,
+    );
+};
+```
+
+When `kv_cache = None`, block.rs early-exits to
+`run_attention_block_with_kv_out` (line 27), which doesn't take a
+vindex and reads from `weights.tensors` directly. But the dequant
+insert that would have populated `weights.tensors` was skipped.
+Lookup misses → `?` propagates `None` → forward becomes a no-op.
+
+**Both callers pass `kv_cache = None`**:
+
+- The diagnostic test (`test_gemma3_layer_health`) calls
+  `predict_q4k_hidden(weights, token_ids, index, None)` directly.
+- The chat path goes `generate_via_cpu_q4k` →
+  `predict_q4k(weights, tokenizer, token_ids, 5, index)` →
+  `predict_q4k_hidden(weights, token_ids, index, None)` at
+  `crates/larql-inference/src/vindex/q4k_forward/generation.rs:17`.
+
+So **every CPU Q4K decode on Gemma 3 4B (and any other model that
+satisfies the four `direct_all_layers` conditions) silently runs a
+no-op forward pass** if the caller doesn't supply a KV cache. The
+production chat path is in this group.
+
+### Fix candidates
+
+In increasing order of cleanup-required:
+
+1. **Always run `insert_q4k_layer_tensors`** (drop the skip
+   optimization). Restores correctness at the cost of ~10 GB RSS
+   on Gemma 3 4B prefill. One-line change in `hidden.rs`. Quickest
+   to land.
+
+2. **Make the caller pass a fresh `KvCache`**. Update
+   `predict_q4k` (`generation.rs:17`) and the test to allocate a
+   `KvCache::new(num_layers)` and pass `Some(&mut cache)`. The
+   cache is discarded after; the side effect is just to engage the
+   direct path in `block.rs:96`. Smaller patch but spreads
+   responsibility — every future caller of `predict_q4k_hidden`
+   now needs to remember to allocate a cache when none is
+   logically needed.
+
+3. **Teach `run_attention_block_with_kv_out` to use the vindex
+   when one is available.** Cleanest separation of concerns: the
+   no-cache path should still try the direct vindex matvec before
+   falling back to `weights.tensors`. Larger patch (refactor of
+   `block.rs:27`'s signature + dispatch) but doesn't require
+   callers to allocate dead caches and doesn't sacrifice the 10 GB
+   savings.
+
+Recommended: **option 2** for the immediate fix (single-call-site,
+no API change, no perf regression), with option 3 filed as a
+follow-up cleanup once the broader CPU KV cache arc (open arc #2
+below) lands and changes the function signatures anyway.
 
 **Two side bugs surfaced during the diagnostic**:
 
@@ -194,16 +283,15 @@ the working tree (parallel session on 2026-05-22):
 
 In order of impact:
 
-1. **Fix the layer no-op in `predict_q4k_hidden`** (THE gating bug).
-   Find why every call to `run_layer_with_ffn_with_cache` returns
-   `None` on the Gemma 3 4B fresh vindex. The propagation chain is
-   `run_layer_with_ffn_with_cache` → `run_attention_block_with_kv_out_with_cache`
-   (uses `?`) → some optional lookup inside. Suspect attention-key
-   resolution: the attn manifest has `q_proj/k_proj/v_proj/o_proj`
-   but the loader's lookup might be using a different key naming
-   (e.g., expecting `Gemma3Arch::attn_q_key(layer)` to produce a
-   different prefix). Easy bisection: instrument `block.rs:81` with
-   `eprintln!` before each `?` to find which `?` fires.
+1. **Fix the `direct_all_layers` / `kv_cache=None` interaction in
+   `predict_q4k_hidden`** (THE gating bug). Pick one of the three
+   candidates from "Fix candidates" above. Recommended:
+   *option 2* — make `predict_q4k`
+   (`crates/larql-inference/src/vindex/q4k_forward/generation.rs:17`)
+   allocate a fresh `KvCache` and pass `Some(&mut cache)` to
+   `predict_q4k_hidden`. Discard the cache after; the side effect
+   engages the direct path in `block.rs:96` and the dequant skip
+   becomes safe.
 
 2. **Fix the convert path's empty `gate_vectors.bin`.** The
    `larql convert gguf-to-vindex --quant q4k` flow writes a 0-byte
@@ -225,14 +313,17 @@ In order of impact:
 
 In order of impact:
 
-1. **Forward layer no-op on Gemma 3 4B** — `predict_q4k_hidden`'s
-   per-layer loop silently returns `None` from
-   `run_layer_with_ffn_with_cache`, leaving residual=embed through
-   all 34 layers. The "Paris" token-1 emission is an embedding-
-   similarity coincidence, not a correctness signal. See
-   "Correctness arc" above for evidence + bisection path.
-   **Gates the bench head-to-head — any perf number on the current
-   vindex is meaningless until this lands.**
+1. **Forward layer no-op on Gemma 3 4B** —
+   `predict_q4k_hidden`'s `direct_all_layers` optimization skips
+   `insert_q4k_layer_tensors` because it assumes the direct Q4_K
+   path will engage; the direct path requires `kv_cache = Some`;
+   callers (both `predict_q4k` and the test) pass `None`; block.rs
+   falls back to `weights.tensors` which is now empty; attention
+   returns `None`; forward is a no-op. The "Paris" emission is
+   embed cosine coincidence. **One-line fix candidate available in
+   "Correctness arc" above.** Gates the bench head-to-head — any
+   perf number on the current vindex is meaningless until this
+   lands.**
 
 2. **CPU Q4K KV cache** — the 153× perf win, *once the layer no-op
    is fixed*. Wire a KV cache through
@@ -299,41 +390,36 @@ In order of impact:
 
 ## Quick start prompt for a fresh session
 
-The highest-leverage opening is the forward-layer no-op bug — that's
-the actual root cause of every gibberish symptom in this arc.
+The bug is fully localized — pick a fix candidate and land it.
 
 > Read RESUME_PROMPT_SESSION_2026-05-14.md, specifically the
-> "Correctness arc" section. The diagnostic ran end-to-end on
-> 2026-05-22/23. Net finding: every call to
-> `run_layer_with_ffn_with_cache` returns `None` on the Gemma 3 4B
-> fresh vindex, so `predict_q4k_hidden`'s residual stream stays at
-> the input embedding through all 34 layers. Evidence: all 35
-> `cpu_h_embed.f32` + `cpu_layer_NN.f32` dumps from
-> `test_gemma3_layer_health` are bit-identical (same MD5). The
-> "Paris" emission at token 1 is an embedding-similarity coincidence
-> from tied embed/lm_head matrices.
+> "Correctness arc" section. The bug is fully localized: in
+> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs:186-198`,
+> the `direct_all_layers` skip leaves `weights.tensors` empty for
+> Gemma 3 4B; in `crates/larql-inference/src/attention/block.rs:96`
+> the `kv_cache = None` early-exit reads from that empty
+> `weights.tensors` and returns `None`; in
+> `crates/larql-inference/src/vindex/q4k_forward/generation.rs:17`
+> `predict_q4k` passes `None` for `kv_cache`. Every CPU Q4K decode
+> on Gemma 3 4B is a silent no-op forward as a result. The "Paris"
+> emission earlier is an embed-cosine accident, not a correctness
+> win.
 >
-> Bisect why every layer returns None. The propagation chain:
-> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs` line ~240
-> → `crates/larql-inference/src/forward/layer.rs::run_layer_with_ffn_with_cache`
-> (line 184) → `crates/larql-inference/src/attention/block.rs::run_attention_block_with_kv_out_with_cache`
-> (line 81). Each function uses `?` to propagate `None` from an
-> optional lookup. Likely suspect: some attention key resolution
-> against the vindex manifest (q_proj/k_proj/v_proj/o_proj are in
-> the manifest, but a missing `attn_q_norm`/`attn_k_norm` or a
-> missing `insert_q4k_layer_tensors` side-effect could be the
-> culprit). Easy bisection: `eprintln!` before every `?` in
-> `block.rs:81`'s body.
->
-> Verify after fix:
+> Land fix candidate 2 (recommended in the resume): modify
+> `predict_q4k` to allocate a fresh
+> `larql_inference::attention::KvCache::new(num_layers)` and pass
+> `Some(&mut cache)` to `predict_q4k_hidden`. The cache is
+> discarded after the call. Verify:
 >
 > 1. `test_gemma3_layer_health` shows per-layer stats *differ*
->    (currently all 34 are bit-identical).
+>    (currently all 34 are bit-identical: mean=-0.0186 std=1.035
+>    max_abs=29.25).
 > 2. `/v1/chat/completions` on `output/gemma-3-4b-it-vindex-fresh`
 >    with `"The capital of France is"` emits coherent English
->    starting from token 1 (currently emits `"Paris"` by accident,
->    then `" pessoal" " pohod" "அச்ச" "澼"`).
-> 3. Re-run the bench measurement once the forward is real.
+>    starting from token 1 (currently emits `"Paris"` by accident
+>    + drift).
+> 3. Re-run the 0.106 tok/s bench measurement once the forward is
+>    real.
 
 Or for the CPU KV cache arc:
 
