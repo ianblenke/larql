@@ -2,10 +2,14 @@
 
 > Sibling to the GPU-arc `RESUME_PROMPT.md`. The work captured here is
 > orthogonal: it cleaned up CI debt, unblocked the bench measurement
-> that #127 had been blocking, and surfaced a **confirmed correctness
-> bug** that gates any further bench claims — Gemma 3 4B's V_proj
-> weight is corrupted during extraction (Q6_K layout bug in the
-> V-slot writer). See "Confirmed correctness bug" below.
+> that #127 had been blocking, and traced the bench-output gibberish
+> end-to-end. Net status: **V_proj corruption already fixed in current
+> code** — the symptom is from stale May-7 vindexes; re-extracting
+> produces a vindex that correctly emits `"Paris"` as token 1 vs the
+> Gemma 3 4B Q4_K_M GGUF. A **secondary token-N divergence** (tokens
+> 2+ drift after a bit-correct token 1) remains, plus a side bug in
+> `convert gguf-to-vindex --quant q4k` that writes empty
+> `gate_vectors.bin`. See "Correctness arc" below.
 
 ## What landed today
 
@@ -55,7 +59,7 @@ user-visible speedup.
 See `openspec/changes/bench-vs-llama-cpp-end-to-end-blockers/proposal.md`
 for the full diagnosis and the "HUNG → measurable" transition.
 
-## ⚠ Confirmed correctness bug — V_proj corrupted during extraction
+## ⚠ Correctness arc — V_proj fixed in current code, secondary token-N divergence open
 
 **The 0.106 tok/s number measures throughput, not correctness.** Output
 samples from the run:
@@ -73,27 +77,54 @@ tokenizer.
 
 ### Diagnostic — what's known
 
+The diagnostic ran end-to-end on 2026-05-22/23 with two test vindexes:
+
+| Vindex | Extracted (date / path) | V_proj diff vs GGUF | Inference status |
+|---|---|---|---|
+| `output/gemma-3-4b-it-vindex` | 2026-04-16 via `extract --quant q4k` | **0.266** (14.86× rel) | ✗ gibberish from token 0 (`" ekonomi", "ítja", …`) |
+| `output/gemma-3-4b-it-vindex-fresh` | 2026-05-29 via current `extract --quant q4k` | **0.0021** (Q6_K rounding noise) | ✓ token 1 = `"Paris"` (lp -0.0008, matches llama.cpp); tokens 2-5 drift into gibberish |
+| `/tmp/gemma3-4b-q4k-fresh.vindex` | 2026-05-22 via `convert gguf-to-vindex --quant q4k` | **0.0** (bit-exact passthrough) | ✗ panics on chat (empty `gate_vectors.bin` from the convert path — secondary bug) |
+
+Layer-level diagnostics already ruled out the easy explanations:
+
 | Layer | Status | Evidence |
 |---|---|---|
 | Tokenizer | ✓ healthy | Round-trip on `output/gemma-3-4b-it-vindex/tokenizer.json`: `<bos>=2`, `<start_of_turn>=105`, `<end_of_turn>=106`, vocab size 262145, `"France"` → `[2, 31756]` → `"<bos>France"`. Standard Gemma 3 layout. |
-| GGUF model file | ✓ healthy | `llama-cli` on `output/gguf-cache/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf` with prompt `"The capital of France is"` → emits **`"Paris! 🇫🇷"`**. Same Q4_K_M file the vindex was extracted from. |
-| larql forward pass on this vindex | ✗ broken | Multilingual gibberish from token 0 across every prompt tried. |
-| **V_proj weight in vindex vs GGUF** | ✗ **structurally wrong** | `test_gemma3_v_proj_source_compare` (run 2026-05-22): max abs diff `0.266`, relative max diff **14.86×**, mean abs value of GGUF V_proj only `0.018`. Not quantization rounding — wrong layout or wrong dequant. |
+| GGUF model file | ✓ healthy | `llama-cli` on `output/gguf-cache/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf` with prompt `"The capital of France is"` → emits **`"Paris! 🇫🇷"`**. |
+| Q6_K kernel roundtrip | ✓ healthy | `test_q6k_roundtrip` on V_proj row 0: max diff 0.0014 (expected Q6_K rounding). |
+| In-memory writer roundtrip | ✓ healthy | `test_v_proj_writer_roundtrip` (quantize_q6_k → dequantize_q6_k in memory on GGUF V_proj): max diff 0.0021. |
 
 ### Diagnosis
 
-**Extraction of V_proj (Q6_K leg in the Q4_K_M mix) corrupts the
-weight.** Every attention head's V output is therefore wrong, the
-residual stream is poisoned by layer 1, and 34 layers later the
-lm_head argmax lands on gibberish IDs.
+**The V_proj corruption is fixed in current code.** Vindexes extracted
+since (at the latest) 2026-05-29 produce healthy V_proj at Q6_K rounding
+levels. The April 16 vindex was extracted with a buggy older writer; the
+fix is **just re-extract** — no source-code change needed.
 
-Likely root cause: **Q6_K layout bug in the V-slot writer at
-`crates/larql-vindex/src/format/weights/write_q4k/attn.rs`**. Same
-class of bug as PR #83 in the session-12 arc — sequential vs
-interleaved Q6_K layout. Session-12's fix targeted `lm_head` (which
-also uses Q6_K); the attn-V slot wasn't updated. Both use the same
-`quantize_q6_k` writer; the difference is likely on the read side
-or in the per-row pad/stride handling.
+The smoke test on the fresh vindex (`/v1/chat/completions` on `"The
+capital of France is"`) now emits **`"Paris"`** as the first generated
+token with logprob -0.0008 (~99.9% confidence) — matches the
+llama.cpp ground truth exactly.
+
+**Two follow-on bugs surfaced during the diagnostic**:
+
+1. **Token-N divergence (token 1 correct, tokens 2+ drift)**. After
+   `"Paris"`, the model emits `" pessoal", " pohod", "அச்ச", "澼"` —
+   confident (logprobs -0.008 to -0.6) but wrong. This is the same
+   pattern session-12 chased on Qwen3.6: PR #81 (`token-0 bit-exact
+   but token-1+ diverges 20×`) → the C.5e-C.5j arc (sk computation
+   order, head-major flatten, multi-layer recurrence drift, decay-
+   first DeltaNet). Gemma 3 4B has no DeltaNet but the divergence
+   shape rhymes — likely some per-token state in the CPU Q4K decode
+   loop isn't being reset cleanly between autoregressive steps, OR
+   numerical drift compounds through the no-KV-cache O(N²) replay.
+
+2. **`larql convert gguf-to-vindex --quant q4k` writes empty
+   `gate_vectors.bin`**. The convert path's gate KNN write step
+   silently produces a 0-byte file, so the inference forward later
+   panics in `predict/honest.rs:247:92` (unwrap on None). The
+   safetensors `extract --quant q4k` path is unaffected (writes
+   gate_vectors.bin correctly).
 
 ### What's already in flight
 
@@ -113,46 +144,53 @@ the working tree (parallel session on 2026-05-22):
 
 **Don't disturb those files** — the next session continues this arc.
 
-### Recommended next step
+### Recommended next steps
 
-Run `test_v_proj_writer_roundtrip` and `test_q6k_roundtrip` first to
-isolate which side of the Q6_K boundary is at fault (writer's
-quantize, reader's dequantize, or padding/stride). Then patch
-`crates/larql-vindex/src/format/weights/write_q4k/attn.rs`'s V slot
-to mirror PR #83's lm_head interleave layout. After re-extracting
-the vindex:
+In order of impact:
 
-1. `test_gemma3_v_proj_source_compare` should show max abs diff ≪ 0.01
-   (target: within 4× of `quantize_q6_k`'s known per-block rounding,
-   i.e. roughly `4 * 2^-6 * mean_abs ≈ 0.001` for this tensor).
-2. `/v1/chat/completions` on the re-extracted vindex with `"The
-   capital of France is"` should emit `"Paris"` as token 1.
+1. **Investigate token-N divergence on Gemma 3 4B.** Token 1 is
+   bit-correct against llama.cpp; tokens 2+ drift. Mirror session-12's
+   C.5e-style diagnostic on Qwen3.6: dump per-layer residuals for
+   tokens 1 and 2 from both larql and llama.cpp (via
+   `llama-eval-callback` with `LLAMA_DUMP_BIN_DIR`), find the layer
+   where the divergence first exceeds Q6_K rounding noise. The CPU
+   Q4K decode path is `generate_via_cpu_q4k` →
+   `crates/larql-inference/src/vindex/q4k_forward/hidden.rs::predict_q4k_hidden`.
+   The user's staged `test_gemma3_layer_health.rs` and
+   `profile_4b_decode.rs` are likely already set up for this.
 
-The 0.106 tok/s perf measurement **must be re-run after the
-correctness fix lands** — the existing number is on a broken vindex
-and means nothing as a head-to-head against llama.cpp.
+2. **Fix the convert path's empty `gate_vectors.bin`.** The
+   `larql convert gguf-to-vindex --quant q4k` flow writes a 0-byte
+   gate file even when source GGUF tensors are intact. Likely in the
+   `build_vindex` call order — `write_gate_vectors` runs before the
+   Q4K writer takes over but appears to be a no-op for GGUF-sourced
+   weights. Compare against the safetensors `extract` path that
+   correctly produces a 3.5 GB gate file.
 
-### Why this matters
+3. **Replace the May 7 broken vindex with the fresh one.** The May
+   7 `output/gemma-3-4b-it-vindex` is structurally broken and should
+   not be used. `output/gemma-3-4b-it-vindex-fresh` is the correct
+   one to bench against.
 
-The whole point of the bench-vs-llama.cpp arc is a head-to-head perf
-claim. A number that's both 153× slow AND outputting gibberish is two
-unrelated problems wearing one face. The V_proj fix is **gating**:
-without it, the perf-gap diagnosis (`O(N²)` no-KV-cache) is correct
-but academic, because nothing the model emits is meaningful.
+4. **Re-run the 0.106 tok/s perf measurement on the fresh vindex.**
+   The original number was on the broken vindex; on `-fresh` the
+   timing should be similar (decode arithmetic doesn't change) but
+   now correctness is established for token 1, so the perf gap
+   diagnosis stands on solid ground.
 
 ## Open arcs from here
 
 In order of impact:
 
-1. **Fix V_proj extraction** (Q6_K layout bug in the V-slot writer
-   at `crates/larql-vindex/src/format/weights/write_q4k/attn.rs`).
-   See the "Confirmed correctness bug" section above for diagnosis,
-   evidence, and step-by-step fix path. **Gates everything else —
+1. **Token-N divergence on Gemma 3 4B** — token 1 = "Paris" (correct)
+   but tokens 2-5 drift into multilingual gibberish. Same shape as
+   session-12's C.5e–C.5j arc on Qwen3.6. See "Correctness arc"
+   above for the diagnostic path. **Gates the bench head-to-head —
    any perf number on the current vindex is meaningless until this
    lands.**
 
-2. **CPU Q4K KV cache** — the 153× perf win, *once V_proj is
-   fixed*. Wire a KV cache through
+2. **CPU Q4K KV cache** — the 153× perf win, *once token-N
+   divergence is fixed*. Wire a KV cache through
    `crates/larql-inference/src/vindex/q4k_forward/hidden.rs` and
    its attention block. Metal already has it
    (`DecodeBackend::decode_token` + `populate_kv_layer` +
@@ -216,32 +254,34 @@ In order of impact:
 
 ## Quick start prompt for a fresh session
 
-The highest-leverage opening is the correctness fix — the V_proj
-extraction bug is now diagnosed and gating. A reasonable opening
-prompt:
+The highest-leverage opening is now the token-N divergence
+investigation. V_proj is fixed (re-extracted vindexes emit `"Paris"`
+correctly as token 1) — the open bug is that tokens 2+ drift.
 
 > Read RESUME_PROMPT_SESSION_2026-05-14.md, specifically the
-> "Confirmed correctness bug — V_proj corrupted during extraction"
-> section. The diagnosis is: `test_gemma3_v_proj_source_compare`
-> shows 14.86× relative max diff between V_proj as loaded from the
-> Gemma 3 4B GGUF vs as loaded from the larql vindex — extraction is
-> corrupting the V projection's Q6_K leg.
+> "Correctness arc" section. Status: V_proj corruption is fixed in
+> current code (verified bit-exact on the fresh vindex), and
+> `/v1/chat/completions` on `output/gemma-3-4b-it-vindex-fresh` with
+> prompt `"The capital of France is"` now emits `"Paris"` as token 1
+> (lp -0.0008, matches llama.cpp). But tokens 2-5 drift into
+> multilingual gibberish: `Paris pessoal pohod அச்ச 澼`.
 >
-> Run `test_v_proj_writer_roundtrip` and `test_q6k_roundtrip` first
-> (both already staged in `crates/larql-inference/tests/`) to bisect
-> which side of the Q6_K boundary fails — writer's quantize,
-> reader's dequantize, or the per-row pad/stride handling. Then
-> patch the V slot in
-> `crates/larql-vindex/src/format/weights/write_q4k/attn.rs`
-> mirroring PR #83's lm_head interleave fix. Re-extract the
-> Gemma 3 4B vindex and verify:
+> Investigate the token-N divergence. The user has
+> `test_gemma3_layer_health.rs` and `profile_4b_decode.rs` staged
+> for per-layer health probes. Mirror session-12's C.5e–C.5j
+> approach on Qwen3.6: dump per-layer residuals from both larql and
+> llama.cpp (via `llama-eval-callback` with `LLAMA_DUMP_BIN_DIR`
+> in `~/3rd-party/llama.cpp/`), find the layer where divergence
+> first exceeds Q6_K rounding noise. The CPU Q4K decode path is
+> `crates/larql-inference/src/vindex/q4k_forward/hidden.rs::predict_q4k_hidden`.
 >
-> 1. `test_gemma3_v_proj_source_compare` shows max abs diff ≪ 0.01.
-> 2. `/v1/chat/completions` on the re-extracted vindex with `"The
->    capital of France is"` emits `"Paris"` as token 1 (currently
->    emits `" ekonomi"`).
-> 3. Re-run the bench measurement — the 0.106 tok/s number was on a
->    broken vindex and means nothing as a head-to-head.
+> Verify after fix:
+>
+> 1. Token 1 still emits `"Paris"` (don't regress!).
+> 2. Tokens 2-5 are now coherent English (currently
+>    `" pessoal", " pohod", "அச்ச", "澼"`).
+> 3. Re-run the bench measurement on the fresh vindex — the 0.106
+>    tok/s number was on the May-7 broken vindex.
 
 Or for the CPU KV cache arc:
 
