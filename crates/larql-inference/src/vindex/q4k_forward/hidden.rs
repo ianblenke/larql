@@ -190,6 +190,21 @@ pub fn predict_q4k_hidden_with_cache(
         && q_dim_pre.is_multiple_of(256)
         && !(0..num_layers).any(|l| arch_pre.kv_shared_source_layer(l).is_some());
 
+    // When `direct_all_layers` is set we skip per-layer f32 dequant into
+    // `weights.tensors`. The cached attention path
+    // (`run_attention_block_with_kv_out_with_cache`) handles this by routing
+    // through `q4k_prefill` / `q4k_direct`, which read straight from the
+    // vindex. The *uncached* early-exit at the top of that function falls
+    // back to `run_attention_block_with_kv_out`, which has no vindex handle
+    // and reads from `weights.tensors` — empty under `direct_all_layers`,
+    // producing a silent no-op forward. Allocate an internal cache so we
+    // always take the vindex-aware path. The two bypass architectures
+    // (hybrid-MoE, cross-layer K/V share) are already excluded by
+    // `direct_all_layers`'s own guard.
+    let mut owned_cache: Option<KvCache> =
+        (kv_cache.is_none() && direct_all_layers).then(|| KvCache::with_layers(num_layers));
+    let mut kv_cache: Option<&mut KvCache> = kv_cache.or(owned_cache.as_mut());
+
     for layer in 0..num_layers {
         let inserted = if direct_all_layers {
             Vec::new()
