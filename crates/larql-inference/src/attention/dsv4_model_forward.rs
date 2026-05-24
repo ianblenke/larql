@@ -650,4 +650,183 @@ mod tests {
             "row 0 and row 1 logits identical (loop not per-token)"
         );
     }
+
+    /// Real-GGUF mixed-variant 3-layer model forward: layers 0, 1, 2.
+    ///
+    /// Per the DSv4-Flash per-layer pattern:
+    /// - layer 0: NoCompress + hash routing
+    /// - layer 1: NoCompress + hash routing
+    /// - layer 2: Indexer (compress_ratio=4) + hash routing
+    ///
+    /// Validates that the model_forward loop handles per-layer variant
+    /// transitions (NoCompress → Indexer) when each layer's dispatcher
+    /// arm uses its own compress/indexer params. This is the first test
+    /// to mix Indexer attention into the model_forward pipeline.
+    ///
+    /// Pipeline: token_ids (4) → embed → 3 layers (with variant switch
+    /// at layer 2) → head → logits (4, 129280).
+    ///
+    /// Expected wall: ~120 s release (3 × ~30 s layers + head + forward).
+    /// Need 16+ tokens because layer 2's compress_ratio=4 requires
+    /// `n_tokens >= compress_ratio` for the compressor builder.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn smoke_real_gguf_mixed_variant_3_layer_model_forward() {
+        use larql_models::loading::gguf::GgufFile;
+
+        use crate::attention::dsv4_attn_block::DsV4AttnBlockParams;
+        use crate::attention::dsv4_attn_block_compress::DsV4AttnBlockCompressParams;
+        use crate::attention::dsv4_attn_block_indexer::DsV4AttnBlockIndexerParams;
+        use crate::attention::dsv4_compressor_prefill::CompressorParams;
+        use crate::attention::dsv4_full_loader::load_dsv4_layer;
+        use crate::attention::dsv4_head_storage::load_dsv4_head;
+        use crate::attention::dsv4_indexer::IndexerParams;
+        use crate::attention::dsv4_rope_tail::DsV4RopeMode;
+        use crate::attention::dsv4_storage_build::DsV4Hyperparams;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+        let storages: Vec<_> = [0, 1, 2]
+            .iter()
+            .map(|&i| load_dsv4_layer(&gguf, &hp, i).expect("load layer"))
+            .collect();
+        assert!(
+            !storages[2].1.has_indexer || storages[2].1.compress_ratio == Some(4),
+            "layer 2 expected to be Indexer if it has one"
+        );
+
+        // Per-layer dispatcher params. Layers 0,1 are NoCompress so
+        // both Options are None; layer 2 needs both populated.
+        let no_cp: Option<DsV4AttnBlockCompressParams> = None;
+        let no_ip: Option<DsV4AttnBlockIndexerParams> = None;
+
+        let attn_2 = DsV4AttnBlockParams {
+            n_embd: hp.n_embd,
+            n_head: hp.n_head,
+            head_dim: hp.head_dim,
+            q_lora_rank: hp.q_lora_rank,
+            n_groups: hp.n_groups,
+            o_lora_rank: hp.o_lora_rank,
+            n_rot: hp.n_rot,
+            rope_base: hp.rope_base,
+            rope_mode: DsV4RopeMode::Neox,
+            window_size: hp.window_size,
+            norm_eps: hp.norm_eps,
+            yarn: hp.yarn,
+        };
+        let comp_2 = CompressorParams {
+            head_dim: hp.head_dim,
+            n_embd: hp.n_embd,
+            compress_ratio: 4,
+            n_rot: hp.n_rot,
+            rope_base: hp.rope_base,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: hp.norm_eps,
+        };
+        let idx_comp_2 = CompressorParams {
+            head_dim: hp.indexer_head_size.expect("indexer_head_size"),
+            n_embd: hp.n_embd,
+            compress_ratio: 4,
+            n_rot: hp.n_rot,
+            rope_base: hp.rope_base,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: hp.norm_eps,
+        };
+        let cp_2 = Some(DsV4AttnBlockCompressParams {
+            attn: attn_2,
+            compressor: comp_2,
+        });
+        let ip_2 = Some(DsV4AttnBlockIndexerParams {
+            attn: attn_2,
+            compressor: comp_2,
+            indexer_compressor: idx_comp_2,
+            indexer: IndexerParams {
+                n_embd: hp.n_embd,
+                q_lora_rank: hp.q_lora_rank,
+                n_index_head: hp.n_index_head.expect("n_index_head"),
+                n_index_head_size: hp.indexer_head_size.expect("indexer_head_size"),
+                n_rot: hp.n_rot,
+                rope_base: hp.rope_base,
+                rope_mode: DsV4RopeMode::Neox,
+            },
+            top_k: hp.top_k.expect("top_k"),
+        });
+
+        // Per-layer dispatch refs (in declaration order matching storages).
+        let dispatch_params: Vec<(_, _)> = vec![
+            (&no_cp, &no_ip), // layer 0
+            (&no_cp, &no_ip), // layer 1
+            (&cp_2, &ip_2),   // layer 2
+        ];
+
+        let layer_p_template = DsV4LayerParams {
+            mhc: MhcParams {
+                n_embd: hp.n_embd,
+                n_hc: hp.n_hc,
+                sinkhorn_iters: 2,
+                hc_eps: 1e-5,
+                norm_eps: hp.norm_eps,
+            },
+            ffn: Dsv4FfnParams {
+                n_expert: hp.n_expert,
+                n_expert_used: hp.n_expert_used,
+                norm_eps: hp.norm_eps,
+                routed_swiglu_limit: 7.0,
+                shared_swiglu_limit: 0.0,
+                expert_weights_norm: hp.expert_weights_norm,
+                expert_weights_scale: hp.expert_weights_scale,
+            },
+        };
+        let layer_params = vec![layer_p_template; storages.len()];
+        let layers: Vec<DsV4LayerWeights> = storages
+            .iter()
+            .zip(dispatch_params.iter())
+            .map(|((s, _), (cp, ip))| DsV4LayerWeights {
+                mhc_attn: s.mhc_attn.as_ref().unwrap().as_weights(),
+                attn: s.dispatcher_layer(cp, ip),
+                mhc_ffn: s.mhc_ffn.as_ref().unwrap().as_weights(),
+                ffn: s.ffn.as_ref().unwrap().as_weights(),
+            })
+            .collect();
+        assert_eq!(layers[0].attn.variant_name(), "no_compress");
+        assert_eq!(layers[1].attn.variant_name(), "no_compress");
+        // layer 2 should be Indexer (assuming the storage has the
+        // compressor + indexer populated, which is the case for layer 2
+        // in DSv4-Flash).
+        assert_eq!(layers[2].attn.variant_name(), "indexer");
+
+        let head_w = head.as_weights();
+        let head_p = head.params(&hp);
+
+        // 16 tokens because compress_ratio=4 needs n_tokens >= 4 (and
+        // we want >= 4 compressed positions for the indexer scoring).
+        let n_tokens = 16;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let logits = dsv4_model_forward(
+            &token_ids,
+            head.token_embd_view(),
+            &layers,
+            &layer_params,
+            &head_w,
+            &head_p,
+            0,
+        );
+
+        assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
+        let n_nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(n_nonfinite, 0, "{n_nonfinite} non-finite logits");
+        let total: f32 = logits.iter().map(|v| v.abs()).sum();
+        assert!(total > 0.0, "logits all zero");
+    }
 }
