@@ -245,3 +245,161 @@ mod tests {
         let _ = DsV4LayerKvCache::with_capacity(4, 0);
     }
 }
+
+/// Per-layer KV cache for the HCA attention variants (Compress and
+/// Indexer). Holds **two** sub-caches:
+///
+/// - `raw`: the per-token kv_a rows, shape `(n_raw_pos, head_dim)` —
+///   same as [`DsV4LayerKvCache`] in the NoCompress path. Capacity =
+///   `max_seq_len`.
+/// - `compressed`: the per-chunk compressed kv rows, shape
+///   `(n_comp, head_dim)`. Capacity = `max_seq_len.div_ceil(compress_ratio)`.
+///
+/// The two caches are decoupled — callers append to each one
+/// independently as the compressor schedule dictates (one raw row per
+/// new token, one compressed row every `compress_ratio` tokens via
+/// the compressor pipeline). This module does not enforce the
+/// compressor's chunk-completion semantics — that's the cached HCA
+/// attention's responsibility in the follow-up PR.
+///
+/// `compress_ratio` is stored so the cached attention can derive the
+/// expected n_comp from n_raw without re-passing it.
+#[derive(Clone)]
+pub struct DsV4LayerHcaCache {
+    /// Raw per-token kv_a cache.
+    pub raw: DsV4LayerKvCache,
+    /// Compressed-per-chunk kv cache.
+    pub compressed: DsV4LayerKvCache,
+    /// Compress ratio for this layer (typically 4 or 128 in DSv4-Flash).
+    pub compress_ratio: usize,
+}
+
+impl DsV4LayerHcaCache {
+    /// Build an empty HCA cache sized for up to `max_seq_len` tokens
+    /// of `head_dim`-sized rows, with chunks of `compress_ratio`
+    /// tokens producing one compressed row each.
+    ///
+    /// The compressed sub-cache is sized to `max_seq_len.div_ceil(compress_ratio)`
+    /// so it covers the case where the final partial chunk also
+    /// produces a compressed row.
+    pub fn with_capacity(max_seq_len: usize, head_dim: usize, compress_ratio: usize) -> Self {
+        assert!(compress_ratio > 0, "compress_ratio must be > 0");
+        let max_n_comp = max_seq_len.div_ceil(compress_ratio);
+        Self {
+            raw: DsV4LayerKvCache::with_capacity(max_seq_len, head_dim),
+            // Pad max_n_comp to at least 1 so the constructor doesn't
+            // panic when max_seq_len < compress_ratio (a legal but
+            // edge-case configuration where no compressed positions
+            // will ever be produced).
+            compressed: DsV4LayerKvCache::with_capacity(max_n_comp.max(1), head_dim),
+            compress_ratio,
+        }
+    }
+
+    /// Current number of raw kv_a rows (equivalently, current sequence
+    /// position).
+    pub fn current_raw_len(&self) -> usize {
+        self.raw.current_len()
+    }
+
+    /// Current number of compressed kv rows.
+    pub fn current_compressed_len(&self) -> usize {
+        self.compressed.current_len()
+    }
+
+    /// Reset both sub-caches for a new sequence.
+    pub fn clear(&mut self) {
+        self.raw.clear();
+        self.compressed.clear();
+    }
+}
+
+#[cfg(test)]
+mod hca_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// Constructor sizes both sub-caches correctly.
+    #[test]
+    fn hca_with_capacity_sizes_both_subcaches() {
+        let cache = DsV4LayerHcaCache::with_capacity(128, 512, 4);
+        assert_eq!(cache.raw.max_seq_len(), 128);
+        assert_eq!(cache.raw.head_dim(), 512);
+        // max_n_comp = ceil(128 / 4) = 32.
+        assert_eq!(cache.compressed.max_seq_len(), 32);
+        assert_eq!(cache.compressed.head_dim(), 512);
+        assert_eq!(cache.compress_ratio, 4);
+        assert_eq!(cache.current_raw_len(), 0);
+        assert_eq!(cache.current_compressed_len(), 0);
+    }
+
+    /// compress_ratio=128 with max_seq_len=128: exactly 1 compressed
+    /// position fits.
+    #[test]
+    fn hca_compress_ratio_128_one_compressed_slot() {
+        let cache = DsV4LayerHcaCache::with_capacity(128, 512, 128);
+        // ceil(128 / 128) = 1.
+        assert_eq!(cache.compressed.max_seq_len(), 1);
+    }
+
+    /// Partial chunks count: max_seq_len=10, compress_ratio=4 → 3 chunks
+    /// (8 covers chunks 0,1; partial chunk 2 covers positions 8,9 → still
+    /// 1 more compressed slot if the partial gets compressed).
+    #[test]
+    fn hca_partial_chunk_gets_a_compressed_slot() {
+        let cache = DsV4LayerHcaCache::with_capacity(10, 4, 4);
+        // ceil(10 / 4) = 3 (two full chunks + one partial).
+        assert_eq!(cache.compressed.max_seq_len(), 3);
+    }
+
+    /// max_seq_len < compress_ratio: max_n_comp = 0 would panic on the
+    /// inner constructor, so we pad to 1.
+    #[test]
+    fn hca_max_seq_len_below_compress_ratio_still_constructible() {
+        let cache = DsV4LayerHcaCache::with_capacity(2, 4, 4);
+        // ceil(2 / 4) = 1 → pad to 1, not 0.
+        assert_eq!(cache.compressed.max_seq_len(), 1);
+        // Raw is still sized as requested.
+        assert_eq!(cache.raw.max_seq_len(), 2);
+    }
+
+    /// Independent appends work on both sub-caches.
+    #[test]
+    fn hca_independent_appends() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(16, 4, 4);
+        // Append 4 raw rows.
+        let raw_rows = Array2::<f32>::from_shape_fn((4, 4), |(t, d)| (t * 10 + d) as f32);
+        cache.raw.append(raw_rows.view());
+        // Append 1 compressed row (representing the chunk that just
+        // closed in the compressor pipeline).
+        let comp_row =
+            Array2::<f32>::from_shape_vec((1, 4), vec![100.0, 101.0, 102.0, 103.0]).unwrap();
+        cache.compressed.append(comp_row.view());
+
+        assert_eq!(cache.current_raw_len(), 4);
+        assert_eq!(cache.current_compressed_len(), 1);
+        assert_eq!(cache.raw.view_current().shape(), &[4, 4]);
+        assert_eq!(cache.compressed.view_current().shape(), &[1, 4]);
+    }
+
+    /// Clear resets both sub-caches.
+    #[test]
+    fn hca_clear_resets_both() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        let row = Array2::<f32>::zeros((1, 4));
+        cache.raw.append(row.view());
+        cache.compressed.append(row.view());
+        assert_eq!(cache.current_raw_len(), 1);
+        assert_eq!(cache.current_compressed_len(), 1);
+        cache.clear();
+        assert_eq!(cache.current_raw_len(), 0);
+        assert_eq!(cache.current_compressed_len(), 0);
+    }
+
+    /// compress_ratio=0 panics.
+    #[test]
+    #[should_panic(expected = "compress_ratio must be > 0")]
+    fn hca_zero_compress_ratio_panics() {
+        let _ = DsV4LayerHcaCache::with_capacity(8, 4, 0);
+    }
+}
