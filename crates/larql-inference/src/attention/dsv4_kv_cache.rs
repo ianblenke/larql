@@ -30,6 +30,8 @@
 use ndarray::{s, Array1, Array2, ArrayView2};
 
 use super::dsv4_compressor_prefill::CompressorOverlapState;
+use super::dsv4_layer_variants::DsV4LayerVariant;
+use super::dsv4_storage_build::DsV4Hyperparams;
 
 /// Per-layer DSv4 MLA KV cache.
 ///
@@ -449,6 +451,41 @@ impl DsV4LayerCache {
             DsV4LayerCache::Hca(c) => c.clear(),
         }
     }
+
+    /// Build the right cache variant for a layer based on its detected
+    /// [`DsV4LayerVariant`]. Encapsulates the per-variant allocation
+    /// logic so callers don't have to match on `(compress_ratio,
+    /// has_indexer)` themselves.
+    ///
+    /// Dispatch:
+    /// - `compress_ratio == None` → [`Self::new_no_compress`]
+    /// - `compress_ratio == Some(r)`, `has_indexer == false` →
+    ///   [`Self::new_hca_compress`] with ratio `r`
+    /// - `compress_ratio == Some(r)`, `has_indexer == true` →
+    ///   [`Self::new_hca_indexer`] with ratio `r` and
+    ///   `hp.indexer_head_size` (must be set)
+    ///
+    /// Use this with the variant returned by
+    /// [`super::dsv4_layer_variants::detect_layer_variant`] to
+    /// pre-allocate the per-layer cache vector that feeds
+    /// `dsv4_streaming_model_forward_cached`.
+    pub fn for_variant(
+        hp: &DsV4Hyperparams,
+        variant: &DsV4LayerVariant,
+        max_seq_len: usize,
+    ) -> Self {
+        match (variant.compress_ratio, variant.has_indexer) {
+            (None, _) => Self::new_no_compress(max_seq_len, hp.head_dim),
+            (Some(ratio), false) => Self::new_hca_compress(max_seq_len, hp.head_dim, ratio),
+            (Some(ratio), true) => Self::new_hca_indexer(
+                max_seq_len,
+                hp.head_dim,
+                ratio,
+                hp.indexer_head_size
+                    .expect("hp.indexer_head_size must be set for indexer layers"),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +609,96 @@ mod hca_tests {
             }
             _ => panic!("expected Hca variant"),
         }
+    }
+
+    /// Helper: minimal DsV4Hyperparams for variant-constructor tests.
+    fn test_hp(indexer_head_size: Option<usize>) -> DsV4Hyperparams {
+        DsV4Hyperparams {
+            n_embd: 64,
+            n_head: 4,
+            head_dim: 64,
+            q_lora_rank: 16,
+            n_groups: 2,
+            o_lora_rank: 8,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: super::super::dsv4_rope_tail::DsV4RopeMode::Neox,
+            window_size: 8,
+            norm_eps: 1e-5,
+            indexer_head_size,
+            n_index_head: indexer_head_size.map(|_| 2),
+            top_k: indexer_head_size.map(|_| 2),
+            n_hc: 4,
+            n_expert: 4,
+            n_expert_used: 2,
+            n_ff_exp: 8,
+            n_expert_shared: 1,
+            expert_weights_norm: true,
+            expert_weights_scale: 1.0,
+            yarn: None,
+            rope_base_swa: None,
+        }
+    }
+
+    #[test]
+    fn layer_cache_for_variant_no_compress() {
+        let hp = test_hp(None);
+        let v = DsV4LayerVariant {
+            uses_hash_routing: true,
+            compress_ratio: None,
+            has_indexer: false,
+        };
+        let c = DsV4LayerCache::for_variant(&hp, &v, 32);
+        assert!(matches!(c, DsV4LayerCache::NoCompress(_)));
+    }
+
+    #[test]
+    fn layer_cache_for_variant_hca_compress_only() {
+        let hp = test_hp(None);
+        let v = DsV4LayerVariant {
+            uses_hash_routing: false,
+            compress_ratio: Some(128),
+            has_indexer: false,
+        };
+        let c = DsV4LayerCache::for_variant(&hp, &v, 64);
+        match c {
+            DsV4LayerCache::Hca(inner) => {
+                assert_eq!(inner.compress_ratio, 128);
+                assert!(inner.index_compressed.is_none());
+            }
+            _ => panic!("expected Hca variant"),
+        }
+    }
+
+    #[test]
+    fn layer_cache_for_variant_hca_with_indexer() {
+        let hp = test_hp(Some(16));
+        let v = DsV4LayerVariant {
+            uses_hash_routing: false,
+            compress_ratio: Some(4),
+            has_indexer: true,
+        };
+        let c = DsV4LayerCache::for_variant(&hp, &v, 32);
+        match c {
+            DsV4LayerCache::Hca(inner) => {
+                assert_eq!(inner.compress_ratio, 4);
+                let idx = inner.index_compressed.as_ref().expect("indexer enabled");
+                assert_eq!(idx.head_dim(), 16);
+            }
+            _ => panic!("expected Hca variant"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "hp.indexer_head_size must be set")]
+    fn layer_cache_for_variant_indexer_without_hp_panics() {
+        let hp = test_hp(None); // indexer_head_size unset
+        let v = DsV4LayerVariant {
+            uses_hash_routing: false,
+            compress_ratio: Some(4),
+            has_indexer: true,
+        };
+        let _ = DsV4LayerCache::for_variant(&hp, &v, 32);
     }
 
     #[test]
