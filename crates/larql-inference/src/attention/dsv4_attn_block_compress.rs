@@ -32,10 +32,11 @@ use ndarray::{s, Array2, ArrayView2, Axis};
 
 use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights};
 use super::dsv4_compressor_prefill::{
-    build_compressor_prefill, CompressorParams, CompressorWeights,
+    build_compressor_prefill, dsv4_compressor_step_coff1, CompressorParams, CompressorWeights,
 };
 use super::dsv4_fp8_kv::fp8_kv_quantize;
 use super::dsv4_grouped_o_proj::grouped_o_proj;
+use super::dsv4_kv_cache::DsV4LayerHcaCache;
 use super::dsv4_masked_attn::dsv4_masked_attn;
 use super::dsv4_rope_tail_yarn::rope_tail_dispatch;
 
@@ -203,6 +204,213 @@ pub fn build_static_mask(
         let c_visible = (abs_pos + 1) / compress_ratio; // exclusive upper bound on c
         for c in 0..c_visible.min(n_comp) {
             mask[[t, n_tokens + c]] = 0.0;
+        }
+    }
+    mask
+}
+
+/// KV-cached variant of [`dsv4_attn_block_compress_no_indexer`].
+///
+/// Same scope: `compress_ratio` in `{1, 2, 3, 5, 6, ...}` — NOT 4
+/// (the indexer-equipped path is a sibling cached function).
+///
+/// Threads incremental state through `&mut DsV4LayerHcaCache`:
+/// - **Raw KV**: new tokens' rotated+FP8 kv_a rows are appended to
+///   `cache.raw`. Query attends to the full raw cache (with sliding-
+///   window mask).
+/// - **Pending cur buffer**: new tokens' post-attn-norm hidden state
+///   (`cur`) rows are pushed to `cache.pending_cur`. Once that buffer
+///   accumulates `compress_ratio` rows, [`dsv4_compressor_step_coff1`]
+///   runs on the completed chunk, the result is FP8-quantized and
+///   appended to `cache.compressed`, and the consumed rows are
+///   drained from `pending_cur`.
+/// - **Mask**: built over the full raw + compressed cache via
+///   [`build_cached_static_mask`], which honors `position_offset` so
+///   new tokens correctly mask out future positions.
+///
+/// Bit-exact-equivalent to [`dsv4_attn_block_compress_no_indexer`] on
+/// the same input when the cache starts empty and `position_offset =
+/// 0`. Verified in the unit tests.
+///
+/// Asserts `position_offset == cache.raw.current_len()` on entry to
+/// catch out-of-sync caller bugs.
+pub fn dsv4_attn_block_compress_no_indexer_cached(
+    x: ArrayView2<f32>,
+    w: &DsV4AttnBlockCompressWeights,
+    p: &DsV4AttnBlockCompressParams,
+    position_offset: usize,
+    cache: &mut DsV4LayerHcaCache,
+) -> Array2<f32> {
+    let n_new = x.shape()[0];
+    assert_eq!(
+        x.shape(),
+        &[n_new, p.attn.n_embd],
+        "x must be (n_tokens, n_embd)"
+    );
+    assert_eq!(
+        p.attn.head_dim, p.compressor.head_dim,
+        "attn and compressor head_dim must match"
+    );
+    assert!(
+        p.compressor.compress_ratio > 0 && p.compressor.compress_ratio != 4,
+        "no-indexer cached path requires compress_ratio in {{1, 2, 3, 5, ...}}; got {}",
+        p.compressor.compress_ratio
+    );
+    assert_eq!(
+        cache.compress_ratio, p.compressor.compress_ratio,
+        "cache.compress_ratio ({}) must equal params.compressor.compress_ratio ({})",
+        cache.compress_ratio, p.compressor.compress_ratio
+    );
+    assert_eq!(
+        cache.raw.current_len(),
+        position_offset,
+        "position_offset ({position_offset}) must equal cache.raw.current_len ({})",
+        cache.raw.current_len()
+    );
+
+    // 1. attn_norm.
+    let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
+
+    // 2. Q low-rank + tail-RoPE (same as prefill).
+    let qr = matmul_x_wt(cur.view(), w.attn.wq_a);
+    let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
+    let q = matmul_x_wt(qr.view(), w.attn.wq_b);
+    let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
+    let q = rope_tail_dispatch(
+        &q,
+        p.attn.n_head,
+        p.attn.head_dim,
+        p.attn.n_rot,
+        p.attn.rope_base,
+        p.attn.rope_mode,
+        p.attn.yarn.as_ref(),
+        false,
+        position_offset,
+    );
+
+    // 3. Raw KV (for new tokens only) + tail-RoPE + FP8 → append to cache.
+    let kv_raw = matmul_x_wt(cur.view(), w.attn.wkv);
+    let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
+    let kv_raw = rope_tail_dispatch(
+        &kv_raw,
+        1,
+        p.attn.head_dim,
+        p.attn.n_rot,
+        p.attn.rope_base,
+        p.attn.rope_mode,
+        p.attn.yarn.as_ref(),
+        false,
+        position_offset,
+    );
+    let kv_raw = fp8_kv_quantize(kv_raw.view(), p.attn.n_rot);
+    cache.raw.append(kv_raw.view());
+
+    // 4. Drain new cur rows into pending_cur; when a full chunk fills,
+    //    run the cached compressor step and append result to compressed.
+    for t in 0..n_new {
+        cache.pending_cur.push(cur.row(t).to_owned());
+        if cache.pending_cur.len() >= p.compressor.compress_ratio {
+            // Build chunk array from the first compress_ratio pending rows.
+            let mut chunk = Array2::<f32>::zeros((p.compressor.compress_ratio, p.attn.n_embd));
+            let drained: Vec<_> = cache
+                .pending_cur
+                .drain(..p.compressor.compress_ratio)
+                .collect();
+            for (r, row) in drained.iter().enumerate() {
+                for d in 0..p.attn.n_embd {
+                    chunk[[r, d]] = row[d];
+                }
+            }
+            let chunk_idx = cache.compressed.current_len();
+            let new_comp =
+                dsv4_compressor_step_coff1(chunk.view(), &w.compressor, &p.compressor, chunk_idx);
+            // FP8 fake-quantize then append.
+            let new_comp_2d =
+                Array2::<f32>::from_shape_vec((1, p.attn.head_dim), new_comp.to_vec())
+                    .expect("compressor step returned head_dim values");
+            let new_comp_2d = fp8_kv_quantize(new_comp_2d.view(), p.attn.n_rot);
+            cache.compressed.append(new_comp_2d.view());
+        }
+    }
+
+    // 5. Concat raw + compressed into a single KV view for masked MQA.
+    let raw_total = cache.raw.current_len();
+    let n_comp_total = cache.compressed.current_len();
+    let n_kv_total = raw_total + n_comp_total;
+    let mut kv_cat = Array2::<f32>::zeros((n_kv_total, p.attn.head_dim));
+    kv_cat
+        .slice_mut(s![..raw_total, ..])
+        .assign(&cache.raw.view_current());
+    kv_cat
+        .slice_mut(s![raw_total.., ..])
+        .assign(&cache.compressed.view_current());
+
+    // 6. Build the static mask for the cached (raw_total ≥ n_new) shape.
+    let mask = build_cached_static_mask(
+        n_new,
+        raw_total,
+        n_comp_total,
+        position_offset,
+        p.attn.window_size,
+        p.compressor.compress_ratio,
+    );
+
+    // 7. Masked MQA.
+    let scale = 1.0 / (p.attn.head_dim as f32).sqrt();
+    let o = dsv4_masked_attn(
+        q.view(),
+        kv_cat.view(),
+        kv_cat.view(),
+        mask.view(),
+        p.attn.n_head,
+        p.attn.head_dim,
+        w.attn.attn_sinks,
+        scale,
+    );
+
+    // 8. Grouped o-proj.
+    grouped_o_proj(
+        o.view(),
+        w.attn.wo_a,
+        w.attn.wo_b,
+        p.attn.n_head,
+        p.attn.head_dim,
+        p.attn.n_groups,
+        p.attn.o_lora_rank,
+    )
+}
+
+/// Cached mask: shape `(n_new, raw_total + n_compressed)`. Raw columns
+/// indexed by absolute KV position `[0, raw_total)`; compressed
+/// columns indexed by chunk `[raw_total, raw_total + n_compressed)`.
+/// For empty cache + `position_offset = 0` + `raw_total == n_new`,
+/// this reduces to [`build_static_mask`].
+pub fn build_cached_static_mask(
+    n_new: usize,
+    raw_total: usize,
+    n_compressed: usize,
+    position_offset: usize,
+    window_size: usize,
+    compress_ratio: usize,
+) -> Array2<f32> {
+    let n_kv_total = raw_total + n_compressed;
+    let mut mask = Array2::<f32>::from_elem((n_new, n_kv_total), f32::NEG_INFINITY);
+    for t in 0..n_new {
+        let abs_pos = position_offset + t;
+        // Raw columns: causal sliding-window. Column j corresponds to
+        // absolute position j (raw cache holds positions 0..raw_total).
+        let j_lo = abs_pos.saturating_sub(window_size - 1);
+        let j_hi = abs_pos.min(raw_total.saturating_sub(1));
+        if abs_pos < raw_total {
+            for j in j_lo..=j_hi {
+                mask[[t, j]] = 0.0;
+            }
+        }
+        // Compressed columns: chunk c spans positions [c*ratio, (c+1)*ratio).
+        // Visible iff fully past abs_pos.
+        let c_visible = (abs_pos + 1) / compress_ratio;
+        for c in 0..c_visible.min(n_compressed) {
+            mask[[t, raw_total + c]] = 0.0;
         }
     }
     mask
@@ -605,5 +813,246 @@ mod tests {
             },
         };
         let _ = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+    }
+
+    // ── Cached Compress attention tests ──
+
+    /// Cornerstone bit-exact equivalence: cached path with empty cache
+    /// + full prefill input matches the non-cached prefill function.
+    #[test]
+    fn cached_compress_empty_cache_equals_prefill() {
+        let n_tokens = 8; // 8 / cr=2 = 4 compressed positions
+        let cr = 2;
+        let (
+            x,
+            attn_norm,
+            wq_a,
+            q_a_norm,
+            wq_b,
+            wkv,
+            kv_a_norm,
+            wo_a,
+            wo_b,
+            attn_sinks,
+            comp_wkv,
+            comp_wgate,
+            comp_ape,
+            comp_norm,
+            p,
+        ) = make_block(n_tokens, cr);
+        let w = DsV4AttnBlockCompressWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+        };
+
+        let out_prefill = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+
+        let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
+        let out_cached =
+            dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache);
+
+        assert_eq!(out_prefill.shape(), out_cached.shape());
+        let mut max_diff = 0.0_f32;
+        for (a, b) in out_prefill.iter().zip(out_cached.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        assert!(
+            max_diff < 1e-5,
+            "cached vs prefill (cr=2, n=8) max diff = {max_diff}"
+        );
+        // Cache state after full prefill:
+        assert_eq!(cache.raw.current_len(), n_tokens);
+        assert_eq!(cache.compressed.current_len(), n_tokens / cr);
+        assert!(cache.pending_cur.is_empty());
+    }
+
+    /// Incremental prefill+decode equivalence: split-call cached path
+    /// matches one-shot cached path on the same input.
+    #[test]
+    fn cached_compress_split_prefill_decode_equals_oneshot() {
+        let n_total = 10; // 5 compressed positions
+        let cr = 2;
+        let (
+            x,
+            attn_norm,
+            wq_a,
+            q_a_norm,
+            wq_b,
+            wkv,
+            kv_a_norm,
+            wo_a,
+            wo_b,
+            attn_sinks,
+            comp_wkv,
+            comp_wgate,
+            comp_ape,
+            comp_norm,
+            p,
+        ) = make_block(n_total, cr);
+        let w = DsV4AttnBlockCompressWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+        };
+
+        // Path A: one-shot cached.
+        let mut cache_a = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
+        let out_one = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache_a);
+
+        // Path B: prefill 6 tokens, then decode 4 more.
+        let mut cache_b = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
+        let x_pre = x.slice(s![..6, ..]);
+        let x_dec = x.slice(s![6.., ..]);
+        let out_pre = dsv4_attn_block_compress_no_indexer_cached(x_pre, &w, &p, 0, &mut cache_b);
+        let out_dec = dsv4_attn_block_compress_no_indexer_cached(x_dec, &w, &p, 6, &mut cache_b);
+
+        // Rows 0..6 should match out_one rows 0..6, rows 6..10 should match out_one rows 6..10.
+        let mut max_diff = 0.0_f32;
+        for t in 0..6 {
+            for d in 0..p.attn.n_embd {
+                max_diff = max_diff.max((out_one[[t, d]] - out_pre[[t, d]]).abs());
+            }
+        }
+        for t in 0..4 {
+            for d in 0..p.attn.n_embd {
+                max_diff = max_diff.max((out_one[[6 + t, d]] - out_dec[[t, d]]).abs());
+            }
+        }
+        assert!(
+            max_diff < 1e-5,
+            "split-call vs one-shot cached: max diff = {max_diff}"
+        );
+        assert_eq!(cache_a.raw.current_len(), n_total);
+        assert_eq!(cache_b.raw.current_len(), n_total);
+        assert_eq!(cache_a.compressed.current_len(), n_total / cr);
+        assert_eq!(cache_b.compressed.current_len(), n_total / cr);
+    }
+
+    /// Partial chunks remain in pending_cur until a new token fills them.
+    /// Tests that the prefill-then-step pattern correctly carries
+    /// state across calls.
+    #[test]
+    fn cached_compress_partial_chunk_stays_pending() {
+        let n_total = 9; // 4 compressed + 1 pending
+        let cr = 2;
+        let (
+            x,
+            attn_norm,
+            wq_a,
+            q_a_norm,
+            wq_b,
+            wkv,
+            kv_a_norm,
+            wo_a,
+            wo_b,
+            attn_sinks,
+            comp_wkv,
+            comp_wgate,
+            comp_ape,
+            comp_norm,
+            p,
+        ) = make_block(n_total, cr);
+        let w = DsV4AttnBlockCompressWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+        };
+        let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
+        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache);
+
+        // 9 tokens with cr=2: 4 full chunks → 4 compressed, 1 leftover pending.
+        assert_eq!(cache.raw.current_len(), 9);
+        assert_eq!(cache.compressed.current_len(), 4);
+        assert_eq!(cache.pending_cur.len(), 1);
+    }
+
+    /// position_offset out of sync with cache.raw.current_len() panics.
+    #[test]
+    #[should_panic(expected = "position_offset")]
+    fn cached_compress_position_offset_mismatch_panics() {
+        let cr = 2;
+        let (
+            _x,
+            attn_norm,
+            wq_a,
+            q_a_norm,
+            wq_b,
+            wkv,
+            kv_a_norm,
+            wo_a,
+            wo_b,
+            attn_sinks,
+            comp_wkv,
+            comp_wgate,
+            comp_ape,
+            comp_norm,
+            p,
+        ) = make_block(4, cr);
+        let w = DsV4AttnBlockCompressWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+        };
+        // Empty cache but caller claims offset=5 → panic.
+        let mut cache = DsV4LayerHcaCache::with_capacity(16, p.attn.head_dim, cr);
+        let x = Array2::<f32>::zeros((1, p.attn.n_embd));
+        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 5, &mut cache);
     }
 }
