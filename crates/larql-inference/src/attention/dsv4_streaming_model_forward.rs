@@ -25,6 +25,7 @@
 
 use ndarray::{Array2, Array3};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
 use larql_models::loading::gguf::GgufFile;
 
 use super::dsv4_attn_block::DsV4AttnBlockParams;
@@ -202,6 +203,7 @@ pub fn dsv4_streaming_model_forward(
     token_ids: &[u32],
     layer_indices: &[usize],
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Result<Array2<f32>, DsV4LoadError> {
     let layer_p = build_layer_params(hp);
     let pool = DispatchParamsPool::new(hp);
@@ -263,18 +265,9 @@ pub fn dsv4_streaming_model_forward(
         }
     }
 
-    // 5. lm_head projection.
-    let n_vocab = head.n_vocab;
-    let mut logits = Array2::<f32>::zeros((n_tokens, n_vocab));
-    for t in 0..n_tokens {
-        for v in 0..n_vocab {
-            let mut acc = 0.0_f32;
-            for d in 0..n_embd {
-                acc += pooled[[t, d]] * head_w.output_lm_head[[v, d]];
-            }
-            logits[[t, v]] = acc;
-        }
-    }
+    // 5. lm_head projection via ComputeBackend (GPU when available).
+    let lm_head_owned = head_w.output_lm_head.to_owned();
+    let logits = dot_proj_gpu(&pooled, &lm_head_owned, backend);
     Ok(logits)
 }
 
@@ -307,6 +300,7 @@ pub fn dsv4_streaming_model_forward_cached(
     layer_indices: &[usize],
     position_offset: usize,
     mut layer_caches: Option<&mut [DsV4LayerCache]>,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Result<Array2<f32>, DsV4LoadError> {
     let layer_p = build_layer_params(hp);
     let pool = DispatchParamsPool::new(hp);
@@ -368,17 +362,9 @@ pub fn dsv4_streaming_model_forward_cached(
         }
     }
 
-    let n_vocab = head.n_vocab;
-    let mut logits = Array2::<f32>::zeros((n_tokens, n_vocab));
-    for t in 0..n_tokens {
-        for v in 0..n_vocab {
-            let mut acc = 0.0_f32;
-            for d in 0..n_embd {
-                acc += pooled[[t, d]] * head_w.output_lm_head[[v, d]];
-            }
-            logits[[t, v]] = acc;
-        }
-    }
+    // 5. lm_head projection via ComputeBackend.
+    let lm_head_owned = head_w.output_lm_head.to_owned();
+    let logits = dot_proj_gpu(&pooled, &lm_head_owned, backend);
     Ok(logits)
 }
 
@@ -476,8 +462,9 @@ mod tests {
             .map(|t| (t * 257 % head.n_vocab) as u32)
             .collect();
 
-        let logits = dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &[0, 1, 2], 0)
-            .expect("streaming forward");
+        let logits =
+            dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &[0, 1, 2], 0, None)
+                .expect("streaming forward");
 
         assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
         let n_nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
@@ -524,8 +511,9 @@ mod tests {
         let n_layer = 43;
         let layer_indices: Vec<usize> = (0..n_layer).collect();
 
-        let logits = dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layer_indices, 0)
-            .expect("streaming forward over all 43 layers");
+        let logits =
+            dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layer_indices, 0, None)
+                .expect("streaming forward over all 43 layers");
 
         assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
         let n_nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
@@ -581,10 +569,11 @@ mod tests {
         let layers = [0, 1, 2];
 
         let logits_a =
-            dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layers, 0).unwrap();
-        let logits_b =
-            dsv4_streaming_model_forward_cached(&gguf, &hp, &head, &token_ids, &layers, 0, None)
-                .unwrap();
+            dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layers, 0, None).unwrap();
+        let logits_b = dsv4_streaming_model_forward_cached(
+            &gguf, &hp, &head, &token_ids, &layers, 0, None, None,
+        )
+        .unwrap();
         assert_eq!(logits_a.shape(), logits_b.shape());
 
         let mut max_diff = 0.0_f32;
@@ -669,6 +658,7 @@ mod tests {
             &layers,
             0,
             Some(&mut layer_caches),
+            None,
         )
         .expect("cached prefill");
         assert_eq!(logits_prefill.shape(), &[n_prefill, head.n_vocab]);
@@ -695,6 +685,7 @@ mod tests {
             &layers,
             n_prefill, // position_offset
             Some(&mut layer_caches),
+            None,
         )
         .expect("cached decode");
         assert_eq!(logits_decode.shape(), &[1, head.n_vocab]);

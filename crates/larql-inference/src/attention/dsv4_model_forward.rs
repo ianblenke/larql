@@ -17,6 +17,8 @@
 
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_mhc::weighted_sum;
 use super::dsv4_per_layer::{dsv4_per_layer_forward, DsV4LayerParams, DsV4LayerWeights};
 
@@ -168,6 +170,12 @@ pub fn embed_tokens(token_ids: &[u32], token_embd: ArrayView2<f32>) -> Array2<f3
 ///
 /// All slices must have the same length `n_layer`. `position_offset`
 /// is 0 for prefill from scratch.
+///
+/// `backend`: optional GPU compute backend. When `Some(_)`, the
+/// lm_head matmul (`pooled @ output_lm_head^T`) dispatches through
+/// the backend's `matmul_transb` — typically cuBLAS GEMM on CUDA
+/// devices, saving the bulk of the lm_head wall time at large vocabs.
+/// Pass `None` for the all-CPU reference path.
 pub fn dsv4_model_forward<'a, 'p>(
     token_ids: &[u32],
     token_embd: ArrayView2<'a, f32>,
@@ -176,6 +184,7 @@ pub fn dsv4_model_forward<'a, 'p>(
     head: &DsV4HeadWeights<'a>,
     head_params: &DsV4HeadParams,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     assert_eq!(
         layers.len(),
@@ -220,19 +229,12 @@ pub fn dsv4_model_forward<'a, 'p>(
         }
     }
 
-    // 6. lm_head projection.
-    let n_vocab = head_params.n_vocab;
-    let mut logits = Array2::<f32>::zeros((n_tokens, n_vocab));
-    for t in 0..n_tokens {
-        for v in 0..n_vocab {
-            let mut acc = 0.0_f32;
-            for d in 0..n_embd {
-                acc += pooled[[t, d]] * head.output_lm_head[[v, d]];
-            }
-            logits[[t, v]] = acc;
-        }
-    }
-    logits
+    // 6. lm_head projection via ComputeBackend (GPU when available,
+    //    ndarray fallback otherwise). pooled is (n_tokens, n_embd) and
+    //    output_lm_head is (n_vocab, n_embd) — dot_proj_gpu computes
+    //    pooled @ output_lm_head^T → (n_tokens, n_vocab).
+    let lm_head_owned = head.output_lm_head.to_owned();
+    dot_proj_gpu(&pooled, &lm_head_owned, backend)
 }
 
 #[cfg(test)]
@@ -522,6 +524,7 @@ mod tests {
             &head_w,
             &head_p,
             0,
+            None,
         );
         assert_eq!(logits.shape(), &[n_tokens, n_vocab]);
         assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
@@ -537,6 +540,30 @@ mod tests {
         assert!(
             row_diff > 1e-3,
             "row 0 and row 1 logits are identical (loop not running per-token)"
+        );
+
+        // Backend-routed CPU lm_head matches the None fallback.
+        let cpu = larql_compute::CpuBackend;
+        let logits_cpu = dsv4_model_forward(
+            &token_ids,
+            token_embd.view(),
+            &layers,
+            &layer_params,
+            &head_w,
+            &head_p,
+            0,
+            Some(&cpu as &dyn larql_compute::ComputeBackend),
+        );
+        assert_eq!(logits_cpu.shape(), logits.shape());
+        let mut max_diff = 0.0_f32;
+        for (a, b) in logits.iter().zip(logits_cpu.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        // CPU backend uses ndarray's BLAS internally; max diff is just
+        // f32 reduction-order noise from parallel BLAS, not algorithmic.
+        assert!(
+            max_diff < 1e-4,
+            "Some(CpuBackend) lm_head vs None lm_head: max diff = {max_diff}"
         );
     }
 
@@ -632,6 +659,7 @@ mod tests {
             &head_w,
             &head_p,
             0,
+            None,
         );
 
         assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
@@ -821,6 +849,7 @@ mod tests {
             &head_w,
             &head_p,
             0,
+            None,
         );
 
         assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);

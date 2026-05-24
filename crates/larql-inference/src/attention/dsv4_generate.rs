@@ -17,6 +17,7 @@
 
 use rand::Rng;
 
+use larql_compute::ComputeBackend;
 use larql_models::loading::gguf::GgufFile;
 
 use super::dsv4_decode_loop::DecodeConfig;
@@ -52,6 +53,7 @@ pub fn dsv4_generate(
     prompt: &[u32],
     decode_config: DecodeConfig,
     rng: &mut impl Rng,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Result<Vec<u32>, DsV4LoadError> {
     assert!(!prompt.is_empty(), "prompt must be non-empty");
 
@@ -73,6 +75,7 @@ pub fn dsv4_generate(
         layer_indices,
         0,
         Some(&mut layer_caches),
+        backend,
     )?;
     let mut tokens = prompt.to_vec();
 
@@ -103,6 +106,7 @@ pub fn dsv4_generate(
             layer_indices,
             pos,
             Some(&mut layer_caches),
+            backend,
         )?;
     }
 
@@ -156,6 +160,7 @@ mod tests {
             &prompt,
             decode_config,
             &mut rng,
+            None,
         )
         .expect("generate");
 
@@ -215,6 +220,7 @@ mod tests {
             &prompt,
             decode_config,
             &mut rng_a,
+            None,
         )
         .expect("generate run A");
 
@@ -227,6 +233,7 @@ mod tests {
             &prompt,
             decode_config,
             &mut rng_b,
+            None,
         )
         .expect("generate run B");
 
