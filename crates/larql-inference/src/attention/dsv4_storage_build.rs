@@ -147,6 +147,7 @@ impl std::error::Error for DsV4BuildError {}
 /// off-by-one shapes → error.
 pub fn build_layer_storage(
     tensors: HashMap<DsV4TensorKind, Vec<f32>>,
+    int_tensors: HashMap<DsV4TensorKind, Vec<i32>>,
     hp: &DsV4Hyperparams,
     compress_ratio: usize,
 ) -> Result<DsV4LayerWeightStorage, DsV4BuildError> {
@@ -214,6 +215,68 @@ pub fn build_layer_storage(
         hc_fn: take_2d(&tensors, DsV4TensorKind::HcFfnFn, hc_mix, hc_dim)?,
         hc_scale: take_scale_array(&tensors, DsV4TensorKind::HcFfnScale)?,
         hc_base: take_vec(&tensors, DsV4TensorKind::HcFfnBase, &[hc_mix])?,
+    });
+
+    // ── FFN block (also always present in DSv4 layers) ──
+    let hidden_shared = hp.n_ff_exp * hp.n_expert_shared;
+    let n_vocab_for_routing = int_tensors
+        .get(&DsV4TensorKind::FfnGateTid2Eid)
+        .map(|v| v.len() / hp.n_expert_used);
+    storage.ffn = Some(super::dsv4_storage::FfnStorage {
+        ffn_norm: take_vec(&tensors, DsV4TensorKind::FfnNorm, &[hp.n_embd])?,
+        gate_inp: take_2d(&tensors, DsV4TensorKind::FfnGateInp, hp.n_expert, hp.n_embd)?,
+        exp_probs_b: tensors
+            .get(&DsV4TensorKind::FfnExpProbsB)
+            .map(|v| ndarray::Array1::from(v.clone())),
+        gate_tid2eid: match (
+            n_vocab_for_routing,
+            int_tensors.get(&DsV4TensorKind::FfnGateTid2Eid),
+        ) {
+            (Some(n_vocab), Some(buf)) => Some(
+                ndarray::Array2::from_shape_vec((n_vocab, hp.n_expert_used), buf.clone())
+                    .expect("tid2eid shape verified by n_vocab derivation"),
+            ),
+            _ => None,
+        },
+        gate_exps: take_3d(
+            &tensors,
+            DsV4TensorKind::FfnGateExps,
+            hp.n_expert,
+            hp.n_ff_exp,
+            hp.n_embd,
+        )?,
+        up_exps: take_3d(
+            &tensors,
+            DsV4TensorKind::FfnUpExps,
+            hp.n_expert,
+            hp.n_ff_exp,
+            hp.n_embd,
+        )?,
+        down_exps: take_3d(
+            &tensors,
+            DsV4TensorKind::FfnDownExps,
+            hp.n_expert,
+            hp.n_embd,
+            hp.n_ff_exp,
+        )?,
+        gate_shexp: take_2d(
+            &tensors,
+            DsV4TensorKind::FfnGateShexp,
+            hidden_shared,
+            hp.n_embd,
+        )?,
+        up_shexp: take_2d(
+            &tensors,
+            DsV4TensorKind::FfnUpShexp,
+            hidden_shared,
+            hp.n_embd,
+        )?,
+        down_shexp: take_2d(
+            &tensors,
+            DsV4TensorKind::FfnDownShexp,
+            hp.n_embd,
+            hidden_shared,
+        )?,
     });
 
     if compress_ratio == 0 {
@@ -436,6 +499,37 @@ mod tests {
         m.insert(DsV4TensorKind::HcFfnFn, vec![0.001; hc_mix * hc_dim]);
         m.insert(DsV4TensorKind::HcFfnScale, vec![0.5, 0.5, 0.5]);
         m.insert(DsV4TensorKind::HcFfnBase, vec![0.0; hc_mix]);
+        // FFN — always required by build_layer_storage.
+        let hidden_shared = hp.n_ff_exp * hp.n_expert_shared;
+        m.insert(DsV4TensorKind::FfnNorm, vec![1.0; hp.n_embd]);
+        m.insert(
+            DsV4TensorKind::FfnGateInp,
+            vec![0.01; hp.n_expert * hp.n_embd],
+        );
+        m.insert(
+            DsV4TensorKind::FfnGateExps,
+            vec![0.01; hp.n_expert * hp.n_ff_exp * hp.n_embd],
+        );
+        m.insert(
+            DsV4TensorKind::FfnUpExps,
+            vec![0.01; hp.n_expert * hp.n_ff_exp * hp.n_embd],
+        );
+        m.insert(
+            DsV4TensorKind::FfnDownExps,
+            vec![0.01; hp.n_expert * hp.n_embd * hp.n_ff_exp],
+        );
+        m.insert(
+            DsV4TensorKind::FfnGateShexp,
+            vec![0.01; hidden_shared * hp.n_embd],
+        );
+        m.insert(
+            DsV4TensorKind::FfnUpShexp,
+            vec![0.01; hidden_shared * hp.n_embd],
+        );
+        m.insert(
+            DsV4TensorKind::FfnDownShexp,
+            vec![0.01; hp.n_embd * hidden_shared],
+        );
         m
     }
 
@@ -443,7 +537,8 @@ mod tests {
     fn build_no_compress_storage() {
         let hp = base_hp();
         let tensors = no_compress_tensors(&hp);
-        let storage = build_layer_storage(tensors, &hp, 0).expect("no-compress build");
+        let storage =
+            build_layer_storage(tensors, HashMap::new(), &hp, 0).expect("no-compress build");
         assert!(storage.compressor.is_none());
         assert!(storage.indexer.is_none());
         assert_eq!(storage.attn_norm.len(), hp.n_embd);
@@ -470,7 +565,8 @@ mod tests {
             vec![0.01; compress_ratio * n_kv],
         );
         tensors.insert(DsV4TensorKind::AttnCompressorNorm, vec![1.0; hp.head_dim]);
-        let storage = build_layer_storage(tensors, &hp, compress_ratio).expect("compress build");
+        let storage = build_layer_storage(tensors, HashMap::new(), &hp, compress_ratio)
+            .expect("compress build");
         assert!(storage.compressor.is_some());
         assert!(storage.indexer.is_none());
         assert_eq!(
@@ -527,7 +623,8 @@ mod tests {
         );
         tensors.insert(DsV4TensorKind::IndexerProj, vec![0.01; inh * hp.n_embd]);
 
-        let storage = build_layer_storage(tensors, &hp, compress_ratio).expect("indexer build");
+        let storage = build_layer_storage(tensors, HashMap::new(), &hp, compress_ratio)
+            .expect("indexer build");
         assert!(storage.compressor.is_some());
         assert!(storage.indexer.is_some());
         assert_eq!(storage.top_k, Some(2));
@@ -538,7 +635,7 @@ mod tests {
         let hp = base_hp();
         let mut tensors = no_compress_tensors(&hp);
         tensors.remove(&DsV4TensorKind::AttnQB);
-        let err = match build_layer_storage(tensors, &hp, 0) {
+        let err = match build_layer_storage(tensors, HashMap::new(), &hp, 0) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
@@ -554,7 +651,7 @@ mod tests {
         let mut tensors = no_compress_tensors(&hp);
         // Wrong size for AttnNorm (too short).
         tensors.insert(DsV4TensorKind::AttnNorm, vec![1.0; 7]);
-        let err = match build_layer_storage(tensors, &hp, 0) {
+        let err = match build_layer_storage(tensors, HashMap::new(), &hp, 0) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
@@ -589,7 +686,7 @@ mod tests {
             vec![0.01; compress_ratio * n_kv],
         );
         tensors.insert(DsV4TensorKind::AttnCompressorNorm, vec![1.0; hp.head_dim]);
-        let err = match build_layer_storage(tensors, &hp, compress_ratio) {
+        let err = match build_layer_storage(tensors, HashMap::new(), &hp, compress_ratio) {
             Ok(_) => panic!("expected error"),
             Err(e) => e,
         };
