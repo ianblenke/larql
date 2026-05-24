@@ -403,7 +403,7 @@ mod tests {
 
         let x =
             Array2::<f32>::from_shape_fn((6, n_embd), |(t, d)| ((t * 7 + d) as f32 * 0.013).sin());
-        let out = dsv4_attn_layer(x.view(), &layer, 0);
+        let out = dsv4_attn_layer(x.view(), &layer, 0, None);
         assert_eq!(out.shape(), &[6, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -425,7 +425,7 @@ mod tests {
 
         let x =
             Array2::<f32>::from_shape_fn((8, n_embd), |(t, d)| ((t * 7 + d) as f32 * 0.013).sin());
-        let out = dsv4_attn_layer(x.view(), &layer, 0);
+        let out = dsv4_attn_layer(x.view(), &layer, 0, None);
         assert_eq!(out.shape(), &[8, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -455,7 +455,7 @@ mod tests {
 
         let x =
             Array2::<f32>::from_shape_fn((16, n_embd), |(t, d)| ((t * 7 + d) as f32 * 0.013).sin());
-        let out = dsv4_attn_layer(x.view(), &layer, 0);
+        let out = dsv4_attn_layer(x.view(), &layer, 0, None);
         assert_eq!(out.shape(), &[16, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
     }

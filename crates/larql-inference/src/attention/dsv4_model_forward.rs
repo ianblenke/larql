@@ -210,6 +210,7 @@ pub fn dsv4_model_forward<'a, 'p>(
             layer_p,
             Some(token_ids),
             position_offset,
+            backend,
         );
     }
 
@@ -1037,8 +1038,14 @@ mod tests {
                 "layer {layer_idx} hash routing"
             );
 
-            residual =
-                dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, Some(&token_ids), 0);
+            residual = dsv4_per_layer_forward(
+                residual.view(),
+                &layer_w,
+                &layer_p,
+                Some(&token_ids),
+                0,
+                None,
+            );
             assert_eq!(residual.shape(), &[n_tokens, hp.n_hc, hp.n_embd]);
             let n_nonfinite = residual.iter().filter(|v| !v.is_finite()).count();
             assert_eq!(

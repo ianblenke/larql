@@ -16,6 +16,7 @@
 //! (Stage 8h-2) construct the variant per-layer from the layer's
 //! `compress_ratio` metadata.
 
+use larql_compute::ComputeBackend;
 use ndarray::{Array2, ArrayView2};
 
 use super::dsv4_attn_block::{
@@ -75,14 +76,20 @@ impl DsV4AttnLayer<'_, '_> {
 
 /// Run the attention block for this layer. Dispatches to the variant
 /// matching the layer's `compress_ratio`.
+///
+/// `backend` routes the per-block matmul shapes through the optional
+/// compute backend (cuBLAS / Metal / CPU). Only the NoCompress prefill
+/// path threads it as of GPU-4a; the Compress and Indexer prefill
+/// variants still ignore it (GPU-4b/4c will lift that).
 pub fn dsv4_attn_layer(
     x: ArrayView2<f32>,
     layer: &DsV4AttnLayer,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     match layer {
         DsV4AttnLayer::NoCompress { weights, params } => {
-            dsv4_attn_block_no_compress(x, weights, params, position_offset)
+            dsv4_attn_block_no_compress(x, weights, params, position_offset, backend)
         }
         DsV4AttnLayer::Compress { weights, params } => {
             dsv4_attn_block_compress_no_indexer(x, weights, params, position_offset)
@@ -267,7 +274,7 @@ mod tests {
             weights: attn_w,
             params: &attn_p,
         };
-        let out_nc = dsv4_attn_layer(x.view(), &layer_nc, 0);
+        let out_nc = dsv4_attn_layer(x.view(), &layer_nc, 0, None);
         assert_eq!(out_nc.shape(), &[n_tokens, n_embd]);
         assert!(out_nc.iter().all(|v| v.is_finite()));
 
@@ -309,7 +316,7 @@ mod tests {
             weights: block_compress_w,
             params: &block_compress_p,
         };
-        let out_c = dsv4_attn_layer(x.view(), &layer_c, 0);
+        let out_c = dsv4_attn_layer(x.view(), &layer_c, 0, None);
         assert_eq!(out_c.shape(), &[n_tokens, n_embd]);
         assert!(out_c.iter().all(|v| v.is_finite()));
 
@@ -495,7 +502,7 @@ mod tests {
         let x = Array2::<f32>::from_shape_fn((n_tokens, n_embd), |(t, d)| {
             ((t * 7 + d) as f32 * 0.013).sin()
         });
-        let out = dsv4_attn_layer(x.view(), &layer_i, 0);
+        let out = dsv4_attn_layer(x.view(), &layer_i, 0, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
         assert_eq!(layer_i.variant_name(), "indexer");

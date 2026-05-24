@@ -68,7 +68,7 @@ mod tests {
         let layer = storage.dispatcher_layer(&None, &None);
         assert_eq!(layer.variant_name(), "no_compress");
 
-        let out = dsv4_attn_layer(x.view(), &layer, 0);
+        let out = dsv4_attn_layer(x.view(), &layer, 0, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
         // Finite-ness is the headline correctness check — if anything in
         // RoPE/SWA/grouped-o-proj goes off the rails we get NaN/Inf.
@@ -171,7 +171,7 @@ mod tests {
             ((t * 17 + d) as f32 * 0.0013).sin() * 0.1
         });
 
-        let out = dsv4_attn_layer(x.view(), &layer, 0);
+        let out = dsv4_attn_layer(x.view(), &layer, 0, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
         let n_nonfinite = out.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(
@@ -302,7 +302,7 @@ mod tests {
 
         // 2. Attention block — Indexer path on the collapsed input.
         let attn_out =
-            crate::attention::dsv4_attn_dispatch::dsv4_attn_layer(pre.cur.view(), &layer, 0);
+            crate::attention::dsv4_attn_dispatch::dsv4_attn_layer(pre.cur.view(), &layer, 0, None);
         assert_eq!(attn_out.shape(), &[n_tokens, n_embd]);
         assert!(
             attn_out.iter().all(|v| v.is_finite()),
@@ -413,7 +413,14 @@ mod tests {
             },
         };
 
-        let out = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, Some(&token_ids), 0);
+        let out = dsv4_per_layer_forward(
+            residual.view(),
+            &layer_w,
+            &layer_p,
+            Some(&token_ids),
+            0,
+            None,
+        );
         assert_eq!(out.shape(), &[n_tokens, n_hc, n_embd]);
         let n_nonfinite = out.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(
@@ -506,8 +513,14 @@ mod tests {
             mhc_ffn: storage_0.mhc_ffn.as_ref().unwrap().as_weights(),
             ffn: storage_0.ffn.as_ref().unwrap().as_weights(),
         };
-        let residual_1 =
-            dsv4_per_layer_forward(residual_0.view(), &layer_w_0, &layer_p, Some(&token_ids), 0);
+        let residual_1 = dsv4_per_layer_forward(
+            residual_0.view(),
+            &layer_w_0,
+            &layer_p,
+            Some(&token_ids),
+            0,
+            None,
+        );
         assert_eq!(residual_1.shape(), &[n_tokens, n_hc, n_embd]);
         assert!(
             residual_1.iter().all(|v| v.is_finite()),
@@ -521,8 +534,14 @@ mod tests {
             mhc_ffn: storage_1.mhc_ffn.as_ref().unwrap().as_weights(),
             ffn: storage_1.ffn.as_ref().unwrap().as_weights(),
         };
-        let residual_2 =
-            dsv4_per_layer_forward(residual_1.view(), &layer_w_1, &layer_p, Some(&token_ids), 0);
+        let residual_2 = dsv4_per_layer_forward(
+            residual_1.view(),
+            &layer_w_1,
+            &layer_p,
+            Some(&token_ids),
+            0,
+            None,
+        );
         assert_eq!(residual_2.shape(), &[n_tokens, n_hc, n_embd]);
         let n_nonfinite = residual_2.iter().filter(|v| !v.is_finite()).count();
         assert_eq!(n_nonfinite, 0, "{n_nonfinite} non-finite after layer 1");

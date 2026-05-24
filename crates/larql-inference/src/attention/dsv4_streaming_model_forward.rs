@@ -243,6 +243,7 @@ pub fn dsv4_streaming_model_forward(
             &layer_p,
             Some(token_ids),
             position_offset,
+            backend,
         );
         // storage drops here, freeing ~26 GB before the next iteration.
     }
