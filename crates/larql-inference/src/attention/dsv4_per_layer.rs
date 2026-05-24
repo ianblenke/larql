@@ -142,6 +142,7 @@ pub fn dsv4_per_layer_forward_cached(
                 params,
                 position_offset,
                 c,
+                backend,
             )
         }
         (DsV4AttnLayer::Indexer { weights, params }, Some(DsV4LayerCache::Hca(c)))

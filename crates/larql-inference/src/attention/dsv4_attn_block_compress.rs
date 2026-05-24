@@ -30,6 +30,8 @@
 
 use ndarray::{s, Array2, ArrayView2, Axis};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights};
 use super::dsv4_compressor_prefill::{
     build_compressor_prefill, dsv4_compressor_step_coff1, CompressorParams, CompressorWeights,
@@ -240,6 +242,7 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
     p: &DsV4AttnBlockCompressParams,
     position_offset: usize,
     cache: &mut DsV4LayerHcaCache,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_new = x.shape()[0];
     assert_eq!(
@@ -271,10 +274,10 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
     // 1. attn_norm.
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
-    // 2. Q low-rank + tail-RoPE (same as prefill).
-    let qr = matmul_x_wt(cur.view(), w.attn.wq_a);
+    // 2. Q low-rank + tail-RoPE (routed via backend when supplied).
+    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = matmul_x_wt(qr.view(), w.attn.wq_b);
+    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -289,7 +292,7 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
     );
 
     // 3. Raw KV (for new tokens only) + tail-RoPE + FP8 → append to cache.
-    let kv_raw = matmul_x_wt(cur.view(), w.attn.wkv);
+    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -864,7 +867,7 @@ mod tests {
 
         let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
         let out_cached =
-            dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache);
+            dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache, None);
 
         assert_eq!(out_prefill.shape(), out_cached.shape());
         let mut max_diff = 0.0_f32;
@@ -926,14 +929,17 @@ mod tests {
 
         // Path A: one-shot cached.
         let mut cache_a = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
-        let out_one = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache_a);
+        let out_one =
+            dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache_a, None);
 
         // Path B: prefill 6 tokens, then decode 4 more.
         let mut cache_b = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
         let x_pre = x.slice(s![..6, ..]);
         let x_dec = x.slice(s![6.., ..]);
-        let out_pre = dsv4_attn_block_compress_no_indexer_cached(x_pre, &w, &p, 0, &mut cache_b);
-        let out_dec = dsv4_attn_block_compress_no_indexer_cached(x_dec, &w, &p, 6, &mut cache_b);
+        let out_pre =
+            dsv4_attn_block_compress_no_indexer_cached(x_pre, &w, &p, 0, &mut cache_b, None);
+        let out_dec =
+            dsv4_attn_block_compress_no_indexer_cached(x_dec, &w, &p, 6, &mut cache_b, None);
 
         // Rows 0..6 should match out_one rows 0..6, rows 6..10 should match out_one rows 6..10.
         let mut max_diff = 0.0_f32;
@@ -1001,7 +1007,7 @@ mod tests {
             },
         };
         let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
-        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache);
+        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 0, &mut cache, None);
 
         // 9 tokens with cr=2: 4 full chunks → 4 compressed, 1 leftover pending.
         assert_eq!(cache.raw.current_len(), 9);
@@ -1053,6 +1059,6 @@ mod tests {
         // Empty cache but caller claims offset=5 → panic.
         let mut cache = DsV4LayerHcaCache::with_capacity(16, p.attn.head_dim, cr);
         let x = Array2::<f32>::zeros((1, p.attn.n_embd));
-        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 5, &mut cache);
+        let _ = dsv4_attn_block_compress_no_indexer_cached(x.view(), &w, &p, 5, &mut cache, None);
     }
 }
