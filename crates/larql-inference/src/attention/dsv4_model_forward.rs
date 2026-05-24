@@ -539,4 +539,115 @@ mod tests {
             "row 0 and row 1 logits are identical (loop not running per-token)"
         );
     }
+
+    /// Real-GGUF 2-layer model forward: full pipeline from token_ids
+    /// through head + token_embd + N layers + mHC head + final norm +
+    /// lm_head, producing (n_tokens, n_vocab) logits.
+    ///
+    /// Pipeline:
+    /// ```text
+    /// token_ids (4) → embed → x (4, 4096)
+    /// → broadcast_to_streams → residual (4, 4, 4096)
+    /// → layer 0 → residual (4, 4, 4096)
+    /// → layer 1 → residual (4, 4, 4096)
+    /// → mHC head → pooled (4, 4096)
+    /// → final norm → pooled (4, 4096)
+    /// → lm_head → logits (4, 129280)
+    /// ```
+    ///
+    /// Expected wall: ~90 s release (head ~20-30s + 2 × ~30s layers).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn smoke_real_gguf_2_layer_model_forward() {
+        use larql_models::loading::gguf::GgufFile;
+
+        use crate::attention::dsv4_full_loader::load_dsv4_layer;
+        use crate::attention::dsv4_head_storage::load_dsv4_head;
+        use crate::attention::dsv4_storage_build::DsV4Hyperparams;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+
+        // ── Load head + 2 layers ──
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+        let storages: Vec<_> = (0..2)
+            .map(|i| load_dsv4_layer(&gguf, &hp, i).expect("load layer"))
+            .collect();
+
+        // ── Build per-layer wiring ──
+        let no_cp: Option<crate::attention::dsv4_attn_block_compress::DsV4AttnBlockCompressParams> =
+            None;
+        let no_ip: Option<crate::attention::dsv4_attn_block_indexer::DsV4AttnBlockIndexerParams> =
+            None;
+        let layer_p = DsV4LayerParams {
+            mhc: MhcParams {
+                n_embd: hp.n_embd,
+                n_hc: hp.n_hc,
+                sinkhorn_iters: 2,
+                hc_eps: 1e-5,
+                norm_eps: hp.norm_eps,
+            },
+            ffn: Dsv4FfnParams {
+                n_expert: hp.n_expert,
+                n_expert_used: hp.n_expert_used,
+                norm_eps: hp.norm_eps,
+                routed_swiglu_limit: 7.0,
+                shared_swiglu_limit: 0.0,
+                expert_weights_norm: hp.expert_weights_norm,
+                expert_weights_scale: hp.expert_weights_scale,
+            },
+        };
+        let layer_params = vec![layer_p; storages.len()];
+        let layers: Vec<DsV4LayerWeights> = storages
+            .iter()
+            .map(|(s, _v)| DsV4LayerWeights {
+                mhc_attn: s.mhc_attn.as_ref().unwrap().as_weights(),
+                attn: s.dispatcher_layer(&no_cp, &no_ip),
+                mhc_ffn: s.mhc_ffn.as_ref().unwrap().as_weights(),
+                ffn: s.ffn.as_ref().unwrap().as_weights(),
+            })
+            .collect();
+
+        // ── Head wiring ──
+        let head_w = head.as_weights();
+        let head_p = head.params(&hp);
+
+        // ── Run the full model forward ──
+        let n_tokens = 4;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let logits = dsv4_model_forward(
+            &token_ids,
+            head.token_embd_view(),
+            &layers,
+            &layer_params,
+            &head_w,
+            &head_p,
+            0,
+        );
+
+        assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
+        let n_nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(n_nonfinite, 0, "{n_nonfinite} non-finite logits");
+        let total: f32 = logits.iter().map(|v| v.abs()).sum();
+        assert!(total > 0.0, "logits all zero");
+
+        // Different token positions should produce distinct logit rows.
+        let mut row_diff = 0.0_f32;
+        for v in 0..head.n_vocab {
+            row_diff += (logits[[0, v]] - logits[[1, v]]).abs();
+        }
+        assert!(
+            row_diff > 0.0,
+            "row 0 and row 1 logits identical (loop not per-token)"
+        );
+    }
 }
