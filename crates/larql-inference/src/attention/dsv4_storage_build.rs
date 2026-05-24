@@ -184,6 +184,7 @@ pub fn build_layer_storage(
         top_k: None,
         mhc_attn: None,
         mhc_ffn: None,
+        ffn: None,
     };
 
     // ── mHC bookends (always present for DSv4 layers) ──

@@ -24,8 +24,10 @@ use super::dsv4_attn_block_compress::{DsV4AttnBlockCompressParams, DsV4AttnBlock
 use super::dsv4_attn_block_indexer::{DsV4AttnBlockIndexerParams, DsV4AttnBlockIndexerWeights};
 use super::dsv4_attn_dispatch::DsV4AttnLayer;
 use super::dsv4_compressor_prefill::{CompressorParams, CompressorWeights};
+use super::dsv4_ffn_block::{Dsv4FfnWeights, SharedExpertWeights};
 use super::dsv4_indexer::{IndexerParams, IndexerWeights};
 use super::dsv4_mhc_bookend::MhcWeights;
+use super::dsv4_moe_dispatch::MoeExpertWeights;
 
 /// Owned weights for the DSv4 compressor (a per-layer HCA producer).
 #[derive(Clone)]
@@ -93,6 +95,51 @@ impl MhcStorage {
     }
 }
 
+/// Owned weights for one layer's FFN block (Stage 8h-3c).
+///
+/// Holds both the per-expert routed weights and the shared-expert
+/// dense FFN. The MoE expert tensors dominate: for DSv4-Flash, each
+/// layer's gate/down/up_exps are 256 × 2048 × 4096 f32 ≈ 8.6 GB
+/// each (≈ 26 GB total per layer). The shared-expert tensors are
+/// 32 MB each. The hash-routing table `gate_tid2eid` is i32 and
+/// only present on the first `n_hash_layers` (3 in DSv4-Flash).
+#[derive(Clone)]
+pub struct FfnStorage {
+    pub ffn_norm: Vec<f32>,
+    pub gate_inp: Array2<f32>,
+    pub exp_probs_b: Option<Array1<f32>>,
+    pub gate_tid2eid: Option<Array2<i32>>,
+    pub gate_exps: Array3<f32>,
+    pub up_exps: Array3<f32>,
+    pub down_exps: Array3<f32>,
+    pub gate_shexp: Array2<f32>,
+    pub up_shexp: Array2<f32>,
+    pub down_shexp: Array2<f32>,
+}
+
+impl FfnStorage {
+    /// Borrow as the Stage 8h-3c `Dsv4FfnWeights` struct that the FFN
+    /// block consumes.
+    pub fn as_weights(&self) -> Dsv4FfnWeights<'_> {
+        Dsv4FfnWeights {
+            ffn_norm: &self.ffn_norm,
+            gate_inp: self.gate_inp.view(),
+            exp_probs_b: self.exp_probs_b.as_ref().map(|a| a.view()),
+            gate_tid2eid: self.gate_tid2eid.as_ref().map(|a| a.view()),
+            moe: MoeExpertWeights {
+                gate_exps: self.gate_exps.view(),
+                up_exps: self.up_exps.view(),
+                down_exps: self.down_exps.view(),
+            },
+            shared: SharedExpertWeights {
+                gate_shexp: self.gate_shexp.view(),
+                up_shexp: self.up_shexp.view(),
+                down_shexp: self.down_shexp.view(),
+            },
+        }
+    }
+}
+
 /// All per-layer DSv4 attention-side weights (FFN side will live in a
 /// sibling struct in Stage 8h-3). Owns the f32 buffers; emits borrowed
 /// views via `as_*_weights()`.
@@ -127,6 +174,10 @@ pub struct DsV4LayerWeightStorage {
     pub mhc_attn: Option<MhcStorage>,
     /// mHC weights for the FFN bookend (`hc_ffn_*`).
     pub mhc_ffn: Option<MhcStorage>,
+    /// Optional FFN block weights (routed MoE + shared expert).
+    /// Holds ~26 GB f32 per layer for DSv4-Flash; loaded separately
+    /// from the smaller attention/mHC weights.
+    pub ffn: Option<FfnStorage>,
 }
 
 impl DsV4LayerWeightStorage {
@@ -257,6 +308,7 @@ mod tests {
             top_k: None,
             mhc_attn: None,
             mhc_ffn: None,
+            ffn: None,
         }
     }
 
@@ -462,6 +514,70 @@ mod tests {
         assert_eq!(w.hc_scale, &storage.hc_scale);
         assert_eq!(w.hc_base.len(), hc_mix);
         assert_eq!(w.hc_base[hc_mix - 1], storage.hc_base[hc_mix - 1]);
+    }
+
+    /// FfnStorage view: every f32 weight + optional i32 routing table
+    /// + optional bias is exposed through the borrowed Dsv4FfnWeights.
+    #[test]
+    fn ffn_storage_as_weights_roundtrip() {
+        let n_embd = 16;
+        let n_expert = 4;
+        let n_expert_used = 2;
+        let n_ff_exp = 8;
+        let hidden_shared = 8; // n_ff_exp * n_expert_shared(=1)
+        let n_vocab = 32;
+
+        let ffn = FfnStorage {
+            ffn_norm: vec![1.0_f32; n_embd],
+            gate_inp: Array2::<f32>::from_shape_fn((n_expert, n_embd), |(e, d)| {
+                (e + d) as f32 * 0.01
+            }),
+            exp_probs_b: Some(Array1::<f32>::from_elem(n_expert, 0.0)),
+            gate_tid2eid: Some(Array2::<i32>::from_shape_fn(
+                (n_vocab, n_expert_used),
+                |(t, k)| ((t + k) as i32) % n_expert as i32,
+            )),
+            gate_exps: Array3::<f32>::from_shape_fn((n_expert, n_ff_exp, n_embd), |(_, _, _)| 0.05),
+            up_exps: Array3::<f32>::from_shape_fn((n_expert, n_ff_exp, n_embd), |(_, _, _)| 0.05),
+            down_exps: Array3::<f32>::from_shape_fn((n_expert, n_embd, n_ff_exp), |(_, _, _)| 0.05),
+            gate_shexp: Array2::<f32>::from_elem((hidden_shared, n_embd), 0.05),
+            up_shexp: Array2::<f32>::from_elem((hidden_shared, n_embd), 0.05),
+            down_shexp: Array2::<f32>::from_elem((n_embd, hidden_shared), 0.05),
+        };
+        let w = ffn.as_weights();
+        assert_eq!(w.ffn_norm.len(), n_embd);
+        assert_eq!(w.gate_inp.shape(), &[n_expert, n_embd]);
+        assert!(w.exp_probs_b.is_some());
+        assert!(w.gate_tid2eid.is_some());
+        assert_eq!(
+            w.gate_tid2eid.as_ref().unwrap().shape(),
+            &[n_vocab, n_expert_used]
+        );
+        assert_eq!(w.moe.gate_exps.shape(), &[n_expert, n_ff_exp, n_embd]);
+        assert_eq!(w.moe.down_exps.shape(), &[n_expert, n_embd, n_ff_exp]);
+        assert_eq!(w.shared.gate_shexp.shape(), &[hidden_shared, n_embd]);
+    }
+
+    /// FfnStorage with no hash-routing table + no bias: views still
+    /// produce a valid Dsv4FfnWeights (gate_tid2eid / exp_probs_b
+    /// both None — exercises the sqrt-softplus routing path).
+    #[test]
+    fn ffn_storage_without_optional_fields() {
+        let ffn = FfnStorage {
+            ffn_norm: vec![1.0; 8],
+            gate_inp: Array2::<f32>::zeros((2, 8)),
+            exp_probs_b: None,
+            gate_tid2eid: None,
+            gate_exps: Array3::<f32>::zeros((2, 4, 8)),
+            up_exps: Array3::<f32>::zeros((2, 4, 8)),
+            down_exps: Array3::<f32>::zeros((2, 8, 4)),
+            gate_shexp: Array2::<f32>::zeros((4, 8)),
+            up_shexp: Array2::<f32>::zeros((4, 8)),
+            down_shexp: Array2::<f32>::zeros((8, 4)),
+        };
+        let w = ffn.as_weights();
+        assert!(w.exp_probs_b.is_none());
+        assert!(w.gate_tid2eid.is_none());
     }
 
     /// DsV4LayerWeightStorage with both mHC bookends populated: views
