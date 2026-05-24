@@ -19,6 +19,8 @@
 
 use ndarray::{Array3, ArrayView3};
 
+use larql_compute::ComputeBackend;
+
 use super::dsv4_attn_block::dsv4_attn_block_no_compress_cached;
 use super::dsv4_attn_block_compress::dsv4_attn_block_compress_no_indexer_cached;
 use super::dsv4_attn_block_indexer::dsv4_attn_block_compress_with_indexer_cached;
@@ -116,6 +118,7 @@ pub fn dsv4_per_layer_forward_cached(
     token_ids: Option<&[u32]>,
     position_offset: usize,
     layer_cache: Option<&mut DsV4LayerCache>,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array3<f32> {
     // ── 1. Attention bookend pre ──
     let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc);
@@ -129,6 +132,7 @@ pub fn dsv4_per_layer_forward_cached(
                 params,
                 position_offset,
                 c,
+                backend,
             )
         }
         (DsV4AttnLayer::Compress { weights, params }, Some(DsV4LayerCache::Hca(c))) => {
@@ -607,7 +611,7 @@ mod tests {
 
         let out_nocache = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0);
         let out_cached =
-            dsv4_per_layer_forward_cached(residual.view(), &layer_w, &layer_p, None, 0, None);
+            dsv4_per_layer_forward_cached(residual.view(), &layer_w, &layer_p, None, 0, None, None);
 
         assert_eq!(out_nocache.shape(), out_cached.shape());
         let mut max_diff = 0.0_f32;
@@ -713,6 +717,7 @@ mod tests {
             None,
             0,
             Some(&mut cache),
+            None,
         );
 
         let mut max_diff = 0.0_f32;

@@ -343,6 +343,7 @@ pub fn dsv4_streaming_model_forward_cached(
             Some(token_ids),
             position_offset,
             cache_for_this_layer,
+            backend,
         );
     }
 
