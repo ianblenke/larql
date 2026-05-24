@@ -140,6 +140,14 @@ impl DsV4Hyperparams {
             Ok(_) | Err(_) => None,
         };
 
+        // FFN / MoE hyperparams.
+        let n_expert = u32_md(md, "deepseek4.expert_count")? as usize;
+        let n_expert_used = u32_md(md, "deepseek4.expert_used_count")? as usize;
+        let n_ff_exp = u32_md(md, "deepseek4.expert_feed_forward_length")? as usize;
+        let n_expert_shared = u32_md(md, "deepseek4.expert_shared_count")? as usize;
+        let expert_weights_norm = bool_md_opt(md, "deepseek4.expert_weights_norm")?.unwrap_or(true);
+        let expert_weights_scale = f32_md_opt(md, "deepseek4.expert_weights_scale")?.unwrap_or(1.0);
+
         // n_hc: number of hyper-connection streams. Derived from the
         // global `hc_head_base` tensor length (4 for DSv4-Flash). If
         // the tensor isn't present we default to 4 — every DSv4 model
@@ -183,6 +191,12 @@ impl DsV4Hyperparams {
             n_index_head,
             top_k,
             n_hc,
+            n_expert,
+            n_expert_used,
+            n_ff_exp,
+            n_expert_shared,
+            expert_weights_norm,
+            expert_weights_scale,
             yarn,
             rope_base_swa,
         })
@@ -223,6 +237,32 @@ fn f32_md(
         GgufValue::F32(f) => Ok(*f),
         GgufValue::F64(f) => Ok(*f as f32),
         _ => Err(DsV4MetadataError::WrongType { key, wanted: "f32" }),
+    }
+}
+
+fn f32_md_opt(
+    md: &std::collections::HashMap<String, GgufValue>,
+    key: &'static str,
+) -> Result<Option<f32>, DsV4MetadataError> {
+    match md.get(key) {
+        None => Ok(None),
+        Some(GgufValue::F32(f)) => Ok(Some(*f)),
+        Some(GgufValue::F64(f)) => Ok(Some(*f as f32)),
+        Some(_) => Err(DsV4MetadataError::WrongType { key, wanted: "f32" }),
+    }
+}
+
+fn bool_md_opt(
+    md: &std::collections::HashMap<String, GgufValue>,
+    key: &'static str,
+) -> Result<Option<bool>, DsV4MetadataError> {
+    match md.get(key) {
+        None => Ok(None),
+        Some(GgufValue::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(DsV4MetadataError::WrongType {
+            key,
+            wanted: "bool",
+        }),
     }
 }
 
@@ -271,6 +311,19 @@ mod tests {
         // SWA-specific rope base: 160 000.0 vs 10 000.0 main.
         let rope_swa = hp.rope_base_swa.expect("rope_base_swa present");
         assert!((rope_swa - 160_000.0).abs() < 1e-3);
+
+        // FFN / MoE hyperparams: DSv4-Flash uses 256 experts, top-6
+        // routing, 2048 hidden per expert, 1 shared expert,
+        // expert_weights_norm=true, expert_weights_scale=1.5.
+        assert_eq!(hp.n_expert, 256);
+        assert_eq!(hp.n_expert_used, 6);
+        assert_eq!(hp.n_ff_exp, 2048);
+        assert_eq!(hp.n_expert_shared, 1);
+        assert!(hp.expert_weights_norm);
+        assert!((hp.expert_weights_scale - 1.5).abs() < 1e-3);
+
+        // n_hc derived from hc_head_base.
+        assert_eq!(hp.n_hc, 4);
     }
 
     /// Missing-key errors carry the key name so callers can pin down

@@ -48,6 +48,19 @@ pub struct DsV4Hyperparams {
     pub top_k: Option<usize>,
     /// Number of hyper-connection streams (mHC). DSv4-Flash uses 4.
     pub n_hc: usize,
+    /// Total number of experts in the routed MoE FFN (256 for DSv4-Flash).
+    pub n_expert: usize,
+    /// Number of routed experts used per token (top-k; 6 for DSv4-Flash).
+    pub n_expert_used: usize,
+    /// Hidden dim of each routed expert's gate/up matmul (2048 for DSv4-Flash).
+    pub n_ff_exp: usize,
+    /// Number of shared experts (1 for DSv4-Flash). The shared-expert
+    /// FFN's hidden dim is `n_ff_exp * n_expert_shared`.
+    pub n_expert_shared: usize,
+    /// Normalize per-token routing weights (Mixtral-style). `true` for DSv4-Flash.
+    pub expert_weights_norm: bool,
+    /// Post-norm routing-weight scalar (1.5 for DSv4-Flash).
+    pub expert_weights_scale: f32,
     /// Optional YARN RoPE scaling config. `Some(_)` for long-context
     /// models like DSv4-Flash (factor=16, 65 536 → 1 048 576); `None`
     /// for short-context or non-YARN models. Propagated into per-layer
@@ -379,6 +392,12 @@ mod tests {
             n_index_head: None,
             top_k: None,
             n_hc: 4,
+            n_expert: 4,
+            n_expert_used: 2,
+            n_ff_exp: 8,
+            n_expert_shared: 1,
+            expert_weights_norm: true,
+            expert_weights_scale: 1.0,
             yarn: None,
             rope_base_swa: None,
         }
