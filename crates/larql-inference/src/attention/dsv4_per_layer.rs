@@ -84,7 +84,7 @@ pub fn dsv4_per_layer_forward(
     let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc);
 
     // ── 5. FFN block ──
-    let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids);
+    let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend);
 
     // ── 6. FFN bookend post → final residual ──
     dsv4_mhc_post(
@@ -174,7 +174,7 @@ pub fn dsv4_per_layer_forward_cached(
     let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc);
 
     // ── 5. FFN block ──
-    let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids);
+    let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend);
 
     // ── 6. FFN bookend post → final residual ──
     dsv4_mhc_post(
