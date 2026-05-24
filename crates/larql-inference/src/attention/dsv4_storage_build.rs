@@ -51,6 +51,12 @@ pub struct DsV4Hyperparams {
     /// for short-context or non-YARN models. Propagated into per-layer
     /// `DsV4AttnBlockParams.yarn` via [`Self::attn_params`].
     pub yarn: Option<DsV4RopeYarnConfig>,
+    /// Optional separate RoPE base for the SWA (sliding-window
+    /// attention) path. DSv4-Flash uses 160 000.0 here vs the main
+    /// 10 000.0. `None` when the model has no SWA-specific override.
+    /// Future PR wires this into the SWA branch where the raw KV
+    /// segment is rotated with this base instead of `rope_base`.
+    pub rope_base_swa: Option<f64>,
 }
 
 impl DsV4Hyperparams {
@@ -343,6 +349,7 @@ mod tests {
             n_index_head: None,
             top_k: None,
             yarn: None,
+            rope_base_swa: None,
         }
     }
 
