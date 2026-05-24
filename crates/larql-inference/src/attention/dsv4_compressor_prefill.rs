@@ -309,6 +309,166 @@ pub fn dsv4_compressor_step_coff1(
     roped.row(0).to_owned()
 }
 
+/// Threaded overlap state for the [`dsv4_compressor_step_coff2`]
+/// chunk-by-chunk compressor (compress_ratio == 4 path).
+///
+/// Holds the previous chunk's `kv_prev` and `score_prev` halves so
+/// the next chunk's call has the same "shifted-by-1" inputs as
+/// [`build_compressor_prefill`]. For chunk index 0 both fields are
+/// `None` and the step uses the same zero / -∞ pad the prefill does.
+///
+/// Per-layer footprint at DSv4-Flash (head_dim=512, compress_ratio=4):
+/// 2 × 4 × 512 × 4 = 16 KB. Trivial.
+#[derive(Clone, Debug, Default)]
+pub struct CompressorOverlapState {
+    /// Last processed chunk's `kv_prev` half. Shape `(compress_ratio,
+    /// head_dim)`. `None` before the first chunk.
+    pub kv_prev_last: Option<Array2<f32>>,
+    /// Last processed chunk's `score_prev` half. Same shape.
+    pub score_prev_last: Option<Array2<f32>>,
+}
+
+impl CompressorOverlapState {
+    /// Empty state — equivalent to "we haven't processed any chunks yet".
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Reset state, e.g. to start a fresh sequence.
+    pub fn clear(&mut self) {
+        self.kv_prev_last = None;
+        self.score_prev_last = None;
+    }
+}
+
+/// Cached / incremental compressor step for the `coff = 2` case
+/// (compress_ratio == 4).
+///
+/// Same role as [`dsv4_compressor_step_coff1`] but the cr=4 path
+/// couples chunks via the prefill compressor's `shift_overlap_state`
+/// call. To stay bit-exact-equivalent with prefill, this step needs
+/// to thread the previous chunk's `kv_prev` / `score_prev` halves
+/// through `&mut overlap_state`.
+///
+/// - First call (chunk 0): pass `CompressorOverlapState::empty()`.
+///   The step pads the "shifted prev" with 0.0 / -∞, matching the
+///   prefill's chunk-0 behavior. After the call, the state holds
+///   chunk 0's kv_prev / score_prev for the next call.
+/// - Subsequent calls: pass the same `&mut overlap_state`. The step
+///   reads the cached `kv_prev_last` / `score_prev_last` as the
+///   shifted prev (equivalent to what the prefill's shift_overlap_state
+///   would produce for this chunk index).
+///
+/// Bit-exact-equivalent to taking row `compressed_chunk_index` of
+/// `build_compressor_prefill(cur_full, ...)` where the full cur
+/// contains the same per-chunk data.
+pub fn dsv4_compressor_step_coff2(
+    cur_chunk: ArrayView2<f32>,
+    w: &CompressorWeights,
+    p: &CompressorParams,
+    compressed_chunk_index: usize,
+    overlap_state: &mut CompressorOverlapState,
+) -> ndarray::Array1<f32> {
+    assert_eq!(
+        p.compress_ratio, 4,
+        "coff=2 path requires compress_ratio == 4; use the coff=1 cached step otherwise"
+    );
+    assert_eq!(
+        cur_chunk.shape(),
+        &[p.compress_ratio, p.n_embd],
+        "cur_chunk must be (compress_ratio, n_embd)"
+    );
+    let n_kv = 2 * p.head_dim; // coff = 2
+    assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
+    assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    assert_eq!(
+        w.ape.shape(),
+        &[p.compress_ratio, n_kv],
+        "ape shape (compress_ratio, 2*head_dim)"
+    );
+    assert_eq!(w.norm.len(), p.head_dim, "norm length");
+
+    // 1. Project chunk to kv and score: each (compress_ratio, 2*head_dim).
+    let kv_chunk = matmul_x_wt(cur_chunk, w.wkv);
+    let mut score_chunk = matmul_x_wt(cur_chunk, w.wgate);
+
+    // 2. Add APE row-wise.
+    for r in 0..p.compress_ratio {
+        for k in 0..n_kv {
+            score_chunk[[r, k]] += w.ape[[r, k]];
+        }
+    }
+
+    // 3. Split into prev (first head_dim) and curr (next head_dim) halves.
+    //    Each is (compress_ratio, head_dim).
+    let kv_curr = kv_chunk
+        .slice(s![.., p.head_dim..2 * p.head_dim])
+        .to_owned();
+    let score_curr = score_chunk
+        .slice(s![.., p.head_dim..2 * p.head_dim])
+        .to_owned();
+    let kv_prev_this_chunk = kv_chunk.slice(s![.., 0..p.head_dim]).to_owned();
+    let score_prev_this_chunk = score_chunk.slice(s![.., 0..p.head_dim]).to_owned();
+
+    // 4. The "shifted prev" for this chunk is what the prefill's
+    //    shift_overlap_state would produce at this chunk index — i.e.,
+    //    the previous chunk's prev half, or zero/-∞ pad for chunk 0.
+    let kv_prev_shifted = overlap_state
+        .kv_prev_last
+        .clone()
+        .unwrap_or_else(|| Array2::<f32>::zeros((p.compress_ratio, p.head_dim)));
+    let score_prev_shifted = overlap_state.score_prev_last.clone().unwrap_or_else(|| {
+        Array2::<f32>::from_elem((p.compress_ratio, p.head_dim), f32::NEG_INFINITY)
+    });
+
+    // 5. Concat [shifted_prev, curr] along the ratio axis → (head_dim, 2*ratio).
+    //    Then add the n_comp=1 outer axis for softmax_pool_ratio.
+    let mut kv_cat = Array3::<f32>::zeros((1, p.head_dim, 2 * p.compress_ratio));
+    let mut score_cat = Array3::<f32>::zeros((1, p.head_dim, 2 * p.compress_ratio));
+    for d in 0..p.head_dim {
+        for r in 0..p.compress_ratio {
+            kv_cat[[0, d, r]] = kv_prev_shifted[[r, d]];
+            kv_cat[[0, d, p.compress_ratio + r]] = kv_curr[[r, d]];
+            score_cat[[0, d, r]] = score_prev_shifted[[r, d]];
+            score_cat[[0, d, p.compress_ratio + r]] = score_curr[[r, d]];
+        }
+    }
+
+    // 6. Update overlap state for the NEXT chunk: store this chunk's
+    //    prev halves. (Must be saved AFTER step 5 so the read above
+    //    sees the previous chunk's data, not this one's.)
+    overlap_state.kv_prev_last = Some(kv_prev_this_chunk);
+    overlap_state.score_prev_last = Some(score_prev_this_chunk);
+
+    // 7. Pool → (1, head_dim).
+    let pooled = softmax_pool_ratio(kv_cat.view(), score_cat.view());
+
+    // 8. RMSNorm + RoPE — same as the coff=1 path.
+    let mut sumsq = 0.0_f32;
+    for d in 0..p.head_dim {
+        let v = pooled[[0, d]];
+        sumsq += v * v;
+    }
+    let inv = 1.0 / (sumsq / p.head_dim as f32 + p.norm_eps).sqrt();
+    let mut normed = Array2::<f32>::zeros((1, p.head_dim));
+    for d in 0..p.head_dim {
+        normed[[0, d]] = pooled[[0, d]] * inv * w.norm[d];
+    }
+
+    let roped = dsv4_rope_tail(
+        &normed,
+        1,
+        p.head_dim,
+        p.n_rot,
+        p.rope_base,
+        p.rope_mode,
+        false,
+        compressed_chunk_index * p.compress_ratio,
+    );
+
+    roped.row(0).to_owned()
+}
+
 /// `out[t, k] = sum_j x[t, j] * w[k, j]` (= `x @ w^T`).
 fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
     let n_tokens = x.shape()[0];
@@ -673,5 +833,193 @@ mod tests {
         // Half-size chunk.
         let chunk = Array2::<f32>::zeros((1, p.n_embd));
         let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+    }
+
+    // ── dsv4_compressor_step_coff2 tests (compress_ratio == 4) ──
+
+    /// Helper: build CompressorParams + weights for coff=2 (compress_ratio = 4).
+    fn make_coff2_weights(
+        head_dim: usize,
+        n_embd: usize,
+    ) -> (
+        CompressorParams,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Vec<f32>,
+    ) {
+        let p = CompressorParams {
+            head_dim,
+            n_embd,
+            compress_ratio: 4, // coff=2
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let n_kv = 2 * head_dim;
+        let wkv = Array2::<f32>::from_shape_fn((n_kv, n_embd), |(i, j)| {
+            ((i * 11 + j) as f32 * 0.014).cos() * 0.05
+        });
+        let wgate = Array2::<f32>::from_shape_fn((n_kv, n_embd), |(i, j)| {
+            ((i * 7 + j) as f32 * 0.016).sin() * 0.05
+        });
+        let ape = Array2::<f32>::from_shape_fn((p.compress_ratio, n_kv), |(r, k)| {
+            ((r * 5 + k) as f32 * 0.025).sin() * 0.05
+        });
+        let norm = vec![1.0_f32; head_dim];
+        (p, wkv, wgate, ape, norm)
+    }
+
+    /// Empty overlap state + 4-row chunk → matches row 0 of prefill on
+    /// the same chunk. Verifies the zero/-∞ pad equivalence with
+    /// `shift_overlap_state` at chunk 0.
+    #[test]
+    fn coff2_step_first_chunk_matches_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff2_weights(8, 16);
+        let chunk = make_input(p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(chunk.view(), &w, &p);
+        let mut state = CompressorOverlapState::empty();
+        let step = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state);
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((prefill[[0, d]] - step[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "first-chunk diff = {max_diff}");
+        // State is now populated for the next chunk.
+        assert!(state.kv_prev_last.is_some());
+        assert!(state.score_prev_last.is_some());
+    }
+
+    /// Two-chunk threading: step(chunk0) + step(chunk1, state) ==
+    /// prefill(chunk0 + chunk1). This is the **cornerstone** bit-exact
+    /// test — overlap state must carry the previous chunk's prev-half
+    /// across calls or the second chunk's pool diverges.
+    #[test]
+    fn coff2_step_two_chunks_threaded_match_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff2_weights(8, 16);
+        let full = make_input(2 * p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        assert_eq!(prefill.shape(), &[2, p.head_dim]);
+
+        let chunk0 = full.slice(s![..p.compress_ratio, ..]);
+        let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
+        let mut state = CompressorOverlapState::empty();
+        let step0 = dsv4_compressor_step_coff2(chunk0, &w, &p, 0, &mut state);
+        let step1 = dsv4_compressor_step_coff2(chunk1, &w, &p, 1, &mut state);
+
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((prefill[[0, d]] - step0[d]).abs());
+            max_diff = max_diff.max((prefill[[1, d]] - step1[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "two-chunk threaded diff = {max_diff}");
+    }
+
+    /// Three-chunk threading: confirms state correctly threads beyond
+    /// the first transition.
+    #[test]
+    fn coff2_step_three_chunks_threaded_match_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff2_weights(8, 16);
+        let full = make_input(3 * p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let mut state = CompressorOverlapState::empty();
+        let chunks: Vec<_> = (0..3)
+            .map(|c| {
+                let lo = c * p.compress_ratio;
+                let hi = (c + 1) * p.compress_ratio;
+                full.slice(s![lo..hi, ..]).to_owned()
+            })
+            .collect();
+        let steps: Vec<_> = chunks
+            .iter()
+            .enumerate()
+            .map(|(c, chunk)| dsv4_compressor_step_coff2(chunk.view(), &w, &p, c, &mut state))
+            .collect();
+
+        let mut max_diff = 0.0_f32;
+        for c in 0..3 {
+            for d in 0..p.head_dim {
+                max_diff = max_diff.max((prefill[[c, d]] - steps[c][d]).abs());
+            }
+        }
+        assert!(max_diff < 1e-6, "three-chunk threaded diff = {max_diff}");
+    }
+
+    /// State clear: after processing chunks 0..N, clear, then process
+    /// chunk 0 again — should match a fresh first-chunk run.
+    #[test]
+    fn coff2_overlap_state_clear_resets_behavior() {
+        let (p, wkv, wgate, ape, norm) = make_coff2_weights(8, 16);
+        let chunk = make_input(p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+
+        // Run once with empty state.
+        let mut state_a = CompressorOverlapState::empty();
+        let out_a = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_a);
+
+        // Run twice with a state that gets cleared.
+        let mut state_b = CompressorOverlapState::empty();
+        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b);
+        state_b.clear();
+        let out_b = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b);
+
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((out_a[d] - out_b[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "clear-then-rerun diff = {max_diff}");
+    }
+
+    /// compress_ratio != 4 → panic.
+    #[test]
+    #[should_panic(expected = "coff=2 path requires compress_ratio == 4")]
+    fn coff2_step_panics_on_non_4_ratio() {
+        let p = CompressorParams {
+            head_dim: 8,
+            n_embd: 16,
+            compress_ratio: 2, // <-- not 4
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let n_kv = 2 * p.head_dim;
+        let wkv = Array2::<f32>::zeros((n_kv, p.n_embd));
+        let wgate = Array2::<f32>::zeros((n_kv, p.n_embd));
+        let ape = Array2::<f32>::zeros((p.compress_ratio, n_kv));
+        let norm = vec![1.0_f32; p.head_dim];
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
+        let mut state = CompressorOverlapState::empty();
+        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state);
     }
 }
