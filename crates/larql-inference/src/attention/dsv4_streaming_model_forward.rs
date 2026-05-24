@@ -601,4 +601,115 @@ mod tests {
             "cached-vs-uncached relative diff {rel} (max_abs={max_abs}, max_diff={max_diff})"
         );
     }
+
+    /// **Real-GGUF cached prefill + decode smoke**.
+    ///
+    /// Allocates per-variant caches for layers 0..3 of DSv4-Flash:
+    /// - Layer 0, 1: `DsV4LayerCache::new_no_compress(...)`
+    /// - Layer 2: `DsV4LayerCache::new_hca_indexer(...)` (cr=4 indexer)
+    ///
+    /// Runs the streaming_cached forward twice:
+    /// 1. **Prefill** (16 tokens, position_offset=0) → logits + caches
+    ///    populated.
+    /// 2. **Decode** (1 token appended, position_offset=16) → new
+    ///    logits row for the appended token.
+    ///
+    /// Verifies the entire cached arc (all 3 cached attention variants,
+    /// per-layer dispatch via `DsV4LayerCache`, position_offset
+    /// advancement) works end-to-end on real DSv4-Flash weights.
+    ///
+    /// Expected wall: ~220 s release (3-layer 16-tok cached prefill
+    /// ~110 s + 3-layer 1-tok cached decode ~110 s, since the decode
+    /// step still has to re-stream all 3 layers from the 172 GB GGUF).
+    /// The KV-cache speedup is per-layer attention compute, not per-
+    /// layer load — proving the cached pipeline works correctness-wise
+    /// is the primary goal here.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn streaming_cached_real_gguf_prefill_then_decode() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        // Pre-allocate caches matching the layer variants:
+        //   layer 0: NoCompress
+        //   layer 1: NoCompress
+        //   layer 2: Indexer (cr=4)
+        let max_seq_len = 64;
+        let mut layer_caches: Vec<DsV4LayerCache> = vec![
+            DsV4LayerCache::new_no_compress(max_seq_len, hp.head_dim),
+            DsV4LayerCache::new_no_compress(max_seq_len, hp.head_dim),
+            DsV4LayerCache::new_hca_indexer(
+                max_seq_len,
+                hp.head_dim,
+                4,
+                hp.indexer_head_size.expect("indexer_head_size"),
+            ),
+        ];
+
+        // 16-token prefill prompt.
+        let n_prefill = 16;
+        let prompt: Vec<u32> = (0..n_prefill)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let layers = [0, 1, 2];
+
+        let logits_prefill = dsv4_streaming_model_forward_cached(
+            &gguf,
+            &hp,
+            &head,
+            &prompt,
+            &layers,
+            0,
+            Some(&mut layer_caches),
+        )
+        .expect("cached prefill");
+        assert_eq!(logits_prefill.shape(), &[n_prefill, head.n_vocab]);
+        let n_nan = logits_prefill.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(n_nan, 0, "prefill logits have {n_nan} non-finite values");
+
+        // After prefill, each cache should hold n_prefill raw rows.
+        for (i, c) in layer_caches.iter().enumerate() {
+            assert_eq!(
+                c.position(),
+                n_prefill,
+                "layer {i} cache position after prefill"
+            );
+        }
+
+        // ── Decode step: feed one new token at position_offset=16. ──
+        let next_tok: u32 = ((n_prefill * 257) % head.n_vocab) as u32;
+        let decode_input = [next_tok];
+        let logits_decode = dsv4_streaming_model_forward_cached(
+            &gguf,
+            &hp,
+            &head,
+            &decode_input,
+            &layers,
+            n_prefill, // position_offset
+            Some(&mut layer_caches),
+        )
+        .expect("cached decode");
+        assert_eq!(logits_decode.shape(), &[1, head.n_vocab]);
+        let n_nan = logits_decode.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(n_nan, 0, "decode logits have {n_nan} non-finite values");
+        let total: f32 = logits_decode.iter().map(|v| v.abs()).sum();
+        assert!(total > 0.0, "decode logits all zero");
+
+        // Each cache should now hold n_prefill + 1 raw rows.
+        for (i, c) in layer_caches.iter().enumerate() {
+            assert_eq!(
+                c.position(),
+                n_prefill + 1,
+                "layer {i} cache position after decode"
+            );
+        }
+    }
 }
