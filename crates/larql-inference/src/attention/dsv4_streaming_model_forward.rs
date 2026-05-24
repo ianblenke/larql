@@ -35,10 +35,13 @@ use super::dsv4_ffn_block::Dsv4FfnParams;
 use super::dsv4_full_loader::{load_dsv4_layer, DsV4LoadError};
 use super::dsv4_head_storage::DsV4HeadStorage;
 use super::dsv4_indexer::IndexerParams;
+use super::dsv4_kv_cache::DsV4LayerKvCache;
 use super::dsv4_layer_variants::DsV4LayerVariant;
 use super::dsv4_mhc_bookend::MhcParams;
 use super::dsv4_model_forward::{broadcast_to_streams, dsv4_hc_head, embed_tokens};
-use super::dsv4_per_layer::{dsv4_per_layer_forward, DsV4LayerParams, DsV4LayerWeights};
+use super::dsv4_per_layer::{
+    dsv4_per_layer_forward, dsv4_per_layer_forward_cached, DsV4LayerParams, DsV4LayerWeights,
+};
 use super::dsv4_rope_tail::DsV4RopeMode;
 use super::dsv4_storage_build::DsV4Hyperparams;
 
@@ -275,6 +278,104 @@ pub fn dsv4_streaming_model_forward(
     Ok(logits)
 }
 
+/// KV-cached variant of [`dsv4_streaming_model_forward`].
+///
+/// Threads a per-layer `&mut DsV4LayerKvCache` through the streaming
+/// loop. NoCompress layers consume their cache (append new kv_a rows,
+/// attend against the full cache); Compress/Indexer layers ignore it
+/// (their cached variants are still TODO).
+///
+/// `layer_caches` must have length `>= layer_indices.len()`; indexing
+/// is positional (caches[i] matches layer_indices[i]). If shorter,
+/// later iterations get `None`. Passing `None` disables caching
+/// entirely (behavior identical to `dsv4_streaming_model_forward`).
+///
+/// `position_offset` is the absolute position of `token_ids[0]` in
+/// the running sequence. For a clean prefill it's 0; for a cached
+/// decode step after an N-token prefill it's N.
+pub fn dsv4_streaming_model_forward_cached(
+    gguf: &GgufFile,
+    hp: &DsV4Hyperparams,
+    head: &DsV4HeadStorage,
+    token_ids: &[u32],
+    layer_indices: &[usize],
+    position_offset: usize,
+    mut layer_caches: Option<&mut [DsV4LayerKvCache]>,
+) -> Result<Array2<f32>, DsV4LoadError> {
+    let layer_p = build_layer_params(hp);
+    let pool = DispatchParamsPool::new(hp);
+
+    let head_w = head.as_weights();
+    let head_p = head.params(hp);
+
+    let x = embed_tokens(token_ids, head.token_embd_view());
+    let mut residual: Array3<f32> = broadcast_to_streams(x.view(), hp.n_hc);
+
+    for (i, &layer_idx) in layer_indices.iter().enumerate() {
+        let (storage, variant) = load_dsv4_layer(gguf, hp, layer_idx)?;
+        let (cp_ref, ip_ref) = pool.pick(&variant);
+        let layer_w = DsV4LayerWeights {
+            mhc_attn: storage
+                .mhc_attn
+                .as_ref()
+                .expect("mhc_attn loaded by full loader")
+                .as_weights(),
+            attn: storage.dispatcher_layer(cp_ref, ip_ref),
+            mhc_ffn: storage
+                .mhc_ffn
+                .as_ref()
+                .expect("mhc_ffn loaded by full loader")
+                .as_weights(),
+            ffn: storage
+                .ffn
+                .as_ref()
+                .expect("ffn loaded by full loader")
+                .as_weights(),
+        };
+        let cache_for_this_layer: Option<&mut DsV4LayerKvCache> = match &mut layer_caches {
+            Some(caches) => caches.get_mut(i),
+            None => None,
+        };
+        residual = dsv4_per_layer_forward_cached(
+            residual.view(),
+            &layer_w,
+            &layer_p,
+            Some(token_ids),
+            position_offset,
+            cache_for_this_layer,
+        );
+    }
+
+    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p);
+
+    let n_tokens = token_ids.len();
+    let n_embd = hp.n_embd;
+    for t in 0..n_tokens {
+        let mut sumsq = 0.0_f32;
+        for d in 0..n_embd {
+            let v = pooled[[t, d]];
+            sumsq += v * v;
+        }
+        let inv = 1.0 / (sumsq / n_embd as f32 + head_p.norm_eps).sqrt();
+        for d in 0..n_embd {
+            pooled[[t, d]] *= inv * head_w.output_norm[d];
+        }
+    }
+
+    let n_vocab = head.n_vocab;
+    let mut logits = Array2::<f32>::zeros((n_tokens, n_vocab));
+    for t in 0..n_tokens {
+        for v in 0..n_vocab {
+            let mut acc = 0.0_f32;
+            for d in 0..n_embd {
+                acc += pooled[[t, d]] * head_w.output_lm_head[[v, d]];
+            }
+            logits[[t, v]] = acc;
+        }
+    }
+    Ok(logits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +546,53 @@ mod tests {
             diff_0last > 0.0,
             "row 0 == row {} (43-layer forward degenerate)",
             n_tokens - 1
+        );
+    }
+
+    /// Real-GGUF: the cached streaming forward with `layer_caches=None`
+    /// produces identical logits to the existing non-cached function.
+    /// Same 3-layer scope as `streaming_helper_3_layer_smoke`.
+    ///
+    /// Expected wall: ~110 s release (3 × ~30 s loads + forward).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn streaming_cached_with_no_cache_equals_uncached() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_tokens = 16;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let layers = [0, 1, 2];
+
+        let logits_a =
+            dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layers, 0).unwrap();
+        let logits_b =
+            dsv4_streaming_model_forward_cached(&gguf, &hp, &head, &token_ids, &layers, 0, None)
+                .unwrap();
+        assert_eq!(logits_a.shape(), logits_b.shape());
+
+        let mut max_diff = 0.0_f32;
+        for (a, b) in logits_a.iter().zip(logits_b.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        // Streaming + lm_head matmul gives wider reduction-order
+        // sensitivity than per-op tests; a logit-magnitude-relative
+        // threshold is more meaningful than an absolute one.
+        let max_abs: f32 = logits_a.iter().fold(0.0, |m, &v| m.max(v.abs()));
+        let rel = max_diff / max_abs.max(1.0);
+        assert!(
+            rel < 1e-4,
+            "cached-vs-uncached relative diff {rel} (max_abs={max_abs}, max_diff={max_diff})"
         );
     }
 }
