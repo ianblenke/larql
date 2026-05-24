@@ -69,6 +69,7 @@ pub fn dsv4_attn_block_compress_no_indexer(
     w: &DsV4AttnBlockCompressWeights,
     p: &DsV4AttnBlockCompressParams,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     assert_eq!(
@@ -94,9 +95,9 @@ pub fn dsv4_attn_block_compress_no_indexer(
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
     // 2. Q low-rank (mirrors Stage 8a).
-    let qr = matmul_x_wt(cur.view(), w.attn.wq_a);
+    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = matmul_x_wt(qr.view(), w.attn.wq_b);
+    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -111,7 +112,7 @@ pub fn dsv4_attn_block_compress_no_indexer(
     );
 
     // 3. Raw KV low-rank.
-    let kv_raw = matmul_x_wt(cur.view(), w.attn.wkv);
+    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -168,7 +169,7 @@ pub fn dsv4_attn_block_compress_no_indexer(
         p.attn.head_dim,
         p.attn.n_groups,
         p.attn.o_lora_rank,
-        None,
+        backend,
     )
 }
 
@@ -639,11 +640,78 @@ mod tests {
                 norm: &comp_norm,
             },
         };
-        let out = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+        let out = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
         assert_eq!(out.shape(), &[n_tokens, p.attn.n_embd]);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
         let total: f32 = out.iter().map(|v| v.abs()).sum();
         assert!(total > 1e-3, "output collapsed (sum={total})");
+    }
+
+    /// CpuBackend equivalence on the Compress prefill block: routing
+    /// Q/KV/O matmuls through `Some(&CpuBackend)` must match the
+    /// `None` fallback to within BLAS reduction tolerance. Locks in
+    /// the GPU-4b backend-threading wiring.
+    #[test]
+    fn compress_prefill_cpu_backend_matches_none_backend() {
+        let n_tokens = 8;
+        let (
+            x,
+            attn_norm,
+            wq_a,
+            q_a_norm,
+            wq_b,
+            wkv,
+            kv_a_norm,
+            wo_a,
+            wo_b,
+            attn_sinks,
+            comp_wkv,
+            comp_wgate,
+            comp_ape,
+            comp_norm,
+            p,
+        ) = make_block(n_tokens, 2);
+
+        let w = DsV4AttnBlockCompressWeights {
+            attn: DsV4AttnBlockWeights {
+                attn_norm: &attn_norm,
+                wq_a: wq_a.view(),
+                q_a_norm: &q_a_norm,
+                wq_b: wq_b.view(),
+                wkv: wkv.view(),
+                kv_a_norm: &kv_a_norm,
+                wo_a: wo_a.view(),
+                wo_b: wo_b.view(),
+                attn_sinks: Some(attn_sinks.view()),
+            },
+            compressor: CompressorWeights {
+                wkv: comp_wkv.view(),
+                wgate: comp_wgate.view(),
+                ape: comp_ape.view(),
+                norm: &comp_norm,
+            },
+        };
+
+        let out_none = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = dsv4_attn_block_compress_no_indexer(
+            x.view(),
+            &w,
+            &p,
+            0,
+            Some(&cpu as &dyn ComputeBackend),
+        );
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on Compress prefill: max_diff={max_diff}"
+        );
     }
 
     /// Static mask shape: `(n_tokens, n_tokens + n_comp)`. Token 0 sees
@@ -761,7 +829,7 @@ mod tests {
                 norm: &comp_norm,
             },
         };
-        let compressed = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+        let compressed = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
         // Compressed path produces different output than the raw-only
         // baseline — i.e. the compressed KV actually contributes.
         let diff: f32 = baseline
@@ -817,7 +885,7 @@ mod tests {
                 norm: &comp_norm,
             },
         };
-        let _ = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+        let _ = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
     }
 
     // ── Cached Compress attention tests ──
@@ -865,7 +933,7 @@ mod tests {
             },
         };
 
-        let out_prefill = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0);
+        let out_prefill = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
 
         let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
         let out_cached =
