@@ -25,6 +25,7 @@ pub mod dsv4_grouped_o_proj;
 pub mod dsv4_head_storage;
 pub mod dsv4_hyperparams_load;
 pub mod dsv4_indexer;
+pub mod dsv4_layer_smoke;
 pub mod dsv4_layer_variants;
 pub mod dsv4_masked_attn;
 pub mod dsv4_mhc;
