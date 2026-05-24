@@ -28,6 +28,8 @@
 
 use ndarray::{s, Array2, Array3, ArrayView2};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_compressor::{shift_overlap_state, softmax_pool_ratio};
 use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
 
@@ -66,6 +68,7 @@ pub fn build_compressor_prefill(
     x: ArrayView2<f32>,
     w: &CompressorWeights,
     p: &CompressorParams,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     assert!(p.compress_ratio > 0, "compress_ratio must be > 0");
     let n_tokens = x.shape()[0];
@@ -88,8 +91,8 @@ pub fn build_compressor_prefill(
     assert_eq!(w.norm.len(), p.head_dim, "norm length must equal head_dim");
 
     // 1. Project to kv and score, each (n_tokens, n_kv).
-    let kv_full = matmul_x_wt(x, w.wkv);
-    let score_full = matmul_x_wt(x, w.wgate);
+    let kv_full = dot_proj_gpu(&x, &w.wkv, backend);
+    let score_full = dot_proj_gpu(&x, &w.wgate, backend);
 
     // 2. Reshape the first cutoff = n_comp * compress_ratio tokens to
     //    (n_comp, ratio, n_kv).
@@ -533,13 +536,67 @@ mod tests {
             norm: &norm,
         };
         let x = make_input(n_tokens, p.n_embd);
-        let out = build_compressor_prefill(x.view(), &w, &p);
+        let out = build_compressor_prefill(x.view(), &w, &p, None);
 
         let n_comp = n_tokens / p.compress_ratio;
         assert_eq!(out.shape(), &[n_comp, p.head_dim]);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite");
         let total: f32 = out.iter().map(|v| v.abs()).sum();
         assert!(total > 1e-3, "output collapsed (sum={total})");
+    }
+
+    /// CpuBackend equivalence: build_compressor_prefill with
+    /// `Some(&CpuBackend)` must match the `None` fallback to within
+    /// BLAS reduction tolerance. Locks in the GPU-7b backend-routing
+    /// wiring on the wkv/wgate matmuls.
+    #[test]
+    fn compressor_prefill_cpu_backend_matches_none_backend() {
+        let p = CompressorParams {
+            head_dim: 16,
+            n_embd: 32,
+            compress_ratio: 2,
+            n_rot: 8,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let coff = 1;
+        let n_kv = coff * p.head_dim;
+        let n_tokens = 12;
+
+        let wkv = Array2::<f32>::from_shape_fn((n_kv, p.n_embd), |(i, j)| {
+            ((i * 3 + j) as f32 * 0.01).cos() * 0.1
+        });
+        let wgate = Array2::<f32>::from_shape_fn((n_kv, p.n_embd), |(i, j)| {
+            ((i * 5 + j) as f32 * 0.011).sin() * 0.1
+        });
+        let ape = Array2::<f32>::from_shape_fn((p.compress_ratio, n_kv), |(r, k)| {
+            ((r + k) as f32 * 0.05).sin() * 0.05
+        });
+        let norm = vec![1.0_f32; p.head_dim];
+
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let x = make_input(n_tokens, p.n_embd);
+
+        let out_none = build_compressor_prefill(x.view(), &w, &p, None);
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = build_compressor_prefill(x.view(), &w, &p, Some(&cpu as &dyn ComputeBackend));
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on compressor prefill: max_diff={max_diff}"
+        );
     }
 
     /// coff=2 path (compress_ratio=4) — verify shape, finiteness, and
@@ -577,7 +634,7 @@ mod tests {
             norm: &norm,
         };
         let x = make_input(n_tokens, p.n_embd);
-        let out = build_compressor_prefill(x.view(), &w, &p);
+        let out = build_compressor_prefill(x.view(), &w, &p, None);
 
         let n_comp = n_tokens / p.compress_ratio;
         assert_eq!(out.shape(), &[n_comp, p.head_dim]);
@@ -619,7 +676,7 @@ mod tests {
             norm: &norm,
         };
         let x = make_input(n_tokens, p.n_embd);
-        let out = build_compressor_prefill(x.view(), &w, &p);
+        let out = build_compressor_prefill(x.view(), &w, &p, None);
         assert_eq!(out.shape(), &[3, p.head_dim]);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -657,7 +714,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let out = build_compressor_prefill(x.view(), &w, &p);
+        let out = build_compressor_prefill(x.view(), &w, &p, None);
         // Consecutive rows differ purely due to per-row tail-RoPE
         // (rows are at positions 0, 2, 4, 6).
         let diff_01: f32 = (0..p.head_dim)
@@ -720,7 +777,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(chunk.view(), &w, &p);
+        let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
         let step = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
 
         assert_eq!(prefill.shape(), &[1, p.head_dim]);
@@ -746,7 +803,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         assert_eq!(prefill.shape(), &[2, p.head_dim]);
 
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
@@ -774,7 +831,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
         let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
         let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0);
@@ -884,7 +941,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(chunk.view(), &w, &p);
+        let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
         let mut state = CompressorOverlapState::empty();
         let step = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state);
         let mut max_diff = 0.0_f32;
@@ -911,7 +968,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         assert_eq!(prefill.shape(), &[2, p.head_dim]);
 
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
@@ -940,7 +997,7 @@ mod tests {
             ape: ape.view(),
             norm: &norm,
         };
-        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         let mut state = CompressorOverlapState::empty();
         let chunks: Vec<_> = (0..3)
             .map(|c| {

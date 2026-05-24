@@ -128,7 +128,7 @@ pub fn dsv4_attn_block_compress_no_indexer(
     let kv_raw = fp8_kv_quantize(kv_raw.view(), p.attn.n_rot);
 
     // 4. Compressed KV.
-    let kv_comp_pre = build_compressor_prefill(cur.view(), &w.compressor, &p.compressor);
+    let kv_comp_pre = build_compressor_prefill(cur.view(), &w.compressor, &p.compressor, backend);
     let kv_comp = fp8_kv_quantize(kv_comp_pre.view(), p.attn.n_rot);
     let n_comp = kv_comp.shape()[0];
 

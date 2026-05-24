@@ -145,7 +145,7 @@ pub fn dsv4_attn_block_compress_with_indexer(
     let kv_raw = fp8_kv_quantize(kv_raw.view(), p.attn.n_rot);
 
     // 4. Main compressed KV.
-    let kv_comp_pre = build_compressor_prefill(cur.view(), &w.compressor, &p.compressor);
+    let kv_comp_pre = build_compressor_prefill(cur.view(), &w.compressor, &p.compressor, backend);
     let kv_comp = fp8_kv_quantize(kv_comp_pre.view(), p.attn.n_rot);
     let n_comp = kv_comp.shape()[0];
 
@@ -153,8 +153,12 @@ pub fn dsv4_attn_block_compress_with_indexer(
     //    No FP8 quant — the indexer uses lower-precision math anyway via
     //    the scaled per-head weights, and the reference doesn't quant
     //    the indexer's KV.
-    let index_kv =
-        build_compressor_prefill(cur.view(), &w.indexer_compressor, &p.indexer_compressor);
+    let index_kv = build_compressor_prefill(
+        cur.view(),
+        &w.indexer_compressor,
+        &p.indexer_compressor,
+        backend,
+    );
     assert_eq!(
         index_kv.shape(),
         &[n_comp, p.indexer.n_index_head_size],
