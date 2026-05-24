@@ -51,6 +51,9 @@ pub fn softmax_pool_ratio(kv: ArrayView3<f32>, score: ArrayView3<f32>) -> Array2
     assert!(ratio > 0, "ratio must be > 0");
 
     let mut out = Array2::<f32>::zeros((n_comp, head_dim));
+    // Reusable weights scratch — one alloc per call, not per (c, d).
+    // Sized to `ratio` so it works for any DSv4 compress_ratio (4, 128, …).
+    let mut weights: Vec<f32> = vec![0.0; ratio];
     for c in 0..n_comp {
         for d in 0..head_dim {
             let mut m = f32::NEG_INFINITY;
@@ -70,11 +73,6 @@ pub fn softmax_pool_ratio(kv: ArrayView3<f32>, score: ArrayView3<f32>) -> Array2
                 continue;
             }
             let mut sum = 0.0_f32;
-            let mut weights: [f32; 64] = [0.0; 64];
-            assert!(
-                ratio <= weights.len(),
-                "softmax_pool_ratio: ratio {ratio} exceeds static buffer"
-            );
             for r in 0..ratio {
                 let e = (score[[c, d, r]] - m).exp();
                 weights[r] = e;
