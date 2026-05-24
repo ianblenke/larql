@@ -285,6 +285,18 @@ pub struct DsV4LayerHcaCache {
     /// Overlap state for the cr=4 compressor step. Empty / unused for
     /// other compress_ratios (the coff=1 cached step doesn't read it).
     pub overlap_state: CompressorOverlapState,
+    /// Indexer compressor's compressed KV cache. `None` for HCA layers
+    /// without an indexer (compress_ratio != 4 → no indexer); `Some(_)`
+    /// enables the cached indexer attention path. Initialize via
+    /// [`Self::with_capacity_and_indexer`] or the `enable_indexer` method.
+    ///
+    /// Indexer rows are sized to `indexer_head_size`, which is
+    /// typically smaller than the main `head_dim` (DSv4-Flash:
+    /// indexer_head_size=128 vs head_dim=512).
+    pub index_compressed: Option<DsV4LayerKvCache>,
+    /// Overlap state for the indexer compressor's coff=2 streaming
+    /// step. Empty / unused when `index_compressed` is `None`.
+    pub indexer_overlap_state: CompressorOverlapState,
 }
 
 impl DsV4LayerHcaCache {
@@ -308,7 +320,38 @@ impl DsV4LayerHcaCache {
             compress_ratio,
             pending_cur: Vec::new(),
             overlap_state: CompressorOverlapState::empty(),
+            index_compressed: None,
+            indexer_overlap_state: CompressorOverlapState::empty(),
         }
+    }
+
+    /// Same as [`Self::with_capacity`] plus the indexer compressed
+    /// cache initialized for an attention layer that runs the indexer
+    /// path. `indexer_head_size` typically differs from the main
+    /// `head_dim` (DSv4-Flash: 128 vs 512). The indexer compressed
+    /// cache is sized to the same `max_n_comp` as the main compressed
+    /// cache.
+    pub fn with_capacity_and_indexer(
+        max_seq_len: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        indexer_head_size: usize,
+    ) -> Self {
+        let mut cache = Self::with_capacity(max_seq_len, head_dim, compress_ratio);
+        cache.enable_indexer(indexer_head_size);
+        cache
+    }
+
+    /// Initialize the indexer compressed cache after construction.
+    /// Idempotent — calling it again replaces the prior cache (e.g.,
+    /// for a fresh sequence with a different indexer head size).
+    pub fn enable_indexer(&mut self, indexer_head_size: usize) {
+        let max_n_comp = self.compressed.max_seq_len();
+        self.index_compressed = Some(DsV4LayerKvCache::with_capacity(
+            max_n_comp,
+            indexer_head_size,
+        ));
+        self.indexer_overlap_state = CompressorOverlapState::empty();
     }
 
     /// Current number of raw kv_a rows (equivalently, current sequence
@@ -322,14 +365,19 @@ impl DsV4LayerHcaCache {
         self.compressed.current_len()
     }
 
-    /// Reset all sub-caches + pending buffer + overlap state for a new
-    /// sequence. After this, the cache behaves as if freshly
-    /// constructed (modulo retained capacity).
+    /// Reset all sub-caches + pending buffer + overlap states (main +
+    /// indexer) + indexer compressed cache for a new sequence. After
+    /// this, the cache behaves as if freshly constructed (modulo
+    /// retained capacity).
     pub fn clear(&mut self) {
         self.raw.clear();
         self.compressed.clear();
         self.pending_cur.clear();
         self.overlap_state.clear();
+        if let Some(idx) = self.index_compressed.as_mut() {
+            idx.clear();
+        }
+        self.indexer_overlap_state.clear();
     }
 }
 
@@ -464,7 +512,50 @@ mod hca_tests {
         );
     }
 
-    /// clear() resets everything: raw + compressed + pending + overlap.
+    /// Default constructor leaves indexer fields disabled.
+    #[test]
+    fn hca_basic_constructor_leaves_indexer_disabled() {
+        let cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        assert!(cache.index_compressed.is_none());
+        assert!(cache.indexer_overlap_state.kv_prev_last.is_none());
+    }
+
+    /// `with_capacity_and_indexer` sizes the indexer compressed cache
+    /// using the same max_n_comp as the main compressed cache but with
+    /// the supplied indexer_head_size.
+    #[test]
+    fn hca_with_capacity_and_indexer_sizes_correctly() {
+        // max_seq_len=128, compress_ratio=4 → max_n_comp = 32.
+        // head_dim=512 (main), indexer_head_size=128.
+        let cache = DsV4LayerHcaCache::with_capacity_and_indexer(128, 512, 4, 128);
+        let idx = cache.index_compressed.as_ref().expect("indexer enabled");
+        assert_eq!(idx.max_seq_len(), 32);
+        assert_eq!(idx.head_dim(), 128);
+        assert_eq!(idx.current_len(), 0);
+    }
+
+    /// `enable_indexer` can be called after the basic constructor and
+    /// is idempotent — calling again replaces the cache (useful if the
+    /// caller wants to switch indexer_head_size between sequences).
+    #[test]
+    fn hca_enable_indexer_idempotent_and_replaces() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(64, 256, 4);
+        cache.enable_indexer(128);
+        assert_eq!(cache.index_compressed.as_ref().unwrap().head_dim(), 128);
+
+        // Append something then enable_indexer again — should clear /
+        // replace the cache.
+        let row = Array2::<f32>::ones((1, 128));
+        cache.index_compressed.as_mut().unwrap().append(row.view());
+        assert_eq!(cache.index_compressed.as_ref().unwrap().current_len(), 1);
+
+        cache.enable_indexer(128); // same size; should reset to empty
+        assert_eq!(cache.index_compressed.as_ref().unwrap().current_len(), 0);
+    }
+
+    /// clear() resets everything: raw + compressed + pending + overlap
+    /// + indexer compressed + indexer overlap. Indexer-enabled variant
+    /// covered by the indexer-specific test below.
     #[test]
     fn hca_clear_resets_all_four_pieces() {
         let mut cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
@@ -482,5 +573,29 @@ mod hca_tests {
         assert!(cache.pending_cur.is_empty());
         assert!(cache.overlap_state.kv_prev_last.is_none());
         assert!(cache.overlap_state.score_prev_last.is_none());
+    }
+
+    /// clear() with the indexer enabled also resets the indexer cache
+    /// + indexer overlap state.
+    #[test]
+    fn hca_clear_resets_indexer_fields_too() {
+        let mut cache = DsV4LayerHcaCache::with_capacity_and_indexer(16, 8, 4, 4);
+        let idx_row = Array2::<f32>::ones((1, 4));
+        cache
+            .index_compressed
+            .as_mut()
+            .unwrap()
+            .append(idx_row.view());
+        cache.indexer_overlap_state.kv_prev_last = Some(Array2::<f32>::ones((4, 4)));
+        cache.indexer_overlap_state.score_prev_last = Some(Array2::<f32>::zeros((4, 4)));
+
+        cache.clear();
+        // Indexer cache is still present but empty.
+        let idx = cache.index_compressed.as_ref().unwrap();
+        assert_eq!(idx.current_len(), 0);
+        assert_eq!(idx.head_dim(), 4); // capacity preserved
+                                       // Indexer overlap state cleared.
+        assert!(cache.indexer_overlap_state.kv_prev_last.is_none());
+        assert!(cache.indexer_overlap_state.score_prev_last.is_none());
     }
 }
