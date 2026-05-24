@@ -46,6 +46,8 @@ pub struct DsV4Hyperparams {
     pub indexer_head_size: Option<usize>,
     pub n_index_head: Option<usize>,
     pub top_k: Option<usize>,
+    /// Number of hyper-connection streams (mHC). DSv4-Flash uses 4.
+    pub n_hc: usize,
     /// Optional YARN RoPE scaling config. `Some(_)` for long-context
     /// models like DSv4-Flash (factor=16, 65 536 → 1 048 576); `None`
     /// for short-context or non-YARN models. Propagated into per-layer
@@ -183,6 +185,22 @@ pub fn build_layer_storage(
         mhc_attn: None,
         mhc_ffn: None,
     };
+
+    // ── mHC bookends (always present for DSv4 layers) ──
+    // Both wrap their respective compute block; loaded regardless of
+    // compress_ratio. hc_dim = n_hc * n_embd; hc_mix = (2 + n_hc) * n_hc.
+    let hc_dim = hp.n_hc * hp.n_embd;
+    let hc_mix = (2 + hp.n_hc) * hp.n_hc;
+    storage.mhc_attn = Some(super::dsv4_storage::MhcStorage {
+        hc_fn: take_2d(&tensors, DsV4TensorKind::HcAttnFn, hc_mix, hc_dim)?,
+        hc_scale: take_scale_array(&tensors, DsV4TensorKind::HcAttnScale)?,
+        hc_base: take_vec(&tensors, DsV4TensorKind::HcAttnBase, &[hc_mix])?,
+    });
+    storage.mhc_ffn = Some(super::dsv4_storage::MhcStorage {
+        hc_fn: take_2d(&tensors, DsV4TensorKind::HcFfnFn, hc_mix, hc_dim)?,
+        hc_scale: take_scale_array(&tensors, DsV4TensorKind::HcFfnScale)?,
+        hc_base: take_vec(&tensors, DsV4TensorKind::HcFfnBase, &[hc_mix])?,
+    });
 
     if compress_ratio == 0 {
         return Ok(storage);
@@ -330,6 +348,15 @@ fn take_3d(
     Ok(Array3::from_shape_vec((dim0, dim1, dim2), v).expect("shape verified by take_vec"))
 }
 
+/// Pull a 3-element scale array (hc_scale layout: `[pre, post, comb]`).
+fn take_scale_array(
+    tensors: &HashMap<DsV4TensorKind, Vec<f32>>,
+    kind: DsV4TensorKind,
+) -> Result<[f32; 3], DsV4BuildError> {
+    let v = take_vec(tensors, kind, &[3])?;
+    Ok([v[0], v[1], v[2]])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +377,7 @@ mod tests {
             indexer_head_size: None,
             n_index_head: None,
             top_k: None,
+            n_hc: 4,
             yarn: None,
             rope_base_swa: None,
         }
@@ -379,6 +407,15 @@ mod tests {
             vec![0.01; hp.n_groups * hp.o_lora_rank * group_dim],
         );
         m.insert(DsV4TensorKind::AttnOutB, vec![0.01; hp.n_embd * low_dim]);
+        // mHC bookends — always required by build_layer_storage.
+        let hc_dim = hp.n_hc * hp.n_embd;
+        let hc_mix = (2 + hp.n_hc) * hp.n_hc;
+        m.insert(DsV4TensorKind::HcAttnFn, vec![0.001; hc_mix * hc_dim]);
+        m.insert(DsV4TensorKind::HcAttnScale, vec![0.5, 0.5, 0.5]);
+        m.insert(DsV4TensorKind::HcAttnBase, vec![0.0; hc_mix]);
+        m.insert(DsV4TensorKind::HcFfnFn, vec![0.001; hc_mix * hc_dim]);
+        m.insert(DsV4TensorKind::HcFfnScale, vec![0.5, 0.5, 0.5]);
+        m.insert(DsV4TensorKind::HcFfnBase, vec![0.0; hc_mix]);
         m
     }
 
