@@ -154,6 +154,7 @@ pub fn dsv4_per_layer_forward_cached(
                 params,
                 position_offset,
                 c,
+                backend,
             )
         }
         // No-cache or mismatched variant pair → non-cached path.
