@@ -140,6 +140,18 @@ impl DsV4Hyperparams {
             Ok(_) | Err(_) => None,
         };
 
+        // n_hc: number of hyper-connection streams. Derived from the
+        // global `hc_head_base` tensor length (4 for DSv4-Flash). If
+        // the tensor isn't present we default to 4 — every DSv4 model
+        // observed so far has n_hc=4.
+        let n_hc = gguf
+            .tensor_infos
+            .iter()
+            .find(|i| i.name() == "hc_head_base")
+            .and_then(|i| i.dims().first().copied())
+            .map(|d| d as usize)
+            .unwrap_or(4);
+
         // SWA-specific rope base (DSv4 separates the sliding-window
         // RoPE from the main one). Optional — when absent the SWA path
         // reuses `rope_base`.
@@ -170,6 +182,7 @@ impl DsV4Hyperparams {
             indexer_head_size,
             n_index_head,
             top_k,
+            n_hc,
             yarn,
             rope_base_swa,
         })
