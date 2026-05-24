@@ -118,6 +118,77 @@ pub fn read_dsv4_layer_tensors_from_gguf(
     Ok(out)
 }
 
+/// Read per-layer DSv4 **integer** tensors (e.g. `ffn_gate_tid2eid`),
+/// keyed by [`DsV4TensorKind`]. Returns `Vec<i32>` per kind so the
+/// downstream loader can shape it into the right routing table.
+///
+/// Skips non-integer types — callers should pair this with
+/// [`read_dsv4_layer_tensors_from_gguf`] for the f32 weights.
+pub fn read_dsv4_layer_int_tensors_from_gguf(
+    gguf: &GgufFile,
+    layer_index: usize,
+) -> Result<HashMap<DsV4TensorKind, Vec<i32>>, ModelError> {
+    let mut want: HashMap<String, DsV4TensorKind> = HashMap::new();
+    for &kind in all_kinds() {
+        if !kind.is_per_layer() {
+            continue;
+        }
+        want.insert(tensor_name_of(kind, layer_index), kind);
+    }
+
+    let mut out: HashMap<DsV4TensorKind, Vec<i32>> = HashMap::new();
+    let mut shard_files: HashMap<usize, File> = HashMap::new();
+    for info in &gguf.tensor_infos {
+        let Some(&kind) = want.get(info.name()) else {
+            continue;
+        };
+        if !is_integer_type(info.tensor_type()) {
+            continue;
+        }
+        let shard_idx = info.shard_idx();
+        let abs_offset = gguf
+            .shard_data_offset(info)
+            .checked_add(info.offset())
+            .ok_or_else(|| {
+                ModelError::Parse(format!(
+                    "DSv4 layer {layer_index}: {} offset overflow",
+                    info.name()
+                ))
+            })?;
+        let n_elements: u64 = info.dims().iter().product();
+        let data_size = tensor_data_size(info.tensor_type(), n_elements as usize)?;
+        // DSv4 integer tensors observed so far are all I32 (type 26).
+        // tensor_data_size returns the right byte count for any int width.
+        let path: PathBuf = gguf.shard_path(info).to_path_buf();
+        let f = shard_files.entry(shard_idx).or_insert_with_key(|_| {
+            File::open(&path)
+                .unwrap_or_else(|e| panic!("DSv4 layer {layer_index}: open shard {path:?}: {e}"))
+        });
+        f.seek(SeekFrom::Start(abs_offset))?;
+        let mut buf = vec![0u8; data_size];
+        f.read_exact(&mut buf)?;
+        // Decode bytes as i32 little-endian. Only I32 (type 26) handled
+        // here — other integer widths are rare in DSv4 and can extend
+        // this later if needed.
+        if info.tensor_type() != larql_models::quant::ggml::TYPE_I32 {
+            continue;
+        }
+        let elems = n_elements as usize;
+        if buf.len() < elems * 4 {
+            return Err(ModelError::Parse(format!(
+                "DSv4 layer {layer_index}: {} I32 buffer too short",
+                info.name()
+            )));
+        }
+        let mut vec = Vec::with_capacity(elems);
+        for chunk in buf[..elems * 4].chunks_exact(4) {
+            vec.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        out.insert(kind, vec);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +249,42 @@ mod tests {
     fn rekey_empty_input_yields_empty_output() {
         let out = rekey_dsv4_layer_tensors(HashMap::new(), 0);
         assert!(out.is_empty());
+    }
+
+    /// Real-GGUF: layer 0's `ffn_gate_tid2eid` is I32 with shape
+    /// `[6, 129280]` = (n_expert_used, n_vocab). Verify the int reader
+    /// loads it correctly.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_loads_ffn_gate_tid2eid() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let map = read_dsv4_layer_int_tensors_from_gguf(&gguf, 0).expect("load int tensors");
+        let table = map
+            .get(&DsV4TensorKind::FfnGateTid2Eid)
+            .expect("ffn_gate_tid2eid present on layer 0");
+        // n_expert_used=6, n_vocab=129280 → 775680 entries.
+        assert_eq!(table.len(), 6 * 129280);
+        // Indices should be in [0, n_expert) = [0, 256).
+        let max_idx = *table.iter().max().unwrap();
+        let min_idx = *table.iter().min().unwrap();
+        assert!(
+            min_idx >= 0 && max_idx < 256,
+            "tid2eid out of expected expert range: min={min_idx} max={max_idx}"
+        );
+
+        // Layers 3+ should NOT have tid2eid (verified by the empty map).
+        let layer_3_map =
+            read_dsv4_layer_int_tensors_from_gguf(&gguf, 3).expect("load int tensors for layer 3");
+        assert!(
+            !layer_3_map.contains_key(&DsV4TensorKind::FfnGateTid2Eid),
+            "layer 3 should not have ffn_gate_tid2eid (hash routing is first 3 layers)"
+        );
     }
 }
