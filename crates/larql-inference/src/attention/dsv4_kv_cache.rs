@@ -27,7 +27,9 @@
 //! the decode forward can reuse cached K/V instead of re-running
 //! prefill from scratch each step.
 
-use ndarray::{s, Array2, ArrayView2};
+use ndarray::{s, Array1, Array2, ArrayView2};
+
+use super::dsv4_compressor_prefill::CompressorOverlapState;
 
 /// Per-layer DSv4 MLA KV cache.
 ///
@@ -272,6 +274,17 @@ pub struct DsV4LayerHcaCache {
     pub compressed: DsV4LayerKvCache,
     /// Compress ratio for this layer (typically 4 or 128 in DSv4-Flash).
     pub compress_ratio: usize,
+    /// Partial-chunk buffer of cur (post-attn-norm hidden) rows that
+    /// haven't yet formed a complete chunk for the compressor. Each
+    /// entry is one row of `n_embd` f32s. At most `compress_ratio - 1`
+    /// entries held at any time — the cached HCA Compress attention
+    /// drains these in `compress_ratio`-sized batches as new tokens
+    /// arrive, calling the matching `dsv4_compressor_step_coff{1,2}`
+    /// and appending the result to `compressed`.
+    pub pending_cur: Vec<Array1<f32>>,
+    /// Overlap state for the cr=4 compressor step. Empty / unused for
+    /// other compress_ratios (the coff=1 cached step doesn't read it).
+    pub overlap_state: CompressorOverlapState,
 }
 
 impl DsV4LayerHcaCache {
@@ -293,6 +306,8 @@ impl DsV4LayerHcaCache {
             // will ever be produced).
             compressed: DsV4LayerKvCache::with_capacity(max_n_comp.max(1), head_dim),
             compress_ratio,
+            pending_cur: Vec::new(),
+            overlap_state: CompressorOverlapState::empty(),
         }
     }
 
@@ -307,10 +322,14 @@ impl DsV4LayerHcaCache {
         self.compressed.current_len()
     }
 
-    /// Reset both sub-caches for a new sequence.
+    /// Reset all sub-caches + pending buffer + overlap state for a new
+    /// sequence. After this, the cache behaves as if freshly
+    /// constructed (modulo retained capacity).
     pub fn clear(&mut self) {
         self.raw.clear();
         self.compressed.clear();
+        self.pending_cur.clear();
+        self.overlap_state.clear();
     }
 }
 
@@ -401,5 +420,67 @@ mod hca_tests {
     #[should_panic(expected = "compress_ratio must be > 0")]
     fn hca_zero_compress_ratio_panics() {
         let _ = DsV4LayerHcaCache::with_capacity(8, 4, 0);
+    }
+
+    // ── Pending buffer + overlap state extension tests ──
+
+    /// Fresh cache: pending_cur empty + overlap state empty.
+    #[test]
+    fn hca_extension_initializes_empty() {
+        let cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        assert!(cache.pending_cur.is_empty());
+        assert!(cache.overlap_state.kv_prev_last.is_none());
+        assert!(cache.overlap_state.score_prev_last.is_none());
+    }
+
+    /// Pending buffer push + len.
+    #[test]
+    fn hca_pending_cur_grows_with_push() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        let row_a = Array1::<f32>::from_vec(vec![1.0, 2.0, 3.0]);
+        let row_b = Array1::<f32>::from_vec(vec![4.0, 5.0, 6.0]);
+        cache.pending_cur.push(row_a.clone());
+        cache.pending_cur.push(row_b.clone());
+        assert_eq!(cache.pending_cur.len(), 2);
+        assert_eq!(cache.pending_cur[0], row_a);
+        assert_eq!(cache.pending_cur[1], row_b);
+    }
+
+    /// Overlap state can be populated and read.
+    #[test]
+    fn hca_overlap_state_can_be_set_and_read() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        let kv_prev = Array2::<f32>::ones((4, 4));
+        let score_prev = Array2::<f32>::zeros((4, 4));
+        cache.overlap_state.kv_prev_last = Some(kv_prev.clone());
+        cache.overlap_state.score_prev_last = Some(score_prev.clone());
+        assert_eq!(
+            cache.overlap_state.kv_prev_last.as_ref().unwrap()[[0, 0]],
+            1.0
+        );
+        assert_eq!(
+            cache.overlap_state.score_prev_last.as_ref().unwrap()[[3, 3]],
+            0.0
+        );
+    }
+
+    /// clear() resets everything: raw + compressed + pending + overlap.
+    #[test]
+    fn hca_clear_resets_all_four_pieces() {
+        let mut cache = DsV4LayerHcaCache::with_capacity(8, 4, 4);
+        // Populate every piece.
+        let row2d = Array2::<f32>::ones((1, 4));
+        cache.raw.append(row2d.view());
+        cache.compressed.append(row2d.view());
+        cache.pending_cur.push(Array1::<f32>::ones(3));
+        cache.overlap_state.kv_prev_last = Some(Array2::<f32>::ones((4, 4)));
+        cache.overlap_state.score_prev_last = Some(Array2::<f32>::zeros((4, 4)));
+
+        cache.clear();
+        assert_eq!(cache.current_raw_len(), 0);
+        assert_eq!(cache.current_compressed_len(), 0);
+        assert!(cache.pending_cur.is_empty());
+        assert!(cache.overlap_state.kv_prev_last.is_none());
+        assert!(cache.overlap_state.score_prev_last.is_none());
     }
 }
