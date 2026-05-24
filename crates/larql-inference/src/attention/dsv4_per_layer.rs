@@ -20,9 +20,11 @@
 use ndarray::{Array3, ArrayView3};
 
 use super::dsv4_attn_block::dsv4_attn_block_no_compress_cached;
+use super::dsv4_attn_block_compress::dsv4_attn_block_compress_no_indexer_cached;
+use super::dsv4_attn_block_indexer::dsv4_attn_block_compress_with_indexer_cached;
 use super::dsv4_attn_dispatch::{dsv4_attn_layer, DsV4AttnLayer};
 use super::dsv4_ffn_block::{dsv4_ffn_block, Dsv4FfnParams, Dsv4FfnWeights};
-use super::dsv4_kv_cache::DsV4LayerKvCache;
+use super::dsv4_kv_cache::DsV4LayerCache;
 use super::dsv4_mhc_bookend::{dsv4_mhc_post, dsv4_mhc_pre, MhcParams, MhcWeights};
 
 /// All weights for a single DSv4 layer: attention variant + its mHC
@@ -92,48 +94,64 @@ pub fn dsv4_per_layer_forward(
 
 /// KV-cached variant of [`dsv4_per_layer_forward`].
 ///
-/// Behavior matrix:
-/// - `layer_cache = None`: identical behavior to [`dsv4_per_layer_forward`].
-///   No caching, runs prefill on every call.
-/// - `layer_cache = Some(_)` + NoCompress attn variant: uses
-///   [`dsv4_attn_block_no_compress_cached`] — appends new kv_a rows
-///   to the cache, attends against the full cache. Enables O(window)
-///   decode after a prefill instead of O(prefill_len) per step.
-/// - `layer_cache = Some(_)` + Compress/Indexer attn: falls back to
-///   the non-cached dispatcher. The HCA paths don't have cached
-///   variants yet — their compressor pipeline needs separate cache
-///   support (follow-up PR). The cache remains untouched in this
-///   case; callers should special-case allocation accordingly.
+/// Dispatches on `(attn variant, cache variant)`:
+/// - `(NoCompress, DsV4LayerCache::NoCompress)` →
+///   [`dsv4_attn_block_no_compress_cached`]
+/// - `(Compress, DsV4LayerCache::Hca)` →
+///   [`dsv4_attn_block_compress_no_indexer_cached`]
+/// - `(Indexer, DsV4LayerCache::Hca)` (with indexer enabled) →
+///   [`dsv4_attn_block_compress_with_indexer_cached`]
+/// - `layer_cache = None` OR mismatched variant pair → fall back to
+///   non-cached [`dsv4_attn_layer`] (correctness preserved, no decode
+///   speedup)
 ///
-/// The `position_offset` is the absolute position of `residual[0]`.
-/// When using the cached path it must equal `layer_cache.current_len()`
-/// on entry; that invariant is asserted inside the cached attention
-/// function.
+/// `position_offset` is the absolute position of `residual[0]`. When a
+/// cached path is selected it must equal the cache's current sequence
+/// position (`DsV4LayerCache::position()`); this is asserted inside
+/// the per-variant cached attention functions.
 pub fn dsv4_per_layer_forward_cached(
     residual: ArrayView3<f32>,
     w: &DsV4LayerWeights,
     p: &DsV4LayerParams,
     token_ids: Option<&[u32]>,
     position_offset: usize,
-    layer_cache: Option<&mut DsV4LayerKvCache>,
+    layer_cache: Option<&mut DsV4LayerCache>,
 ) -> Array3<f32> {
     // ── 1. Attention bookend pre ──
     let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc);
 
-    // ── 2. Attention block (cached if possible) ──
+    // ── 2. Attention block (cached if variants align, fallback otherwise) ──
     let attn_out = match (&w.attn, layer_cache) {
-        (DsV4AttnLayer::NoCompress { weights, params }, Some(cache)) => {
+        (DsV4AttnLayer::NoCompress { weights, params }, Some(DsV4LayerCache::NoCompress(c))) => {
             dsv4_attn_block_no_compress_cached(
                 pre_attn.cur.view(),
                 weights,
                 params,
                 position_offset,
-                cache,
+                c,
             )
         }
-        // No-cache cases (None) and HCA variants (Compress/Indexer) → fall
-        // back to non-cached dispatcher. The HCA variants will gain cached
-        // counterparts in a follow-up PR.
+        (DsV4AttnLayer::Compress { weights, params }, Some(DsV4LayerCache::Hca(c))) => {
+            dsv4_attn_block_compress_no_indexer_cached(
+                pre_attn.cur.view(),
+                weights,
+                params,
+                position_offset,
+                c,
+            )
+        }
+        (DsV4AttnLayer::Indexer { weights, params }, Some(DsV4LayerCache::Hca(c)))
+            if c.index_compressed.is_some() =>
+        {
+            dsv4_attn_block_compress_with_indexer_cached(
+                pre_attn.cur.view(),
+                weights,
+                params,
+                position_offset,
+                c,
+            )
+        }
+        // No-cache or mismatched variant pair → non-cached path.
         _ => dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset),
     };
 
@@ -687,7 +705,7 @@ mod tests {
 
         let out_nocache = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0);
 
-        let mut cache = DsV4LayerKvCache::with_capacity(32, attn_params.head_dim);
+        let mut cache = DsV4LayerCache::new_no_compress(32, attn_params.head_dim);
         let out_cached = dsv4_per_layer_forward_cached(
             residual.view(),
             &layer_w,
@@ -705,6 +723,6 @@ mod tests {
             max_diff < 1e-5,
             "cached(NoCompress, empty cache) vs non-cached: max diff = {max_diff}"
         );
-        assert_eq!(cache.current_len(), n_tokens);
+        assert_eq!(cache.position(), n_tokens);
     }
 }
