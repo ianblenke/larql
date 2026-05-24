@@ -171,4 +171,73 @@ mod tests {
             );
         }
     }
+
+    /// Real-GGUF sampled decode: same setup as the greedy smoke but
+    /// with `SamplingConfig::default_sampling()` (T=0.7, top_k=40,
+    /// top_p=0.95). Also exercises the seed-determinism contract:
+    /// running twice with the same seed produces identical tokens.
+    ///
+    /// Wall: ~500 s release per call × 2 calls for the determinism
+    /// check = ~1000 s. Tradeoff is worth it because the determinism
+    /// check rules out subtle RNG/state-leakage bugs across the
+    /// cached-decode pipeline.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk (~17 min wall)"]
+    fn generate_real_gguf_sampled_seeded_is_deterministic() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_prompt = 16;
+        let prompt: Vec<u32> = (0..n_prompt)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let decode_config = DecodeConfig {
+            max_new_tokens: 2,
+            eos_token: None,
+            sampling: SamplingConfig::default_sampling(), // T=0.7, top_k=40, top_p=0.95
+        };
+
+        // Two independent runs with the same RNG seed.
+        let mut rng_a = StdRng::seed_from_u64(0xc0ffee);
+        let tokens_a = dsv4_generate(
+            &gguf,
+            &hp,
+            &head,
+            &[0, 1, 2],
+            &prompt,
+            decode_config,
+            &mut rng_a,
+        )
+        .expect("generate run A");
+
+        let mut rng_b = StdRng::seed_from_u64(0xc0ffee);
+        let tokens_b = dsv4_generate(
+            &gguf,
+            &hp,
+            &head,
+            &[0, 1, 2],
+            &prompt,
+            decode_config,
+            &mut rng_b,
+        )
+        .expect("generate run B");
+
+        assert_eq!(
+            tokens_a, tokens_b,
+            "same seed must produce identical tokens"
+        );
+        assert_eq!(tokens_a.len(), n_prompt + 2);
+        // Generated tokens are valid vocab IDs.
+        for &t in &tokens_a[n_prompt..] {
+            assert!((t as usize) < head.n_vocab);
+        }
+    }
 }
