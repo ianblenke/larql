@@ -164,6 +164,39 @@ mod tests {
         for &v in storage.q_a_norm.iter().take(16) {
             assert!(v.is_finite(), "non-finite q_a_norm");
         }
+
+        // mHC bookends loaded (Stage mhc-loader).
+        let hc_dim = hp.n_hc * hp.n_embd;
+        let hc_mix = (2 + hp.n_hc) * hp.n_hc;
+        let mhc_attn = storage.mhc_attn.as_ref().expect("mhc_attn present");
+        assert_eq!(mhc_attn.hc_fn.shape(), &[hc_mix, hc_dim]);
+        assert_eq!(mhc_attn.hc_base.len(), hc_mix);
+        let mhc_ffn = storage.mhc_ffn.as_ref().expect("mhc_ffn present");
+        assert_eq!(mhc_ffn.hc_fn.shape(), &[hc_mix, hc_dim]);
+        assert_eq!(mhc_ffn.hc_base.len(), hc_mix);
+
+        // FFN block loaded (Stage ffn-loader). Layer 0 is a hash-routing
+        // layer in DSv4-Flash (n_hash_layers=3); gate_tid2eid IS present.
+        let ffn = storage.ffn.as_ref().expect("ffn present");
+        assert_eq!(ffn.ffn_norm.len(), hp.n_embd);
+        assert_eq!(ffn.gate_inp.shape(), &[hp.n_expert, hp.n_embd]);
+        assert_eq!(
+            ffn.gate_exps.shape(),
+            &[hp.n_expert, hp.n_ff_exp, hp.n_embd]
+        );
+        assert_eq!(
+            ffn.down_exps.shape(),
+            &[hp.n_expert, hp.n_embd, hp.n_ff_exp]
+        );
+        let hidden_shared = hp.n_ff_exp * hp.n_expert_shared;
+        assert_eq!(ffn.gate_shexp.shape(), &[hidden_shared, hp.n_embd]);
+        assert_eq!(ffn.down_shexp.shape(), &[hp.n_embd, hidden_shared]);
+        // Hash-routing table: should be present for layer 0.
+        let tid2eid = ffn
+            .gate_tid2eid
+            .as_ref()
+            .expect("hash routing table loaded");
+        assert_eq!(tid2eid.shape()[1], hp.n_expert_used);
     }
 
     /// Same, for layer 4 (the cheapest indexer + compressor layer):
