@@ -325,4 +325,102 @@ mod tests {
         let total: f32 = new_residual.iter().map(|v| v.abs()).sum();
         assert!(total > 0.0, "new_residual is all zeros");
     }
+
+    /// Full per-layer forward on real layer 0: mHC pre → attention
+    /// (NoCompress variant) → mHC post → mHC pre → FFN (hash routing,
+    /// since layer 0 ∈ [0, n_hash_layers=3)) → mHC post.
+    ///
+    /// This is the most ambitious DSv4 smoke yet: every stage from
+    /// 8a through 8h-3d-2 runs on real GGUF weights, with the actual
+    /// 256-expert MoE FFN dispatching through ~26 GB of f32 expert
+    /// tensors. Expect ~30 s release-mode runtime (dominated by Q6_K
+    /// dequant of the 3 expert tensors during load).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn smoke_layer_0_full_per_layer_forward() {
+        use ndarray::Array3;
+
+        use crate::attention::dsv4_ffn_block::Dsv4FfnParams;
+        use crate::attention::dsv4_mhc_bookend::MhcParams;
+        use crate::attention::dsv4_per_layer::{
+            dsv4_per_layer_forward, DsV4LayerParams, DsV4LayerWeights,
+        };
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let (storage, variant) = load_dsv4_layer(&gguf, &hp, 0).expect("load layer 0");
+        assert!(variant.uses_hash_routing, "layer 0 should hash-route");
+
+        // 4-token 4-stream residual (n_hc=4 for DSv4-Flash).
+        let n_tokens = 4;
+        let n_embd = hp.n_embd;
+        let n_hc = hp.n_hc;
+        let residual = Array3::<f32>::from_shape_fn((n_tokens, n_hc, n_embd), |(t, h, d)| {
+            ((t * 13 + h * 7 + d) as f32 * 0.0013).sin() * 0.1
+        });
+
+        // Token IDs must be < n_vocab. Derive n_vocab from gate_tid2eid.
+        let ffn = storage.ffn.as_ref().expect("ffn loaded");
+        let n_vocab = ffn
+            .gate_tid2eid
+            .as_ref()
+            .expect("hash routing table on layer 0")
+            .shape()[0];
+        let token_ids: Vec<u32> = (0..n_tokens).map(|t| (t * 257 % n_vocab) as u32).collect();
+
+        // Wire layer storage views into per-layer weights.
+        let attn_layer = storage.dispatcher_layer(&None, &None); // NoCompress
+        let mhc_attn = storage
+            .mhc_attn
+            .as_ref()
+            .expect("mhc_attn loaded")
+            .as_weights();
+        let mhc_ffn = storage
+            .mhc_ffn
+            .as_ref()
+            .expect("mhc_ffn loaded")
+            .as_weights();
+        let ffn_weights = ffn.as_weights();
+        let layer_w = DsV4LayerWeights {
+            mhc_attn,
+            attn: attn_layer,
+            mhc_ffn,
+            ffn: ffn_weights,
+        };
+        let layer_p = DsV4LayerParams {
+            mhc: MhcParams {
+                n_embd: hp.n_embd,
+                n_hc: hp.n_hc,
+                sinkhorn_iters: 2,
+                hc_eps: 1e-5,
+                norm_eps: hp.norm_eps,
+            },
+            ffn: Dsv4FfnParams {
+                n_expert: hp.n_expert,
+                n_expert_used: hp.n_expert_used,
+                norm_eps: hp.norm_eps,
+                routed_swiglu_limit: 7.0,
+                shared_swiglu_limit: 0.0,
+                expert_weights_norm: hp.expert_weights_norm,
+                expert_weights_scale: hp.expert_weights_scale,
+            },
+        };
+
+        let out = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, Some(&token_ids), 0);
+        assert_eq!(out.shape(), &[n_tokens, n_hc, n_embd]);
+        let n_nonfinite = out.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            n_nonfinite, 0,
+            "{n_nonfinite} non-finite values in full per-layer output"
+        );
+        let total: f32 = out.iter().map(|v| v.abs()).sum();
+        assert!(total > 0.0, "per-layer output is all zeros");
+    }
 }
