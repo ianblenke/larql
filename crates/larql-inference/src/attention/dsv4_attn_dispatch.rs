@@ -78,9 +78,8 @@ impl DsV4AttnLayer<'_, '_> {
 /// matching the layer's `compress_ratio`.
 ///
 /// `backend` routes the per-block matmul shapes through the optional
-/// compute backend (cuBLAS / Metal / CPU). NoCompress (GPU-4a) and
-/// Compress (GPU-4b) prefill paths thread it; the Indexer prefill
-/// variant still ignores it (GPU-4c will lift that).
+/// compute backend (cuBLAS / Metal / CPU). All three prefill variants
+/// (NoCompress GPU-4a, Compress GPU-4b, Indexer GPU-4c) thread it.
 pub fn dsv4_attn_layer(
     x: ArrayView2<f32>,
     layer: &DsV4AttnLayer,
@@ -95,7 +94,7 @@ pub fn dsv4_attn_layer(
             dsv4_attn_block_compress_no_indexer(x, weights, params, position_offset, backend)
         }
         DsV4AttnLayer::Indexer { weights, params } => {
-            dsv4_attn_block_compress_with_indexer(x, weights, params, position_offset)
+            dsv4_attn_block_compress_with_indexer(x, weights, params, position_offset, backend)
         }
     }
 }
