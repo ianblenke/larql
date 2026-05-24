@@ -25,6 +25,7 @@ use super::dsv4_attn_block_indexer::{DsV4AttnBlockIndexerParams, DsV4AttnBlockIn
 use super::dsv4_attn_dispatch::DsV4AttnLayer;
 use super::dsv4_compressor_prefill::{CompressorParams, CompressorWeights};
 use super::dsv4_indexer::{IndexerParams, IndexerWeights};
+use super::dsv4_mhc_bookend::MhcWeights;
 
 /// Owned weights for the DSv4 compressor (a per-layer HCA producer).
 #[derive(Clone)]
@@ -68,6 +69,30 @@ impl IndexerStorage {
     }
 }
 
+/// Owned weights for one mHC bookend (attn or FFN side).
+///
+/// Per the DSv4 schema, each layer has two mHC bookends — one
+/// wrapping attention (`hc_attn_*`) and one wrapping the FFN
+/// (`hc_ffn_*`). Each uses the same `MhcWeights` shape:
+/// `hc_fn (hc_mix × hc_dim)` + `hc_scale (3 entries)` +
+/// `hc_base (hc_mix entries)`.
+#[derive(Clone)]
+pub struct MhcStorage {
+    pub hc_fn: Array2<f32>,
+    pub hc_scale: [f32; 3],
+    pub hc_base: Vec<f32>,
+}
+
+impl MhcStorage {
+    pub fn as_weights(&self) -> MhcWeights<'_> {
+        MhcWeights {
+            hc_fn: self.hc_fn.view(),
+            hc_scale: &self.hc_scale,
+            hc_base: &self.hc_base,
+        }
+    }
+}
+
 /// All per-layer DSv4 attention-side weights (FFN side will live in a
 /// sibling struct in Stage 8h-3). Owns the f32 buffers; emits borrowed
 /// views via `as_*_weights()`.
@@ -97,6 +122,11 @@ pub struct DsV4LayerWeightStorage {
     pub indexer_compressor_params: Option<CompressorParams>,
     pub indexer_params: Option<IndexerParams>,
     pub top_k: Option<usize>,
+    // ── Optional mHC bookend weights ──
+    /// mHC weights for the attention bookend (`hc_attn_*`).
+    pub mhc_attn: Option<MhcStorage>,
+    /// mHC weights for the FFN bookend (`hc_ffn_*`).
+    pub mhc_ffn: Option<MhcStorage>,
 }
 
 impl DsV4LayerWeightStorage {
@@ -225,6 +255,8 @@ mod tests {
             indexer_compressor_params: None,
             indexer_params: None,
             top_k: None,
+            mhc_attn: None,
+            mhc_ffn: None,
         }
     }
 
@@ -404,5 +436,62 @@ mod tests {
         let some_comp_p = Some(comp_p);
         let l2 = storage.dispatcher_layer(&some_comp_p, &None);
         assert_eq!(l2.variant_name(), "no_compress");
+    }
+
+    /// MhcStorage view: hc_fn, hc_scale, hc_base round-trip exactly
+    /// through the borrowed `MhcWeights` view.
+    #[test]
+    fn mhc_storage_as_weights_roundtrip() {
+        let hc_dim = 16;
+        let hc_mix = 24; // (2 + 4) * 4 = 24 for n_hc=4
+        let storage = MhcStorage {
+            hc_fn: Array2::<f32>::from_shape_fn((hc_mix, hc_dim), |(m, d)| {
+                ((m * 31 + d) as f32 * 0.013).sin()
+            }),
+            hc_scale: [0.5, 0.7, 1.1],
+            hc_base: (0..hc_mix).map(|i| (i as f32) * 0.01).collect(),
+        };
+        let w = storage.as_weights();
+        // Spot check a few elements.
+        assert_eq!(w.hc_fn.shape(), &[hc_mix, hc_dim]);
+        assert_eq!(w.hc_fn[[0, 0]], storage.hc_fn[[0, 0]]);
+        assert_eq!(
+            w.hc_fn[[hc_mix - 1, hc_dim - 1]],
+            storage.hc_fn[[hc_mix - 1, hc_dim - 1]]
+        );
+        assert_eq!(w.hc_scale, &storage.hc_scale);
+        assert_eq!(w.hc_base.len(), hc_mix);
+        assert_eq!(w.hc_base[hc_mix - 1], storage.hc_base[hc_mix - 1]);
+    }
+
+    /// DsV4LayerWeightStorage with both mHC bookends populated: views
+    /// produce the expected hc_fn shapes for downstream wiring.
+    #[test]
+    fn layer_storage_with_mhc_bookends_exposes_views() {
+        let n_embd = 64;
+        let mut storage = synthetic_no_compress(n_embd);
+        let hc_dim = 4 * n_embd; // n_hc=4, n_embd=64 → 256
+        let hc_mix = 6 * 4; // (2 + n_hc) * n_hc = 24
+        storage.mhc_attn = Some(MhcStorage {
+            hc_fn: Array2::<f32>::from_shape_fn((hc_mix, hc_dim), |(m, d)| {
+                ((m + d) as f32 * 0.001).sin()
+            }),
+            hc_scale: [0.5, 0.5, 0.5],
+            hc_base: vec![0.0; hc_mix],
+        });
+        storage.mhc_ffn = Some(MhcStorage {
+            hc_fn: Array2::<f32>::from_shape_fn((hc_mix, hc_dim), |(m, d)| {
+                ((m + d) as f32 * 0.002).cos()
+            }),
+            hc_scale: [0.5, 0.5, 0.5],
+            hc_base: vec![0.0; hc_mix],
+        });
+
+        let mhc_attn_view = storage.mhc_attn.as_ref().unwrap().as_weights();
+        let mhc_ffn_view = storage.mhc_ffn.as_ref().unwrap().as_weights();
+        assert_eq!(mhc_attn_view.hc_fn.shape(), &[hc_mix, hc_dim]);
+        assert_eq!(mhc_ffn_view.hc_fn.shape(), &[hc_mix, hc_dim]);
+        // attn and ffn use different fns — distinct values.
+        assert_ne!(mhc_attn_view.hc_fn[[0, 1]], mhc_ffn_view.hc_fn[[0, 1]]);
     }
 }

@@ -180,6 +180,8 @@ pub fn build_layer_storage(
         indexer_compressor_params: None,
         indexer_params: None,
         top_k: None,
+        mhc_attn: None,
+        mhc_ffn: None,
     };
 
     if compress_ratio == 0 {
