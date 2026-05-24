@@ -140,6 +140,21 @@ impl DsV4Hyperparams {
             Ok(_) | Err(_) => None,
         };
 
+        // SWA-specific rope base (DSv4 separates the sliding-window
+        // RoPE from the main one). Optional — when absent the SWA path
+        // reuses `rope_base`.
+        let rope_base_swa = match md.get("deepseek4.rope.freq_base_swa") {
+            None => None,
+            Some(GgufValue::F32(v)) => Some(*v as f64),
+            Some(GgufValue::F64(v)) => Some(*v),
+            Some(_) => {
+                return Err(DsV4MetadataError::WrongType {
+                    key: "deepseek4.rope.freq_base_swa",
+                    wanted: "f32",
+                });
+            }
+        };
+
         Ok(DsV4Hyperparams {
             n_embd,
             n_head,
@@ -156,6 +171,7 @@ impl DsV4Hyperparams {
             n_index_head,
             top_k,
             yarn,
+            rope_base_swa,
         })
     }
 }
@@ -238,6 +254,10 @@ mod tests {
         assert_eq!(yarn.n_ctx_orig, 65536);
         assert!((yarn.beta_fast - 32.0).abs() < 1e-3);
         assert!((yarn.beta_slow - 1.0).abs() < 1e-3);
+
+        // SWA-specific rope base: 160 000.0 vs 10 000.0 main.
+        let rope_swa = hp.rope_base_swa.expect("rope_base_swa present");
+        assert!((rope_swa - 160_000.0).abs() < 1e-3);
     }
 
     /// Missing-key errors carry the key name so callers can pin down
