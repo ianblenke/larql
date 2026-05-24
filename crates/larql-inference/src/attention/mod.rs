@@ -17,6 +17,7 @@ pub mod dsv4_attn_block_indexer;
 pub mod dsv4_attn_dispatch;
 pub mod dsv4_compressor;
 pub mod dsv4_compressor_prefill;
+pub mod dsv4_decode_loop;
 pub mod dsv4_ffn_block;
 pub mod dsv4_fp8_kv;
 pub mod dsv4_full_loader;
