@@ -738,7 +738,7 @@ mod tests {
             wo_b: wo_b.view(),
             attn_sinks: Some(attn_sinks.view()),
         };
-        let baseline = dsv4_attn_block_no_compress(x.view(), &attn_w, &p.attn, 0);
+        let baseline = dsv4_attn_block_no_compress(x.view(), &attn_w, &p.attn, 0, None);
 
         let n_kv = p.compressor.head_dim;
         let comp_wkv = Array2::<f32>::from_shape_fn((n_kv, p.compressor.n_embd), |(i, j)| {

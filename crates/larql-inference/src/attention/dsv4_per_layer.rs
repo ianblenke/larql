@@ -64,12 +64,13 @@ pub fn dsv4_per_layer_forward(
     p: &DsV4LayerParams,
     token_ids: Option<&[u32]>,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array3<f32> {
     // ── 1. Attention bookend pre ──
     let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc);
 
     // ── 2. Attention block ──
-    let attn_out = dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset);
+    let attn_out = dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset, backend);
 
     // ── 3. Attention bookend post → updated residual ──
     let residual_mid = dsv4_mhc_post(
@@ -158,7 +159,7 @@ pub fn dsv4_per_layer_forward_cached(
             )
         }
         // No-cache or mismatched variant pair → non-cached path.
-        _ => dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset),
+        _ => dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset, backend),
     };
 
     // ── 3. Attention bookend post → updated residual ──
@@ -351,7 +352,7 @@ mod tests {
             },
         };
 
-        let out = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0);
+        let out = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0, None);
         assert_eq!(out.shape(), &[n_tokens, n_hc, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
         let total: f32 = out.iter().map(|v| v.abs()).sum();
@@ -611,7 +612,8 @@ mod tests {
             },
         };
 
-        let out_nocache = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0);
+        let out_nocache =
+            dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0, None);
         let out_cached =
             dsv4_per_layer_forward_cached(residual.view(), &layer_w, &layer_p, None, 0, None, None);
 
@@ -709,7 +711,8 @@ mod tests {
             },
         };
 
-        let out_nocache = dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0);
+        let out_nocache =
+            dsv4_per_layer_forward(residual.view(), &layer_w, &layer_p, None, 0, None);
 
         let mut cache = DsV4LayerCache::new_no_compress(32, attn_params.head_dim);
         let out_cached = dsv4_per_layer_forward_cached(

@@ -94,6 +94,7 @@ pub fn dsv4_attn_block_no_compress(
     w: &DsV4AttnBlockWeights,
     p: &DsV4AttnBlockParams,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     assert_eq!(
@@ -107,10 +108,10 @@ pub fn dsv4_attn_block_no_compress(
 
     // 2. Q low-rank.
     //    qr = (cur @ Wq_a^T) — (n_tokens, q_lora_rank)
-    let qr = matmul_x_wt(cur.view(), w.wq_a);
+    let qr = dot_proj_gpu(&cur, &w.wq_a, backend);
     let qr = rms_norm_2d(qr.view(), w.q_a_norm, p.norm_eps);
     //    q = qr @ Wq_b^T — (n_tokens, n_head * head_dim)
-    let q = matmul_x_wt(qr.view(), w.wq_b);
+    let q = dot_proj_gpu(&qr, &w.wq_b, backend);
     //    per-head RMSNorm (no learned weight) on each (token, head)
     //    n_embd_head_k vector — apply BEFORE tail-RoPE.
     let q = rms_norm_per_head(q.view(), p.n_head, p.head_dim, p.norm_eps);
@@ -128,7 +129,7 @@ pub fn dsv4_attn_block_no_compress(
 
     // 3. KV low-rank — single shared head.
     //    kv = (cur @ Wkv^T) — (n_tokens, head_dim)
-    let kv = matmul_x_wt(cur.view(), w.wkv);
+    let kv = dot_proj_gpu(&cur, &w.wkv, backend);
     let kv = rms_norm_2d(kv.view(), w.kv_a_norm, p.norm_eps);
     //    tail-RoPE — reshape view (n_tokens, head_dim) treated as 1 head.
     let kv = rope_tail_dispatch(
@@ -170,7 +171,7 @@ pub fn dsv4_attn_block_no_compress(
         p.head_dim,
         p.n_groups,
         p.o_lora_rank,
-        None,
+        backend,
     )
 }
 
@@ -439,7 +440,7 @@ mod tests {
         let x = Array2::<f32>::from_shape_fn((n_tokens, p.n_embd), |(t, d)| {
             ((t * 17 + d) as f32 * 0.013).sin()
         });
-        let out = dsv4_attn_block_no_compress(x.view(), &w, &p, 0);
+        let out = dsv4_attn_block_no_compress(x.view(), &w, &p, 0, None);
 
         assert_eq!(out.shape(), &[n_tokens, p.n_embd]);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
@@ -516,8 +517,8 @@ mod tests {
             ..w_nosink
         };
 
-        let out_nosink = dsv4_attn_block_no_compress(x.view(), &w_nosink, &p, 0);
-        let out_sink = dsv4_attn_block_no_compress(x.view(), &w_sink, &p, 0);
+        let out_nosink = dsv4_attn_block_no_compress(x.view(), &w_nosink, &p, 0, None);
+        let out_sink = dsv4_attn_block_no_compress(x.view(), &w_sink, &p, 0, None);
 
         assert!(out_nosink.iter().all(|v| v.is_finite()));
         assert!(out_sink.iter().all(|v| v.is_finite()));
@@ -577,9 +578,87 @@ mod tests {
             attn_sinks: None,
         };
         let x = Array2::<f32>::from_elem((1, p.n_embd), 0.5);
-        let out = dsv4_attn_block_no_compress(x.view(), &w, &p, 0);
+        let out = dsv4_attn_block_no_compress(x.view(), &w, &p, 0, None);
         assert_eq!(out.shape(), &[1, p.n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// CpuBackend equivalence on the prefill block: routing Q/KV/O
+    /// matmuls through `Some(&CpuBackend)` must match the `None`
+    /// fallback to within BLAS reduction tolerance. Locks in the
+    /// backend-threading wiring at the prefill entry point.
+    #[test]
+    fn prefill_cpu_backend_matches_none_backend() {
+        let p = DsV4AttnBlockParams {
+            n_embd: 64,
+            n_head: 4,
+            head_dim: 64,
+            q_lora_rank: 16,
+            n_groups: 2,
+            o_lora_rank: 8,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            window_size: 8,
+            norm_eps: 1e-5,
+            yarn: None,
+        };
+        let group_heads = p.n_head / p.n_groups;
+        let group_dim = p.head_dim * group_heads;
+        let low_dim = p.o_lora_rank * p.n_groups;
+        let attn_norm = vec![1.0_f32; p.n_embd];
+        let wq_a = Array2::<f32>::from_shape_fn((p.q_lora_rank, p.n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.01).sin()
+        });
+        let q_a_norm = vec![1.0_f32; p.q_lora_rank];
+        let wq_b =
+            Array2::<f32>::from_shape_fn((p.n_head * p.head_dim, p.q_lora_rank), |(i, j)| {
+                ((i + j) as f32 * 0.013).cos() * 0.1
+            });
+        let wkv = Array2::<f32>::from_shape_fn((p.head_dim, p.n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.007).sin() * 0.05
+        });
+        let kv_a_norm = vec![1.0_f32; p.head_dim];
+        let wo_a =
+            Array3::<f32>::from_shape_fn((p.n_groups, p.o_lora_rank, group_dim), |(g, r, j)| {
+                ((g + r + j) as f32 * 0.005).cos() * 0.05
+            });
+        let wo_b = Array2::<f32>::from_shape_fn((p.n_embd, low_dim), |(i, j)| {
+            ((i + j) as f32 * 0.011).sin() * 0.1
+        });
+        let attn_sinks = Array1::<f32>::from_elem(p.n_head, -1.0);
+        let w = DsV4AttnBlockWeights {
+            attn_norm: &attn_norm,
+            wq_a: wq_a.view(),
+            q_a_norm: &q_a_norm,
+            wq_b: wq_b.view(),
+            wkv: wkv.view(),
+            kv_a_norm: &kv_a_norm,
+            wo_a: wo_a.view(),
+            wo_b: wo_b.view(),
+            attn_sinks: Some(attn_sinks.view()),
+        };
+
+        let n_tokens = 6;
+        let x = Array2::<f32>::from_shape_fn((n_tokens, p.n_embd), |(t, d)| {
+            ((t * 19 + d) as f32 * 0.012).sin()
+        });
+
+        let out_none = dsv4_attn_block_no_compress(x.view(), &w, &p, 0, None);
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu =
+            dsv4_attn_block_no_compress(x.view(), &w, &p, 0, Some(&cpu as &dyn ComputeBackend));
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on prefill: max_diff={max_diff}"
+        );
     }
 
     // ── Cached-attention tests ──
@@ -665,7 +744,7 @@ mod tests {
         });
 
         // Path A: non-cached prefill.
-        let out_prefill = dsv4_attn_block_no_compress(x.view(), &w, &p, 0);
+        let out_prefill = dsv4_attn_block_no_compress(x.view(), &w, &p, 0, None);
 
         // Path B: cached path with empty cache.
         let mut cache = DsV4LayerKvCache::with_capacity(64, p.head_dim);
