@@ -132,6 +132,14 @@ impl DsV4Hyperparams {
         }
         let o_lora_rank = hidden / n_groups;
 
+        // YARN scaling: extract if present, otherwise None.
+        let yarn = match super::dsv4_yarn_config::DsV4RopeYarnConfig::from_gguf(gguf) {
+            Ok(cfg) if cfg.scaling_type == super::dsv4_yarn_config::RopeScalingType::Yarn => {
+                Some(cfg)
+            }
+            Ok(_) | Err(_) => None,
+        };
+
         Ok(DsV4Hyperparams {
             n_embd,
             n_head,
@@ -147,6 +155,7 @@ impl DsV4Hyperparams {
             indexer_head_size,
             n_index_head,
             top_k,
+            yarn,
         })
     }
 }
@@ -221,6 +230,14 @@ mod tests {
         assert_eq!(hp.indexer_head_size, Some(128));
         assert_eq!(hp.n_index_head, Some(64));
         assert_eq!(hp.top_k, Some(512));
+
+        // YARN: DSv4-Flash has factor=16, beta_fast=32, beta_slow=1,
+        // n_ctx_orig=65536. hp.yarn must be Some.
+        let yarn = hp.yarn.expect("yarn config present");
+        assert!((yarn.freq_scale - 0.0625).abs() < 1e-5);
+        assert_eq!(yarn.n_ctx_orig, 65536);
+        assert!((yarn.beta_fast - 32.0).abs() < 1e-3);
+        assert!((yarn.beta_slow - 1.0).abs() < 1e-3);
     }
 
     /// Missing-key errors carry the key name so callers can pin down

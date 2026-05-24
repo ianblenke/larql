@@ -37,7 +37,7 @@ use super::dsv4_compressor_prefill::{
 use super::dsv4_fp8_kv::fp8_kv_quantize;
 use super::dsv4_grouped_o_proj::grouped_o_proj;
 use super::dsv4_masked_attn::dsv4_masked_attn;
-use super::dsv4_rope_tail::dsv4_rope_tail;
+use super::dsv4_rope_tail_yarn::rope_tail_dispatch;
 
 /// Combined weights for the HCA no-indexer block.
 #[derive(Clone, Copy)]
@@ -95,13 +95,14 @@ pub fn dsv4_attn_block_compress_no_indexer(
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
     let q = matmul_x_wt(qr.view(), w.attn.wq_b);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
-    let q = dsv4_rope_tail(
+    let q = rope_tail_dispatch(
         &q,
         p.attn.n_head,
         p.attn.head_dim,
         p.attn.n_rot,
         p.attn.rope_base,
         p.attn.rope_mode,
+        p.attn.yarn.as_ref(),
         false,
         position_offset,
     );
@@ -109,13 +110,14 @@ pub fn dsv4_attn_block_compress_no_indexer(
     // 3. Raw KV low-rank.
     let kv_raw = matmul_x_wt(cur.view(), w.attn.wkv);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
-    let kv_raw = dsv4_rope_tail(
+    let kv_raw = rope_tail_dispatch(
         &kv_raw,
         1,
         p.attn.head_dim,
         p.attn.n_rot,
         p.attn.rope_base,
         p.attn.rope_mode,
+        p.attn.yarn.as_ref(),
         false,
         position_offset,
     );

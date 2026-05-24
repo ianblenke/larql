@@ -23,6 +23,7 @@ use super::dsv4_compressor_prefill::CompressorParams;
 use super::dsv4_indexer::IndexerParams;
 use super::dsv4_rope_tail::DsV4RopeMode;
 use super::dsv4_storage::{CompressorStorage, DsV4LayerWeightStorage, IndexerStorage};
+use super::dsv4_yarn_config::DsV4RopeYarnConfig;
 
 /// DSv4 model-wide hyperparameters. Set once for the whole model (no
 /// per-layer variation except `compress_ratio`, which is handed to the
@@ -45,6 +46,11 @@ pub struct DsV4Hyperparams {
     pub indexer_head_size: Option<usize>,
     pub n_index_head: Option<usize>,
     pub top_k: Option<usize>,
+    /// Optional YARN RoPE scaling config. `Some(_)` for long-context
+    /// models like DSv4-Flash (factor=16, 65 536 → 1 048 576); `None`
+    /// for short-context or non-YARN models. Propagated into per-layer
+    /// `DsV4AttnBlockParams.yarn` via [`Self::attn_params`].
+    pub yarn: Option<DsV4RopeYarnConfig>,
 }
 
 impl DsV4Hyperparams {
@@ -61,7 +67,7 @@ impl DsV4Hyperparams {
             rope_mode: self.rope_mode,
             window_size: self.window_size,
             norm_eps: self.norm_eps,
-            yarn: None,
+            yarn: self.yarn,
         }
     }
 }
@@ -336,6 +342,7 @@ mod tests {
             indexer_head_size: None,
             n_index_head: None,
             top_k: None,
+            yarn: None,
         }
     }
 
