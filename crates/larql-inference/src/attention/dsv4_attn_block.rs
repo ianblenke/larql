@@ -170,6 +170,7 @@ pub fn dsv4_attn_block_no_compress(
         p.head_dim,
         p.n_groups,
         p.o_lora_rank,
+        None,
     )
 }
 
@@ -360,6 +361,7 @@ pub fn dsv4_attn_block_no_compress_cached(
         p.head_dim,
         p.n_groups,
         p.o_lora_rank,
+        backend,
     )
 }
 
