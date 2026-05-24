@@ -213,6 +213,102 @@ pub fn build_compressor_prefill(
     roped
 }
 
+/// Cached / incremental compressor step for the `coff = 1` case.
+///
+/// Processes a single chunk of `compress_ratio` cur rows and returns
+/// one compressed kv row of shape `(head_dim,)`. Used by the cached
+/// HCA Compress attention path to produce one new compressed position
+/// each time a chunk completes during streaming decode.
+///
+/// This is bit-exact equivalent to taking row `compressed_chunk_index`
+/// of `build_compressor_prefill(cur_full, ...)` where
+/// `cur_full[c*ratio..(c+1)*ratio] == cur_chunk` for c =
+/// compressed_chunk_index. The two are equivalent **because for coff=1
+/// the compressor's chunks are independent** — no overlap state
+/// flows between chunks. The cr=4 path (coff=2) needs overlap state
+/// and is handled in a follow-up PR.
+///
+/// Requires `cur_chunk.shape() == [p.compress_ratio, p.n_embd]` and
+/// `p.compress_ratio != 4`.
+pub fn dsv4_compressor_step_coff1(
+    cur_chunk: ArrayView2<f32>,
+    w: &CompressorWeights,
+    p: &CompressorParams,
+    compressed_chunk_index: usize,
+) -> ndarray::Array1<f32> {
+    assert!(p.compress_ratio > 0, "compress_ratio must be > 0");
+    assert_ne!(
+        p.compress_ratio, 4,
+        "coff=1 path requires compress_ratio != 4; use the coff=2 cached step for cr=4"
+    );
+    assert_eq!(
+        cur_chunk.shape(),
+        &[p.compress_ratio, p.n_embd],
+        "cur_chunk must be (compress_ratio, n_embd)"
+    );
+    let n_kv = p.head_dim; // coff = 1 → n_kv == head_dim
+    assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
+    assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    assert_eq!(
+        w.ape.shape(),
+        &[p.compress_ratio, n_kv],
+        "ape shape (compress_ratio, head_dim)"
+    );
+    assert_eq!(w.norm.len(), p.head_dim, "norm length");
+
+    // 1. Project chunk to kv and score: each (compress_ratio, head_dim).
+    let kv_chunk = matmul_x_wt(cur_chunk, w.wkv);
+    let mut score_chunk = matmul_x_wt(cur_chunk, w.wgate);
+
+    // 2. Add APE row-wise.
+    for r in 0..p.compress_ratio {
+        for k in 0..n_kv {
+            score_chunk[[r, k]] += w.ape[[r, k]];
+        }
+    }
+
+    // 3. Permute (compress_ratio, head_dim) → (1, head_dim, compress_ratio)
+    //    so softmax_pool_ratio can pool over the chunk dim.
+    let mut kv_3d = Array3::<f32>::zeros((1, p.head_dim, p.compress_ratio));
+    let mut score_3d = Array3::<f32>::zeros((1, p.head_dim, p.compress_ratio));
+    for d in 0..p.head_dim {
+        for r in 0..p.compress_ratio {
+            kv_3d[[0, d, r]] = kv_chunk[[r, d]];
+            score_3d[[0, d, r]] = score_chunk[[r, d]];
+        }
+    }
+
+    // 4. Pool → (1, head_dim).
+    let pooled = softmax_pool_ratio(kv_3d.view(), score_3d.view());
+
+    // 5. RMSNorm with learned gain on the single row.
+    let mut sumsq = 0.0_f32;
+    for d in 0..p.head_dim {
+        let v = pooled[[0, d]];
+        sumsq += v * v;
+    }
+    let inv = 1.0 / (sumsq / p.head_dim as f32 + p.norm_eps).sqrt();
+    let mut normed = Array2::<f32>::zeros((1, p.head_dim));
+    for d in 0..p.head_dim {
+        normed[[0, d]] = pooled[[0, d]] * inv * w.norm[d];
+    }
+
+    // 6. Tail-RoPE at absolute position `compressed_chunk_index * compress_ratio`.
+    let roped = dsv4_rope_tail(
+        &normed,
+        1,
+        p.head_dim,
+        p.n_rot,
+        p.rope_base,
+        p.rope_mode,
+        false,
+        compressed_chunk_index * p.compress_ratio,
+    );
+
+    // Return as 1D (head_dim,).
+    roped.row(0).to_owned()
+}
+
 /// `out[t, k] = sum_j x[t, j] * w[k, j]` (= `x @ w^T`).
 fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
     let n_tokens = x.shape()[0];
@@ -412,5 +508,170 @@ mod tests {
             .sum();
         assert!(diff_01 > 1e-3, "rows 0/1 should differ (diff={diff_01})");
         assert!(diff_12 > 1e-3, "rows 1/2 should differ (diff={diff_12})");
+    }
+
+    // ── dsv4_compressor_step_coff1 tests ──
+
+    /// Helper: build CompressorParams + weights for coff=1 (compress_ratio != 4).
+    fn make_coff1_weights(
+        compress_ratio: usize,
+        head_dim: usize,
+        n_embd: usize,
+    ) -> (
+        CompressorParams,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Vec<f32>,
+    ) {
+        assert_ne!(compress_ratio, 4);
+        let p = CompressorParams {
+            head_dim,
+            n_embd,
+            compress_ratio,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            norm_eps: 1e-5,
+        };
+        let n_kv = head_dim; // coff=1
+        let wkv = Array2::<f32>::from_shape_fn((n_kv, n_embd), |(i, j)| {
+            ((i * 11 + j) as f32 * 0.013).cos() * 0.05
+        });
+        let wgate = Array2::<f32>::from_shape_fn((n_kv, n_embd), |(i, j)| {
+            ((i * 7 + j) as f32 * 0.017).sin() * 0.05
+        });
+        let ape = Array2::<f32>::from_shape_fn((compress_ratio, n_kv), |(r, k)| {
+            ((r * 5 + k) as f32 * 0.03).sin() * 0.05
+        });
+        let norm = vec![1.0_f32; head_dim];
+        (p, wkv, wgate, ape, norm)
+    }
+
+    /// Single chunk via the cached step equals row 0 of the prefill
+    /// compressor on the same chunk.
+    #[test]
+    fn coff1_step_single_chunk_matches_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff1_weights(2, 8, 16);
+        let chunk = make_input(p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(chunk.view(), &w, &p);
+        let step = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+
+        assert_eq!(prefill.shape(), &[1, p.head_dim]);
+        assert_eq!(step.shape(), &[p.head_dim]);
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((prefill[[0, d]] - step[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "single-chunk diff = {max_diff}");
+    }
+
+    /// Two-chunk prefill via cached step (chunk-by-chunk) equals the
+    /// prefill compressor on the concatenated 2-chunk input. This is
+    /// the bit-exact incremental equivalence — the cornerstone for
+    /// cached HCA decode.
+    #[test]
+    fn coff1_step_two_chunks_match_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff1_weights(2, 8, 16);
+        let full = make_input(2 * p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        assert_eq!(prefill.shape(), &[2, p.head_dim]);
+
+        let chunk0 = full.slice(s![..p.compress_ratio, ..]);
+        let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
+        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0);
+        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1);
+
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((prefill[[0, d]] - step0[d]).abs());
+            max_diff = max_diff.max((prefill[[1, d]] - step1[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "two-chunk diff = {max_diff}");
+    }
+
+    /// Larger compress_ratio (16) also matches prefill chunk-by-chunk.
+    /// Verifies the helper isn't accidentally specialized to small ratios.
+    #[test]
+    fn coff1_step_ratio_16_matches_prefill() {
+        let (p, wkv, wgate, ape, norm) = make_coff1_weights(16, 8, 16);
+        let full = make_input(2 * p.compress_ratio, p.n_embd);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let prefill = build_compressor_prefill(full.view(), &w, &p);
+        let chunk0 = full.slice(s![..p.compress_ratio, ..]);
+        let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
+        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0);
+        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1);
+
+        let mut max_diff = 0.0_f32;
+        for d in 0..p.head_dim {
+            max_diff = max_diff.max((prefill[[0, d]] - step0[d]).abs());
+            max_diff = max_diff.max((prefill[[1, d]] - step1[d]).abs());
+        }
+        assert!(max_diff < 1e-6, "ratio=16 diff = {max_diff}");
+    }
+
+    /// compress_ratio=4 → panic (use the coff=2 cached step instead).
+    #[test]
+    #[should_panic(expected = "coff=1 path requires compress_ratio != 4")]
+    fn coff1_step_panics_on_ratio_4() {
+        let (p, wkv, wgate, ape, norm) = {
+            let p = CompressorParams {
+                head_dim: 8,
+                n_embd: 16,
+                compress_ratio: 4, // <-- the disallowed value
+                n_rot: 0,
+                rope_base: 10000.0,
+                rope_mode: DsV4RopeMode::Neox,
+                norm_eps: 1e-5,
+            };
+            let n_kv = p.head_dim;
+            let wkv = Array2::<f32>::zeros((n_kv, p.n_embd));
+            let wgate = Array2::<f32>::zeros((n_kv, p.n_embd));
+            let ape = Array2::<f32>::zeros((p.compress_ratio, n_kv));
+            let norm = vec![1.0_f32; p.head_dim];
+            (p, wkv, wgate, ape, norm)
+        };
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
+        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+    }
+
+    /// Wrong chunk shape → panic.
+    #[test]
+    #[should_panic(expected = "cur_chunk must be")]
+    fn coff1_step_wrong_chunk_shape_panics() {
+        let (p, wkv, wgate, ape, norm) = make_coff1_weights(2, 8, 16);
+        let w = CompressorWeights {
+            wkv: wkv.view(),
+            wgate: wgate.view(),
+            ape: ape.view(),
+            norm: &norm,
+        };
+        // Half-size chunk.
+        let chunk = Array2::<f32>::zeros((1, p.n_embd));
+        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
     }
 }
