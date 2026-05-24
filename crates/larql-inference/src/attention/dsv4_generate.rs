@@ -247,4 +247,95 @@ mod tests {
             assert!((t as usize) < head.n_vocab);
         }
     }
+
+    /// **GPU milestone test**: real-GGUF `dsv4_generate` with the
+    /// default ComputeBackend (CUDA when the `cuda` feature is on +
+    /// a CUDA device is present, CPU otherwise).
+    ///
+    /// Verifies the GPU lm_head path executes end-to-end on real
+    /// DSv4-Flash weights and produces tokens equivalent to the
+    /// CPU-only run. The lm_head is the dominant matmul cost
+    /// (128 × 129280 × 4096 = 67 GFLOPs); routing it through cuBLAS
+    /// should shave roughly a minute off each call on a 4090.
+    ///
+    /// Equivalence claim: greedy decode picks `argmax` over the logits.
+    /// CPU and cuBLAS differ only in summation order (parallel reduction
+    /// is not bit-identical), but for non-degenerate logit gaps the
+    /// argmax is stable, so the **token sequence is identical** across
+    /// backends. If a future change introduces a degenerate top-2 logit
+    /// case at any of the predicted positions this test could become
+    /// flaky — relax to `tokens.len() == expected` if that happens.
+    ///
+    /// Requires `--features cuda` AND the real GGUF on disk. Wall
+    /// expectation: prefill ~70 s (was ~110 s CPU-only) + 1 decode
+    /// step ~50 s (was ~100 s) — total ~120 s vs ~210 s CPU-only.
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "Requires --features cuda + real DSv4-Flash GGUF + CUDA device"]
+    fn generate_real_gguf_with_default_backend_matches_cpu() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_prompt = 16;
+        let prompt: Vec<u32> = (0..n_prompt)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let decode_config = DecodeConfig {
+            max_new_tokens: 1,
+            eos_token: None,
+            sampling: super::super::dsv4_sampling::SamplingConfig::greedy(),
+        };
+
+        // CPU-only baseline.
+        let mut rng_cpu = StdRng::seed_from_u64(0);
+        let tokens_cpu = dsv4_generate(
+            &gguf,
+            &hp,
+            &head,
+            &[0, 1, 2],
+            &prompt,
+            decode_config,
+            &mut rng_cpu,
+            None,
+        )
+        .expect("CPU generate");
+
+        // GPU-routed (default_backend on this build returns CudaBackend
+        // when the cuda feature is enabled and a device is present;
+        // otherwise it falls back to CpuBackend and this still passes,
+        // just without GPU acceleration).
+        let backend = larql_compute::default_backend();
+        eprintln!(
+            "[dsv4-gpu] running with backend: {} ({})",
+            backend.name(),
+            backend.device_info()
+        );
+        let mut rng_gpu = StdRng::seed_from_u64(0);
+        let tokens_gpu = dsv4_generate(
+            &gguf,
+            &hp,
+            &head,
+            &[0, 1, 2],
+            &prompt,
+            decode_config,
+            &mut rng_gpu,
+            Some(backend.as_ref()),
+        )
+        .expect("GPU-routed generate");
+
+        // Greedy is stable across CPU/GPU when argmax has a clear winner.
+        assert_eq!(
+            tokens_cpu, tokens_gpu,
+            "GPU and CPU greedy generation diverged"
+        );
+        assert_eq!(tokens_cpu.len(), n_prompt + 1);
+    }
 }
