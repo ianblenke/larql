@@ -24866,37 +24866,49 @@
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 313,
+      "line": 356,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::ffn_block_regular_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 243,
+      "line": 286,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_ffn_block::shared_expert_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
+      "line": 245,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::shared_expert_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 193,
+      "line": 194,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 313,
+      "line": 356,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::ffn_block_regular_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 243,
+      "line": 286,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_ffn_block::tests::shared_expert_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
+      "line": 245,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::shared_expert_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 193,
+      "line": 194,
       "crate": "larql_inference"
     },
     {

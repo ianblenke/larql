@@ -16,6 +16,8 @@
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_moe_dispatch::{dsv4_moe_dispatch, MoeExpertWeights};
 use super::dsv4_moe_ops::clamped_swiglu_row;
 use super::dsv4_moe_routing::{compute_router_topk, hash_route_topk, RoutingResult};
@@ -35,10 +37,15 @@ pub struct SharedExpertWeights<'a> {
 
 /// Run the shared-expert FFN over every token. Plain SwiGLU (no
 /// clamping) — pass `swiglu_limit = 0.0` to mean "no clamping".
+///
+/// `backend` routes the three matmuls (gate, up, down) through the
+/// optional compute backend (cuBLAS / Metal / CPU). All matmuls are
+/// batched across tokens — one GEMM per matmul, not one per token.
 pub fn dsv4_shared_expert_ffn(
     x: ArrayView2<f32>,
     w: &SharedExpertWeights,
     swiglu_limit: f32,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     let n_embd = x.shape()[1];
@@ -47,35 +54,23 @@ pub fn dsv4_shared_expert_ffn(
     assert_eq!(w.up_shexp.shape(), &[hidden, n_embd], "up_shexp shape");
     assert_eq!(w.down_shexp.shape(), &[n_embd, hidden], "down_shexp shape");
 
-    let mut out = Array2::<f32>::zeros((n_tokens, n_embd));
-    let mut gate_out = ndarray::Array1::<f32>::zeros(hidden);
-    let mut up_out = ndarray::Array1::<f32>::zeros(hidden);
+    // 1. Gate + up matmuls, batched over tokens.
+    //    x: (n_tokens, n_embd), gate_shexp: (hidden, n_embd)
+    //    → gate_all = x @ gate_shexp^T = (n_tokens, hidden).
+    let gate_all = dot_proj_gpu(&x, &w.gate_shexp, backend);
+    let up_all = dot_proj_gpu(&x, &w.up_shexp, backend);
+
+    // 2. Per-token SwiGLU activation.
+    let mut activated = Array2::<f32>::zeros((n_tokens, hidden));
     for t in 0..n_tokens {
-        // gate_out[i] = sum_j gate_shexp[i, j] * x[t, j]
-        // up_out[i]   = sum_j up_shexp[i, j] * x[t, j]
-        for i in 0..hidden {
-            let mut g = 0.0_f32;
-            let mut u = 0.0_f32;
-            for j in 0..n_embd {
-                let xj = x[[t, j]];
-                g += w.gate_shexp[[i, j]] * xj;
-                u += w.up_shexp[[i, j]] * xj;
-            }
-            gate_out[i] = g;
-            up_out[i] = u;
-        }
-        // act = swiglu(gate_out, up_out)
-        let activated = clamped_swiglu_row(gate_out.view(), up_out.view(), swiglu_limit);
-        // out[t, d] = sum_i down_shexp[d, i] * act[i]
-        for d in 0..n_embd {
-            let mut acc = 0.0_f32;
-            for i in 0..hidden {
-                acc += w.down_shexp[[d, i]] * activated[i];
-            }
-            out[[t, d]] = acc;
-        }
+        let act_row = clamped_swiglu_row(gate_all.row(t), up_all.row(t), swiglu_limit);
+        activated.row_mut(t).assign(&act_row);
     }
-    out
+
+    // 3. Down matmul, batched.
+    //    activated: (n_tokens, hidden), down_shexp: (n_embd, hidden)
+    //    → out = activated @ down_shexp^T = (n_tokens, n_embd).
+    dot_proj_gpu(&activated, &w.down_shexp, backend)
 }
 
 /// All weights for the DSv4 FFN block (pre-norm + routed + shared).
@@ -117,11 +112,17 @@ pub struct Dsv4FfnParams {
 
 /// Run the full DSv4 FFN block. `token_ids` is required only when
 /// `weights.gate_tid2eid` is `Some(_)` (hash-routing layer).
+///
+/// `backend` routes the shared-expert FFN's gate/up/down matmuls
+/// through the optional compute backend. As of GPU-7a, the routed
+/// MoE dispatch is still all-CPU per-token; threading backend through
+/// it is a follow-up.
 pub fn dsv4_ffn_block(
     x: ArrayView2<f32>,
     w: &Dsv4FfnWeights,
     p: &Dsv4FfnParams,
     token_ids: Option<&[u32]>,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     let n_embd = x.shape()[1];
@@ -150,7 +151,7 @@ pub fn dsv4_ffn_block(
     let moe_out = dsv4_moe_dispatch(cur.view(), &routing, &w.moe, p.routed_swiglu_limit);
 
     // 4. Shared expert FFN.
-    let shared_out = dsv4_shared_expert_ffn(cur.view(), &w.shared, p.shared_swiglu_limit);
+    let shared_out = dsv4_shared_expert_ffn(cur.view(), &w.shared, p.shared_swiglu_limit, backend);
 
     // 5. Sum.
     let mut out = Array2::<f32>::zeros((n_tokens, n_embd));
@@ -206,7 +207,7 @@ mod tests {
             up_shexp: up_shexp.view(),
             down_shexp: down_shexp.view(),
         };
-        let out = dsv4_shared_expert_ffn(x.view(), &w, 0.0);
+        let out = dsv4_shared_expert_ffn(x.view(), &w, 0.0, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
 
@@ -235,6 +236,48 @@ mod tests {
                 out[[0, d]]
             );
         }
+    }
+
+    /// CpuBackend equivalence: shared-expert FFN with `Some(&CpuBackend)`
+    /// must match the `None` fallback. Locks in the GPU-7a
+    /// backend-threading wiring at the shared-expert entry point.
+    #[test]
+    fn shared_expert_cpu_backend_matches_none_backend() {
+        let n_tokens = 5;
+        let n_embd = 32;
+        let hidden = 48;
+        let x = Array2::<f32>::from_shape_fn((n_tokens, n_embd), |(t, d)| {
+            ((t * 13 + d) as f32 * 0.011).sin()
+        });
+        let gate_shexp = Array2::<f32>::from_shape_fn((hidden, n_embd), |(i, j)| {
+            ((i * 7 + j) as f32 * 0.013).cos() * 0.05
+        });
+        let up_shexp = Array2::<f32>::from_shape_fn((hidden, n_embd), |(i, j)| {
+            ((i * 5 + j) as f32 * 0.017).sin() * 0.05
+        });
+        let down_shexp = Array2::<f32>::from_shape_fn((n_embd, hidden), |(d, i)| {
+            ((d * 3 + i) as f32 * 0.019).cos() * 0.05
+        });
+        let w = SharedExpertWeights {
+            gate_shexp: gate_shexp.view(),
+            up_shexp: up_shexp.view(),
+            down_shexp: down_shexp.view(),
+        };
+
+        let out_none = dsv4_shared_expert_ffn(x.view(), &w, 0.0, None);
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = dsv4_shared_expert_ffn(x.view(), &w, 0.0, Some(&cpu as &dyn ComputeBackend));
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on shared expert FFN: max_diff={max_diff}"
+        );
     }
 
     /// Full FFN block with regular routing: pre-norm → routed + shared →
@@ -300,7 +343,7 @@ mod tests {
             expert_weights_norm: true,
             expert_weights_scale: 1.0,
         };
-        let out = dsv4_ffn_block(x.view(), &w, &p, None);
+        let out = dsv4_ffn_block(x.view(), &w, &p, None, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
         let total: f32 = out.iter().map(|v| v.abs()).sum();
@@ -374,7 +417,7 @@ mod tests {
             expert_weights_scale: 1.0,
         };
         let token_ids = vec![5u32, 0, 11];
-        let out = dsv4_ffn_block(x.view(), &w, &p, Some(&token_ids));
+        let out = dsv4_ffn_block(x.view(), &w, &p, Some(&token_ids), None);
         // gate_inp was NaN; hash path must not consult it. Output finite
         // proves we didn't fall through to sqrt-softplus.
         assert!(
