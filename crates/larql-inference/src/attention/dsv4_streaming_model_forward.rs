@@ -35,7 +35,7 @@ use super::dsv4_ffn_block::Dsv4FfnParams;
 use super::dsv4_full_loader::{load_dsv4_layer, DsV4LoadError};
 use super::dsv4_head_storage::DsV4HeadStorage;
 use super::dsv4_indexer::IndexerParams;
-use super::dsv4_kv_cache::DsV4LayerKvCache;
+use super::dsv4_kv_cache::DsV4LayerCache;
 use super::dsv4_layer_variants::DsV4LayerVariant;
 use super::dsv4_mhc_bookend::MhcParams;
 use super::dsv4_model_forward::{broadcast_to_streams, dsv4_hc_head, embed_tokens};
@@ -280,10 +280,16 @@ pub fn dsv4_streaming_model_forward(
 
 /// KV-cached variant of [`dsv4_streaming_model_forward`].
 ///
-/// Threads a per-layer `&mut DsV4LayerKvCache` through the streaming
-/// loop. NoCompress layers consume their cache (append new kv_a rows,
-/// attend against the full cache); Compress/Indexer layers ignore it
-/// (their cached variants are still TODO).
+/// Threads a per-layer `&mut DsV4LayerCache` through the streaming
+/// loop. All 3 attention variants (NoCompress / Compress / Indexer)
+/// dispatch to their cached counterparts when the cache variant
+/// matches the layer variant; mismatched pairs fall back to the
+/// non-cached attention path (correctness preserved, no speedup).
+///
+/// Cache allocation convention (matches DSv4-Flash):
+/// - Layer 0, 1: `DsV4LayerCache::new_no_compress(...)`
+/// - Odd layers 3..=41 (cr=128): `DsV4LayerCache::new_hca_compress(...)`
+/// - Even layers 2..=42 (cr=4 + indexer): `DsV4LayerCache::new_hca_indexer(...)`
 ///
 /// `layer_caches` must have length `>= layer_indices.len()`; indexing
 /// is positional (caches[i] matches layer_indices[i]). If shorter,
@@ -300,7 +306,7 @@ pub fn dsv4_streaming_model_forward_cached(
     token_ids: &[u32],
     layer_indices: &[usize],
     position_offset: usize,
-    mut layer_caches: Option<&mut [DsV4LayerKvCache]>,
+    mut layer_caches: Option<&mut [DsV4LayerCache]>,
 ) -> Result<Array2<f32>, DsV4LoadError> {
     let layer_p = build_layer_params(hp);
     let pool = DispatchParamsPool::new(hp);
@@ -332,7 +338,7 @@ pub fn dsv4_streaming_model_forward_cached(
                 .expect("ffn loaded by full loader")
                 .as_weights(),
         };
-        let cache_for_this_layer: Option<&mut DsV4LayerKvCache> = match &mut layer_caches {
+        let cache_for_this_layer: Option<&mut DsV4LayerCache> = match &mut layer_caches {
             Some(caches) => caches.get_mut(i),
             None => None,
         };

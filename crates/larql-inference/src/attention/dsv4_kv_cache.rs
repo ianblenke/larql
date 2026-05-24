@@ -381,6 +381,76 @@ impl DsV4LayerHcaCache {
     }
 }
 
+/// Per-layer KV cache enum spanning the two cache shapes used by the
+/// three DSv4 attention variants:
+/// - `NoCompress` → simple `(n_pos, head_dim)` MLA cache for the
+///   compress_ratio=0 attention path
+/// - `Hca` → raw + compressed + (optional) indexer caches for the
+///   HCA Compress and Indexer attention paths
+///
+/// `dsv4_per_layer_forward_cached` matches on `(attn variant, cache
+/// variant)` pairs to dispatch to the right cached attention function.
+/// Mismatched pairs (e.g., Compress attn with NoCompress cache) fall
+/// back to the non-cached attention dispatcher — correctness preserved,
+/// no decode speedup.
+pub enum DsV4LayerCache {
+    /// For NoCompress attention layers (DSv4-Flash layers 0, 1).
+    NoCompress(DsV4LayerKvCache),
+    /// For HCA Compress and Indexer attention layers (DSv4-Flash
+    /// layers 2..=42). The inner cache carries the indexer's
+    /// compressed cache + overlap state if the Indexer path is used.
+    Hca(DsV4LayerHcaCache),
+}
+
+impl DsV4LayerCache {
+    /// Build a NoCompress-variant cache.
+    pub fn new_no_compress(max_seq_len: usize, head_dim: usize) -> Self {
+        DsV4LayerCache::NoCompress(DsV4LayerKvCache::with_capacity(max_seq_len, head_dim))
+    }
+
+    /// Build an HCA cache for the Compress attention path (no indexer).
+    pub fn new_hca_compress(max_seq_len: usize, head_dim: usize, compress_ratio: usize) -> Self {
+        DsV4LayerCache::Hca(DsV4LayerHcaCache::with_capacity(
+            max_seq_len,
+            head_dim,
+            compress_ratio,
+        ))
+    }
+
+    /// Build an HCA cache for the Indexer attention path (cr=4 + indexer).
+    pub fn new_hca_indexer(
+        max_seq_len: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        indexer_head_size: usize,
+    ) -> Self {
+        DsV4LayerCache::Hca(DsV4LayerHcaCache::with_capacity_and_indexer(
+            max_seq_len,
+            head_dim,
+            compress_ratio,
+            indexer_head_size,
+        ))
+    }
+
+    /// Current absolute sequence position (= number of raw KV rows
+    /// cached so far). Equivalent across both variants since both hold
+    /// one raw KV row per token.
+    pub fn position(&self) -> usize {
+        match self {
+            DsV4LayerCache::NoCompress(c) => c.current_len(),
+            DsV4LayerCache::Hca(c) => c.raw.current_len(),
+        }
+    }
+
+    /// Reset the inner cache for a new sequence.
+    pub fn clear(&mut self) {
+        match self {
+            DsV4LayerCache::NoCompress(c) => c.clear(),
+            DsV4LayerCache::Hca(c) => c.clear(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod hca_tests {
     use super::*;
@@ -468,6 +538,53 @@ mod hca_tests {
     #[should_panic(expected = "compress_ratio must be > 0")]
     fn hca_zero_compress_ratio_panics() {
         let _ = DsV4LayerHcaCache::with_capacity(8, 4, 0);
+    }
+
+    // ── DsV4LayerCache enum tests ──
+
+    #[test]
+    fn layer_cache_enum_dispatch_no_compress() {
+        let cache = DsV4LayerCache::new_no_compress(16, 8);
+        assert_eq!(cache.position(), 0);
+        assert!(matches!(cache, DsV4LayerCache::NoCompress(_)));
+    }
+
+    #[test]
+    fn layer_cache_enum_dispatch_hca_compress() {
+        let cache = DsV4LayerCache::new_hca_compress(16, 8, 4);
+        assert_eq!(cache.position(), 0);
+        match cache {
+            DsV4LayerCache::Hca(c) => {
+                assert!(c.index_compressed.is_none(), "no indexer");
+                assert_eq!(c.compress_ratio, 4);
+            }
+            _ => panic!("expected Hca variant"),
+        }
+    }
+
+    #[test]
+    fn layer_cache_enum_dispatch_hca_indexer() {
+        let cache = DsV4LayerCache::new_hca_indexer(16, 8, 4, 4);
+        match cache {
+            DsV4LayerCache::Hca(c) => {
+                assert!(c.index_compressed.is_some(), "indexer enabled");
+                assert_eq!(c.index_compressed.as_ref().unwrap().head_dim(), 4);
+            }
+            _ => panic!("expected Hca variant"),
+        }
+    }
+
+    #[test]
+    fn layer_cache_clear_routes_to_inner() {
+        let mut cache = DsV4LayerCache::new_no_compress(8, 4);
+        // Manually advance the inner cache.
+        if let DsV4LayerCache::NoCompress(c) = &mut cache {
+            let row = Array2::<f32>::ones((1, 4));
+            c.append(row.view());
+        }
+        assert_eq!(cache.position(), 1);
+        cache.clear();
+        assert_eq!(cache.position(), 0);
     }
 
     // ── Pending buffer + overlap state extension tests ──
