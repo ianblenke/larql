@@ -39,6 +39,7 @@ pub mod dsv4_rope_tail;
 pub mod dsv4_rope_tail_yarn;
 pub mod dsv4_storage;
 pub mod dsv4_storage_build;
+pub mod dsv4_streaming_model_forward;
 pub mod dsv4_swa;
 pub mod dsv4_yarn_config;
 pub mod fine_profile;
