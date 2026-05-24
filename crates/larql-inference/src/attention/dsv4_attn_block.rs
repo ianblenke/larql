@@ -30,6 +30,7 @@ use ndarray::{Array2, ArrayView1, ArrayView2, ArrayView3};
 
 use super::dsv4_fp8_kv::fp8_kv_quantize;
 use super::dsv4_grouped_o_proj::grouped_o_proj;
+use super::dsv4_kv_cache::DsV4LayerKvCache;
 use super::dsv4_rope_tail::DsV4RopeMode;
 use super::dsv4_rope_tail_yarn::rope_tail_dispatch;
 use super::dsv4_swa::dsv4_sliding_window_attn;
@@ -242,6 +243,120 @@ fn rms_norm_per_head(x: ArrayView2<f32>, n_head: usize, head_dim: usize, eps: f3
         }
     }
     out
+}
+
+/// KV-cached variant of [`dsv4_attn_block_no_compress`].
+///
+/// Computes the same attention as the non-cached prefill, but the
+/// caller supplies a [`DsV4LayerKvCache`] that persists across calls.
+/// Each call appends the newly-computed `kv_a` rows for `x` to the
+/// cache, then attends `x`'s queries against the *full* cached K/V
+/// (prior tokens + new). This enables incremental decode: a 1-token
+/// `x` after a 128-token prefill runs in O(window_size) attention
+/// time instead of O(prefill_len).
+///
+/// `position_offset` MUST equal `cache.current_len()` on entry — the
+/// absolute position of `x[0]` in the running sequence. The function
+/// asserts this invariant.
+///
+/// Equivalence with prefill: running this with an empty cache and a
+/// full sequence produces the same output (within FP8 rounding noise)
+/// as [`dsv4_attn_block_no_compress`] on the same sequence — verified
+/// in the unit tests.
+pub fn dsv4_attn_block_no_compress_cached(
+    x: ArrayView2<f32>,
+    w: &DsV4AttnBlockWeights,
+    p: &DsV4AttnBlockParams,
+    position_offset: usize,
+    cache: &mut DsV4LayerKvCache,
+) -> Array2<f32> {
+    let n_tokens = x.shape()[0];
+    assert_eq!(
+        x.shape(),
+        &[n_tokens, p.n_embd],
+        "x must be (n_tokens, n_embd)"
+    );
+    assert_eq!(
+        cache.head_dim(),
+        p.head_dim,
+        "cache.head_dim ({}) must match params.head_dim ({})",
+        cache.head_dim(),
+        p.head_dim
+    );
+    assert_eq!(
+        cache.current_len(),
+        position_offset,
+        "position_offset ({position_offset}) must equal cache.current_len ({}) — cache and \
+         offset are out of sync",
+        cache.current_len()
+    );
+
+    // 1. attn_norm.
+    let cur = rms_norm_2d(x, w.attn_norm, p.norm_eps);
+
+    // 2. Q low-rank + tail-RoPE.
+    let qr = matmul_x_wt(cur.view(), w.wq_a);
+    let qr = rms_norm_2d(qr.view(), w.q_a_norm, p.norm_eps);
+    let q = matmul_x_wt(qr.view(), w.wq_b);
+    let q = rms_norm_per_head(q.view(), p.n_head, p.head_dim, p.norm_eps);
+    let q = rope_tail_dispatch(
+        &q,
+        p.n_head,
+        p.head_dim,
+        p.n_rot,
+        p.rope_base,
+        p.rope_mode,
+        p.yarn.as_ref(),
+        false,
+        position_offset,
+    );
+
+    // 3. KV low-rank + tail-RoPE (for the NEW tokens only).
+    let kv_new = matmul_x_wt(cur.view(), w.wkv);
+    let kv_new = rms_norm_2d(kv_new.view(), w.kv_a_norm, p.norm_eps);
+    let kv_new = rope_tail_dispatch(
+        &kv_new,
+        1,
+        p.head_dim,
+        p.n_rot,
+        p.rope_base,
+        p.rope_mode,
+        p.yarn.as_ref(),
+        false,
+        position_offset,
+    );
+
+    // 4. FP8 fake-quantize.
+    let kv_new = fp8_kv_quantize(kv_new.view(), p.n_rot);
+
+    // 5. Append to cache → cache now has (position_offset + n_tokens, head_dim).
+    cache.append(kv_new.view());
+
+    // 6. SWA MQA against the full cached K/V; Q is just the new positions.
+    let kv_full = cache.view_current();
+    let scale = 1.0 / (p.head_dim as f32).sqrt();
+    let o = dsv4_sliding_window_attn(
+        q.view(),
+        kv_full,
+        kv_full,
+        p.n_head,
+        p.head_dim,
+        p.window_size,
+        w.attn_sinks,
+        scale,
+        position_offset,
+    );
+
+    // 7. Grouped low-rank o-proj.
+    grouped_o_proj(
+        o.view(),
+        w.wo_a,
+        w.wo_b,
+        p.n_head,
+        p.head_dim,
+        p.n_groups,
+        p.o_lora_rank,
+    )
 }
 
 #[cfg(test)]
@@ -459,5 +574,214 @@ mod tests {
         let out = dsv4_attn_block_no_compress(x.view(), &w, &p, 0);
         assert_eq!(out.shape(), &[1, p.n_embd]);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    // ── Cached-attention tests ──
+
+    /// Helper to build a deterministic weight set + params for cache
+    /// equivalence tests. Same dimensions across all cached-attn tests.
+    fn build_cached_test_weights() -> (
+        DsV4AttnBlockParams,
+        Vec<f32>, // attn_norm
+        Array2<f32>,
+        Vec<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Vec<f32>,
+        Array3<f32>,
+        Array2<f32>,
+        Array1<f32>,
+    ) {
+        let p = DsV4AttnBlockParams {
+            n_embd: 64,
+            n_head: 4,
+            head_dim: 64,
+            q_lora_rank: 16,
+            n_groups: 2,
+            o_lora_rank: 8,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            window_size: 8,
+            norm_eps: 1e-5,
+            yarn: None,
+        };
+        let group_heads = p.n_head / p.n_groups;
+        let group_dim = p.head_dim * group_heads;
+        let low_dim = p.o_lora_rank * p.n_groups;
+        let attn_norm = vec![1.0_f32; p.n_embd];
+        let wq_a = Array2::<f32>::from_shape_fn((p.q_lora_rank, p.n_embd), |(i, j)| {
+            ((i * 17 + j) as f32 * 0.013).sin()
+        });
+        let q_a_norm = vec![1.0_f32; p.q_lora_rank];
+        let wq_b =
+            Array2::<f32>::from_shape_fn((p.n_head * p.head_dim, p.q_lora_rank), |(i, j)| {
+                ((i * 11 + j) as f32 * 0.017).cos() * 0.1
+            });
+        let wkv = Array2::<f32>::from_shape_fn((p.head_dim, p.n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.007).sin() * 0.05
+        });
+        let kv_a_norm = vec![1.0_f32; p.head_dim];
+        let wo_a =
+            Array3::<f32>::from_shape_fn((p.n_groups, p.o_lora_rank, group_dim), |(g, r, j)| {
+                ((g * 100 + r * 10 + j) as f32 * 0.0005).cos() * 0.05
+            });
+        let wo_b = Array2::<f32>::from_shape_fn((p.n_embd, low_dim), |(i, j)| {
+            ((i * 5 + j * 3) as f32 * 0.0011).sin() * 0.1
+        });
+        let attn_sinks = Array1::<f32>::from_elem(p.n_head, -1.0);
+        (
+            p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks,
+        )
+    }
+
+    /// Cached path with an empty initial cache producing the same N-token
+    /// output as the non-cached prefill path. The cache absorbs all the
+    /// new kv_a rows and SWA sees the same K/V either way.
+    #[test]
+    fn cached_full_prefill_equals_uncached() {
+        let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
+            build_cached_test_weights();
+        let w = DsV4AttnBlockWeights {
+            attn_norm: &attn_norm,
+            wq_a: wq_a.view(),
+            q_a_norm: &q_a_norm,
+            wq_b: wq_b.view(),
+            wkv: wkv.view(),
+            kv_a_norm: &kv_a_norm,
+            wo_a: wo_a.view(),
+            wo_b: wo_b.view(),
+            attn_sinks: Some(attn_sinks.view()),
+        };
+        let n_tokens = 5;
+        let x = Array2::<f32>::from_shape_fn((n_tokens, p.n_embd), |(t, d)| {
+            ((t * 13 + d) as f32 * 0.011).sin()
+        });
+
+        // Path A: non-cached prefill.
+        let out_prefill = dsv4_attn_block_no_compress(x.view(), &w, &p, 0);
+
+        // Path B: cached path with empty cache.
+        let mut cache = DsV4LayerKvCache::with_capacity(64, p.head_dim);
+        let out_cached = dsv4_attn_block_no_compress_cached(x.view(), &w, &p, 0, &mut cache);
+
+        assert_eq!(out_prefill.shape(), out_cached.shape());
+        let mut max_diff = 0.0_f32;
+        for (a, b) in out_prefill.iter().zip(out_cached.iter()) {
+            let d = (a - b).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+        // Same computation deterministically — exact match expected
+        // (no batch reduction order changes).
+        assert!(max_diff < 1e-5, "cached vs prefill max diff = {max_diff}");
+        assert_eq!(cache.current_len(), n_tokens);
+    }
+
+    /// Incremental: prefill 4 tokens via cached path, then decode 1
+    /// token via cached path. The accumulated 5-row output should
+    /// match running all 5 tokens through cached path with an empty
+    /// cache (since attention is causal — token 4's output depends
+    /// only on tokens 0..4).
+    #[test]
+    fn cached_prefill_then_decode_equals_full_cached() {
+        let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
+            build_cached_test_weights();
+        let w = DsV4AttnBlockWeights {
+            attn_norm: &attn_norm,
+            wq_a: wq_a.view(),
+            q_a_norm: &q_a_norm,
+            wq_b: wq_b.view(),
+            wkv: wkv.view(),
+            kv_a_norm: &kv_a_norm,
+            wo_a: wo_a.view(),
+            wo_b: wo_b.view(),
+            attn_sinks: Some(attn_sinks.view()),
+        };
+        let n_total = 5;
+        let x_full = Array2::<f32>::from_shape_fn((n_total, p.n_embd), |(t, d)| {
+            ((t * 13 + d) as f32 * 0.011).sin()
+        });
+
+        // Path A: one-shot cached call.
+        let mut cache_a = DsV4LayerKvCache::with_capacity(32, p.head_dim);
+        let out_full = dsv4_attn_block_no_compress_cached(x_full.view(), &w, &p, 0, &mut cache_a);
+
+        // Path B: split prefill (4) + decode (1) via the cached path.
+        let mut cache_b = DsV4LayerKvCache::with_capacity(32, p.head_dim);
+        let x_prefill = x_full.slice(ndarray::s![..4, ..]);
+        let x_decode = x_full.slice(ndarray::s![4..5, ..]);
+        let out_prefill = dsv4_attn_block_no_compress_cached(x_prefill, &w, &p, 0, &mut cache_b);
+        let out_decode = dsv4_attn_block_no_compress_cached(x_decode, &w, &p, 4, &mut cache_b);
+
+        // Compare: out_prefill (rows 0..4) + out_decode (row 4) == out_full.
+        for t in 0..4 {
+            for d in 0..p.n_embd {
+                let a = out_full[[t, d]];
+                let b = out_prefill[[t, d]];
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "prefill row {t} dim {d}: full {a} vs split {b}"
+                );
+            }
+        }
+        for d in 0..p.n_embd {
+            let a = out_full[[4, d]];
+            let b = out_decode[[0, d]];
+            assert!(
+                (a - b).abs() < 1e-5,
+                "decode row 4 dim {d}: full {a} vs split {b}"
+            );
+        }
+        // Both caches end with the same length.
+        assert_eq!(cache_a.current_len(), n_total);
+        assert_eq!(cache_b.current_len(), n_total);
+    }
+
+    /// position_offset mismatch with cache.current_len() panics.
+    #[test]
+    #[should_panic(expected = "position_offset")]
+    fn cached_position_offset_mismatch_panics() {
+        let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
+            build_cached_test_weights();
+        let w = DsV4AttnBlockWeights {
+            attn_norm: &attn_norm,
+            wq_a: wq_a.view(),
+            q_a_norm: &q_a_norm,
+            wq_b: wq_b.view(),
+            wkv: wkv.view(),
+            kv_a_norm: &kv_a_norm,
+            wo_a: wo_a.view(),
+            wo_b: wo_b.view(),
+            attn_sinks: Some(attn_sinks.view()),
+        };
+        // Cache is empty (current_len=0) but caller claims offset=5 → panic.
+        let mut cache = DsV4LayerKvCache::with_capacity(16, p.head_dim);
+        let x = Array2::<f32>::zeros((1, p.n_embd));
+        let _ = dsv4_attn_block_no_compress_cached(x.view(), &w, &p, 5, &mut cache);
+    }
+
+    /// head_dim mismatch between cache and params panics.
+    #[test]
+    #[should_panic(expected = "cache.head_dim")]
+    fn cached_head_dim_mismatch_panics() {
+        let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
+            build_cached_test_weights();
+        let w = DsV4AttnBlockWeights {
+            attn_norm: &attn_norm,
+            wq_a: wq_a.view(),
+            q_a_norm: &q_a_norm,
+            wq_b: wq_b.view(),
+            wkv: wkv.view(),
+            kv_a_norm: &kv_a_norm,
+            wo_a: wo_a.view(),
+            wo_b: wo_b.view(),
+            attn_sinks: Some(attn_sinks.view()),
+        };
+        // Cache head_dim = 32 but params head_dim = 64 → panic.
+        let mut cache = DsV4LayerKvCache::with_capacity(16, 32);
+        let x = Array2::<f32>::zeros((1, p.n_embd));
+        let _ = dsv4_attn_block_no_compress_cached(x.view(), &w, &p, 0, &mut cache);
     }
 }
