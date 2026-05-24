@@ -378,4 +378,73 @@ mod tests {
         let total: f32 = logits.iter().map(|v| v.abs()).sum();
         assert!(total > 0.0, "logits all zero");
     }
+
+    /// **The full 43-layer DSv4-Flash streaming forward.**
+    ///
+    /// Runs every layer of the real ~172 GB DSv4-Flash GGUF through
+    /// the streaming helper, producing final (n_tokens, 129280) logits.
+    /// Each layer's storage (~26 GB f32 of FFN expert tensors) is
+    /// loaded, executed, and dropped before the next layer loads —
+    /// peak RAM stays bounded at one layer + head + residual.
+    ///
+    /// Expected wall: **~22-25 min release mode**. Breakdown:
+    /// - Head load: ~6 s
+    /// - 43 × ~30 s layer load = ~22 min
+    /// - Forward + lm_head matmul: ~1-2 min
+    ///
+    /// Need 128 tokens because the cr=128 layers require
+    /// `n_tokens >= compress_ratio`. The 128 × 129280 lm_head matmul
+    /// is ~67 GFLOPs — completes in ~1 min release.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk and ~25 min wall"]
+    fn streaming_full_43_layer_forward() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        // 128 tokens (covers cr=128 layers' compressor n_tokens requirement).
+        let n_tokens = 128;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let n_layer = 43;
+        let layer_indices: Vec<usize> = (0..n_layer).collect();
+
+        let logits = dsv4_streaming_model_forward(&gguf, &hp, &head, &token_ids, &layer_indices, 0)
+            .expect("streaming forward over all 43 layers");
+
+        assert_eq!(logits.shape(), &[n_tokens, head.n_vocab]);
+        let n_nonfinite = logits.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            n_nonfinite, 0,
+            "{n_nonfinite} non-finite values in full-43 logits"
+        );
+        let total: f32 = logits.iter().map(|v| v.abs()).sum();
+        assert!(total > 0.0, "full-43 logits all zero");
+
+        // Per-token distinctness: different positions should produce
+        // distinct logit rows after 43 layers of processing.
+        let mut diff_01: f32 = 0.0;
+        let mut diff_0last: f32 = 0.0;
+        for v in 0..head.n_vocab {
+            diff_01 += (logits[[0, v]] - logits[[1, v]]).abs();
+            diff_0last += (logits[[0, v]] - logits[[n_tokens - 1, v]]).abs();
+        }
+        assert!(
+            diff_01 > 0.0,
+            "row 0 == row 1 (43-layer forward degenerate)"
+        );
+        assert!(
+            diff_0last > 0.0,
+            "row 0 == row {} (43-layer forward degenerate)",
+            n_tokens - 1
+        );
+    }
 }
