@@ -423,4 +423,126 @@ mod tests {
         let total: f32 = out.iter().map(|v| v.abs()).sum();
         assert!(total > 0.0, "per-layer output is all zeros");
     }
+
+    /// 2-layer chained forward on real layers 0 and 1 (both NoCompress
+    /// variant, both hash-routed since 0,1 ∈ [0, n_hash_layers=3)).
+    ///
+    /// Validates layer-to-layer residual handoff on real GGUF weights:
+    /// the residual emitted by layer 0 is fed directly into layer 1's
+    /// `dsv4_per_layer_forward`. Cross-checks that layer 1's output
+    /// differs from layer 0's (proves both layers actually transform
+    /// the residual and the chain isn't degenerate).
+    ///
+    /// Pipeline:
+    ///   residual_0 (4, n_hc=4, n_embd=4096)
+    ///     → dsv4_per_layer_forward(layer_0) → residual_1
+    ///     → dsv4_per_layer_forward(layer_1) → residual_2
+    ///
+    /// Expected wall: ~60 s release mode (2 × ~30 s load).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn smoke_layers_0_to_1_chained_forward() {
+        use ndarray::Array3;
+
+        use crate::attention::dsv4_ffn_block::Dsv4FfnParams;
+        use crate::attention::dsv4_mhc_bookend::MhcParams;
+        use crate::attention::dsv4_per_layer::{
+            dsv4_per_layer_forward, DsV4LayerParams, DsV4LayerWeights,
+        };
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let (storage_0, variant_0) = load_dsv4_layer(&gguf, &hp, 0).expect("load layer 0");
+        let (storage_1, variant_1) = load_dsv4_layer(&gguf, &hp, 1).expect("load layer 1");
+        assert!(variant_0.uses_hash_routing, "layer 0 hash-routes");
+        assert!(variant_1.uses_hash_routing, "layer 1 hash-routes");
+
+        let n_tokens = 4;
+        let n_embd = hp.n_embd;
+        let n_hc = hp.n_hc;
+        let residual_0 = Array3::<f32>::from_shape_fn((n_tokens, n_hc, n_embd), |(t, h, d)| {
+            ((t * 13 + h * 7 + d) as f32 * 0.0013).sin() * 0.1
+        });
+
+        // Token IDs must be valid for layer 0's and layer 1's tid2eid.
+        let n_vocab = storage_0
+            .ffn
+            .as_ref()
+            .and_then(|f| f.gate_tid2eid.as_ref())
+            .expect("layer 0 hash table")
+            .shape()[0];
+        let token_ids: Vec<u32> = (0..n_tokens).map(|t| (t * 257 % n_vocab) as u32).collect();
+
+        let layer_p = DsV4LayerParams {
+            mhc: MhcParams {
+                n_embd: hp.n_embd,
+                n_hc: hp.n_hc,
+                sinkhorn_iters: 2,
+                hc_eps: 1e-5,
+                norm_eps: hp.norm_eps,
+            },
+            ffn: Dsv4FfnParams {
+                n_expert: hp.n_expert,
+                n_expert_used: hp.n_expert_used,
+                norm_eps: hp.norm_eps,
+                routed_swiglu_limit: 7.0,
+                shared_swiglu_limit: 0.0,
+                expert_weights_norm: hp.expert_weights_norm,
+                expert_weights_scale: hp.expert_weights_scale,
+            },
+        };
+
+        // Run layer 0.
+        let layer_w_0 = DsV4LayerWeights {
+            mhc_attn: storage_0.mhc_attn.as_ref().unwrap().as_weights(),
+            attn: storage_0.dispatcher_layer(&None, &None),
+            mhc_ffn: storage_0.mhc_ffn.as_ref().unwrap().as_weights(),
+            ffn: storage_0.ffn.as_ref().unwrap().as_weights(),
+        };
+        let residual_1 =
+            dsv4_per_layer_forward(residual_0.view(), &layer_w_0, &layer_p, Some(&token_ids), 0);
+        assert_eq!(residual_1.shape(), &[n_tokens, n_hc, n_embd]);
+        assert!(
+            residual_1.iter().all(|v| v.is_finite()),
+            "non-finite after layer 0"
+        );
+
+        // Run layer 1 fed by layer 0's output.
+        let layer_w_1 = DsV4LayerWeights {
+            mhc_attn: storage_1.mhc_attn.as_ref().unwrap().as_weights(),
+            attn: storage_1.dispatcher_layer(&None, &None),
+            mhc_ffn: storage_1.mhc_ffn.as_ref().unwrap().as_weights(),
+            ffn: storage_1.ffn.as_ref().unwrap().as_weights(),
+        };
+        let residual_2 =
+            dsv4_per_layer_forward(residual_1.view(), &layer_w_1, &layer_p, Some(&token_ids), 0);
+        assert_eq!(residual_2.shape(), &[n_tokens, n_hc, n_embd]);
+        let n_nonfinite = residual_2.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(n_nonfinite, 0, "{n_nonfinite} non-finite after layer 1");
+
+        // Cross-check: residual_2 differs from residual_1 (layer 1
+        // actually transformed something).
+        let mut diff: f32 = 0.0;
+        for (a, b) in residual_1.iter().zip(residual_2.iter()) {
+            diff += (a - b).abs();
+        }
+        assert!(diff > 0.0, "residual_2 == residual_1 (layer 1 was a no-op)");
+
+        // And residual_1 differs from residual_0 too (layer 0 also worked).
+        let mut diff_0: f32 = 0.0;
+        for (a, b) in residual_0.iter().zip(residual_1.iter()) {
+            diff_0 += (a - b).abs();
+        }
+        assert!(
+            diff_0 > 0.0,
+            "residual_1 == residual_0 (layer 0 was a no-op)"
+        );
+    }
 }
