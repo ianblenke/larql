@@ -13,7 +13,9 @@
 use larql_models::detect::ModelError;
 use larql_models::loading::gguf::GgufFile;
 
-use super::dsv4_gguf_reader::read_dsv4_layer_tensors_from_gguf;
+use super::dsv4_gguf_reader::{
+    read_dsv4_layer_int_tensors_from_gguf, read_dsv4_layer_tensors_from_gguf,
+};
 use super::dsv4_hyperparams_load::DsV4MetadataError;
 use super::dsv4_layer_variants::{detect_layer_variant, DsV4LayerVariant};
 use super::dsv4_storage::DsV4LayerWeightStorage;
@@ -70,8 +72,9 @@ pub fn load_dsv4_layer(
 ) -> Result<(DsV4LayerWeightStorage, DsV4LayerVariant), DsV4LoadError> {
     let variant = detect_layer_variant(gguf, layer_index, hp.head_dim);
     let raw = read_dsv4_layer_tensors_from_gguf(gguf, layer_index)?;
+    let int_raw = read_dsv4_layer_int_tensors_from_gguf(gguf, layer_index)?;
     let compress_ratio = variant.compress_ratio.unwrap_or(0);
-    let storage = build_layer_storage(raw, hp, compress_ratio)
+    let storage = build_layer_storage(raw, int_raw, hp, compress_ratio)
         .map_err(|cause| DsV4LoadError::Build { layer_index, cause })?;
     Ok((storage, variant))
 }
