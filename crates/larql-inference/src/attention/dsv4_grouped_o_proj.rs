@@ -1,4 +1,4 @@
-//! DeepSeek V4 grouped low-rank output projection — CPU reference.
+//! DeepSeek V4 grouped low-rank output projection — vectorized + backend-routed.
 //!
 //! Replaces the standard `attn_output` projection in DSv4-Flash. The
 //! per-token attention output `[n_head, n_embd_head]` is reshaped into
@@ -16,10 +16,15 @@
 //! `n_embd_head * group_heads` and `n_embd`.
 //!
 //! Reference: llama.cpp PR #23122 `src/models/deepseek4.cpp:567-594`
-//! (`dsv4_grouped_out`). Implemented here as pure ndarray; GPU port
-//! follows in a later stage.
+//! (`dsv4_grouped_out`).
+//!
+//! GPU offload: when `backend` is `Some(..)`, both the per-group A
+//! matmul (one cuBLAS GEMM per group) and the shared B matmul route
+//! through [`dot_proj_gpu`]. When `None`, the same shape goes through
+//! ndarray BLAS on CPU.
 
-use ndarray::{Array1, Array2, ArrayView2, ArrayView3};
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+use ndarray::{s, Array2, ArrayView2, ArrayView3};
 
 /// Apply the grouped low-rank output projection to the attention block's
 /// per-token output.
@@ -35,6 +40,8 @@ use ndarray::{Array1, Array2, ArrayView2, ArrayView3};
 ///   `out[t, i] = sum_k wo_b[i, k] * low[t, k]`.
 /// - `n_head`, `n_embd_head`, `n_groups`, `o_lora_rank` — dimensions
 ///   (must satisfy `n_head % n_groups == 0`).
+/// - `backend` — optional compute backend; routes the two underlying
+///   matmuls through cuBLAS / Metal / CPU as available.
 ///
 /// Output: `(n_tokens, n_embd_out)`.
 pub fn grouped_o_proj(
@@ -45,6 +52,7 @@ pub fn grouped_o_proj(
     n_embd_head: usize,
     n_groups: usize,
     o_lora_rank: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     assert!(
         n_head > 0 && n_groups > 0 && n_head % n_groups == 0,
@@ -72,37 +80,23 @@ pub fn grouped_o_proj(
         "wo_b second dim must be o_lora_rank * n_groups"
     );
 
-    let mut out = Array2::<f32>::zeros((n_tokens, n_embd_out));
-
-    // Per-token: per-group A matmul, concatenate, then shared B matmul.
-    let mut low = Array1::<f32>::zeros(low_dim);
-    for t in 0..n_tokens {
-        // 1. Per-group A matmul. Group `g` reads `o[t, g*group_dim..(g+1)*group_dim]`
-        //    and projects through `wo_a[g]` (shape `[o_lora_rank, group_dim]`)
-        //    into `low[g*o_lora_rank..(g+1)*o_lora_rank]`.
-        for g in 0..n_groups {
-            let group_off = g * group_dim;
-            let low_off = g * o_lora_rank;
-            for r in 0..o_lora_rank {
-                let mut acc = 0.0_f32;
-                for j in 0..group_dim {
-                    acc += wo_a[[g, r, j]] * o[[t, group_off + j]];
-                }
-                low[low_off + r] = acc;
-            }
-        }
-
-        // 2. Shared B matmul: `out[t, i] = sum_k wo_b[i, k] * low[k]`.
-        for i in 0..n_embd_out {
-            let mut acc = 0.0_f32;
-            for k in 0..low_dim {
-                acc += wo_b[[i, k]] * low[k];
-            }
-            out[[t, i]] = acc;
-        }
+    // 1. Per-group A matmul, batched across tokens.
+    //    For each group g: o_group (n_tokens, group_dim) @ wo_a[g]^T (group_dim, o_lora_rank)
+    //                      → low[:, low_off..low_off+o_lora_rank] (n_tokens, o_lora_rank).
+    let mut low = Array2::<f32>::zeros((n_tokens, low_dim));
+    for g in 0..n_groups {
+        let group_off = g * group_dim;
+        let low_off = g * o_lora_rank;
+        let o_group = o.slice(s![.., group_off..group_off + group_dim]);
+        let wo_a_g = wo_a.slice(s![g, .., ..]);
+        let part = dot_proj_gpu(&o_group, &wo_a_g, backend);
+        low.slice_mut(s![.., low_off..low_off + o_lora_rank])
+            .assign(&part);
     }
 
-    out
+    // 2. Shared B matmul: low (n_tokens, low_dim) @ wo_b^T (low_dim, n_embd_out)
+    //                   → out (n_tokens, n_embd_out).
+    dot_proj_gpu(&low, &wo_b, backend)
 }
 
 #[cfg(test)]
@@ -156,6 +150,7 @@ mod tests {
             n_embd_head,
             n_groups,
             o_lora_rank,
+            None,
         );
         for t in 0..n_tokens {
             for j in 0..(n_head * n_embd_head) {
@@ -215,6 +210,7 @@ mod tests {
             n_embd_head,
             n_groups,
             o_lora_rank,
+            None,
         );
         assert!(approx_eq(out[[0, 0]], 10.0, 1e-5));
         assert!(approx_eq(out[[0, 1]], 26.0, 1e-5));
@@ -268,10 +264,82 @@ mod tests {
             n_embd_head,
             n_groups,
             o_lora_rank,
+            None,
         );
         assert_eq!(out.shape(), &[n_tokens, n_embd_out]);
         for v in out.iter() {
             assert!(v.is_finite(), "non-finite output: {v}");
         }
+    }
+
+    /// CpuBackend equivalence: `Some(&CpuBackend)` should match `None`
+    /// to within BLAS reduction tolerance. Locks in the backend-routing
+    /// path doesn't perturb numerics.
+    #[test]
+    fn cpu_backend_matches_none_backend() {
+        let n_head = 8;
+        let n_embd_head = 16;
+        let n_groups = 4;
+        let group_heads = n_head / n_groups; // 2
+        let group_dim = n_embd_head * group_heads; // 32
+        let o_lora_rank = 12;
+        let low_dim = o_lora_rank * n_groups; // 48
+        let n_embd_out = 24;
+
+        let mut wo_a = ndarray::Array3::<f32>::zeros((n_groups, o_lora_rank, group_dim));
+        for g in 0..n_groups {
+            for r in 0..o_lora_rank {
+                for j in 0..group_dim {
+                    wo_a[[g, r, j]] = ((g * 13 + r * 7 + j) as f32 * 0.011).sin();
+                }
+            }
+        }
+        let mut wo_b = Array2::<f32>::zeros((n_embd_out, low_dim));
+        for i in 0..n_embd_out {
+            for k in 0..low_dim {
+                wo_b[[i, k]] = ((i * 5 + k * 3) as f32 * 0.009).cos();
+            }
+        }
+
+        let n_tokens = 5;
+        let mut o = Array2::<f32>::zeros((n_tokens, n_head * n_embd_head));
+        for t in 0..n_tokens {
+            for j in 0..(n_head * n_embd_head) {
+                o[[t, j]] = ((t * 31 + j) as f32 * 0.04).sin();
+            }
+        }
+
+        let out_none = grouped_o_proj(
+            o.view(),
+            wo_a.view(),
+            wo_b.view(),
+            n_head,
+            n_embd_head,
+            n_groups,
+            o_lora_rank,
+            None,
+        );
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = grouped_o_proj(
+            o.view(),
+            wo_a.view(),
+            wo_b.view(),
+            n_head,
+            n_embd_head,
+            n_groups,
+            o_lora_rank,
+            Some(&cpu as &dyn ComputeBackend),
+        );
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch: max_diff={max_diff}"
+        );
     }
 }
