@@ -67,7 +67,7 @@ pub fn dsv4_per_layer_forward(
     backend: Option<&dyn ComputeBackend>,
 ) -> Array3<f32> {
     // ── 1. Attention bookend pre ──
-    let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc);
+    let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc, backend);
 
     // ── 2. Attention block ──
     let attn_out = dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset, backend);
@@ -81,7 +81,7 @@ pub fn dsv4_per_layer_forward(
     );
 
     // ── 4. FFN bookend pre ──
-    let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc);
+    let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc, backend);
 
     // ── 5. FFN block ──
     let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend);
@@ -122,7 +122,7 @@ pub fn dsv4_per_layer_forward_cached(
     backend: Option<&dyn ComputeBackend>,
 ) -> Array3<f32> {
     // ── 1. Attention bookend pre ──
-    let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc);
+    let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc, backend);
 
     // ── 2. Attention block (cached if variants align, fallback otherwise) ──
     let attn_out = match (&w.attn, layer_cache) {
@@ -171,7 +171,7 @@ pub fn dsv4_per_layer_forward_cached(
     );
 
     // ── 4. FFN bookend pre ──
-    let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc);
+    let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc, backend);
 
     // ── 5. FFN block ──
     let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend);

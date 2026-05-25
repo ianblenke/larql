@@ -31,6 +31,8 @@
 
 use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_mhc::{expand, split_sinkhorn, weighted_sum};
 
 /// Per-block mHC weights.
@@ -69,7 +71,12 @@ pub struct MhcPreResult {
 }
 
 /// Run the mHC pre-bookend.
-pub fn dsv4_mhc_pre(residual: ArrayView3<f32>, w: &MhcWeights, p: &MhcParams) -> MhcPreResult {
+pub fn dsv4_mhc_pre(
+    residual: ArrayView3<f32>,
+    w: &MhcWeights,
+    p: &MhcParams,
+    backend: Option<&dyn ComputeBackend>,
+) -> MhcPreResult {
     let n_tokens = residual.shape()[0];
     let n_hc = p.n_hc;
     let n_embd = p.n_embd;
@@ -109,16 +116,7 @@ pub fn dsv4_mhc_pre(residual: ArrayView3<f32>, w: &MhcWeights, p: &MhcParams) ->
     }
 
     // 3. mixes = flat @ hc_fn^T → (n_tokens, hc_mix).
-    let mut mixes = Array2::<f32>::zeros((n_tokens, hc_mix));
-    for t in 0..n_tokens {
-        for m in 0..hc_mix {
-            let mut acc = 0.0_f32;
-            for k in 0..hc_dim {
-                acc += flat[[t, k]] * w.hc_fn[[m, k]];
-            }
-            mixes[[t, m]] = acc;
-        }
-    }
+    let mixes = dot_proj_gpu(&flat, &w.hc_fn, backend);
 
     // 4. split = split_sinkhorn(mixes, ...) → (n_tokens, hc_mix).
     let split = split_sinkhorn(
@@ -197,7 +195,7 @@ mod tests {
             hc_eps: 1e-5,
             norm_eps: 1e-5,
         };
-        let pre = dsv4_mhc_pre(residual.view(), &w, &p);
+        let pre = dsv4_mhc_pre(residual.view(), &w, &p, None);
         assert_eq!(pre.cur.shape(), &[n_tokens, n_embd]);
         assert_eq!(pre.post.shape(), &[n_tokens, n_hc]);
         assert_eq!(pre.comb.shape(), &[n_tokens, n_hc, n_hc]);
@@ -211,6 +209,65 @@ mod tests {
         );
         assert_eq!(new_residual.shape(), &[n_tokens, n_hc, n_embd]);
         assert!(new_residual.iter().all(|v| v.is_finite()));
+    }
+
+    /// CpuBackend equivalence: dsv4_mhc_pre with `Some(&CpuBackend)`
+    /// must match the `None` fallback. Locks in the GPU-7e
+    /// backend-routing wiring on the hc_fn matmul.
+    #[test]
+    fn mhc_pre_cpu_backend_matches_none_backend() {
+        let n_tokens = 4;
+        let n_hc = 4;
+        let n_embd = 16;
+        let hc_dim = n_hc * n_embd;
+        let hc_mix = (2 + n_hc) * n_hc;
+
+        let residual = make_residual(n_tokens, n_hc, n_embd);
+        let hc_fn = Array2::<f32>::from_shape_fn((hc_mix, hc_dim), |(m, k)| {
+            ((m * 3 + k) as f32 * 0.013).sin() * 0.1
+        });
+        let hc_scale = [0.5_f32, 0.5, 0.5];
+        let hc_base = vec![0.0_f32; hc_mix];
+
+        let w = MhcWeights {
+            hc_fn: hc_fn.view(),
+            hc_scale: &hc_scale,
+            hc_base: &hc_base,
+        };
+        let p = MhcParams {
+            n_embd,
+            n_hc,
+            sinkhorn_iters: 2,
+            hc_eps: 1e-5,
+            norm_eps: 1e-5,
+        };
+
+        let pre_none = dsv4_mhc_pre(residual.view(), &w, &p, None);
+        let cpu = larql_compute::CpuBackend;
+        let pre_cpu = dsv4_mhc_pre(residual.view(), &w, &p, Some(&cpu as &dyn ComputeBackend));
+
+        assert_eq!(pre_none.cur.shape(), pre_cpu.cur.shape());
+        let max_cur = pre_none
+            .cur
+            .iter()
+            .zip(pre_cpu.cur.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let max_post = pre_none
+            .post
+            .iter()
+            .zip(pre_cpu.post.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let max_comb = pre_none
+            .comb
+            .iter()
+            .zip(pre_cpu.comb.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_cur < 1e-4, "cur mismatch: {max_cur}");
+        assert!(max_post < 1e-5, "post mismatch: {max_post}");
+        assert!(max_comb < 1e-5, "comb mismatch: {max_comb}");
     }
 
     /// With small hc_fn weights, the comb matrix Sinkhorn-normalises
@@ -240,7 +297,7 @@ mod tests {
             hc_eps: 1e-5,
             norm_eps: 1e-5,
         };
-        let pre = dsv4_mhc_pre(residual.view(), &w, &p);
+        let pre = dsv4_mhc_pre(residual.view(), &w, &p, None);
         for t in 0..n_tokens {
             for dst in 0..n_hc {
                 let row_sum: f32 = (0..n_hc).map(|src| pre.comb[[t, dst, src]]).sum();
@@ -284,7 +341,7 @@ mod tests {
             hc_eps: 1e-5,
             norm_eps: 1e-5,
         };
-        let pre = dsv4_mhc_pre(residual.view(), &w, &p);
+        let pre = dsv4_mhc_pre(residual.view(), &w, &p, None);
         // Block_out: a learnable transformation of cur — here, scale by 0.5
         // (purely to exercise the post bookend, not to mean anything).
         let block_out = pre.cur.mapv(|v| v * 0.5);
@@ -340,7 +397,7 @@ mod tests {
             hc_eps: 1e-5,
             norm_eps: 1e-5,
         };
-        let pre = dsv4_mhc_pre(residual.view(), &w, &p);
+        let pre = dsv4_mhc_pre(residual.view(), &w, &p, None);
         let zero_block = Array2::<f32>::zeros((n_tokens, n_embd));
         let new_residual = dsv4_mhc_post(
             zero_block.view(),
