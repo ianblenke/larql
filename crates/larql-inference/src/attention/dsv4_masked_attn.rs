@@ -73,24 +73,40 @@ pub fn dsv4_masked_attn(
     let mut scores = dot_proj_gpu(&q_flat, &k, backend);
 
     // 3. Apply mask (broadcast over heads) + scale + optional sinks +
-    //    in-place softmax per row. Append sink as an n_kv_total-th column
-    //    by tracking it alongside; we don't expand the scores tensor.
-    for t in 0..n_tokens {
-        for h in 0..n_head {
-            let row_idx = t * n_head + h;
-            let mut row = scores.slice_mut(s![row_idx, ..]);
+    //    in-place softmax per row. Each (token, head) row is
+    //    independent → parallelise via rayon. Each row's work is
+    //    O(n_kv_total) — for DSv4-Flash with 128-token prefill, 64
+    //    heads, n_kv_total≈128, that's 8192 independent rows; rayon
+    //    distributes them across cores during the softmax phase
+    //    between the two GEMMs.
+    //
+    //    Note: cannot use par_iter on `scores.rows_mut()` directly
+    //    because the closure needs to know `(t, h)` to look up the
+    //    mask row and sink. So we work on raw row slices via
+    //    par_chunks_mut.
+    use rayon::prelude::*;
+    let attn_sinks_slice = attn_sinks.map(|s| s.to_vec());
+    let scores_raw = scores
+        .as_slice_mut()
+        .expect("scores is contiguous standard-layout");
+    scores_raw
+        .par_chunks_mut(n_kv_total)
+        .enumerate()
+        .for_each(|(row_idx, row)| {
+            let t = row_idx / n_head;
+            let h = row_idx % n_head;
             // Apply scale + mask in one pass.
             for j in 0..n_kv_total {
                 row[j] = row[j] * kq_scale + mask[[t, j]];
             }
             // Optional per-head sink, tracked as a virtual extra column.
-            let sink = attn_sinks.map(|s| s[h]);
+            let sink = attn_sinks_slice.as_ref().map(|s| s[h]);
 
             // Stable softmax over [row[0..n_kv_total], sink?].
             let mut m = f32::NEG_INFINITY;
-            for j in 0..n_kv_total {
-                if row[j] > m {
-                    m = row[j];
+            for &v in row.iter() {
+                if v > m {
+                    m = v;
                 }
             }
             if let Some(sv) = sink {
@@ -105,7 +121,7 @@ pub fn dsv4_masked_attn(
                 for j in 0..n_kv_total {
                     row[j] = 0.0;
                 }
-                continue;
+                return;
             }
             let mut sum = 0.0_f32;
             for j in 0..n_kv_total {
@@ -119,14 +135,13 @@ pub fn dsv4_masked_attn(
                 for j in 0..n_kv_total {
                     row[j] = 0.0;
                 }
-                continue;
+                return;
             }
             let inv = 1.0 / sum;
             for j in 0..n_kv_total {
                 row[j] *= inv;
             }
-        }
-    }
+        });
 
     // 4. softmax_scores @ V → out_flat (batch, head_dim), batched GEMM.
     //    `scores` is now the row-normalised attention weights;
