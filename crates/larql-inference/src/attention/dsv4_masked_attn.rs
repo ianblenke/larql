@@ -17,7 +17,7 @@
 
 use ndarray::{s, Array2, ArrayView1, ArrayView2};
 
-use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_compute::{dot_proj_gpu, matmul_gpu, ComputeBackend};
 
 /// Masked multi-query attention.
 ///
@@ -144,16 +144,11 @@ pub fn dsv4_masked_attn(
         });
 
     // 4. softmax_scores @ V → out_flat (batch, head_dim), batched GEMM.
-    //    `scores` is now the row-normalised attention weights;
-    //    `dot_proj_gpu(scores, V_T_as_rows, …)` computes scores @ V^T,
-    //    but V is (n_kv_total, head_dim) which is the *non-transposed*
-    //    layout. To produce softmax_scores @ V we need
-    //    `matmul_gpu(scores, V)` (no transpose). Equivalently:
-    //    `dot_proj_gpu(scores, V^T, …)` where V^T is (head_dim, n_kv_total)
-    //    — explicit transpose. Use the latter to stay on the same backend
-    //    API surface.
-    let v_t = v.t().as_standard_layout().to_owned();
-    let out_flat = dot_proj_gpu(&scores, &v_t, backend);
+    //    V is (n_kv_total, head_dim) — non-transposed layout — so we use
+    //    `matmul_gpu` directly (no transpose) instead of materialising
+    //    V^T just to feed `dot_proj_gpu`. Saves a per-call copy of
+    //    n_kv_total × head_dim floats.
+    let out_flat = matmul_gpu(&scores, &v, backend);
 
     // 5. Reshape back: (batch, head_dim) → (n_tokens, n_head * head_dim).
     out_flat
