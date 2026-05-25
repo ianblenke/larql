@@ -387,6 +387,7 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
                 &p.compressor,
                 chunk_idx_main,
                 &mut cache.overlap_state,
+                backend,
             );
             let new_main_2d =
                 Array2::<f32>::from_shape_vec((1, p.attn.head_dim), new_main.to_vec())
@@ -408,6 +409,7 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
                 &p.indexer_compressor,
                 chunk_idx_idx,
                 &mut cache.indexer_overlap_state,
+                backend,
             );
             let new_idx_2d =
                 Array2::<f32>::from_shape_vec((1, p.indexer.n_index_head_size), new_idx.to_vec())
