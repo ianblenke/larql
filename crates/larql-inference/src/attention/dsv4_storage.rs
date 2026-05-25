@@ -19,6 +19,8 @@
 
 use ndarray::{Array1, Array2, Array3};
 
+use larql_models::quant::lazy::QuantTensor;
+
 use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights};
 use super::dsv4_attn_block_compress::{DsV4AttnBlockCompressParams, DsV4AttnBlockCompressWeights};
 use super::dsv4_attn_block_indexer::{DsV4AttnBlockIndexerParams, DsV4AttnBlockIndexerWeights};
@@ -115,6 +117,30 @@ pub struct FfnStorage {
     pub gate_shexp: Array2<f32>,
     pub up_shexp: Array2<f32>,
     pub down_shexp: Array2<f32>,
+    // ── Dual storage: resident quantized routed experts ──
+    //
+    // `dsv4-quant-residency` (P1). The routed-MoE expert tensors are
+    // the memory hog: for DSv4-Flash each of gate/up/down_exps is
+    // 256 × 2048 × 4096 f32 ≈ 8.6 GB (≈ 26 GB/layer, ~1.1 TB model).
+    // Holding them as resident `QuantTensor`s over the raw Q4_K bytes
+    // shrinks that to the on-disk footprint (~161 GB model), which is
+    // what makes the model fit in RAM and removes the per-token
+    // streaming reload+dequant the 2026-05-25 bench showed dominates.
+    //
+    // Dual-representation contract (mirrors qwen35's
+    // `ffn_gate_quant` + `ffn_gate`): for each expert tensor exactly
+    // one representation is populated. When `*_quant` is `Some`, the
+    // matching f32 `Array3` is empty (`0×0×0`) and the quant-aware
+    // forward dispatch (P2) reads the `QuantTensor` via
+    // `expert_slice` + lazy-quant matmul. When `*_quant` is `None`
+    // (today's default, and the fallback for any unsupported GGUF
+    // format), the f32 array is populated and the existing f32 path
+    // runs unchanged. The `[n_expert*out_dim, in_dim]` packing of
+    // these `QuantTensor`s is verified against the GGUF layout by
+    // `dsv4_gguf_reader::tests::real_gguf_audit_expert_slice_packing`.
+    pub gate_exps_quant: Option<QuantTensor>,
+    pub up_exps_quant: Option<QuantTensor>,
+    pub down_exps_quant: Option<QuantTensor>,
 }
 
 impl FfnStorage {
@@ -543,6 +569,9 @@ mod tests {
             gate_shexp: Array2::<f32>::from_elem((hidden_shared, n_embd), 0.05),
             up_shexp: Array2::<f32>::from_elem((hidden_shared, n_embd), 0.05),
             down_shexp: Array2::<f32>::from_elem((n_embd, hidden_shared), 0.05),
+            gate_exps_quant: None,
+            up_exps_quant: None,
+            down_exps_quant: None,
         };
         let w = ffn.as_weights();
         assert_eq!(w.ffn_norm.len(), n_embd);
@@ -574,6 +603,9 @@ mod tests {
             gate_shexp: Array2::<f32>::zeros((4, 8)),
             up_shexp: Array2::<f32>::zeros((4, 8)),
             down_shexp: Array2::<f32>::zeros((8, 4)),
+            gate_exps_quant: None,
+            up_exps_quant: None,
+            down_exps_quant: None,
         };
         let w = ffn.as_weights();
         assert!(w.exp_probs_b.is_none());

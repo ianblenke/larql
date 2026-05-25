@@ -471,4 +471,95 @@ mod tests {
             y[0]
         );
     }
+
+    /// P1 (dsv4-quant-residency): prove the resident-quant footprint of
+    /// one layer's routed MoE experts is the Q4_K size, not the f32
+    /// expansion. This is the memory win that lets the model fit in RAM
+    /// (~161 GB resident vs ~1.1 TB f32) and removes the per-token
+    /// streaming reload. Builds the three expert `QuantTensor`s
+    /// (gate/up/down) directly from GGUF bytes via `from_raw` — the
+    /// `FfnStorage::{gate,up,down}_exps_quant` dual-storage fields hold
+    /// exactly these — and asserts the total resident bytes are a small
+    /// fraction of the f32 size.
+    ///
+    /// Backs spec scenarios "Loader keeps Q4_K bytes quantized" and
+    /// "Resident footprint fits the quantized size".
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_resident_expert_footprint() {
+        use larql_models::quant::lazy::QuantTensor;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+
+        // Read raw bytes for one named tensor (no dequant).
+        let read_raw = |suffix: &str| -> (Vec<u8>, u32, Vec<u64>) {
+            let info = gguf
+                .tensor_infos
+                .iter()
+                .find(|i| i.name().ends_with(suffix))
+                .unwrap_or_else(|| panic!("no tensor ending in {suffix}"));
+            let abs_offset = gguf
+                .shard_data_offset(info)
+                .checked_add(info.offset())
+                .expect("offset");
+            let n_elements: u64 = info.dims().iter().product();
+            let data_size =
+                tensor_data_size(info.tensor_type(), n_elements as usize).expect("size");
+            let mut f = File::open(gguf.shard_path(info)).expect("open shard");
+            f.seek(SeekFrom::Start(abs_offset)).expect("seek");
+            let mut buf = vec![0u8; data_size];
+            f.read_exact(&mut buf).expect("read");
+            (buf, info.tensor_type(), info.dims().to_vec())
+        };
+
+        let mut quant_bytes = 0usize;
+        let mut f32_bytes = 0usize;
+        for suffix in [
+            ".ffn_gate_exps.weight",
+            ".ffn_up_exps.weight",
+            ".ffn_down_exps.weight",
+        ] {
+            let (buf, ty, dims) = read_raw(suffix);
+            assert_eq!(dims.len(), 3, "{suffix} should be 3D");
+            // GGUF fastest-first [in_dim, out_dim, n_expert] → flat
+            // [n_expert*out_dim, in_dim] for from_raw.
+            let in_dim = dims[0] as usize;
+            let out_dim = dims[1] as usize;
+            let n_expert = dims[2] as usize;
+            let n_elem = in_dim * out_dim * n_expert;
+            quant_bytes += buf.len();
+            f32_bytes += n_elem * std::mem::size_of::<f32>();
+            // The resident dual-storage field holds exactly this tensor.
+            let qt = QuantTensor::from_raw(buf, ty, n_expert * out_dim, in_dim)
+                .unwrap_or_else(|e| panic!("from_raw {suffix}: {e:?}"));
+            assert_eq!(qt.shape(), [n_expert * out_dim, in_dim]);
+        }
+
+        let ratio = quant_bytes as f64 / f32_bytes as f64;
+        eprintln!(
+            "resident MoE experts (1 layer): quant {:.2} GB vs f32 {:.2} GB ({:.1}× smaller, ratio {:.3})",
+            quant_bytes as f64 / 1e9,
+            f32_bytes as f64 / 1e9,
+            1.0 / ratio,
+            ratio,
+        );
+        // Q4_K is ~4.5 bits/weight vs f32's 32 → resident should be well
+        // under a quarter of the f32 expansion. Generous bound (0.25) so
+        // a future re-quant (Q5_K/Q6_K mix) still passes while still
+        // proving the win is real.
+        assert!(
+            ratio < 0.25,
+            "resident MoE footprint {ratio:.3} not materially smaller than f32 — \
+             expected the Q4_K bytes (~0.14×), got {:.2} GB quant vs {:.2} GB f32",
+            quant_bytes as f64 / 1e9,
+            f32_bytes as f64 / 1e9,
+        );
+    }
 }

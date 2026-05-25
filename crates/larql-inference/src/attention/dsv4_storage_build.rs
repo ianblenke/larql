@@ -277,6 +277,11 @@ pub fn build_layer_storage(
             hp.n_embd,
             hidden_shared,
         )?,
+        // f32 builder: routed experts stay f32 (quant residency is the
+        // opt-in resident loader, a follow-up). dsv4-quant-residency P1.
+        gate_exps_quant: None,
+        up_exps_quant: None,
+        down_exps_quant: None,
     });
 
     if compress_ratio == 0 {

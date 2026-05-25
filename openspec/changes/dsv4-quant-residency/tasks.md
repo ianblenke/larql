@@ -6,8 +6,8 @@
 
 ## 2. P1 — Dual storage + quant-aware loader (no forward change)
 
-- [ ] 2.1 Add `Option<QuantTensor>` fields to `DsV4LayerWeightStorage` (wq_a/wq_b/wkv/wo_a/wo_b) alongside the f32 arrays in `dsv4_storage.rs`
-- [ ] 2.2 Add `Option<QuantTensor>` fields to `FfnStorage` (gate_inp, gate_exps, up_exps, down_exps, shared gate/up/down) alongside f32
+- [ ] 2.1 Add `Option<QuantTensor>` fields to `DsV4LayerWeightStorage` (wq_a/wq_b/wkv/wo_a/wo_b) alongside the f32 arrays in `dsv4_storage.rs` — *deferred to a follow-up; attention weights are tiny (negligible RAM), their quant residency only matters for P4 GPU offload*
+- [x] 2.2 Add `Option<QuantTensor>` fields to `FfnStorage` — done for the routed experts (`gate_exps_quant`/`up_exps_quant`/`down_exps_quant`), the ~26 GB/layer memory hog, alongside the f32 `Array3`s. Dual-representation contract documented on the struct (quant `Some` ⇒ f32 empty). Footprint proven: `real_gguf_resident_expert_footprint` shows 4.18 GB quant vs 25.77 GB f32 per layer (6.2× smaller). Shared-expert + `gate_inp` stay f32 (small) for now.
 - [ ] 2.3 Add `Option<QuantTensor>` for compressor (wkv/wgate) and indexer (wq_b/wproj) and mHC hc_fn — or document they stay f32 (small)
 - [ ] 2.4 Change `dsv4_gguf_reader.rs::read_dsv4_layer_tensors_from_gguf` to return raw bytes + tensor_type for the large weights instead of eagerly dequantizing
 - [ ] 2.5 Update `dsv4_storage_build.rs::build_layer_storage` to build `QuantTensor::from_raw` for supported formats, f32 fallback otherwise
