@@ -252,11 +252,28 @@ mod tests {
     /// default ComputeBackend (CUDA when the `cuda` feature is on +
     /// a CUDA device is present, CPU otherwise).
     ///
-    /// Verifies the GPU lm_head path executes end-to-end on real
-    /// DSv4-Flash weights and produces tokens equivalent to the
-    /// CPU-only run. The lm_head is the dominant matmul cost
-    /// (128 × 129280 × 4096 = 67 GFLOPs); routing it through cuBLAS
-    /// should shave roughly a minute off each call on a 4090.
+    /// Originally added in PR #340 to verify the lm_head GPU path
+    /// end-to-end. As of the PR #339-#361 series, **every matmul-shaped
+    /// hot loop on the DSv4 forward path routes through
+    /// ComputeBackend** — meaning this test now exercises the full GPU
+    /// coverage in a single end-to-end greedy-decode run:
+    ///
+    /// | Path                        | Started routing in |
+    /// |-----------------------------|--------------------|
+    /// | lm_head                     | #339               |
+    /// | Cached HCA Q/KV/O (all 3 variants) | #341 / #342 / #343 |
+    /// | Prefill HCA Q/KV/O (all 3 variants) | #345 / #346 / #347 |
+    /// | grouped_o_proj (vectorized) | #344               |
+    /// | Compressor prefill + cached step | #349 / #356  |
+    /// | Indexer scores              | #350               |
+    /// | Router gate_inp             | #351               |
+    /// | mHC bookend + output head   | #352 / #353        |
+    /// | Shared expert FFN           | #348               |
+    /// | Routed MoE dispatch (scatter-gather + rayon) | #354 / #355 |
+    /// | Masked attention (Q@K^T + softmax@V batched GEMMs) | #358 |
+    /// | Sliding-window attention (delegates to masked) | #359 |
+    /// | masked_attn softmax (rayon)  | #360               |
+    /// | masked_attn second GEMM (matmul_gpu, no V^T copy) | #361 |
     ///
     /// Equivalence claim: greedy decode picks `argmax` over the logits.
     /// CPU and cuBLAS differ only in summation order (parallel reduction
@@ -266,9 +283,7 @@ mod tests {
     /// case at any of the predicted positions this test could become
     /// flaky — relax to `tokens.len() == expected` if that happens.
     ///
-    /// Requires `--features cuda` AND the real GGUF on disk. Wall
-    /// expectation: prefill ~70 s (was ~110 s CPU-only) + 1 decode
-    /// step ~50 s (was ~100 s) — total ~120 s vs ~210 s CPU-only.
+    /// Requires `--features cuda` AND the real GGUF on disk.
     #[test]
     #[cfg(feature = "cuda")]
     #[ignore = "Requires --features cuda + real DSv4-Flash GGUF + CUDA device"]
