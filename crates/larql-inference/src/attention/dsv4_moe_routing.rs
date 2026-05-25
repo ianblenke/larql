@@ -23,6 +23,8 @@
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_moe_ops::{hash_route_lookup, sqrt_softplus};
 
 /// Per-layer routing decisions: which experts each token uses and
@@ -53,6 +55,7 @@ pub fn compute_router_topk(
     n_expert_used: usize,
     normalize: bool,
     scale: f32,
+    backend: Option<&dyn ComputeBackend>,
 ) -> RoutingResult {
     let n_tokens = x.shape()[0];
     let n_embd = x.shape()[1];
@@ -65,17 +68,8 @@ pub fn compute_router_topk(
         "n_expert_used must be in (0, n_expert]"
     );
 
-    // logits[t, e] = sum_d x[t, d] * gate_inp[e, d]
-    let mut logits = Array2::<f32>::zeros((n_tokens, n_expert));
-    for t in 0..n_tokens {
-        for e in 0..n_expert {
-            let mut acc = 0.0_f32;
-            for d in 0..n_embd {
-                acc += x[[t, d]] * gate_inp[[e, d]];
-            }
-            logits[[t, e]] = acc;
-        }
-    }
+    // logits = x @ gate_inp^T → (n_tokens, n_expert), batched through backend.
+    let logits = dot_proj_gpu(&x, &gate_inp, backend);
 
     // probs = sqrt(softplus(logits)) — the pre-bias selection-weight basis.
     let probs = sqrt_softplus(logits.view());
@@ -190,6 +184,7 @@ mod tests {
             n_expert_used,
             false,
             1.0,
+            None,
         );
         assert_eq!(r.indices[[0, 0]], 2);
         assert_eq!(r.indices[[0, 1]], 3);
@@ -218,6 +213,7 @@ mod tests {
             n_expert_used,
             false,
             1.0,
+            None,
         );
         // Selected expert is 2.
         assert_eq!(r.indices[[0, 0]], 2);
@@ -249,6 +245,7 @@ mod tests {
             n_expert_used,
             true,
             1.0,
+            None,
         );
         for t in 0..3 {
             let sum: f32 = (0..n_expert_used).map(|k| r.weights[[t, k]]).sum();
@@ -276,6 +273,7 @@ mod tests {
             n_expert_used,
             true,
             1.0,
+            None,
         );
         let r_scaled = compute_router_topk(
             x.view(),
@@ -285,6 +283,7 @@ mod tests {
             n_expert_used,
             true,
             2.5,
+            None,
         );
         for k in 0..n_expert_used {
             assert!(
@@ -299,6 +298,67 @@ mod tests {
             );
             assert_eq!(r_scaled.indices[[0, k]], r_unscaled.indices[[0, k]]);
         }
+    }
+
+    /// CpuBackend equivalence: compute_router_topk with
+    /// `Some(&CpuBackend)` must match the `None` fallback. Locks in
+    /// the GPU-7d backend-routing wiring on the gate_inp matmul.
+    #[test]
+    fn router_cpu_backend_matches_none_backend() {
+        let n_embd = 16;
+        let n_expert = 8;
+        let n_expert_used = 2;
+        let n_tokens = 4;
+        let x = Array2::<f32>::from_shape_fn((n_tokens, n_embd), |(t, d)| {
+            ((t * 11 + d) as f32 * 0.013).sin()
+        });
+        let gate_inp = Array2::<f32>::from_shape_fn((n_expert, n_embd), |(e, d)| {
+            ((e * 7 + d) as f32 * 0.019).cos() * 0.1
+        });
+
+        let r_none = compute_router_topk(
+            x.view(),
+            gate_inp.view(),
+            None,
+            n_expert,
+            n_expert_used,
+            true,
+            1.0,
+            None,
+        );
+        let cpu = larql_compute::CpuBackend;
+        let r_cpu = compute_router_topk(
+            x.view(),
+            gate_inp.view(),
+            None,
+            n_expert,
+            n_expert_used,
+            true,
+            1.0,
+            Some(&cpu as &dyn ComputeBackend),
+        );
+
+        assert_eq!(r_none.indices.shape(), r_cpu.indices.shape());
+        assert_eq!(r_none.weights.shape(), r_cpu.weights.shape());
+        for t in 0..n_tokens {
+            for k in 0..n_expert_used {
+                assert_eq!(
+                    r_none.indices[[t, k]],
+                    r_cpu.indices[[t, k]],
+                    "indices mismatch at t={t} k={k}"
+                );
+            }
+        }
+        let max_diff = r_none
+            .weights
+            .iter()
+            .zip(r_cpu.weights.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "CpuBackend vs None mismatch on router weights: max_diff={max_diff}"
+        );
     }
 
     /// Hash routing: indices come from the lookup table; weights are uniform.
@@ -348,6 +408,7 @@ mod tests {
             n_expert_used,
             true,
             1.0,
+            None,
         );
         assert_eq!(r.indices.shape(), &[n_tokens, n_expert_used]);
         assert_eq!(r.weights.shape(), &[n_tokens, n_expert_used]);

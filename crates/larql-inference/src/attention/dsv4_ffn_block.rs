@@ -144,6 +144,7 @@ pub fn dsv4_ffn_block(
             p.n_expert_used,
             p.expert_weights_norm,
             p.expert_weights_scale,
+            backend,
         )
     };
 
