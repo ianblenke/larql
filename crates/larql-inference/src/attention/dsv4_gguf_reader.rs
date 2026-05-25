@@ -287,4 +287,188 @@ mod tests {
             "layer 3 should not have ffn_gate_tid2eid (hash routing is first 3 layers)"
         );
     }
+
+    /// P0 audit (dsv4-quant-residency change): enumerate every GGUF
+    /// tensor type DSv4-Flash actually uses and assert that every
+    /// matmul weight is in a format the `QuantTensor` lazy-quant path
+    /// can run resident — Q4_K/Q5_K/Q6_K/Q8_0 (with F32 as the
+    /// small-tensor fallback). Integer tensors (`*.weight` routing
+    /// tables like `ffn_gate_tid2eid`) are read by the separate int
+    /// reader and are excluded from the matmul invariant.
+    ///
+    /// This is the load-bearing precondition for P1/P2: if any large
+    /// weight uses a format `QuantTensor::matvec` cannot dispatch, the
+    /// dual-storage port must route it to the f32 fallback. The test
+    /// prints a full type histogram so any future GGUF re-quant is
+    /// visible, and fails loudly if a new unsupported format appears.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_audit_tensor_types() {
+        use larql_models::quant::ggml::{
+            is_integer_type, type_name, TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0,
+        };
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+
+        // Histogram: tensor_type id → (count, example name).
+        let mut histogram: HashMap<u32, (usize, String)> = HashMap::new();
+        // Matmul weights whose format the lazy-quant path cannot run.
+        let mut unsupported: Vec<(String, u32)> = Vec::new();
+
+        // Formats `QuantTensor::matvec` dispatches (lazy.rs). F32 is the
+        // small-tensor fallback (norms, biases); the K-quants are the
+        // large matmul weights we want resident.
+        let supported = [TYPE_F32, TYPE_Q4_K, TYPE_Q5_K, TYPE_Q6_K, TYPE_Q8_0];
+
+        for info in &gguf.tensor_infos {
+            let ty = info.tensor_type();
+            let entry = histogram
+                .entry(ty)
+                .or_insert_with(|| (0, info.name().to_string()));
+            entry.0 += 1;
+
+            // Integer routing tables (ffn_gate_tid2eid, exp_probs_b ids)
+            // are not matmul weights — the int reader handles them.
+            if is_integer_type(ty) {
+                continue;
+            }
+            if !supported.contains(&ty) {
+                unsupported.push((info.name().to_string(), ty));
+            }
+        }
+
+        // Print the histogram sorted by type id for a stable audit log.
+        let mut types: Vec<u32> = histogram.keys().copied().collect();
+        types.sort_unstable();
+        eprintln!(
+            "DSv4-Flash GGUF tensor-type histogram ({} tensors):",
+            gguf.tensor_infos.len()
+        );
+        for ty in types {
+            let (count, example) = &histogram[&ty];
+            eprintln!(
+                "  {:>10} (id {:>3}): {:>5} tensors  e.g. {example}",
+                type_name(ty),
+                ty,
+                count,
+            );
+        }
+
+        if !unsupported.is_empty() {
+            eprintln!(
+                "{} weight tensor(s) use a format the lazy-quant path cannot run:",
+                unsupported.len()
+            );
+            for (name, ty) in &unsupported {
+                eprintln!("  {name} → {} (id {ty})", type_name(*ty));
+            }
+        }
+
+        assert!(
+            unsupported.is_empty(),
+            "DSv4-Flash uses {} matmul-weight format(s) outside Q4_K/Q5_K/Q6_K/Q8_0/F32 \
+             — these need the f32 fallback in dual storage (see first entry: {:?})",
+            unsupported.len(),
+            unsupported.first(),
+        );
+    }
+
+    /// P0 audit task 1.2 (dsv4-quant-residency): confirm
+    /// `QuantTensor::from_raw` accepts DSv4's MoE expert tensor bytes
+    /// and that `expert_slice` packing matches the GGUF expert layout.
+    ///
+    /// DSv4 packs `ffn_*_exps` 3D as GGUF dims `[in_dim, out_dim,
+    /// n_expert]` (fastest-first), which `from_raw` treats as a flat
+    /// 2D `[n_expert * out_dim, in_dim]`. `expert_slice(e, n_expert)`
+    /// must then yield the per-expert `[out_dim, in_dim]` matrix, and a
+    /// `matvec` against it must run through the lazy-quant kernel
+    /// (no full dequant). This is the precondition for P2 task 3.4
+    /// (MoE dispatch via `expert_slice` instead of per-expert dequant).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_audit_expert_slice_packing() {
+        use larql_models::quant::lazy::QuantTensor;
+        use ndarray::Array1;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+
+        // Find a routed-MoE gate-experts tensor (any layer that has one).
+        let info = gguf
+            .tensor_infos
+            .iter()
+            .find(|i| i.name().ends_with(".ffn_gate_exps.weight"))
+            .expect("DSv4 GGUF has an ffn_gate_exps.weight tensor");
+        let dims = info.dims().to_vec();
+        eprintln!(
+            "{}: dims {:?} type {}",
+            info.name(),
+            dims,
+            larql_models::quant::ggml::type_name(info.tensor_type())
+        );
+        // GGUF stores fastest-first: [in_dim, out_dim, n_expert].
+        assert_eq!(dims.len(), 3, "ffn_gate_exps should be 3D (got {dims:?})");
+        let in_dim = dims[0] as usize;
+        let out_dim = dims[1] as usize;
+        let n_expert = dims[2] as usize;
+        // Flat 2D for from_raw: rows = n_expert * out_dim, cols = in_dim.
+        let rows = n_expert * out_dim;
+        let cols = in_dim;
+
+        // Read the raw quantized bytes (no dequant).
+        let abs_offset = gguf
+            .shard_data_offset(info)
+            .checked_add(info.offset())
+            .expect("offset");
+        let n_elements: u64 = info.dims().iter().product();
+        let data_size = tensor_data_size(info.tensor_type(), n_elements as usize).expect("size");
+        let mut f = File::open(gguf.shard_path(info)).expect("open shard");
+        f.seek(SeekFrom::Start(abs_offset)).expect("seek");
+        let mut buf = vec![0u8; data_size];
+        f.read_exact(&mut buf).expect("read tensor bytes");
+
+        // Build resident QuantTensor directly from GGUF bytes.
+        let qt = QuantTensor::from_raw(buf, info.tensor_type(), rows, cols)
+            .expect("from_raw accepts DSv4 expert tensor");
+        assert_eq!(qt.shape(), [rows, cols]);
+
+        // expert_slice must give the per-expert [out_dim, in_dim] matrix.
+        for e in [0usize, 1, n_expert / 2, n_expert - 1] {
+            let slice = qt.expert_slice(e, n_expert).expect("expert_slice");
+            assert_eq!(
+                slice.shape(),
+                [out_dim, in_dim],
+                "expert {e} slice shape mismatch"
+            );
+        }
+
+        // The lazy-quant matvec must run against a sliced expert without
+        // materializing the full f32 weight.
+        let expert0 = qt.expert_slice(0, n_expert).expect("expert_slice 0");
+        let x = Array1::<f32>::from_elem(in_dim, 0.01);
+        let y = expert0.matvec(&x).expect("matvec on quant expert slice");
+        assert_eq!(y.len(), out_dim);
+        assert!(
+            y.iter().all(|v| v.is_finite()),
+            "matvec produced non-finite output"
+        );
+        eprintln!(
+            "expert_slice OK: n_expert={n_expert} out_dim={out_dim} in_dim={in_dim}; \
+             matvec y[0]={:.5}",
+            y[0]
+        );
+    }
 }

@@ -1,10 +1,10 @@
 {
   "summary": {
-    "capabilities": 54,
-    "requirements": 528,
-    "scenarios": 1551,
+    "capabilities": 55,
+    "requirements": 534,
+    "scenarios": 1564,
     "scenarios_backed": 1345,
-    "scenarios_unbacked": 206,
+    "scenarios_unbacked": 219,
     "test_refs": 3482,
     "test_refs_unresolved": 98
   },
@@ -5333,6 +5333,146 @@
               "unbacked": true,
               "spec_file": "openspec/specs/deploy-cpu-gpu-split/spec.md",
               "line": 83
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsv4-quant-residency",
+      "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+      "requirements": [
+        {
+          "name": "Dual-representation layer storage",
+          "scenarios": [
+            {
+              "name": "Quantized tensor populates the QuantTensor field",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 12
+            },
+            {
+              "name": "Unsupported format falls back to f32",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 20
+            }
+          ]
+        },
+        {
+          "name": "Quantized weights are not eagerly dequantized",
+          "scenarios": [
+            {
+              "name": "Loader keeps Q4_K bytes quantized",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 36
+            },
+            {
+              "name": "Resident footprint fits the quantized size",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 42
+            }
+          ]
+        },
+        {
+          "name": "Quant-aware forward dispatch",
+          "scenarios": [
+            {
+              "name": "Quantized weight uses the lazy-quant path",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 57
+            },
+            {
+              "name": "f32 fallback weight uses the existing path",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 64
+            },
+            {
+              "name": "MoE experts read quantized slices without re-dequant",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 71
+            }
+          ]
+        },
+        {
+          "name": "Resident (non-streaming) model forward",
+          "scenarios": [
+            {
+              "name": "Weights loaded once for multi-step decode",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 87
+            },
+            {
+              "name": "Streaming path retained for oversized models",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 93
+            }
+          ]
+        },
+        {
+          "name": "Quantized forward numerical parity",
+          "scenarios": [
+            {
+              "name": "Logits within tolerance",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 107
+            },
+            {
+              "name": "Greedy tokens match",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 114
+            }
+          ]
+        },
+        {
+          "name": "CPU-FFN / GPU-attention hybrid placement",
+          "scenarios": [
+            {
+              "name": "Attention on GPU, FFN on CPU",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 128
+            },
+            {
+              "name": "Attention weights fit device memory",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+              "line": 136
             }
           ]
         }
@@ -22442,55 +22582,55 @@
     {
       "fqn": "larql_compute::cuda::backend::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2143,
+      "line": 2174,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::driver_missing_returns_typed_error",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2063,
+      "line": 2094,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2128,
+      "line": 2159,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_decode_after_cuda_decode_backend",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2120,
+      "line": 2151,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_f32_gemv_after_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2080,
+      "line": 2111,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_fa2_after_fused_attention",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2105,
+      "line": 2136,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::supports_q4_matvec_after_q4_baseline",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2094,
+      "line": 2125,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::cuda_graph_capture_replay_smoke_test",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2143,
+      "line": 2174,
       "crate": "larql_compute"
     },
     {
       "fqn": "larql_compute::cuda::backend::tests::supports_cuda_oxide_when_feature_enabled",
       "file": "crates/larql-compute/src/cuda/backend.rs",
-      "line": 2128,
+      "line": 2159,
       "crate": "larql_compute"
     },
     {
@@ -25104,6 +25244,18 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_audit_expert_slice_packing",
+      "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
+      "line": 396,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_audit_tensor_types",
+      "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
+      "line": 306,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_loads_ffn_gate_tid2eid",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
       "line": 259,
@@ -25137,6 +25289,18 @@
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_picks_only_requested_layer",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
       "line": 197,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_audit_expert_slice_packing",
+      "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
+      "line": 396,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_audit_tensor_types",
+      "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
+      "line": 306,
       "crate": "larql_inference"
     },
     {
