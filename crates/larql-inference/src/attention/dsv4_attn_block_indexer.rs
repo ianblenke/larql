@@ -179,6 +179,7 @@ pub fn dsv4_attn_block_compress_with_indexer(
         indexer_causal_mask.view(),
         &w.indexer,
         &p.indexer,
+        backend,
     );
 
     // 7. Argsort top-k.
@@ -436,6 +437,7 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
         idx_causal.view(),
         &w.indexer,
         &p.indexer,
+        backend,
     );
 
     // 6. Argsort top-k and sparse mask.

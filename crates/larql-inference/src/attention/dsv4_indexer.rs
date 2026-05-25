@@ -19,6 +19,8 @@
 
 use ndarray::{Array2, ArrayView2, ArrayView3};
 
+use larql_compute::{dot_proj_gpu, ComputeBackend};
+
 use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
 
 /// Per-layer indexer weight refs.
@@ -64,6 +66,7 @@ pub fn build_indexer_scores_prefill(
     causal_mask: ArrayView2<f32>,
     w: &IndexerWeights,
     p: &IndexerParams,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     let n_comp = index_kv.shape()[0];
@@ -91,7 +94,7 @@ pub fn build_indexer_scores_prefill(
     assert_eq!(w.wproj.shape(), &[p.n_index_head, p.n_embd], "wproj shape");
 
     // 1. q = qr @ wq_b^T  →  (n_tokens, n_index_head * n_index_head_size)
-    let q = matmul_x_wt(qr, w.wq_b);
+    let q = dot_proj_gpu(&qr, &w.wq_b, backend);
     //    Tail-RoPE at positions 0..n_tokens-1.
     let q = dsv4_rope_tail(
         &q,
@@ -127,7 +130,7 @@ pub fn build_indexer_scores_prefill(
     }
 
     // 4. weights = x @ wproj^T  →  (n_tokens, n_index_head), scaled.
-    let weights = matmul_x_wt(x, w.wproj);
+    let weights = dot_proj_gpu(&x, &w.wproj, backend);
     let scale = 1.0 / ((p.n_index_head_size * p.n_index_head) as f32).sqrt();
     let mut scaled_weights = Array2::<f32>::zeros((n_tokens, p.n_index_head));
     for t in 0..n_tokens {
@@ -309,6 +312,7 @@ mod tests {
             causal_mask.view(),
             &w,
             &p,
+            None,
         );
         assert_eq!(out.shape(), &[n_tokens, n_comp]);
         assert!(out.iter().all(|v| v.is_finite()));
@@ -352,6 +356,7 @@ mod tests {
             causal_mask.view(),
             &w,
             &p,
+            None,
         );
         // wproj=0 → scaled_weights=0 → score contribution from path is 0.
         // out should equal causal_mask exactly.
@@ -365,6 +370,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CpuBackend equivalence: build_indexer_scores_prefill with
+    /// `Some(&CpuBackend)` must match the `None` fallback to within
+    /// BLAS reduction tolerance. Locks in the GPU-7c backend-routing
+    /// wiring on the wq_b/wproj matmuls.
+    #[test]
+    fn indexer_scores_cpu_backend_matches_none_backend() {
+        let p = IndexerParams {
+            n_embd: 16,
+            q_lora_rank: 12,
+            n_index_head: 2,
+            n_index_head_size: 8,
+            n_rot: 0,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+        };
+        let n_tokens = 5;
+        let n_comp = 4;
+
+        let x = Array2::<f32>::from_shape_fn((n_tokens, p.n_embd), |(t, d)| {
+            ((t * 13 + d) as f32 * 0.011).sin()
+        });
+        let qr = Array2::<f32>::from_shape_fn((n_tokens, p.q_lora_rank), |(t, d)| {
+            ((t * 7 + d) as f32 * 0.017).cos() * 0.1
+        });
+        let index_kv = Array2::<f32>::from_shape_fn((n_comp, p.n_index_head_size), |(c, d)| {
+            ((c * 5 + d) as f32 * 0.013).sin() * 0.1
+        });
+        let wq_b = Array2::<f32>::from_shape_fn(
+            (p.n_index_head * p.n_index_head_size, p.q_lora_rank),
+            |(i, j)| ((i + j) as f32 * 0.013).sin() * 0.1,
+        );
+        let wproj = Array2::<f32>::from_shape_fn((p.n_index_head, p.n_embd), |(i, j)| {
+            ((i + j) as f32 * 0.019).cos() * 0.1
+        });
+        let causal_mask = Array2::<f32>::zeros((n_tokens, n_comp));
+
+        let w = IndexerWeights {
+            wq_b: wq_b.view(),
+            wproj: wproj.view(),
+        };
+
+        let out_none = build_indexer_scores_prefill(
+            x.view(),
+            qr.view(),
+            index_kv.view(),
+            causal_mask.view(),
+            &w,
+            &p,
+            None,
+        );
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = build_indexer_scores_prefill(
+            x.view(),
+            qr.view(),
+            index_kv.view(),
+            causal_mask.view(),
+            &w,
+            &p,
+            Some(&cpu as &dyn ComputeBackend),
+        );
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on indexer scores: max_diff={max_diff}"
+        );
     }
 
     /// Top-k selection picks the indices with the largest scores per row.
