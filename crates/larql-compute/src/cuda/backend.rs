@@ -73,6 +73,16 @@ pub struct CudaBackend {
     /// distinct host buffers with identical bytes still collide
     /// safely.
     f32_norm_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
+    /// Per-content-hash cache of f32 weight matrices used as the `B`
+    /// operand in `matmul` / `matmul_transb`. The DSv4 GPU push
+    /// (PRs #339-#367) threads every matmul through this backend; the
+    /// 2026-05-25 bench showed `dot_proj_gpu` ran at 0.98× CPU speed
+    /// because each call re-uploaded its weight matrix (KB to MB).
+    /// This cache eliminates that re-upload: first call htods, later
+    /// calls borrow the device buffer via `Arc::clone`. Same content
+    /// hash semantics as [`f32_norm_device_cache`] — ptr/len/head/tail
+    /// 64-bit summary; safe for read-only inference weights.
+    f32_weight_device_cache: Mutex<HashMap<DeviceBytesKey, Arc<CudaSlice<f32>>>>,
     /// Per-pointer cache of f16 weight bytes (e.g. tied-embedding
     /// `embeddings.bin` reused as lm_head) converted to device-resident
     /// f32 for cuBLAS GEMV. Avoids re-uploading the 168 MB lm_head
@@ -201,6 +211,7 @@ impl CudaBackend {
             q4k_f16_device_cache: Mutex::new(HashMap::new()),
             q6k_f16_device_cache: Mutex::new(HashMap::new()),
             f32_norm_device_cache: Mutex::new(HashMap::new()),
+            f32_weight_device_cache: Mutex::new(HashMap::new()),
             f16_f32_device_cache: Mutex::new(HashMap::new()),
             qwen35_f32_state_cache: Mutex::new(HashMap::new()),
             decode_scratch: Mutex::new(None),
@@ -643,6 +654,50 @@ impl CudaBackend {
             .f32_norm_device_cache
             .lock()
             .map_err(|_| CudaInitError::DriverMissing("f32 norm cache poisoned".into()))?;
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
+        Ok(Arc::clone(entry))
+    }
+
+    /// Content-keyed device cache for f32 matmul weight matrices.
+    ///
+    /// First call uploads `host` to the device and inserts; later
+    /// calls with the same `(ptr, len, head, tail)` key return the
+    /// same `Arc<CudaSlice<f32>>` without re-uploading.
+    ///
+    /// Used by [`MatMul::matmul`] / [`MatMul::matmul_transb`] for the
+    /// `B` (weight) operand. The 2026-05-25 RTX 4090 bench on
+    /// DSv4-Flash showed that the GPU push was bottlenecked by
+    /// re-uploading B on every call — eliminating that re-upload is
+    /// the change that should move the speedup from 0.98× to >1×.
+    ///
+    /// The cache lives on the backend and grows monotonically across
+    /// the process lifetime. For workloads where weights move
+    /// (training, partial dequant) callers must not use this — but
+    /// for read-only inference (DSv4 / qwen35 / etc.) it's safe.
+    pub(crate) fn arc_f32_weight_device_buf(
+        &self,
+        host: &[f32],
+    ) -> Result<Arc<CudaSlice<f32>>, CudaInitError> {
+        // SAFETY: f32 has no padding; reinterpreting as bytes for a
+        // hash key is well-defined.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(host.as_ptr() as *const u8, std::mem::size_of_val(host))
+        };
+        let key = DeviceBytesKey::from_slice(bytes);
+        {
+            let cache = self
+                .f32_weight_device_cache
+                .lock()
+                .map_err(|_| CudaInitError::DriverMissing("f32 weight cache poisoned".into()))?;
+            if let Some(arc) = cache.get(&key) {
+                return Ok(Arc::clone(arc));
+            }
+        }
+        let arc = Arc::new(self.drv.device_buf_from(host)?);
+        let mut cache = self
+            .f32_weight_device_cache
+            .lock()
+            .map_err(|_| CudaInitError::DriverMissing("f32 weight cache poisoned".into()))?;
         let entry = cache.entry(key).or_insert_with(|| Arc::clone(&arc));
         Ok(Arc::clone(entry))
     }
@@ -1193,16 +1248,88 @@ impl DeviceStateKey {
 
 // ── MatMul: real cuBLAS calls ──────────────────────────────────────────
 
+/// Weight size (in f32 elements) at-or-below which the device cache
+/// is used for the matmul `B` operand. **Default 0 = cache disabled.**
+///
+/// ## Why off by default
+///
+/// The 2026-05-25 RTX 4090 bench (`dsv4_bench_cpu_vs_cuda`) showed
+/// this cache delivers **no measurable win on the DSv4 streaming
+/// forward** and an earlier unbounded version OOM'd the card. Two
+/// reasons it doesn't help the default path:
+///
+/// 1. `dsv4_streaming_model_forward_cached` re-loads + dequantizes
+///    each layer's weights per token and **drops** them between
+///    layers, so the `as_ptr()` cache key changes every call — the
+///    cache always misses. (See [[dsv4-gpu-push]].)
+/// 2. Even where it would hit, the streaming dequant (~30 s/layer)
+///    dominates wall time; matmul htod is noise next to it.
+///
+/// Where it *is* useful: a **non-streaming hybrid** where attention
+/// weights stay resident in host RAM with stable pointers and are
+/// pushed to the GPU once (FFN-on-CPU / attention-on-GPU design).
+/// In that mode set `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS` to e.g.
+/// `4194304` (4 M f32 = 16 MB) — large enough for every attention /
+/// mHC / router / shared-expert weight, small enough to skip the
+/// multi-GB MoE expert tensors that would blow VRAM.
+///
+/// Override at runtime with `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS=N`.
+const DEFAULT_WEIGHT_CACHE_MAX_ELEMS: usize = 0;
+
+fn weight_cache_max_elems() -> usize {
+    std::env::var("LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WEIGHT_CACHE_MAX_ELEMS)
+}
+
+/// Return a device-resident `B` for the matmul, using the weight
+/// cache when (a) the view is contiguous (cache key matches) and
+/// (b) the tensor fits the size threshold.
+fn cached_or_fresh_b(backend: &CudaBackend, b: ArrayView2<f32>) -> Arc<CudaSlice<f32>> {
+    let max_elems = weight_cache_max_elems();
+    match b.as_slice() {
+        Some(b_slice) if max_elems > 0 && b_slice.len() <= max_elems => backend
+            .arc_f32_weight_device_buf(b_slice)
+            .expect("CudaBackend matmul: htod cached b failed"),
+        Some(_) | None => {
+            // Either too large to cache, or non-contiguous (strided/
+            // transposed view; cache key wouldn't match anyway).
+            // Collect-then-upload, no insert into cache.
+            let b_buf = backend.as_contiguous(b);
+            let dev = backend
+                .drv
+                .device_buf_from(&b_buf)
+                .expect("CudaBackend matmul: htod b failed");
+            Arc::new(dev)
+        }
+    }
+}
+
 impl MatMul for CudaBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
         let (m, k) = a.dim();
         let (k2, n) = b.dim();
         assert_eq!(k, k2, "matmul shape mismatch: {a:?} × {b:?}");
 
+        // A is the per-call input — htod fresh. B is the weight —
+        // route through `arc_f32_weight_device_buf` so repeated calls
+        // borrow the same device buffer (this is the bench finding's
+        // critical optimisation: see [[dsv4-gpu-push]]).
         let a_buf = self.as_contiguous(a);
-        let b_buf = self.as_contiguous(b);
-        let out = kernels::matmul(&self.drv, &a_buf, &b_buf, m, n, k)
+        let a_dev = self
+            .drv
+            .device_buf_from(&a_buf)
+            .expect("CudaBackend::matmul: htod a failed");
+        let b_dev = cached_or_fresh_b(self, b);
+
+        let c_dev = kernels::matmul_device_inout(&self.drv, &a_dev, &b_dev, m, n, k)
             .expect("CudaBackend::matmul: cuBLAS failed");
+        self.drv.sync().expect("CudaBackend::matmul: sync failed");
+        let out = self
+            .drv
+            .to_host(&c_dev)
+            .expect("CudaBackend::matmul: dtoh failed");
 
         Array2::from_shape_vec((m, n), out).expect("CudaBackend::matmul: shape mismatch on result")
     }
@@ -1213,10 +1340,25 @@ impl MatMul for CudaBackend {
         let (n, k2) = b.dim();
         assert_eq!(k, k2, "matmul_transb shape mismatch: {a:?} × {b:?}^T");
 
+        // Same caching strategy as `matmul`: A is input (fresh htod),
+        // B is weight (cached). See [[dsv4-gpu-push]] for the bench
+        // result motivating this.
         let a_buf = self.as_contiguous(a);
-        let b_buf = self.as_contiguous(b);
-        let out = kernels::matmul_transb(&self.drv, &a_buf, &b_buf, m, n, k)
+        let a_dev = self
+            .drv
+            .device_buf_from(&a_buf)
+            .expect("CudaBackend::matmul_transb: htod a failed");
+        let b_dev = cached_or_fresh_b(self, b);
+
+        let c_dev = kernels::matmul_transb_device_inout(&self.drv, &a_dev, &b_dev, m, n, k)
             .expect("CudaBackend::matmul_transb: cuBLAS failed");
+        self.drv
+            .sync()
+            .expect("CudaBackend::matmul_transb: sync failed");
+        let out = self
+            .drv
+            .to_host(&c_dev)
+            .expect("CudaBackend::matmul_transb: dtoh failed");
 
         Array2::from_shape_vec((m, n), out)
             .expect("CudaBackend::matmul_transb: shape mismatch on result")

@@ -67,6 +67,43 @@ pub(crate) fn matmul(
     drv.to_host(&c_dev)
 }
 
+/// Device-resident no-transb variant. Mirrors [`matmul_transb_device_inout`].
+/// Caller provides A and B as device slices; this skips htod on both and
+/// returns a device slice for C — only one alloc + one GEMM call.
+///
+/// Shapes match the host variant: A is `m × k` row-major,
+/// B is `k × n` row-major, C is `m × n` row-major.
+pub(crate) fn matmul_device_inout(
+    drv: &Driver,
+    a_dev: &CudaSlice<f32>,
+    b_dev: &CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaSlice<f32>, CudaInitError> {
+    debug_assert_eq!(a_dev.len(), m * k, "A length mismatch");
+    debug_assert_eq!(b_dev.len(), k * n, "B length mismatch");
+    let mut c_dev = drv.device_alloc_uninit(m * n)?;
+    let cfg = GemmConfig {
+        transa: CUBLAS_OP_N,
+        transb: CUBLAS_OP_N,
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        alpha: 1.0_f32,
+        lda: n as i32,
+        ldb: k as i32,
+        beta: 0.0_f32,
+        ldc: n as i32,
+    };
+    unsafe {
+        drv.blas
+            .gemm(cfg, b_dev, a_dev, &mut c_dev)
+            .map_err(|e| CudaInitError::DriverMissing(format!("cublas matmul_device: {e:?}")))?;
+    }
+    Ok(c_dev)
+}
+
 /// Compute row-major `C = A * B^T` where:
 ///   A is `m × k` row-major
 ///   B is `n × k` row-major (transposed naturally by the multiply)
