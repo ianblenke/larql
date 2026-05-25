@@ -15,7 +15,9 @@
 //! the shared single-KV-head layout, which we already build manually
 //! in `dsv4_sliding_window_attn`.
 
-use ndarray::{Array2, ArrayView1, ArrayView2};
+use ndarray::{s, Array2, ArrayView1, ArrayView2};
+
+use larql_compute::{dot_proj_gpu, ComputeBackend};
 
 /// Masked multi-query attention.
 ///
@@ -42,6 +44,7 @@ pub fn dsv4_masked_attn(
     head_dim: usize,
     attn_sinks: Option<ArrayView1<f32>>,
     kq_scale: f32,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = q.shape()[0];
     let n_kv_total = k.shape()[0];
@@ -57,54 +60,90 @@ pub fn dsv4_masked_attn(
         assert_eq!(s.len(), n_head, "attn_sinks must have one entry per head");
     }
 
-    let mut out = Array2::<f32>::zeros((n_tokens, n_head * head_dim));
+    let batch = n_tokens * n_head;
+
+    // 1. Reshape q (n_tokens, n_head*head_dim) → q_flat (batch, head_dim).
+    //    Memory layout matches: same row-major order, q[t, h*head_dim+d] = q_flat[t*n_head+h, d].
+    let q_flat = q
+        .to_owned()
+        .into_shape((batch, head_dim))
+        .expect("q reshape (n_tokens, n_head*head_dim) → (batch, head_dim)");
+
+    // 2. Q_flat @ K^T → scores (batch, n_kv_total), batched GEMM.
+    let mut scores = dot_proj_gpu(&q_flat, &k, backend);
+
+    // 3. Apply mask (broadcast over heads) + scale + optional sinks +
+    //    in-place softmax per row. Append sink as an n_kv_total-th column
+    //    by tracking it alongside; we don't expand the scores tensor.
     for t in 0..n_tokens {
         for h in 0..n_head {
-            let q_off = h * head_dim;
-            // Compute scores: q[t,h] · k[j] * kq_scale + mask[t,j].
-            let mut scores: Vec<f32> = Vec::with_capacity(n_kv_total + 1);
+            let row_idx = t * n_head + h;
+            let mut row = scores.slice_mut(s![row_idx, ..]);
+            // Apply scale + mask in one pass.
             for j in 0..n_kv_total {
-                let mut dot = 0.0_f32;
-                for d in 0..head_dim {
-                    dot += q[[t, q_off + d]] * k[[j, d]];
-                }
-                scores.push(dot * kq_scale + mask[[t, j]]);
+                row[j] = row[j] * kq_scale + mask[[t, j]];
             }
-            if let Some(s) = attn_sinks {
-                scores.push(s[h]);
-            }
+            // Optional per-head sink, tracked as a virtual extra column.
+            let sink = attn_sinks.map(|s| s[h]);
 
-            // Stable softmax. If every score is -∞, contribute zero.
+            // Stable softmax over [row[0..n_kv_total], sink?].
             let mut m = f32::NEG_INFINITY;
-            for &s in &scores {
-                if s > m {
-                    m = s;
+            for j in 0..n_kv_total {
+                if row[j] > m {
+                    m = row[j];
+                }
+            }
+            if let Some(sv) = sink {
+                if sv > m {
+                    m = sv;
                 }
             }
             if !m.is_finite() {
-                // All -∞ → leave out[t, h*..] as zero.
+                // All -∞ → contribute zero. Zero out the score row so
+                // the subsequent scores @ V matmul produces zero too
+                // (current row[j] entries are still -∞ from the mask).
+                for j in 0..n_kv_total {
+                    row[j] = 0.0;
+                }
                 continue;
             }
             let mut sum = 0.0_f32;
-            for s in scores.iter_mut() {
-                *s = (*s - m).exp();
-                sum += *s;
+            for j in 0..n_kv_total {
+                row[j] = (row[j] - m).exp();
+                sum += row[j];
+            }
+            if let Some(sv) = sink {
+                sum += (sv - m).exp();
             }
             if sum == 0.0 {
+                for j in 0..n_kv_total {
+                    row[j] = 0.0;
+                }
                 continue;
             }
             let inv = 1.0 / sum;
-
-            for d in 0..head_dim {
-                let mut acc = 0.0_f32;
-                for (j, &w) in scores.iter().take(n_kv_total).enumerate() {
-                    acc += w * v[[j, d]];
-                }
-                out[[t, q_off + d]] = acc * inv;
+            for j in 0..n_kv_total {
+                row[j] *= inv;
             }
         }
     }
-    out
+
+    // 4. softmax_scores @ V → out_flat (batch, head_dim), batched GEMM.
+    //    `scores` is now the row-normalised attention weights;
+    //    `dot_proj_gpu(scores, V_T_as_rows, …)` computes scores @ V^T,
+    //    but V is (n_kv_total, head_dim) which is the *non-transposed*
+    //    layout. To produce softmax_scores @ V we need
+    //    `matmul_gpu(scores, V)` (no transpose). Equivalently:
+    //    `dot_proj_gpu(scores, V^T, …)` where V^T is (head_dim, n_kv_total)
+    //    — explicit transpose. Use the latter to stay on the same backend
+    //    API surface.
+    let v_t = v.t().as_standard_layout().to_owned();
+    let out_flat = dot_proj_gpu(&scores, &v_t, backend);
+
+    // 5. Reshape back: (batch, head_dim) → (n_tokens, n_head * head_dim).
+    out_flat
+        .into_shape((n_tokens, n_head * head_dim))
+        .expect("out reshape (batch, head_dim) → (n_tokens, n_head*head_dim)")
 }
 
 #[cfg(test)]
@@ -147,6 +186,7 @@ mod tests {
             head_dim,
             None,
             scale,
+            None,
         );
 
         // Reference: full softmax MQA, no mask.
@@ -222,6 +262,7 @@ mod tests {
             head_dim,
             None,
             scale,
+            None,
         );
         let swa = dsv4_sliding_window_attn(
             q.view(),
@@ -263,6 +304,7 @@ mod tests {
             head_dim,
             None,
             1.0,
+            None,
         );
         for d in 0..head_dim {
             assert_eq!(out[[0, d]], 0.0, "all-(-∞) row should produce zero");
@@ -295,6 +337,7 @@ mod tests {
             head_dim,
             None,
             1.0,
+            None,
         );
         // No sinks: q·k=0 → uniform softmax → mean(V)=1.0.
         for v in no_sink.iter() {
@@ -310,6 +353,7 @@ mod tests {
             head_dim,
             Some(sinks.view()),
             1.0,
+            None,
         );
         for v in with_sink.iter() {
             assert!(*v < 1e-10, "dominant sink should starve V output: {v}");
@@ -347,10 +391,70 @@ mod tests {
             head_dim,
             None,
             1.0,
+            None,
         );
         // Token 0: uniform over {1, 3} → mean(10, 30) = 20.
         assert!(approx_eq(out[[0, 0]], 20.0, 1e-5));
         // Token 1: uniform over {0, 4} → mean(0, 40) = 20.
         assert!(approx_eq(out[[1, 0]], 20.0, 1e-5));
+    }
+
+    /// CpuBackend equivalence: vectorized masked attention with
+    /// `Some(&CpuBackend)` must match the `None` fallback. Locks in
+    /// the GPU-10 backend-routing wiring on Q@K^T and softmax@V.
+    #[test]
+    fn cpu_backend_matches_none_backend() {
+        let n_tokens = 4;
+        let n_head = 3;
+        let head_dim = 8;
+        let n_kv = 6;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q = Array2::<f32>::from_shape_fn((n_tokens, n_head * head_dim), |(t, d)| {
+            ((t * 7 + d) as f32 * 0.011).sin()
+        });
+        let k = Array2::<f32>::from_shape_fn((n_kv, head_dim), |(j, d)| {
+            ((j * 5 + d) as f32 * 0.013).cos()
+        });
+        let v = Array2::<f32>::from_shape_fn((n_kv, head_dim), |(j, d)| {
+            ((j * 3 + d) as f32 * 0.017).sin()
+        });
+        let mask = Array2::<f32>::zeros((n_tokens, n_kv));
+        let sinks = Array1::<f32>::from_elem(n_head, -1.0);
+
+        let out_none = dsv4_masked_attn(
+            q.view(),
+            k.view(),
+            v.view(),
+            mask.view(),
+            n_head,
+            head_dim,
+            Some(sinks.view()),
+            scale,
+            None,
+        );
+        let cpu = larql_compute::CpuBackend;
+        let out_cpu = dsv4_masked_attn(
+            q.view(),
+            k.view(),
+            v.view(),
+            mask.view(),
+            n_head,
+            head_dim,
+            Some(sinks.view()),
+            scale,
+            Some(&cpu as &dyn larql_compute::ComputeBackend),
+        );
+
+        assert_eq!(out_none.shape(), out_cpu.shape());
+        let max_diff = out_none
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "CpuBackend vs None mismatch on masked attn: max_diff={max_diff}"
+        );
     }
 }
