@@ -377,6 +377,10 @@ mod tests {
     ///   for the full 43-layer forward)
     /// - `LARQL_DSV4_BENCH_SKIP_CPU=1` — skip the CPU baseline (useful
     ///   when iterating on GPU and the CPU run is too slow)
+    /// - `LARQL_DSV4_BENCH_VERBOSE=1` — print each decode step's wall
+    ///   time individually. Useful for inspecting the warmup-decay
+    ///   curve and sanity-checking whether the step==0 warmup
+    ///   heuristic captures the real cold-start cost.
     ///
     /// VRAM is captured by shelling out to `nvidia-smi
     /// --query-gpu=memory.used --format=csv,noheader,nounits -i 0`
@@ -579,6 +583,7 @@ mod tests {
         //    the lazy weight htod, for CPU it pays first-touch cache
         //    warming. `decode_s` reports steady-state across the
         //    remaining N-1 steps.
+        let verbose = std::env::var("LARQL_DSV4_BENCH_VERBOSE").is_ok();
         let mut tokens = prompt.to_vec();
         let mut warmup_s = 0.0_f64;
         let mut decode_s = 0.0_f64;
@@ -610,6 +615,14 @@ mod tests {
                 warmup_s = dt;
             } else {
                 decode_s += dt;
+            }
+            if verbose {
+                let kind = if step == 0 { "warmup" } else { "steady" };
+                eprintln!(
+                    "[{tag}]     step {step:>3} ({kind}): {:.2}s ({:.1} ms)",
+                    dt,
+                    dt * 1000.0
+                );
             }
         }
         let steady_steps = n_decode.saturating_sub(1).max(1);
