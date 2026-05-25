@@ -238,6 +238,7 @@ pub fn dsv4_compressor_step_coff1(
     w: &CompressorWeights,
     p: &CompressorParams,
     compressed_chunk_index: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> ndarray::Array1<f32> {
     assert!(p.compress_ratio > 0, "compress_ratio must be > 0");
     assert_ne!(
@@ -260,8 +261,8 @@ pub fn dsv4_compressor_step_coff1(
     assert_eq!(w.norm.len(), p.head_dim, "norm length");
 
     // 1. Project chunk to kv and score: each (compress_ratio, head_dim).
-    let kv_chunk = matmul_x_wt(cur_chunk, w.wkv);
-    let mut score_chunk = matmul_x_wt(cur_chunk, w.wgate);
+    let kv_chunk = dot_proj_gpu(&cur_chunk, &w.wkv, backend);
+    let mut score_chunk = dot_proj_gpu(&cur_chunk, &w.wgate, backend);
 
     // 2. Add APE row-wise.
     for r in 0..p.compress_ratio {
@@ -371,6 +372,7 @@ pub fn dsv4_compressor_step_coff2(
     p: &CompressorParams,
     compressed_chunk_index: usize,
     overlap_state: &mut CompressorOverlapState,
+    backend: Option<&dyn ComputeBackend>,
 ) -> ndarray::Array1<f32> {
     assert_eq!(
         p.compress_ratio, 4,
@@ -392,8 +394,8 @@ pub fn dsv4_compressor_step_coff2(
     assert_eq!(w.norm.len(), p.head_dim, "norm length");
 
     // 1. Project chunk to kv and score: each (compress_ratio, 2*head_dim).
-    let kv_chunk = matmul_x_wt(cur_chunk, w.wkv);
-    let mut score_chunk = matmul_x_wt(cur_chunk, w.wgate);
+    let kv_chunk = dot_proj_gpu(&cur_chunk, &w.wkv, backend);
+    let mut score_chunk = dot_proj_gpu(&cur_chunk, &w.wgate, backend);
 
     // 2. Add APE row-wise.
     for r in 0..p.compress_ratio {
@@ -778,7 +780,7 @@ mod tests {
             norm: &norm,
         };
         let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
-        let step = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+        let step = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0, None);
 
         assert_eq!(prefill.shape(), &[1, p.head_dim]);
         assert_eq!(step.shape(), &[p.head_dim]);
@@ -808,8 +810,8 @@ mod tests {
 
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
         let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
-        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0);
-        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1);
+        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0, None);
+        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1, None);
 
         let mut max_diff = 0.0_f32;
         for d in 0..p.head_dim {
@@ -834,8 +836,8 @@ mod tests {
         let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
         let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
-        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0);
-        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1);
+        let step0 = dsv4_compressor_step_coff1(chunk0, &w, &p, 0, None);
+        let step1 = dsv4_compressor_step_coff1(chunk1, &w, &p, 1, None);
 
         let mut max_diff = 0.0_f32;
         for d in 0..p.head_dim {
@@ -873,7 +875,7 @@ mod tests {
             norm: &norm,
         };
         let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
-        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0, None);
     }
 
     /// Wrong chunk shape → panic.
@@ -889,7 +891,7 @@ mod tests {
         };
         // Half-size chunk.
         let chunk = Array2::<f32>::zeros((1, p.n_embd));
-        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0);
+        let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0, None);
     }
 
     // ── dsv4_compressor_step_coff2 tests (compress_ratio == 4) ──
@@ -943,7 +945,7 @@ mod tests {
         };
         let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
         let mut state = CompressorOverlapState::empty();
-        let step = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state);
+        let step = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state, None);
         let mut max_diff = 0.0_f32;
         for d in 0..p.head_dim {
             max_diff = max_diff.max((prefill[[0, d]] - step[d]).abs());
@@ -974,8 +976,8 @@ mod tests {
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
         let chunk1 = full.slice(s![p.compress_ratio..2 * p.compress_ratio, ..]);
         let mut state = CompressorOverlapState::empty();
-        let step0 = dsv4_compressor_step_coff2(chunk0, &w, &p, 0, &mut state);
-        let step1 = dsv4_compressor_step_coff2(chunk1, &w, &p, 1, &mut state);
+        let step0 = dsv4_compressor_step_coff2(chunk0, &w, &p, 0, &mut state, None);
+        let step1 = dsv4_compressor_step_coff2(chunk1, &w, &p, 1, &mut state, None);
 
         let mut max_diff = 0.0_f32;
         for d in 0..p.head_dim {
@@ -1009,7 +1011,7 @@ mod tests {
         let steps: Vec<_> = chunks
             .iter()
             .enumerate()
-            .map(|(c, chunk)| dsv4_compressor_step_coff2(chunk.view(), &w, &p, c, &mut state))
+            .map(|(c, chunk)| dsv4_compressor_step_coff2(chunk.view(), &w, &p, c, &mut state, None))
             .collect();
 
         let mut max_diff = 0.0_f32;
@@ -1036,13 +1038,13 @@ mod tests {
 
         // Run once with empty state.
         let mut state_a = CompressorOverlapState::empty();
-        let out_a = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_a);
+        let out_a = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_a, None);
 
         // Run twice with a state that gets cleared.
         let mut state_b = CompressorOverlapState::empty();
-        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b);
+        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b, None);
         state_b.clear();
-        let out_b = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b);
+        let out_b = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state_b, None);
 
         let mut max_diff = 0.0_f32;
         for d in 0..p.head_dim {
@@ -1077,6 +1079,6 @@ mod tests {
         };
         let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
         let mut state = CompressorOverlapState::empty();
-        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state);
+        let _ = dsv4_compressor_step_coff2(chunk.view(), &w, &p, 0, &mut state, None);
     }
 }

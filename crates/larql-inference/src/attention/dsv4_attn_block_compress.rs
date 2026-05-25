@@ -327,8 +327,13 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
                 }
             }
             let chunk_idx = cache.compressed.current_len();
-            let new_comp =
-                dsv4_compressor_step_coff1(chunk.view(), &w.compressor, &p.compressor, chunk_idx);
+            let new_comp = dsv4_compressor_step_coff1(
+                chunk.view(),
+                &w.compressor,
+                &p.compressor,
+                chunk_idx,
+                backend,
+            );
             // FP8 fake-quantize then append.
             let new_comp_2d =
                 Array2::<f32>::from_shape_vec((1, p.attn.head_dim), new_comp.to_vec())
