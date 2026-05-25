@@ -25712,73 +25712,73 @@
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::all_neg_inf_mask_row_yields_zero",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 301,
+      "line": 296,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 422,
+      "line": 417,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 337,
+      "line": 332,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::sparse_mask_restricts_attention_to_allowed_positions",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 383,
+      "line": 378,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::swa_mask_matches_sliding_window_attn",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 241,
+      "line": 236,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::all_neg_inf_mask_row_yields_zero",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 301,
+      "line": 296,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 422,
+      "line": 417,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 337,
+      "line": 332,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::sparse_mask_restricts_attention_to_allowed_positions",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 383,
+      "line": 378,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::swa_mask_matches_sliding_window_attn",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 241,
+      "line": 236,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::zero_mask_matches_unmasked_mqa",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 177,
+      "line": 172,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::zero_mask_matches_unmasked_mqa",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 177,
+      "line": 172,
       "crate": "larql_inference"
     },
     {
