@@ -468,36 +468,41 @@ mod tests {
             Some(backend.as_ref()),
         );
 
-        // Summary table.
+        // Summary table. `decode_s` is the steady-state wall (decode
+        // steps 2..=n_decode); `warmup_s` is step 1, reported
+        // separately. tok/s_dec is computed over steady-state only.
+        let steady_steps = n_decode.saturating_sub(1).max(1);
         eprintln!();
         eprintln!("=== Summary ===");
         eprintln!(
-            "                {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-            "prefill_s", "decode_s", "ms/tok", "tok/s_dec", "vram_MiB"
+            "                {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "prefill_s", "warmup_s", "decode_s", "ms/tok", "tok/s_dec", "vram_MiB"
         );
         if let Some(p) = &cpu {
             eprintln!(
-                "  cpu          {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
+                "  cpu          {:>10.2}  {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
                 p.prefill_s,
+                p.warmup_s,
                 p.decode_s,
-                1000.0 * p.decode_s / n_decode.max(1) as f64,
-                n_decode as f64 / p.decode_s.max(1e-9),
+                1000.0 * p.decode_s / steady_steps as f64,
+                steady_steps as f64 / p.decode_s.max(1e-9),
                 p.vram_mib
             );
         }
         eprintln!(
-            "  cuda         {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
+            "  cuda         {:>10.2}  {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
             cuda.prefill_s,
+            cuda.warmup_s,
             cuda.decode_s,
-            1000.0 * cuda.decode_s / n_decode.max(1) as f64,
-            n_decode as f64 / cuda.decode_s.max(1e-9),
+            1000.0 * cuda.decode_s / steady_steps as f64,
+            steady_steps as f64 / cuda.decode_s.max(1e-9),
             cuda.vram_mib
         );
         if let Some(p) = &cpu {
             let prefill_speedup = p.prefill_s / cuda.prefill_s.max(1e-9);
             let decode_speedup = p.decode_s / cuda.decode_s.max(1e-9);
             eprintln!(
-                "  cpu/cuda     {:>10.2}x prefill   {:>10.2}x decode",
+                "  cpu/cuda     {:>10.2}x prefill   {:>10.2}x decode (steady-state)",
                 prefill_speedup, decode_speedup
             );
         }
@@ -508,11 +513,16 @@ mod tests {
         assert!(cuda.prefill_s > 0.0);
     }
 
-    /// One backend's measurement: prefill wall + decode wall + VRAM
-    /// snapshot at the end of the run.
+    /// One backend's measurement: prefill wall + warmup decode +
+    /// steady-state decode + VRAM snapshot at the end of the run.
+    /// `decode_s` is the **steady-state** wall (excludes the first
+    /// decode step's warmup cost — first step pays device-resident
+    /// weight load for CUDA / first-touch cache warming for CPU).
+    /// `warmup_s` is reported separately for transparency.
     #[cfg(feature = "cuda")]
     struct BenchPhase {
         prefill_s: f64,
+        warmup_s: f64,
         decode_s: f64,
         vram_mib: u64,
     }
@@ -564,10 +574,15 @@ mod tests {
         );
 
         // 2. Decode loop with argmax (deterministic, cheap; the
-        //    bench measures wall, not sampling behavior).
+        //    bench measures wall, not sampling behavior). The first
+        //    step is timed separately as `warmup` — for CUDA it pays
+        //    the lazy weight htod, for CPU it pays first-touch cache
+        //    warming. `decode_s` reports steady-state across the
+        //    remaining N-1 steps.
         let mut tokens = prompt.to_vec();
-        let t_decode = std::time::Instant::now();
-        for _ in 0..n_decode {
+        let mut warmup_s = 0.0_f64;
+        let mut decode_s = 0.0_f64;
+        for step in 0..n_decode {
             let last = logits.shape()[0] - 1;
             let row = logits.row(last);
             let next = row
@@ -578,6 +593,7 @@ mod tests {
                 .expect("non-empty logits");
             tokens.push(next);
             let pos = tokens.len() - 1;
+            let t_step = std::time::Instant::now();
             logits = dsv4_streaming_model_forward_cached(
                 gguf,
                 hp,
@@ -589,15 +605,23 @@ mod tests {
                 backend,
             )
             .expect("decode step");
+            let dt = t_step.elapsed().as_secs_f64();
+            if step == 0 {
+                warmup_s = dt;
+            } else {
+                decode_s += dt;
+            }
         }
-        let decode_s = t_decode.elapsed().as_secs_f64();
+        let steady_steps = n_decode.saturating_sub(1).max(1);
         let vram_mib = read_nvidia_smi_used_mib();
         eprintln!(
-            "[{tag}]   decode done in {decode_s:.2}s ({n_decode} tokens, {:.1} ms/tok)  vram={vram_mib} MiB",
-            1000.0 * decode_s / n_decode.max(1) as f64
+            "[{tag}]   decode done   warmup={warmup_s:.2}s  steady={decode_s:.2}s ({} steps, {:.1} ms/tok)  vram={vram_mib} MiB",
+            steady_steps,
+            1000.0 * decode_s / steady_steps as f64
         );
         BenchPhase {
             prefill_s,
+            warmup_s,
             decode_s,
             vram_mib,
         }
