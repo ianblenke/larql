@@ -328,6 +328,7 @@ mod tests {
             n_expert_used,
             true,
             1.0,
+            None,
         );
 
         let gate_exps = Array3::<f32>::from_shape_fn((n_expert, n_ff_exp, n_embd), |(e, i, j)| {

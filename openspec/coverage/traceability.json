@@ -24878,49 +24878,49 @@
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 356,
+      "line": 357,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::ffn_block_regular_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 286,
+      "line": 287,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::shared_expert_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 245,
+      "line": 246,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::shared_expert_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 194,
+      "line": 195,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 356,
+      "line": 357,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::ffn_block_regular_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 286,
+      "line": 287,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::shared_expert_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 245,
+      "line": 246,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::shared_expert_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 194,
+      "line": 195,
       "crate": "larql_inference"
     },
     {
@@ -26084,73 +26084,85 @@
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::bias_affects_selection_not_weights",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 203,
+      "line": 198,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::hash_routing_uniform_weights_and_table_dispatch",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 306,
+      "line": 366,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::normalize_yields_sum_to_one",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 237,
+      "line": 233,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_routing::router_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
+      "line": 307,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::router_picks_dominant_expert",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 175,
+      "line": 169,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::scale_multiplies_weights",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 264,
+      "line": 261,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::shapes_consistent_across_paths",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 335,
+      "line": 395,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::bias_affects_selection_not_weights",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 203,
+      "line": 198,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::hash_routing_uniform_weights_and_table_dispatch",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 306,
+      "line": 366,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::normalize_yields_sum_to_one",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 237,
+      "line": 233,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_routing::tests::router_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
+      "line": 307,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::router_picks_dominant_expert",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 175,
+      "line": 169,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::scale_multiplies_weights",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 264,
+      "line": 261,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_routing::tests::shapes_consistent_across_paths",
       "file": "crates/larql-inference/src/attention/dsv4_moe_routing.rs",
-      "line": 335,
+      "line": 395,
       "crate": "larql_inference"
     },
     {
