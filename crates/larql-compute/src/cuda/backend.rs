@@ -1248,21 +1248,33 @@ impl DeviceStateKey {
 
 // ── MatMul: real cuBLAS calls ──────────────────────────────────────────
 
-/// Weight size (in f32 elements) above which the device cache is
-/// bypassed. Caching every weight is unsafe for DSv4 — dequantized
-/// MoE expert weights can be many GB each, blowing the 24 GB 4090
-/// VRAM after only a couple of layers (observed: OOM at ~10 GB).
+/// Weight size (in f32 elements) at-or-below which the device cache
+/// is used for the matmul `B` operand. **Default 0 = cache disabled.**
 ///
-/// 4 M f32 = 16 MB per tensor is the cutoff. Below that, the per-call
-/// htod savings (which is the bench bottleneck) dominate. Above that,
-/// the weight is so large that re-uploading per call is
-/// "comparable" to the GEMM, and caching it costs more VRAM than it
-/// saves bandwidth (especially for MoE experts where each individual
-/// weight is touched only once per (token, expert)).
+/// ## Why off by default
 ///
-/// Override at runtime with `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS=N`
-/// (set to 0 to disable caching entirely).
-const DEFAULT_WEIGHT_CACHE_MAX_ELEMS: usize = 4 * 1024 * 1024;
+/// The 2026-05-25 RTX 4090 bench (`dsv4_bench_cpu_vs_cuda`) showed
+/// this cache delivers **no measurable win on the DSv4 streaming
+/// forward** and an earlier unbounded version OOM'd the card. Two
+/// reasons it doesn't help the default path:
+///
+/// 1. `dsv4_streaming_model_forward_cached` re-loads + dequantizes
+///    each layer's weights per token and **drops** them between
+///    layers, so the `as_ptr()` cache key changes every call — the
+///    cache always misses. (See [[dsv4-gpu-push]].)
+/// 2. Even where it would hit, the streaming dequant (~30 s/layer)
+///    dominates wall time; matmul htod is noise next to it.
+///
+/// Where it *is* useful: a **non-streaming hybrid** where attention
+/// weights stay resident in host RAM with stable pointers and are
+/// pushed to the GPU once (FFN-on-CPU / attention-on-GPU design).
+/// In that mode set `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS` to e.g.
+/// `4194304` (4 M f32 = 16 MB) — large enough for every attention /
+/// mHC / router / shared-expert weight, small enough to skip the
+/// multi-GB MoE expert tensors that would blow VRAM.
+///
+/// Override at runtime with `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS=N`.
+const DEFAULT_WEIGHT_CACHE_MAX_ELEMS: usize = 0;
 
 fn weight_cache_max_elems() -> usize {
     std::env::var("LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS")
