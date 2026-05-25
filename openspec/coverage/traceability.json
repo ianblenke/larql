@@ -25832,49 +25832,61 @@
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::comb_columns_normalize_to_one",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 219,
+      "line": 276,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc_bookend::mhc_pre_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
+      "line": 218,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::pre_and_post_shapes",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 174,
+      "line": 172,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::pre_post_round_trip_finite",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 262,
+      "line": 319,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::tests::comb_columns_normalize_to_one",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 219,
+      "line": 276,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_mhc_bookend::tests::mhc_pre_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
+      "line": 218,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::tests::pre_and_post_shapes",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 174,
+      "line": 172,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::tests::pre_post_round_trip_finite",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 262,
+      "line": 319,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::tests::zero_block_preserves_residual_magnitude_bound",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 308,
+      "line": 365,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_mhc_bookend::zero_block_preserves_residual_magnitude_bound",
       "file": "crates/larql-inference/src/attention/dsv4_mhc_bookend.rs",
-      "line": 308,
+      "line": 365,
       "crate": "larql_inference"
     },
     {

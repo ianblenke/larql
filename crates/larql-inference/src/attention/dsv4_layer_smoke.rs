@@ -296,7 +296,7 @@ mod tests {
             .as_weights();
 
         // 1. mHC pre — collapse 4-stream → 1-stream cur.
-        let pre = dsv4_mhc_pre(residual.view(), &mhc_attn, &mhc_p);
+        let pre = dsv4_mhc_pre(residual.view(), &mhc_attn, &mhc_p, None);
         assert_eq!(pre.cur.shape(), &[n_tokens, n_embd]);
         assert!(pre.cur.iter().all(|v| v.is_finite()), "pre.cur not finite");
 
