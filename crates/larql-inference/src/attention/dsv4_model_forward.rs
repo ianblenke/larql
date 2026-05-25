@@ -75,6 +75,7 @@ pub fn dsv4_hc_head(
     residual: ArrayView3<f32>,
     w: &DsV4HeadWeights,
     p: &DsV4HeadParams,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = residual.shape()[0];
     let n_hc = p.n_hc;
@@ -115,16 +116,7 @@ pub fn dsv4_hc_head(
         }
     }
     // 3. pre = flat @ output_hc_fn^T → (n_tokens, n_hc)
-    let mut pre = Array2::<f32>::zeros((n_tokens, n_hc));
-    for t in 0..n_tokens {
-        for h in 0..n_hc {
-            let mut acc = 0.0_f32;
-            for k in 0..hc_dim {
-                acc += flat[[t, k]] * w.output_hc_fn[[h, k]];
-            }
-            pre[[t, h]] = acc;
-        }
-    }
+    let mut pre = dot_proj_gpu(&flat, &w.output_hc_fn, backend);
     // 4. pre *= output_hc_scale (broadcast across all)
     for v in pre.iter_mut() {
         *v *= w.output_hc_scale;
@@ -215,7 +207,7 @@ pub fn dsv4_model_forward<'a, 'p>(
     }
 
     // 4. mHC head → 1-stream pooled.
-    let mut pooled = dsv4_hc_head(residual.view(), head, head_params);
+    let mut pooled = dsv4_hc_head(residual.view(), head, head_params, backend);
 
     // 5. Final RMSNorm.
     for t in 0..n_tokens {
@@ -307,7 +299,7 @@ mod tests {
             norm_eps: 1e-5,
             hc_eps: 1e-5,
         };
-        let pooled = dsv4_hc_head(residual.view(), &head_w, &head_p);
+        let pooled = dsv4_hc_head(residual.view(), &head_w, &head_p, None);
         assert_eq!(pooled.shape(), &[n_tokens, n_embd]);
         assert!(pooled.iter().all(|v| v.is_finite()));
     }
@@ -1059,7 +1051,7 @@ mod tests {
         // ── Head: residual → pooled → logits ──
         let head_w = head.as_weights();
         let head_p = head.params(&hp);
-        let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p);
+        let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p, None);
         let n_embd = hp.n_embd;
         for t in 0..n_tokens {
             let mut sumsq = 0.0_f32;
