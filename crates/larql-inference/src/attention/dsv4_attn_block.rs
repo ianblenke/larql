@@ -175,31 +175,6 @@ pub fn dsv4_attn_block_no_compress(
     )
 }
 
-/// `out[t, k] = sum_j x[t, j] * w[k, j]` — i.e. `x @ w^T`.
-fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
-    let n_tokens = x.shape()[0];
-    let n_in = x.shape()[1];
-    let n_out = w.shape()[0];
-    assert_eq!(
-        w.shape()[1],
-        n_in,
-        "matmul_x_wt: w second dim ({}) must equal x second dim ({})",
-        w.shape()[1],
-        n_in
-    );
-    let mut out = Array2::<f32>::zeros((n_tokens, n_out));
-    for t in 0..n_tokens {
-        for k in 0..n_out {
-            let mut acc = 0.0_f32;
-            for j in 0..n_in {
-                acc += x[[t, j]] * w[[k, j]];
-            }
-            out[[t, k]] = acc;
-        }
-    }
-    out
-}
-
 /// RMSNorm along axis 1 (per-row) with a learned per-feature gain weight.
 /// `out[t, d] = x[t, d] / sqrt(mean(x[t, :]^2) + eps) * weight[d]`.
 fn rms_norm_2d(x: ArrayView2<f32>, weight: &[f32], eps: f32) -> Array2<f32> {

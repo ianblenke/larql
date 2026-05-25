@@ -235,25 +235,6 @@ pub fn build_compressed_mask_from_topk(
     mask
 }
 
-/// `out[t, k] = sum_j x[t, j] * w[k, j]` (= `x @ w^T`).
-fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
-    let n_tokens = x.shape()[0];
-    let n_in = x.shape()[1];
-    let n_out = w.shape()[0];
-    assert_eq!(w.shape()[1], n_in);
-    let mut out = Array2::<f32>::zeros((n_tokens, n_out));
-    for t in 0..n_tokens {
-        for k in 0..n_out {
-            let mut acc = 0.0_f32;
-            for j in 0..n_in {
-                acc += x[[t, j]] * w[[k, j]];
-            }
-            out[[t, k]] = acc;
-        }
-    }
-    out
-}
-
 // Unused import workaround: we expose ArrayView3 only via the public
 // builder; this re-export keeps the existing IndexerWeights doc happy
 // without forcing callers to pull ArrayView3 in scope.

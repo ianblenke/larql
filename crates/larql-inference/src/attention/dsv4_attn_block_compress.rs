@@ -469,24 +469,6 @@ fn rms_norm_per_head(x: ArrayView2<f32>, n_head: usize, head_dim: usize, eps: f3
     out
 }
 
-fn matmul_x_wt(x: ArrayView2<f32>, w: ArrayView2<f32>) -> Array2<f32> {
-    let n_tokens = x.shape()[0];
-    let n_in = x.shape()[1];
-    let n_out = w.shape()[0];
-    assert_eq!(w.shape()[1], n_in);
-    let mut out = Array2::<f32>::zeros((n_tokens, n_out));
-    for t in 0..n_tokens {
-        for k in 0..n_out {
-            let mut acc = 0.0_f32;
-            for j in 0..n_in {
-                acc += x[[t, j]] * w[[k, j]];
-            }
-            out[[t, k]] = acc;
-        }
-    }
-    out
-}
-
 // Silence unused-Axis warning if codegen ever drops the import.
 #[allow(dead_code)]
 fn _axis_marker(_: Axis) {}
