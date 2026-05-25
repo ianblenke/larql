@@ -25892,85 +25892,85 @@
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::broadcast_to_streams_replicates",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 266,
+      "line": 258,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::embed_picks_vocab_row",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 254,
+      "line": 246,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::hc_head_shape_and_finite",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 281,
+      "line": 273,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::model_forward_two_layers_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 318,
+      "line": 310,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_2_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 589,
+      "line": 581,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_mixed_variant_3_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 703,
+      "line": 695,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_streaming_5_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 889,
+      "line": 881,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::broadcast_to_streams_replicates",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 266,
+      "line": 258,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::embed_picks_vocab_row",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 254,
+      "line": 246,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::hc_head_shape_and_finite",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 281,
+      "line": 273,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::model_forward_two_layers_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 318,
+      "line": 310,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_2_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 589,
+      "line": 581,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_mixed_variant_3_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 703,
+      "line": 695,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_streaming_5_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 889,
+      "line": 881,
       "crate": "larql_inference"
     },
     {

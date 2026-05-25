@@ -249,7 +249,7 @@ pub fn dsv4_streaming_model_forward(
     }
 
     // 3. mHC head → 1-stream pooled.
-    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p);
+    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p, backend);
 
     // 4. Final RMSNorm.
     let n_tokens = token_ids.len();
@@ -348,7 +348,7 @@ pub fn dsv4_streaming_model_forward_cached(
         );
     }
 
-    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p);
+    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p, backend);
 
     let n_tokens = token_ids.len();
     let n_embd = hp.n_embd;
