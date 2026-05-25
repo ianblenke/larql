@@ -103,41 +103,55 @@ pub fn dsv4_moe_dispatch(
         }
     }
 
+    // Per-expert map: gather + 3 batched matmuls + SwiGLU. Independent
+    // across experts → parallelise via rayon. With CPU backend
+    // (`None`) this gives a CPU-side speedup on multi-core hosts; with
+    // a CUDA backend, the cuBLAS calls serialize on the device anyway
+    // so the parallelism only benefits the gather + activation steps.
+    use rayon::prelude::*;
+    let per_expert_outputs: Vec<(usize, Array2<f32>)> = buckets
+        .par_iter()
+        .enumerate()
+        .filter(|(_, positions)| !positions.is_empty())
+        .map(|(e, positions)| {
+            let bucket_size = positions.len();
+
+            // Gather x rows into a contiguous (bucket_size, n_embd) tensor.
+            let mut bucket_x = Array2::<f32>::zeros((bucket_size, n_embd));
+            for (b, &(t, _)) in positions.iter().enumerate() {
+                bucket_x.row_mut(b).assign(&x.row(t));
+            }
+
+            // Slice per-expert weight matrices.
+            // gate_exps[e]: (n_ff_exp, n_embd), up_exps[e]: (n_ff_exp, n_embd),
+            // down_exps[e]: (n_embd, n_ff_exp).
+            let gate_e = w.gate_exps.slice(s![e, .., ..]);
+            let up_e = w.up_exps.slice(s![e, .., ..]);
+            let down_e = w.down_exps.slice(s![e, .., ..]);
+
+            // Two batched matmuls: gate, up → (bucket_size, n_ff_exp) each.
+            let g = dot_proj_gpu(&bucket_x, &gate_e, backend);
+            let u = dot_proj_gpu(&bucket_x, &up_e, backend);
+
+            // SwiGLU activation per row.
+            let mut inter = Array2::<f32>::zeros((bucket_size, n_ff_exp));
+            for b in 0..bucket_size {
+                let activated = clamped_swiglu_row(g.row(b), u.row(b), swiglu_limit);
+                inter.row_mut(b).assign(&activated);
+            }
+
+            // Third batched matmul: down → (bucket_size, n_embd).
+            let d = dot_proj_gpu(&inter, &down_e, backend);
+            (e, d)
+        })
+        .collect();
+
+    // Sequential scatter: each token can receive contributions from up
+    // to `n_expert_used` experts; using `+=` on `out` requires
+    // exclusive access to avoid write races, so this stays sequential.
     let mut out = Array2::<f32>::zeros((n_tokens, n_embd));
-    for (e, positions) in buckets.iter().enumerate() {
-        if positions.is_empty() {
-            continue;
-        }
-        let bucket_size = positions.len();
-
-        // Gather x rows into a contiguous (bucket_size, n_embd) tensor.
-        let mut bucket_x = Array2::<f32>::zeros((bucket_size, n_embd));
-        for (b, &(t, _)) in positions.iter().enumerate() {
-            bucket_x.row_mut(b).assign(&x.row(t));
-        }
-
-        // Slice per-expert weight matrices.
-        // gate_exps[e]: (n_ff_exp, n_embd), up_exps[e]: (n_ff_exp, n_embd),
-        // down_exps[e]: (n_embd, n_ff_exp).
-        let gate_e = w.gate_exps.slice(s![e, .., ..]);
-        let up_e = w.up_exps.slice(s![e, .., ..]);
-        let down_e = w.down_exps.slice(s![e, .., ..]);
-
-        // Two batched matmuls: gate, up → (bucket_size, n_ff_exp) each.
-        let g = dot_proj_gpu(&bucket_x, &gate_e, backend);
-        let u = dot_proj_gpu(&bucket_x, &up_e, backend);
-
-        // SwiGLU activation per row.
-        let mut inter = Array2::<f32>::zeros((bucket_size, n_ff_exp));
-        for b in 0..bucket_size {
-            let activated = clamped_swiglu_row(g.row(b), u.row(b), swiglu_limit);
-            inter.row_mut(b).assign(&activated);
-        }
-
-        // Third batched matmul: down → (bucket_size, n_embd).
-        let d = dot_proj_gpu(&inter, &down_e, backend);
-
-        // Scatter weighted contributions back to out.
+    for (e, d) in per_expert_outputs.iter() {
+        let positions = &buckets[*e];
         for (b, &(t, weight)) in positions.iter().enumerate() {
             for h in 0..n_embd {
                 out[[t, h]] += weight * d[[b, h]];
