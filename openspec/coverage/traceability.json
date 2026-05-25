@@ -24182,97 +24182,97 @@
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::block_finite_and_nontrivial_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 356,
+      "line": 358,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::block_first_row_position_zero_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 517,
+      "line": 519,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::block_with_and_without_sinks_differs",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 432,
+      "line": 434,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::cached_full_prefill_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 702,
+      "line": 704,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::cached_head_dim_mismatch_panics",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 831,
+      "line": 833,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::cached_position_offset_mismatch_panics",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 808,
+      "line": 810,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::cached_prefill_then_decode_equals_full_cached",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 748,
+      "line": 750,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::prefill_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 566,
+      "line": 568,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::block_finite_and_nontrivial_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 356,
+      "line": 358,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::block_first_row_position_zero_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 517,
+      "line": 519,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::block_with_and_without_sinks_differs",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 432,
+      "line": 434,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::cached_full_prefill_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 702,
+      "line": 704,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::cached_head_dim_mismatch_panics",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 831,
+      "line": 833,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::cached_position_offset_mismatch_panics",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 808,
+      "line": 810,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::cached_prefill_then_decode_equals_full_cached",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 748,
+      "line": 750,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_attn_block::tests::prefill_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_attn_block.rs",
-      "line": 566,
+      "line": 568,
       "crate": "larql_inference"
     },
     {
@@ -25712,25 +25712,25 @@
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::all_neg_inf_mask_row_yields_zero",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 285,
+      "line": 286,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 406,
+      "line": 407,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 321,
+      "line": 322,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::sparse_mask_restricts_attention_to_allowed_positions",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 367,
+      "line": 368,
       "crate": "larql_inference"
     },
     {
@@ -25742,25 +25742,25 @@
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::all_neg_inf_mask_row_yields_zero",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 285,
+      "line": 286,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 406,
+      "line": 407,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 321,
+      "line": 322,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_masked_attn::tests::sparse_mask_restricts_attention_to_allowed_positions",
       "file": "crates/larql-inference/src/attention/dsv4_masked_attn.rs",
-      "line": 367,
+      "line": 368,
       "crate": "larql_inference"
     },
     {
@@ -26864,73 +26864,73 @@
     {
       "fqn": "larql_inference::attention::dsv4_swa::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 324,
+      "line": 313,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::large_window_matches_causal_mqa",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 175,
+      "line": 161,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::position_offset_matches_sequential",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 373,
+      "line": 364,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::shape_and_finiteness",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 139,
+      "line": 124,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::dominant_sink_collapses_output",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 324,
+      "line": 313,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::large_window_matches_causal_mqa",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 175,
+      "line": 161,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::position_offset_matches_sequential",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 373,
+      "line": 364,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::shape_and_finiteness",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 139,
+      "line": 124,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::window_excludes_far_past",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 282,
+      "line": 270,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::tests::window_one_attends_only_to_self",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 237,
+      "line": 224,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::window_excludes_far_past",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 282,
+      "line": 270,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_swa::window_one_attends_only_to_self",
       "file": "crates/larql-inference/src/attention/dsv4_swa.rs",
-      "line": 237,
+      "line": 224,
       "crate": "larql_inference"
     },
     {

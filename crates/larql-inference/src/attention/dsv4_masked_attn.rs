@@ -274,6 +274,7 @@ mod tests {
             None,
             scale,
             0,
+            None,
         );
         for (a, b) in masked.iter().zip(swa.iter()) {
             assert!((a - b).abs() < 1e-5, "masked={a} swa={b}");

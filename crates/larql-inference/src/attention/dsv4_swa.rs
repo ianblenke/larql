@@ -24,6 +24,10 @@
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
+use larql_compute::ComputeBackend;
+
+use super::dsv4_masked_attn::dsv4_masked_attn;
+
 /// Sliding-window multi-query attention with optional attention sinks.
 ///
 /// Inputs:
@@ -52,6 +56,7 @@ pub fn dsv4_sliding_window_attn(
     attn_sinks: Option<ArrayView1<f32>>,
     kq_scale: f32,
     position_offset: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     let n_tokens = q.shape()[0];
     assert_eq!(
@@ -71,8 +76,12 @@ pub fn dsv4_sliding_window_attn(
     assert!(window_size > 0, "window_size must be positive");
 
     let n_kv_total = k.shape()[0];
-    let mut out = Array2::<f32>::zeros((n_tokens, n_head * head_dim));
 
+    // Build the explicit sliding-window + causal mask and forward to
+    // the vectorized dsv4_masked_attn (GPU-10). Same numerics as the
+    // prior per-token-per-head loop — the `swa_mask_matches_sliding_window_attn`
+    // parity test pins this — but with two batched GEMMs instead.
+    let mut mask = Array2::<f32>::from_elem((n_tokens, n_kv_total), f32::NEG_INFINITY);
     for t in 0..n_tokens {
         let abs_pos = position_offset + t;
         assert!(
@@ -80,47 +89,23 @@ pub fn dsv4_sliding_window_attn(
             "query at abs_pos={abs_pos} but KV only has {n_kv_total} rows"
         );
         let j_lo = abs_pos.saturating_sub(window_size - 1);
-        let j_hi = abs_pos; // inclusive
-        let window_len = j_hi - j_lo + 1;
-
-        for h in 0..n_head {
-            let q_off = h * head_dim;
-
-            let mut scores: Vec<f32> = Vec::with_capacity(window_len + 1);
-            for j in j_lo..=j_hi {
-                let mut acc = 0.0_f32;
-                for d in 0..head_dim {
-                    acc += q[[t, q_off + d]] * k[[j, d]];
-                }
-                scores.push(acc * kq_scale);
-            }
-            if let Some(s) = attn_sinks {
-                scores.push(s[h]);
-            }
-
-            let mut m = f32::NEG_INFINITY;
-            for &s in &scores {
-                if s > m {
-                    m = s;
-                }
-            }
-            let mut sum = 0.0_f32;
-            for s in scores.iter_mut() {
-                *s = (*s - m).exp();
-                sum += *s;
-            }
-            let inv = 1.0 / sum;
-
-            for d in 0..head_dim {
-                let mut acc = 0.0_f32;
-                for (idx, j) in (j_lo..=j_hi).enumerate() {
-                    acc += scores[idx] * v[[j, d]];
-                }
-                out[[t, q_off + d]] = acc * inv;
-            }
+        let j_hi = abs_pos;
+        for j in j_lo..=j_hi {
+            mask[[t, j]] = 0.0;
         }
     }
-    out
+
+    dsv4_masked_attn(
+        q,
+        k,
+        v,
+        mask.view(),
+        n_head,
+        head_dim,
+        attn_sinks,
+        kq_scale,
+        backend,
+    )
 }
 
 #[cfg(test)]
@@ -163,6 +148,7 @@ mod tests {
             None,
             1.0 / (head_dim as f32).sqrt(),
             0,
+            None,
         );
         assert_eq!(out.shape(), &[n_tokens, n_head * head_dim]);
         assert!(out.iter().all(|x| x.is_finite()));
@@ -199,6 +185,7 @@ mod tests {
             None,
             scale,
             0,
+            None,
         );
 
         // Reference: manual causal MQA, no window.
@@ -259,6 +246,7 @@ mod tests {
             None,
             scale,
             0,
+            None,
         );
         for t in 0..n_tokens {
             for h in 0..n_head {
@@ -304,6 +292,7 @@ mod tests {
             None,
             scale,
             4, // abs position of q[0] is 4
+            None,
         );
         assert!(
             approx_eq(out[[0, 0]], 0.0, 1e-3),
@@ -343,6 +332,7 @@ mod tests {
             None,
             scale,
             0,
+            None,
         );
         for v in no_sink.iter() {
             assert!(approx_eq(*v, 1.0, 1e-5), "no-sink uniform softmax: {v}");
@@ -360,6 +350,7 @@ mod tests {
             Some(sinks.view()),
             scale,
             0,
+            None,
         );
         for v in with_sink.iter() {
             assert!(*v < 1e-10, "dominant sink should starve V output: {v}");
@@ -397,6 +388,7 @@ mod tests {
             None,
             scale,
             0,
+            None,
         );
 
         // Single-token at offset=4 — same Q row.
@@ -415,6 +407,7 @@ mod tests {
             None,
             scale,
             4,
+            None,
         );
 
         let row_full = out_full.row(4).to_vec();
