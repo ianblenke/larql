@@ -1,8 +1,8 @@
 ## 1. P0 — Audit & groundwork
 
-- [ ] 1.1 Enumerate the GGUF tensor types DSv4-Flash actually uses (dump `tensor_type` per tensor); confirm all large matmul weights are Q4_K/Q5_K/Q6_K/Q8_0, and list any format needing the f32 fallback
-- [ ] 1.2 Confirm `QuantTensor::from_raw` accepts each of those formats and that `expert_slice` packing matches DSv4's `[n_expert, n_ff_exp, n_embd]` expert layout (write a tiny unit test in larql-models or larql-inference)
-- [ ] 1.3 Decide the resident-RAM gate: document the host RAM requirement (~161 GB → ≥192 GB host) and how callers opt into resident vs streaming
+- [x] 1.1 Enumerate the GGUF tensor types DSv4-Flash actually uses (dump `tensor_type` per tensor); confirm all large matmul weights are Q4_K/Q5_K/Q6_K/Q8_0, and list any format needing the f32 fallback — `real_gguf_audit_tensor_types` in `dsv4_gguf_reader.rs`. Result: F32 (684, norms/small), Q4_K (598, large matmul weights), Q6_K (43, output/lm_head), I32 (3, routing tables handled by the int reader). **No format needs an unexpected f32 fallback** — every matmul weight is Q4_K/Q6_K, both lazy-quant-supported.
+- [x] 1.2 Confirm `QuantTensor::from_raw` accepts each of those formats and that `expert_slice` packing matches DSv4's expert layout — `real_gguf_audit_expert_slice_packing` in `dsv4_gguf_reader.rs`. Result: `ffn_gate_exps` GGUF dims `[in_dim=4096, out_dim=2048, n_expert=256]` → `from_raw` flat `[n_expert*out_dim=524288, in_dim=4096]`; `expert_slice(e, 256)` yields `[2048, 4096]` per expert; `matvec` runs on a slice with finite output (no full dequant). Same `[n_expert*out_dim, in_dim]` packing as qwen35.
+- [x] 1.3 Decide the resident-RAM gate: document the host RAM requirement (~161 GB → ≥192 GB host) and how callers opt into resident vs streaming — captured in design D4 (resident forward is a *new* entry point; `dsv4_streaming_model_forward_cached` retained for model-exceeds-RAM) and the spec's "Streaming path retained for oversized models" scenario. Caller opt-in is an explicit resident-forward constructor, not a silent default (design Risks: "gate the resident path on an explicit caller choice").
 
 ## 2. P1 — Dual storage + quant-aware loader (no forward change)
 
