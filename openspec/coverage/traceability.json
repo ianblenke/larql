@@ -25070,7 +25070,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_generate::generate_real_gguf_with_default_backend_matches_cpu",
       "file": "crates/larql-inference/src/attention/dsv4_generate.rs",
-      "line": 275,
+      "line": 290,
       "crate": "larql_inference"
     },
     {
@@ -25088,7 +25088,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_generate::tests::generate_real_gguf_with_default_backend_matches_cpu",
       "file": "crates/larql-inference/src/attention/dsv4_generate.rs",
-      "line": 275,
+      "line": 290,
       "crate": "larql_inference"
     },
     {
