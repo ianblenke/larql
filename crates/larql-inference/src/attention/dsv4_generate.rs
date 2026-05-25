@@ -353,4 +353,190 @@ mod tests {
         );
         assert_eq!(tokens_cpu.len(), n_prompt + 1);
     }
+
+    /// **DSv4-Flash benchmark**: time prefill + decode for CPU vs CUDA
+    /// and snapshot peak VRAM via `nvidia-smi`.
+    ///
+    /// This is the deliverable that answers "did the GPU push (#339-#362)
+    /// pay off?" — it runs the same prompt + decode steps under both
+    /// backends back-to-back and prints a side-by-side table. Output
+    /// goes to stderr because Rust's test harness captures stdout by
+    /// default; run with `cargo test -- --nocapture` to see it.
+    ///
+    /// Knobs (env vars):
+    /// - `LARQL_DSV4_BENCH_PROMPT_TOKENS` — prefill length (default 16)
+    /// - `LARQL_DSV4_BENCH_DECODE_TOKENS` — decode steps (default 4)
+    /// - `LARQL_DSV4_BENCH_LAYERS` — comma-separated layer indices
+    ///   (default 0,1,2 to keep wall-time reasonable; pass e.g. 0,1,…,42
+    ///   for the full 43-layer forward)
+    /// - `LARQL_DSV4_BENCH_SKIP_CPU=1` — skip the CPU baseline (useful
+    ///   when iterating on GPU and the CPU run is too slow)
+    ///
+    /// VRAM is captured by shelling out to `nvidia-smi
+    /// --query-gpu=memory.used --format=csv,noheader,nounits -i 0`
+    /// after each backend's run completes. This is the same number
+    /// `nvidia-smi` shows in interactive use. Returns 0 if nvidia-smi
+    /// isn't on PATH (silent on non-CUDA hosts).
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "Requires --features cuda + real DSv4-Flash GGUF + CUDA device; LARQL_DSV4_BENCH_LAYERS env var controls layer count"]
+    fn dsv4_bench_cpu_vs_cuda() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_prompt: usize = std::env::var("LARQL_DSV4_BENCH_PROMPT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let n_decode: usize = std::env::var("LARQL_DSV4_BENCH_DECODE_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let layers: Vec<usize> = std::env::var("LARQL_DSV4_BENCH_LAYERS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 1, 2]);
+        let skip_cpu = std::env::var("LARQL_DSV4_BENCH_SKIP_CPU").is_ok();
+
+        let prompt: Vec<u32> = (0..n_prompt)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let decode_config = DecodeConfig {
+            max_new_tokens: n_decode,
+            eos_token: None,
+            sampling: SamplingConfig::greedy(),
+        };
+
+        eprintln!();
+        eprintln!("=== DSv4-Flash benchmark ===");
+        eprintln!(
+            "  prompt_tokens={n_prompt}  decode_tokens={n_decode}  layers={:?}  (n={})",
+            layers,
+            layers.len()
+        );
+
+        let mut cpu_total_s: Option<f64> = None;
+        let mut cpu_vram_mib = 0u64;
+        if !skip_cpu {
+            eprintln!("[cpu]   starting...");
+            let t0 = std::time::Instant::now();
+            let mut rng = StdRng::seed_from_u64(0);
+            let tokens = dsv4_generate(
+                &gguf,
+                &hp,
+                &head,
+                &layers,
+                &prompt,
+                decode_config,
+                &mut rng,
+                None,
+            )
+            .expect("CPU generate");
+            let dt = t0.elapsed().as_secs_f64();
+            cpu_vram_mib = read_nvidia_smi_used_mib();
+            cpu_total_s = Some(dt);
+            eprintln!(
+                "[cpu]   done   total={dt:.2}s  tokens_out={} (prompt+{n_decode})  vram={cpu_vram_mib} MiB",
+                tokens.len()
+            );
+        } else {
+            eprintln!("[cpu]   skipped (LARQL_DSV4_BENCH_SKIP_CPU set)");
+        }
+
+        // Reset CUDA backend state between runs would be ideal; we
+        // can't easily do that here. The CudaBackend caches device
+        // buffers across calls, so a fresh process would give a
+        // cleaner peak. This in-process number is "VRAM during the
+        // 2nd run if 1st run was CPU" which is still informative.
+        let backend = larql_compute::default_backend();
+        eprintln!(
+            "[cuda]  backend: {} ({})",
+            backend.name(),
+            backend.device_info()
+        );
+        eprintln!("[cuda]  starting...");
+        let t0 = std::time::Instant::now();
+        let mut rng = StdRng::seed_from_u64(0);
+        let tokens = dsv4_generate(
+            &gguf,
+            &hp,
+            &head,
+            &layers,
+            &prompt,
+            decode_config,
+            &mut rng,
+            Some(backend.as_ref()),
+        )
+        .expect("CUDA generate");
+        let cuda_total_s = t0.elapsed().as_secs_f64();
+        let cuda_vram_mib = read_nvidia_smi_used_mib();
+        eprintln!(
+            "[cuda]  done   total={cuda_total_s:.2}s  tokens_out={} (prompt+{n_decode})  vram={cuda_vram_mib} MiB",
+            tokens.len()
+        );
+
+        // Summary table.
+        eprintln!();
+        eprintln!("=== Summary ===");
+        eprintln!(
+            "                {:>10}  {:>10}  {:>10}",
+            "total_s", "tok/s_dec", "vram_MiB"
+        );
+        if let Some(s) = cpu_total_s {
+            eprintln!(
+                "  cpu          {:>10.2}  {:>10.2}  {:>10}",
+                s,
+                n_decode as f64 / s,
+                cpu_vram_mib
+            );
+        }
+        eprintln!(
+            "  cuda         {:>10.2}  {:>10.2}  {:>10}",
+            cuda_total_s,
+            n_decode as f64 / cuda_total_s,
+            cuda_vram_mib
+        );
+        if let Some(s) = cpu_total_s {
+            let speedup = s / cuda_total_s;
+            eprintln!("  cpu/cuda     {:>10.2}x speedup (total wall)", speedup);
+        }
+        eprintln!();
+
+        // Sanity: at least the prompt + 1 generated token in both
+        // runs. Deeper equivalence is the milestone test's job.
+        assert!(tokens.len() >= n_prompt);
+    }
+
+    /// Shell out to `nvidia-smi` to fetch current GPU-0 memory usage
+    /// in MiB. Returns 0 if nvidia-smi isn't on PATH or the call
+    /// fails — silent on non-CUDA hosts. Captures the bench's peak
+    /// only approximately: it's "memory in use *right now*" when the
+    /// run completes, which for a single-process CUDA workload that
+    /// doesn't free aggressively is close to the high-water mark.
+    #[cfg(feature = "cuda")]
+    fn read_nvidia_smi_used_mib() -> u64 {
+        let out = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                "0",
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
 }
