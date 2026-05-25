@@ -213,6 +213,7 @@ pub fn dsv4_attn_block_compress_with_indexer(
         p.attn.head_dim,
         w.attn.attn_sinks,
         scale,
+        backend,
     );
 
     grouped_o_proj(
@@ -476,6 +477,7 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
         p.attn.head_dim,
         w.attn.attn_sinks,
         scale,
+        backend,
     );
 
     // 11. Grouped o-proj.
