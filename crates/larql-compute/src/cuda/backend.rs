@@ -1248,6 +1248,52 @@ impl DeviceStateKey {
 
 // ── MatMul: real cuBLAS calls ──────────────────────────────────────────
 
+/// Weight size (in f32 elements) above which the device cache is
+/// bypassed. Caching every weight is unsafe for DSv4 — dequantized
+/// MoE expert weights can be many GB each, blowing the 24 GB 4090
+/// VRAM after only a couple of layers (observed: OOM at ~10 GB).
+///
+/// 4 M f32 = 16 MB per tensor is the cutoff. Below that, the per-call
+/// htod savings (which is the bench bottleneck) dominate. Above that,
+/// the weight is so large that re-uploading per call is
+/// "comparable" to the GEMM, and caching it costs more VRAM than it
+/// saves bandwidth (especially for MoE experts where each individual
+/// weight is touched only once per (token, expert)).
+///
+/// Override at runtime with `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS=N`
+/// (set to 0 to disable caching entirely).
+const DEFAULT_WEIGHT_CACHE_MAX_ELEMS: usize = 4 * 1024 * 1024;
+
+fn weight_cache_max_elems() -> usize {
+    std::env::var("LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WEIGHT_CACHE_MAX_ELEMS)
+}
+
+/// Return a device-resident `B` for the matmul, using the weight
+/// cache when (a) the view is contiguous (cache key matches) and
+/// (b) the tensor fits the size threshold.
+fn cached_or_fresh_b(backend: &CudaBackend, b: ArrayView2<f32>) -> Arc<CudaSlice<f32>> {
+    let max_elems = weight_cache_max_elems();
+    match b.as_slice() {
+        Some(b_slice) if max_elems > 0 && b_slice.len() <= max_elems => backend
+            .arc_f32_weight_device_buf(b_slice)
+            .expect("CudaBackend matmul: htod cached b failed"),
+        Some(_) | None => {
+            // Either too large to cache, or non-contiguous (strided/
+            // transposed view; cache key wouldn't match anyway).
+            // Collect-then-upload, no insert into cache.
+            let b_buf = backend.as_contiguous(b);
+            let dev = backend
+                .drv
+                .device_buf_from(&b_buf)
+                .expect("CudaBackend matmul: htod b failed");
+            Arc::new(dev)
+        }
+    }
+}
+
 impl MatMul for CudaBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
         let (m, k) = a.dim();
@@ -1263,22 +1309,7 @@ impl MatMul for CudaBackend {
             .drv
             .device_buf_from(&a_buf)
             .expect("CudaBackend::matmul: htod a failed");
-        let b_dev = match b.as_slice() {
-            Some(b_slice) => self
-                .arc_f32_weight_device_buf(b_slice)
-                .expect("CudaBackend::matmul: htod cached b failed"),
-            None => {
-                // Non-contiguous view (transposed/strided) — collect then
-                // upload, skip the cache (ptr/len key wouldn't match
-                // future calls anyway).
-                let b_buf = self.as_contiguous(b);
-                let dev = self
-                    .drv
-                    .device_buf_from(&b_buf)
-                    .expect("CudaBackend::matmul: htod b failed");
-                std::sync::Arc::new(dev)
-            }
-        };
+        let b_dev = cached_or_fresh_b(self, b);
 
         let c_dev = kernels::matmul_device_inout(&self.drv, &a_dev, &b_dev, m, n, k)
             .expect("CudaBackend::matmul: cuBLAS failed");
@@ -1305,19 +1336,7 @@ impl MatMul for CudaBackend {
             .drv
             .device_buf_from(&a_buf)
             .expect("CudaBackend::matmul_transb: htod a failed");
-        let b_dev = match b.as_slice() {
-            Some(b_slice) => self
-                .arc_f32_weight_device_buf(b_slice)
-                .expect("CudaBackend::matmul_transb: htod cached b failed"),
-            None => {
-                let b_buf = self.as_contiguous(b);
-                let dev = self
-                    .drv
-                    .device_buf_from(&b_buf)
-                    .expect("CudaBackend::matmul_transb: htod b failed");
-                std::sync::Arc::new(dev)
-            }
-        };
+        let b_dev = cached_or_fresh_b(self, b);
 
         let c_dev = kernels::matmul_transb_device_inout(&self.drv, &a_dev, &b_dev, m, n, k)
             .expect("CudaBackend::matmul_transb: cuBLAS failed");
