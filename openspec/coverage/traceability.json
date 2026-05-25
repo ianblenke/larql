@@ -25974,51 +25974,63 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_moe_dispatch::moe_dispatch_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
+      "line": 386,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::route_then_dispatch_finite_nonzero",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 310,
+      "line": 334,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::single_expert_unit_weight_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 142,
+      "line": 163,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::moe_dispatch_cpu_backend_matches_none_backend",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
+      "line": 386,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::route_then_dispatch_finite_nonzero",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 310,
+      "line": 334,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::single_expert_unit_weight_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 142,
+      "line": 163,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::weighted_sum_linearity",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 206,
+      "line": 227,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::zero_weights_produces_zero_output",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 281,
+      "line": 305,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::weighted_sum_linearity",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 206,
+      "line": 227,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::zero_weights_produces_zero_output",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 281,
+      "line": 305,
       "crate": "larql_inference"
     },
     {

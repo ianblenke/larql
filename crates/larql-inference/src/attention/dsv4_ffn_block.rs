@@ -113,10 +113,10 @@ pub struct Dsv4FfnParams {
 /// Run the full DSv4 FFN block. `token_ids` is required only when
 /// `weights.gate_tid2eid` is `Some(_)` (hash-routing layer).
 ///
-/// `backend` routes the shared-expert FFN's gate/up/down matmuls
-/// through the optional compute backend. As of GPU-7a, the routed
-/// MoE dispatch is still all-CPU per-token; threading backend through
-/// it is a follow-up.
+/// `backend` routes the router gate_inp matmul (GPU-7d), the
+/// scatter-gather routed MoE dispatch (GPU-8 — per-expert gate / up /
+/// down), and the shared-expert FFN gate / up / down (GPU-7a) through
+/// the optional compute backend.
 pub fn dsv4_ffn_block(
     x: ArrayView2<f32>,
     w: &Dsv4FfnWeights,
@@ -149,7 +149,7 @@ pub fn dsv4_ffn_block(
     };
 
     // 3. Routed MoE dispatch.
-    let moe_out = dsv4_moe_dispatch(cur.view(), &routing, &w.moe, p.routed_swiglu_limit);
+    let moe_out = dsv4_moe_dispatch(cur.view(), &routing, &w.moe, p.routed_swiglu_limit, backend);
 
     // 4. Shared expert FFN.
     let shared_out = dsv4_shared_expert_ffn(cur.view(), &w.shared, p.shared_swiglu_limit, backend);
