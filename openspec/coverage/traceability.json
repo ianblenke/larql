@@ -25058,7 +25058,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda",
       "file": "crates/larql-inference/src/attention/dsv4_generate.rs",
-      "line": 389,
+      "line": 393,
       "crate": "larql_inference"
     },
     {
@@ -25082,7 +25082,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_generate::tests::dsv4_bench_cpu_vs_cuda",
       "file": "crates/larql-inference/src/attention/dsv4_generate.rs",
-      "line": 389,
+      "line": 393,
       "crate": "larql_inference"
     },
     {
