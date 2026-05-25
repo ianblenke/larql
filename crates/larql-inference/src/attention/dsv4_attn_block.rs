@@ -160,6 +160,7 @@ pub fn dsv4_attn_block_no_compress(
         w.attn_sinks,
         scale,
         position_offset,
+        backend,
     );
 
     // 6. Grouped low-rank output projection → (n_tokens, n_embd).
@@ -326,6 +327,7 @@ pub fn dsv4_attn_block_no_compress_cached(
         w.attn_sinks,
         scale,
         position_offset,
+        backend,
     );
 
     // 7. Grouped low-rank o-proj.
