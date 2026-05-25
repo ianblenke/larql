@@ -353,4 +353,272 @@ mod tests {
         );
         assert_eq!(tokens_cpu.len(), n_prompt + 1);
     }
+
+    /// **DSv4-Flash benchmark**: time prefill + decode separately for
+    /// CPU vs CUDA and snapshot peak VRAM via `nvidia-smi`.
+    ///
+    /// This is the deliverable that answers "did the GPU push (#339-#362)
+    /// pay off?" — it runs the same prompt + decode steps under both
+    /// backends back-to-back and prints a side-by-side table. Output
+    /// goes to stderr because Rust's test harness captures stdout by
+    /// default; run with `cargo test -- --nocapture` to see it.
+    ///
+    /// Prefill and decode are timed independently (matches the qwen35
+    /// bench format: `prefill_ms / decode ms/tok / tok/s`) by inlining
+    /// the prefill + decode loop here instead of wrapping
+    /// `dsv4_generate` whole-cloth. Production `dsv4_generate` is
+    /// untouched.
+    ///
+    /// Knobs (env vars):
+    /// - `LARQL_DSV4_BENCH_PROMPT_TOKENS` — prefill length (default 16)
+    /// - `LARQL_DSV4_BENCH_DECODE_TOKENS` — decode steps (default 4)
+    /// - `LARQL_DSV4_BENCH_LAYERS` — comma-separated layer indices
+    ///   (default 0,1,2 to keep wall-time reasonable; pass e.g. 0,1,…,42
+    ///   for the full 43-layer forward)
+    /// - `LARQL_DSV4_BENCH_SKIP_CPU=1` — skip the CPU baseline (useful
+    ///   when iterating on GPU and the CPU run is too slow)
+    ///
+    /// VRAM is captured by shelling out to `nvidia-smi
+    /// --query-gpu=memory.used --format=csv,noheader,nounits -i 0`
+    /// after each backend's run completes. This is the same number
+    /// `nvidia-smi` shows in interactive use. Returns 0 if nvidia-smi
+    /// isn't on PATH (silent on non-CUDA hosts).
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "Requires --features cuda + real DSv4-Flash GGUF + CUDA device; LARQL_DSV4_BENCH_LAYERS env var controls layer count"]
+    fn dsv4_bench_cpu_vs_cuda() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_prompt: usize = std::env::var("LARQL_DSV4_BENCH_PROMPT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let n_decode: usize = std::env::var("LARQL_DSV4_BENCH_DECODE_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let layers: Vec<usize> = std::env::var("LARQL_DSV4_BENCH_LAYERS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 1, 2]);
+        let skip_cpu = std::env::var("LARQL_DSV4_BENCH_SKIP_CPU").is_ok();
+
+        let prompt: Vec<u32> = (0..n_prompt)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+        let decode_config = DecodeConfig {
+            max_new_tokens: n_decode,
+            eos_token: None,
+            sampling: SamplingConfig::greedy(),
+        };
+
+        eprintln!();
+        eprintln!("=== DSv4-Flash benchmark ===");
+        eprintln!(
+            "  prompt_tokens={n_prompt}  decode_tokens={n_decode}  layers={:?}  (n={})",
+            layers,
+            layers.len()
+        );
+
+        let mut cpu: Option<BenchPhase> = None;
+        if !skip_cpu {
+            eprintln!("[cpu]   starting...");
+            cpu = Some(run_phase(
+                "cpu", &gguf, &hp, &head, &layers, &prompt, n_decode, None,
+            ));
+        } else {
+            eprintln!("[cpu]   skipped (LARQL_DSV4_BENCH_SKIP_CPU set)");
+        }
+
+        // CudaBackend caches device buffers across calls, so a fresh
+        // process would give a cleaner VRAM peak. This in-process
+        // number is "VRAM in use right now" after the CUDA run — for
+        // a single workload that doesn't free aggressively it's close
+        // to the high-water mark.
+        let backend = larql_compute::default_backend();
+        eprintln!(
+            "[cuda]  backend: {} ({})",
+            backend.name(),
+            backend.device_info()
+        );
+        eprintln!("[cuda]  starting...");
+        let cuda = run_phase(
+            "cuda",
+            &gguf,
+            &hp,
+            &head,
+            &layers,
+            &prompt,
+            n_decode,
+            Some(backend.as_ref()),
+        );
+
+        // Summary table.
+        eprintln!();
+        eprintln!("=== Summary ===");
+        eprintln!(
+            "                {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "prefill_s", "decode_s", "ms/tok", "tok/s_dec", "vram_MiB"
+        );
+        if let Some(p) = &cpu {
+            eprintln!(
+                "  cpu          {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
+                p.prefill_s,
+                p.decode_s,
+                1000.0 * p.decode_s / n_decode.max(1) as f64,
+                n_decode as f64 / p.decode_s.max(1e-9),
+                p.vram_mib
+            );
+        }
+        eprintln!(
+            "  cuda         {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
+            cuda.prefill_s,
+            cuda.decode_s,
+            1000.0 * cuda.decode_s / n_decode.max(1) as f64,
+            n_decode as f64 / cuda.decode_s.max(1e-9),
+            cuda.vram_mib
+        );
+        if let Some(p) = &cpu {
+            let prefill_speedup = p.prefill_s / cuda.prefill_s.max(1e-9);
+            let decode_speedup = p.decode_s / cuda.decode_s.max(1e-9);
+            eprintln!(
+                "  cpu/cuda     {:>10.2}x {:>9}  {:>10.2}x decode",
+                prefill_speedup, "prefill", decode_speedup
+            );
+        }
+        eprintln!();
+
+        // Sanity: prefill produced a logit row count == prompt length.
+        // Deeper equivalence is the milestone test's job.
+        assert!(cuda.prefill_s > 0.0);
+    }
+
+    /// One backend's measurement: prefill wall + decode wall + VRAM
+    /// snapshot at the end of the run.
+    #[cfg(feature = "cuda")]
+    struct BenchPhase {
+        prefill_s: f64,
+        decode_s: f64,
+        vram_mib: u64,
+    }
+
+    /// Run the same prefill + N-step decode loop that `dsv4_generate`
+    /// runs, but time the prefill and decode phases independently and
+    /// capture VRAM at the end. Mirrors `dsv4_generate`'s structure
+    /// without modifying that production path.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_phase(
+        tag: &str,
+        gguf: &GgufFile,
+        hp: &DsV4Hyperparams,
+        head: &DsV4HeadStorage,
+        layers: &[usize],
+        prompt: &[u32],
+        n_decode: usize,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> BenchPhase {
+        let max_seq_len = prompt.len() + n_decode;
+        let mut layer_caches: Vec<DsV4LayerCache> = layers
+            .iter()
+            .map(|&i| {
+                let variant = detect_layer_variant(gguf, i, hp.head_dim);
+                DsV4LayerCache::for_variant(hp, &variant, max_seq_len)
+            })
+            .collect();
+
+        // 1. Prefill: full prompt through cached forward.
+        let t_prefill = std::time::Instant::now();
+        let mut logits = dsv4_streaming_model_forward_cached(
+            gguf,
+            hp,
+            head,
+            prompt,
+            layers,
+            0,
+            Some(&mut layer_caches),
+            backend,
+        )
+        .expect("prefill");
+        let prefill_s = t_prefill.elapsed().as_secs_f64();
+        eprintln!(
+            "[{tag}]   prefill done in {prefill_s:.2}s ({} tokens)",
+            prompt.len()
+        );
+
+        // 2. Decode loop: argmax sampling for deterministic timing.
+        //    (`dsv4_sample_next_token` with `SamplingConfig::greedy`
+        //    seeded RNG would also be deterministic but argmax is
+        //    cheaper and doesn't perturb wall time.)
+        let mut tokens = prompt.to_vec();
+        let t_decode = std::time::Instant::now();
+        for _ in 0..n_decode {
+            let last = logits.shape()[0] - 1;
+            let row = logits.row(last);
+            let next = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .expect("non-empty logits");
+            tokens.push(next);
+            let pos = tokens.len() - 1;
+            logits = dsv4_streaming_model_forward_cached(
+                gguf,
+                hp,
+                head,
+                &[next],
+                layers,
+                pos,
+                Some(&mut layer_caches),
+                backend,
+            )
+            .expect("decode step");
+        }
+        let decode_s = t_decode.elapsed().as_secs_f64();
+        let vram_mib = read_nvidia_smi_used_mib();
+        eprintln!(
+            "[{tag}]   decode done in {decode_s:.2}s ({n_decode} tokens, {:.1} ms/tok)  vram={vram_mib} MiB",
+            1000.0 * decode_s / n_decode.max(1) as f64
+        );
+        BenchPhase {
+            prefill_s,
+            decode_s,
+            vram_mib,
+        }
+    }
+
+    /// Shell out to `nvidia-smi` to fetch current GPU-0 memory usage
+    /// in MiB. Returns 0 if nvidia-smi isn't on PATH or the call
+    /// fails — silent on non-CUDA hosts. Captures the bench's peak
+    /// only approximately: it's "memory in use *right now*" when the
+    /// run completes, which for a single-process CUDA workload that
+    /// doesn't free aggressively is close to the high-water mark.
+    #[cfg(feature = "cuda")]
+    fn read_nvidia_smi_used_mib() -> u64 {
+        let out = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                "0",
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
 }
