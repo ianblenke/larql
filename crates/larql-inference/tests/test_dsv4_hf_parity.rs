@@ -50,8 +50,7 @@ use larql_inference::attention::dsv4_topk_logits::dsv4_topk_logits;
 use larql_models::loading::gguf::GgufFile;
 use serde::Deserialize;
 
-const GGUF_PATH: &str =
-    "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf";
+const GGUF_PATH: &str = "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf";
 const DEFAULT_REF: &str = "crates/larql-inference/tests/goldens/dsv4_flash_hf_reference.json";
 
 /// DSv4-Flash is 43 transformer blocks (matches the full-model streaming
@@ -102,7 +101,10 @@ fn dsv4_forward_matches_hf_reference() {
     let reference: HfReference =
         serde_json::from_str(&std::fs::read_to_string(&ref_path).expect("read reference dump"))
             .expect("parse reference dump JSON");
-    assert!(!reference.token_ids.is_empty(), "reference has no token_ids");
+    assert!(
+        !reference.token_ids.is_empty(),
+        "reference has no token_ids"
+    );
     assert!(!reference.top_k.is_empty(), "reference has no top_k");
 
     let gguf = GgufFile::open(gguf_path).expect("open DSv4 GGUF");
