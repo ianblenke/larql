@@ -211,6 +211,17 @@ pub fn build_vindex_streaming(
     // Check expert format from the architecture
     let expert_format = arch.expert_format();
 
+    // Per-expert SVD-summary tier (opt-in). The CLI's
+    // `--summary-features-per-expert` flag threads K here as an env var
+    // (see `extract_index_cmd`) so this streaming gate path can read it
+    // without an API break. When set, each expert's gate matrix is
+    // compressed to its top-K right singular vectors instead of writing
+    // the full `[intermediate, hidden]` rows — `K × hidden` per expert.
+    let summary_k: Option<usize> = std::env::var("LARQL_SUMMARY_FEATURES_PER_EXPERT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0);
+
     // Skip the per-layer gate loop entirely on resume.
     let layer_count_for_loop = if resumed_gate { 0 } else { num_layers };
     for layer in 0..layer_count_for_loop {
@@ -309,10 +320,30 @@ pub fn build_vindex_streaming(
                 };
 
                 if let Some(tensor) = get_tensor_f32(&shard_mmaps, &tensor_index, &gate_key)? {
-                    features_per_expert = tensor.shape()[0];
-                    total_features += features_per_expert;
-                    let data = tensor.as_slice().unwrap();
-                    layer_bytes += write_floats(&mut gate_file, data, dtype)?;
+                    let out_features = tensor.shape()[0];
+                    // Summary tier: replace the full gate matrix with its
+                    // top-K right singular vectors (`[K, hidden]`) when K
+                    // is set and actually reduces the row count.
+                    match summary_k {
+                        Some(k) if k < out_features => {
+                            let summary = crate::extract::moe_svd::top_k_right_singular_vectors(
+                                tensor.view(),
+                                k,
+                                4, // power-iteration rounds (see moe_svd docs)
+                                ((layer as u64) << 32) | expert as u64,
+                            );
+                            features_per_expert = k;
+                            total_features += k;
+                            let data = summary.as_slice().expect("svd output is contiguous");
+                            layer_bytes += write_floats(&mut gate_file, data, dtype)?;
+                        }
+                        _ => {
+                            features_per_expert = out_features;
+                            total_features += out_features;
+                            let data = tensor.as_slice().unwrap();
+                            layer_bytes += write_floats(&mut gate_file, data, dtype)?;
+                        }
+                    }
                 }
             }
 

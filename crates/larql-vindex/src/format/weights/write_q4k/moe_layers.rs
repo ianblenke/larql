@@ -176,7 +176,14 @@ fn build_per_expert_entries(
             let mut gate_up_f32 = Vec::with_capacity(gate_f32.len() + up_f32.len());
             gate_up_f32.extend_from_slice(&gate_f32);
             gate_up_f32.extend_from_slice(&up_f32);
-            (quantize_f32(&gate_up_f32, fmt)?, None)
+            // Pad hidden → 256-element boundary, same as `down` below.
+            // gate_up is [2*moe_inter, hidden] row-major; block formats
+            // (Q4_K/Q6_K) quantize each row in 256-element super-blocks,
+            // so the input width must be 256-aligned. No-op when `hidden`
+            // is already a multiple of 256 (every real model), so this
+            // only affects sub-256 synthetic fixtures.
+            let (gate_up_padded, _) = pad_cols_to_256(&gate_up_f32, 2 * moe_inter, hidden);
+            (quantize_f32(&gate_up_padded, fmt)?, None)
         };
 
         // Resolve down bytes + format.
