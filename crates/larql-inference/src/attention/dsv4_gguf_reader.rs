@@ -118,6 +118,99 @@ pub fn read_dsv4_layer_tensors_from_gguf(
     Ok(out)
 }
 
+/// A routed-MoE expert tensor read straight from the GGUF as its raw
+/// quantized bytes, plus the metadata `QuantTensor::from_raw` needs.
+///
+/// `rows`/`cols` are the flat 2D `[n_expert * out_dim, in_dim]` shape
+/// (GGUF stores the tensor 3D fastest-first as `[in_dim, out_dim,
+/// n_expert]`). This is exactly the packing `QuantTensor::expert_slice`
+/// expects, verified against the real GGUF by
+/// [`tests::real_gguf_audit_expert_slice_packing`].
+pub struct RawExpertTensor {
+    pub bytes: Vec<u8>,
+    pub tensor_type: u32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Read the routed-MoE expert tensors (`ffn_gate_exps`, `ffn_up_exps`,
+/// `ffn_down_exps`) for `layer_index` as **raw quantized bytes** —
+/// without dequantizing.
+///
+/// This is the resident-quant (`dsv4-quant-residency`) counterpart to
+/// [`read_dsv4_layer_tensors_from_gguf`]: the bytes are handed to
+/// `QuantTensor::from_raw`, so the ~26 GB/layer f32 expansion of these
+/// tensors is never allocated. Only 3D expert tensors are returned; any
+/// kind absent for the layer is simply not in the map (e.g. a dense
+/// layer with no routed experts).
+pub fn read_dsv4_layer_raw_expert_tensors_from_gguf(
+    gguf: &GgufFile,
+    layer_index: usize,
+) -> Result<HashMap<DsV4TensorKind, RawExpertTensor>, ModelError> {
+    let want: HashMap<String, DsV4TensorKind> = [
+        DsV4TensorKind::FfnGateExps,
+        DsV4TensorKind::FfnUpExps,
+        DsV4TensorKind::FfnDownExps,
+    ]
+    .into_iter()
+    .map(|k| (tensor_name_of(k, layer_index), k))
+    .collect();
+
+    let mut out: HashMap<DsV4TensorKind, RawExpertTensor> = HashMap::new();
+    let mut shard_files: HashMap<usize, File> = HashMap::new();
+    for info in &gguf.tensor_infos {
+        let Some(&kind) = want.get(info.name()) else {
+            continue;
+        };
+        let dims = info.dims();
+        if dims.len() != 3 {
+            return Err(ModelError::Parse(format!(
+                "DSv4 layer {layer_index}: {} expected a 3D expert tensor, got dims {dims:?}",
+                info.name(),
+            )));
+        }
+        // GGUF stores fastest-first `[in_dim, out_dim, n_expert]`; the
+        // flat 2D `from_raw` shape is `[n_expert * out_dim, in_dim]`.
+        let in_dim = dims[0] as usize;
+        let out_dim = dims[1] as usize;
+        let n_expert = dims[2] as usize;
+        let rows = n_expert * out_dim;
+        let cols = in_dim;
+
+        let abs_offset = gguf
+            .shard_data_offset(info)
+            .checked_add(info.offset())
+            .ok_or_else(|| {
+                ModelError::Parse(format!(
+                    "DSv4 layer {layer_index}: {} offset overflow",
+                    info.name()
+                ))
+            })?;
+        let n_elements: u64 = dims.iter().product();
+        let data_size = tensor_data_size(info.tensor_type(), n_elements as usize)?;
+
+        let path: PathBuf = gguf.shard_path(info).to_path_buf();
+        let f = shard_files.entry(info.shard_idx()).or_insert_with_key(|_| {
+            File::open(&path)
+                .unwrap_or_else(|e| panic!("DSv4 layer {layer_index}: open shard {path:?}: {e}"))
+        });
+        f.seek(SeekFrom::Start(abs_offset))?;
+        let mut bytes = vec![0u8; data_size];
+        f.read_exact(&mut bytes)?;
+
+        out.insert(
+            kind,
+            RawExpertTensor {
+                bytes,
+                tensor_type: info.tensor_type(),
+                rows,
+                cols,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Read per-layer DSv4 **integer** tensors (e.g. `ffn_gate_tid2eid`),
 /// keyed by [`DsV4TensorKind`]. Returns `Vec<i32>` per kind so the
 /// downstream loader can shape it into the right routing table.
@@ -561,5 +654,61 @@ mod tests {
             quant_bytes as f64 / 1e9,
             f32_bytes as f64 / 1e9,
         );
+    }
+
+    /// P1 (dsv4-quant-residency): `read_dsv4_layer_raw_expert_tensors_from_gguf`
+    /// returns the three routed-expert tensors as raw quantized bytes
+    /// with the `from_raw`-ready `[n_expert*out_dim, in_dim]` shape, and
+    /// those bytes round-trip through `QuantTensor::from_raw`. This is
+    /// the resident loader's input — the f32 expansion is never built.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_raw_expert_reader_round_trips_to_quant_tensor() {
+        use larql_models::quant::ggml::type_name;
+        use larql_models::quant::lazy::QuantTensor;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+
+        // Pick a routed-MoE layer (hash routing is layers 0-2; layer 4
+        // is a regular routed-expert layer).
+        let raw = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 4)
+            .expect("read raw expert tensors");
+
+        for kind in [
+            DsV4TensorKind::FfnGateExps,
+            DsV4TensorKind::FfnUpExps,
+            DsV4TensorKind::FfnDownExps,
+        ] {
+            let t = raw
+                .get(&kind)
+                .unwrap_or_else(|| panic!("layer 4 should have {kind}"));
+            // Byte length must match the declared quant shape exactly.
+            let expected = tensor_data_size(t.tensor_type, t.rows * t.cols).expect("size");
+            assert_eq!(
+                t.bytes.len(),
+                expected,
+                "{kind}: raw byte length {} != expected {expected} for {} {}×{}",
+                t.bytes.len(),
+                type_name(t.tensor_type),
+                t.rows,
+                t.cols,
+            );
+            // And the bytes build a QuantTensor of that shape (no dequant).
+            let qt = QuantTensor::from_raw(t.bytes.clone(), t.tensor_type, t.rows, t.cols)
+                .unwrap_or_else(|e| panic!("from_raw {kind}: {e:?}"));
+            assert_eq!(qt.shape(), [t.rows, t.cols]);
+        }
+
+        // A dense / hash-routed-only layer query still succeeds (the map
+        // just contains whatever expert tensors exist).
+        let _ = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 0)
+            .expect("layer 0 raw expert read");
     }
 }
