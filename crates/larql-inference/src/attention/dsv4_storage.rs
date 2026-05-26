@@ -29,7 +29,7 @@ use super::dsv4_compressor_prefill::{CompressorParams, CompressorWeights};
 use super::dsv4_ffn_block::{Dsv4FfnWeights, SharedExpertWeights};
 use super::dsv4_indexer::{IndexerParams, IndexerWeights};
 use super::dsv4_mhc_bookend::MhcWeights;
-use super::dsv4_moe_dispatch::MoeExpertWeights;
+use super::dsv4_moe_dispatch::{MoeExpertWeights, ResidentMoeExperts};
 
 /// Owned weights for the DSv4 compressor (a per-layer HCA producer).
 #[derive(Clone)]
@@ -156,6 +156,26 @@ impl FfnStorage {
                 gate_exps: self.gate_exps.view(),
                 up_exps: self.up_exps.view(),
                 down_exps: self.down_exps.view(),
+                // Resident-quant experts when populated (dsv4-quant-residency).
+                // `n_expert` from gate_inp `[n_expert, n_embd]`; `n_ff_exp`
+                // from the flat quant rows `[n_expert*n_ff_exp, n_embd]`.
+                quant: match (
+                    self.gate_exps_quant.as_ref(),
+                    self.up_exps_quant.as_ref(),
+                    self.down_exps_quant.as_ref(),
+                ) {
+                    (Some(gate), Some(up), Some(down)) => {
+                        let n_expert = self.gate_inp.shape()[0];
+                        Some(ResidentMoeExperts {
+                            gate,
+                            up,
+                            down,
+                            n_expert,
+                            n_ff_exp: gate.shape()[0] / n_expert.max(1),
+                        })
+                    }
+                    _ => None,
+                },
             },
             shared: SharedExpertWeights {
                 gate_shexp: self.gate_shexp.view(),

@@ -20,19 +20,41 @@
 use ndarray::{s, Array2, ArrayView2, ArrayView3};
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 
 use super::dsv4_moe_ops::clamped_swiglu_row;
 use super::dsv4_moe_routing::RoutingResult;
 
+/// Resident-quantized routed experts (`dsv4-quant-residency`). When
+/// present on [`MoeExpertWeights`], the dispatch obtains each expert's
+/// gate/up/down as a zero-copy [`QuantTensor::expert_slice`] and runs
+/// the lazy-quant `matmul` (CPU) instead of the f32 `dot_proj_gpu`
+/// path — no per-expert f32 dequant. Each tensor packs all experts
+/// flat as `[n_expert * out_dim, in_dim]`; `expert_slice(e, n_expert)`
+/// gives the per-expert `[out_dim, in_dim]` matrix. `n_ff_exp` is the
+/// gate/up `out_dim` (carried explicitly because the f32 `gate_exps`
+/// array is empty in resident mode, so its shape can't supply dims).
+#[derive(Clone, Copy)]
+pub struct ResidentMoeExperts<'a> {
+    pub gate: &'a QuantTensor,
+    pub up: &'a QuantTensor,
+    pub down: &'a QuantTensor,
+    pub n_expert: usize,
+    pub n_ff_exp: usize,
+}
+
 /// Per-layer MoE expert weight views.
 #[derive(Clone, Copy)]
 pub struct MoeExpertWeights<'a> {
-    /// `(n_expert, n_ff_exp, n_embd)`
+    /// `(n_expert, n_ff_exp, n_embd)` — empty (`0×0×0`) when `quant` is set.
     pub gate_exps: ArrayView3<'a, f32>,
     /// `(n_expert, n_ff_exp, n_embd)`
     pub up_exps: ArrayView3<'a, f32>,
     /// `(n_expert, n_embd, n_ff_exp)`
     pub down_exps: ArrayView3<'a, f32>,
+    /// Resident-quant experts. `Some` ⇒ use the lazy-quant path and the
+    /// f32 arrays above are empty; `None` ⇒ f32 path (today's default).
+    pub quant: Option<ResidentMoeExperts<'a>>,
 }
 
 /// Run weighted MoE expert dispatch.
@@ -52,24 +74,30 @@ pub fn dsv4_moe_dispatch(
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     let n_embd = x.shape()[1];
-    let n_expert = w.gate_exps.shape()[0];
-    let n_ff_exp = w.gate_exps.shape()[1];
+    // Dims come from the quant bundle when present (the f32 arrays are
+    // empty in resident mode); otherwise from the f32 `gate_exps`.
+    let (n_expert, n_ff_exp) = match &w.quant {
+        Some(q) => (q.n_expert, q.n_ff_exp),
+        None => (w.gate_exps.shape()[0], w.gate_exps.shape()[1]),
+    };
 
-    assert_eq!(
-        w.gate_exps.shape(),
-        &[n_expert, n_ff_exp, n_embd],
-        "gate_exps shape"
-    );
-    assert_eq!(
-        w.up_exps.shape(),
-        &[n_expert, n_ff_exp, n_embd],
-        "up_exps shape"
-    );
-    assert_eq!(
-        w.down_exps.shape(),
-        &[n_expert, n_embd, n_ff_exp],
-        "down_exps shape"
-    );
+    if w.quant.is_none() {
+        assert_eq!(
+            w.gate_exps.shape(),
+            &[n_expert, n_ff_exp, n_embd],
+            "gate_exps shape"
+        );
+        assert_eq!(
+            w.up_exps.shape(),
+            &[n_expert, n_ff_exp, n_embd],
+            "up_exps shape"
+        );
+        assert_eq!(
+            w.down_exps.shape(),
+            &[n_expert, n_embd, n_ff_exp],
+            "down_exps shape"
+        );
+    }
     let n_expert_used = routing.indices.shape()[1];
     assert_eq!(
         routing.indices.shape(),
@@ -122,16 +150,29 @@ pub fn dsv4_moe_dispatch(
                 bucket_x.row_mut(b).assign(&x.row(t));
             }
 
-            // Slice per-expert weight matrices.
-            // gate_exps[e]: (n_ff_exp, n_embd), up_exps[e]: (n_ff_exp, n_embd),
-            // down_exps[e]: (n_embd, n_ff_exp).
-            let gate_e = w.gate_exps.slice(s![e, .., ..]);
-            let up_e = w.up_exps.slice(s![e, .., ..]);
-            let down_e = w.down_exps.slice(s![e, .., ..]);
-
             // Two batched matmuls: gate, up → (bucket_size, n_ff_exp) each.
-            let g = dot_proj_gpu(&bucket_x, &gate_e, backend);
-            let u = dot_proj_gpu(&bucket_x, &up_e, backend);
+            // Quant: zero-copy per-expert slice + lazy-quant matmul on
+            // CPU (no f32 dequant). f32: slice the dequantized weight and
+            // route through `dot_proj_gpu` (CPU or `backend`).
+            // gate/up slice: (n_ff_exp, n_embd); down slice: (n_embd, n_ff_exp).
+            let (g, u) = match &w.quant {
+                Some(q) => {
+                    let gate_e = q.gate.expert_slice(e, n_expert).expect("gate expert_slice");
+                    let up_e = q.up.expert_slice(e, n_expert).expect("up expert_slice");
+                    (
+                        gate_e.matmul(&bucket_x).expect("gate quant matmul"),
+                        up_e.matmul(&bucket_x).expect("up quant matmul"),
+                    )
+                }
+                None => {
+                    let gate_e = w.gate_exps.slice(s![e, .., ..]);
+                    let up_e = w.up_exps.slice(s![e, .., ..]);
+                    (
+                        dot_proj_gpu(&bucket_x, &gate_e, backend),
+                        dot_proj_gpu(&bucket_x, &up_e, backend),
+                    )
+                }
+            };
 
             // SwiGLU activation per row.
             let mut inter = Array2::<f32>::zeros((bucket_size, n_ff_exp));
@@ -141,7 +182,16 @@ pub fn dsv4_moe_dispatch(
             }
 
             // Third batched matmul: down → (bucket_size, n_embd).
-            let d = dot_proj_gpu(&inter, &down_e, backend);
+            let d = match &w.quant {
+                Some(q) => {
+                    let down_e = q.down.expert_slice(e, n_expert).expect("down expert_slice");
+                    down_e.matmul(&inter).expect("down quant matmul")
+                }
+                None => {
+                    let down_e = w.down_exps.slice(s![e, .., ..]);
+                    dot_proj_gpu(&inter, &down_e, backend)
+                }
+            };
             (e, d)
         })
         .collect();
@@ -203,6 +253,7 @@ mod tests {
             gate_exps: gate_exps.view(),
             up_exps: up_exps.view(),
             down_exps: down_exps.view(),
+            quant: None,
         };
         let out = dsv4_moe_dispatch(x.view(), &routing, &w, swiglu_limit, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
@@ -260,6 +311,7 @@ mod tests {
             gate_exps: gate_exps.view(),
             up_exps: up_exps.view(),
             down_exps: down_exps.view(),
+            quant: None,
         };
 
         // Solo dispatch through expert 1 (weight 1.0).
@@ -335,6 +387,7 @@ mod tests {
             gate_exps: gate_exps.view(),
             up_exps: up_exps.view(),
             down_exps: down_exps.view(),
+            quant: None,
         };
         let out = dsv4_moe_dispatch(x.view(), &routing, &w, 7.0, None);
         for v in out.iter() {
@@ -382,6 +435,7 @@ mod tests {
             gate_exps: gate_exps.view(),
             up_exps: up_exps.view(),
             down_exps: down_exps.view(),
+            quant: None,
         };
         let out = dsv4_moe_dispatch(x.view(), &routing, &w, 7.0, None);
         assert_eq!(out.shape(), &[n_tokens, n_embd]);
@@ -433,6 +487,7 @@ mod tests {
             gate_exps: gate_exps.view(),
             up_exps: up_exps.view(),
             down_exps: down_exps.view(),
+            quant: None,
         };
 
         let out_none = dsv4_moe_dispatch(x.view(), &routing, &w, 7.0, None);
@@ -455,5 +510,92 @@ mod tests {
             max_diff < 1e-4,
             "CpuBackend vs None mismatch on MoE dispatch: max_diff={max_diff}"
         );
+    }
+
+    /// dsv4-quant-residency P2: the quant MoE dispatch (`expert_slice` +
+    /// lazy-quant `matmul`) matches the f32 dispatch within tolerance.
+    /// Built from the SAME weights as TYPE_F32 `QuantTensor`s, so the
+    /// only difference is the code path + reduction order — outputs
+    /// agree tightly. Backs spec scenario "MoE experts read quantized
+    /// slices without re-dequant".
+    #[test]
+    fn quant_moe_dispatch_matches_f32_within_tolerance() {
+        use larql_models::quant::ggml::TYPE_F32;
+        use larql_models::quant::lazy::QuantTensor;
+
+        let n_expert = 4;
+        let n_ff_exp = 6;
+        let n_embd = 8;
+        let n_tokens = 3;
+        let n_expert_used = 2;
+        let swiglu_limit = 7.0;
+
+        let x = Array2::<f32>::from_shape_fn((n_tokens, n_embd), |(t, d)| {
+            ((t * 7 + d) as f32 * 0.05).sin()
+        });
+        let gate_exps = Array3::<f32>::from_shape_fn((n_expert, n_ff_exp, n_embd), |(e, i, j)| {
+            ((e * 100 + i * 10 + j) as f32 * 0.01).sin()
+        });
+        let up_exps = Array3::<f32>::from_shape_fn((n_expert, n_ff_exp, n_embd), |(e, i, j)| {
+            ((e * 100 + i * 10 + j) as f32 * 0.013).cos()
+        });
+        let down_exps = Array3::<f32>::from_shape_fn((n_expert, n_embd, n_ff_exp), |(e, d, i)| {
+            ((e * 100 + d * 10 + i) as f32 * 0.011).sin()
+        });
+
+        // Route each token to two experts.
+        let mut indices = Array2::<usize>::zeros((n_tokens, n_expert_used));
+        let mut weights = Array2::<f32>::zeros((n_tokens, n_expert_used));
+        for t in 0..n_tokens {
+            indices[[t, 0]] = t % n_expert;
+            indices[[t, 1]] = (t + 1) % n_expert;
+            weights[[t, 0]] = 0.6;
+            weights[[t, 1]] = 0.4;
+        }
+        let routing = RoutingResult { indices, weights };
+
+        // f32 path.
+        let w_f32 = MoeExpertWeights {
+            gate_exps: gate_exps.view(),
+            up_exps: up_exps.view(),
+            down_exps: down_exps.view(),
+            quant: None,
+        };
+        let out_f32 = dsv4_moe_dispatch(x.view(), &routing, &w_f32, swiglu_limit, None);
+
+        // Quant path: TYPE_F32 QuantTensors over the same row-major bytes.
+        // `Array3::iter` yields C-order `[e][out][in]` == the flat
+        // `[n_expert*out_dim, in_dim]` from_raw / expert_slice layout.
+        let to_quant = |a: &Array3<f32>, rows: usize, cols: usize| -> QuantTensor {
+            let bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+            QuantTensor::from_raw(bytes, TYPE_F32, rows, cols).unwrap()
+        };
+        let gate_q = to_quant(&gate_exps, n_expert * n_ff_exp, n_embd);
+        let up_q = to_quant(&up_exps, n_expert * n_ff_exp, n_embd);
+        let down_q = to_quant(&down_exps, n_expert * n_embd, n_ff_exp);
+
+        let empty = Array3::<f32>::zeros((0, 0, 0));
+        let w_quant = MoeExpertWeights {
+            gate_exps: empty.view(),
+            up_exps: empty.view(),
+            down_exps: empty.view(),
+            quant: Some(ResidentMoeExperts {
+                gate: &gate_q,
+                up: &up_q,
+                down: &down_q,
+                n_expert,
+                n_ff_exp,
+            }),
+        };
+        let out_quant = dsv4_moe_dispatch(x.view(), &routing, &w_quant, swiglu_limit, None);
+
+        assert_eq!(out_f32.shape(), out_quant.shape());
+        for (a, b) in out_f32.iter().zip(out_quant.iter()) {
+            assert!(
+                approx_eq(*a, *b, 1e-5),
+                "quant {b} vs f32 {a} (diff {})",
+                (a - b).abs()
+            );
+        }
     }
 }
