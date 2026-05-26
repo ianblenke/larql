@@ -1,11 +1,11 @@
 {
   "summary": {
-    "capabilities": 55,
-    "requirements": 534,
-    "scenarios": 1564,
-    "scenarios_backed": 1354,
-    "scenarios_unbacked": 210,
-    "test_refs": 3491,
+    "capabilities": 56,
+    "requirements": 537,
+    "scenarios": 1569,
+    "scenarios_backed": 1358,
+    "scenarios_unbacked": 211,
+    "test_refs": 3495,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5333,6 +5333,75 @@
               "unbacked": true,
               "spec_file": "openspec/specs/deploy-cpu-gpu-split/spec.md",
               "line": 83
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsv4-hf-parity",
+      "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+      "requirements": [
+        {
+          "name": "External HF reference dump format",
+          "scenarios": [
+            {
+              "name": "Dump carries tokenized prompt and top-K reference",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+              "line": 11
+            },
+            {
+              "name": "Rust consumes the dump without a Python dependency",
+              "tests_resolved": [
+                "larql_inference::test_dsv4_hf_parity::dsv4_forward_matches_hf_reference"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+              "line": 19
+            }
+          ]
+        },
+        {
+          "name": "DSv4 forward matches the HF reference",
+          "scenarios": [
+            {
+              "name": "Greedy next-token matches the reference",
+              "tests_resolved": [
+                "larql_inference::test_dsv4_hf_parity::dsv4_forward_matches_hf_reference"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+              "line": 37
+            },
+            {
+              "name": "Top-K overlaps and top-1 logit within tolerance",
+              "tests_resolved": [
+                "larql_inference::test_dsv4_hf_parity::dsv4_forward_matches_hf_reference"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+              "line": 45
+            }
+          ]
+        },
+        {
+          "name": "Harness skips cleanly without the reference dump",
+          "scenarios": [
+            {
+              "name": "Missing dump or GGUF skips the test",
+              "tests_resolved": [
+                "larql_inference::test_dsv4_hf_parity::dsv4_forward_matches_hf_reference"
+              ],
+              "tests_unresolved": [],
+              "unbacked": false,
+              "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
+              "line": 60
             }
           ]
         }
