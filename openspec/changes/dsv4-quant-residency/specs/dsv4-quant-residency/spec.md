@@ -38,12 +38,14 @@ in the quantized footprint (~161 GB) rather than the f32 footprint
 - **WHEN** the loader reads a Q4_K FFN expert tensor from the GGUF
 - **THEN** it SHALL retain the Q4_K bytes in a `QuantTensor` and SHALL
   NOT allocate the dequantized f32 expansion of that tensor
+<!-- test: larql_inference::attention::dsv4_gguf_reader::real_gguf_resident_expert_footprint -->
 
 #### Scenario: Resident footprint fits the quantized size
 
 - **WHEN** all layers of DSv4-Flash are loaded resident
 - **THEN** the total weight memory SHALL be on the order of the
   quantized GGUF size, not the f32 expansion
+<!-- test: larql_inference::attention::dsv4_gguf_reader::real_gguf_resident_expert_footprint -->
 
 ### Requirement: Quant-aware forward dispatch
 
