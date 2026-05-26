@@ -3,9 +3,9 @@
     "capabilities": 55,
     "requirements": 534,
     "scenarios": 1564,
-    "scenarios_backed": 1349,
-    "scenarios_unbacked": 215,
-    "test_refs": 3486,
+    "scenarios_backed": 1350,
+    "scenarios_unbacked": 214,
+    "test_refs": 3487,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5426,9 +5426,11 @@
           "scenarios": [
             {
               "name": "Weights loaded once for multi-step decode",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_streaming_model_forward::resident_forward_matches_streaming_forward"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
               "line": 91
             },
@@ -5438,7 +5440,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 97
+              "line": 98
             }
           ]
         },
@@ -5451,7 +5453,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 111
+              "line": 112
             },
             {
               "name": "Greedy tokens match",
@@ -5459,7 +5461,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 118
+              "line": 119
             }
           ]
         },
@@ -5472,7 +5474,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 132
+              "line": 133
             },
             {
               "name": "Attention weights fit device memory",
@@ -5480,7 +5482,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 140
+              "line": 141
             }
           ]
         }
@@ -27018,61 +27020,67 @@
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::dispatch_pool_picks_correct_variant_arm",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 382,
+      "line": 476,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::streaming_cached_real_gguf_prefill_then_decode",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 620,
+      "line": 714,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::streaming_cached_with_no_cache_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 555,
+      "line": 649,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::streaming_full_43_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 496,
+      "line": 590,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::streaming_helper_3_layer_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 449,
+      "line": 543,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::dispatch_pool_picks_correct_variant_arm",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 382,
+      "line": 476,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::resident_forward_matches_streaming_forward",
+      "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
+      "line": 814,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::streaming_cached_real_gguf_prefill_then_decode",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 620,
+      "line": 714,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::streaming_cached_with_no_cache_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 555,
+      "line": 649,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::streaming_full_43_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 496,
+      "line": 590,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_streaming_model_forward::tests::streaming_helper_3_layer_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_streaming_model_forward.rs",
-      "line": 449,
+      "line": 543,
       "crate": "larql_inference"
     },
     {
