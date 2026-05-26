@@ -93,6 +93,7 @@ the case where the quantized weight set exceeds host RAM.
 - **WHEN** a multi-step decode runs against the resident forward
 - **THEN** each layer's weights SHALL be loaded from the GGUF at most
   once for the whole decode, not once per token
+<!-- test: larql_inference::attention::dsv4_streaming_model_forward::resident_forward_matches_streaming_forward -->
 
 #### Scenario: Streaming path retained for oversized models
 

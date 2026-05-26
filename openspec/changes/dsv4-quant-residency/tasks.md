@@ -26,11 +26,11 @@
 
 ## 4. P3 — Resident (non-streaming) forward
 
-- [ ] 4.1 Add a resident forward entry point that takes pre-built `&[DsV4LayerWeightStorage]` (all layers' QuantTensors) and runs all decode steps against them
-- [ ] 4.2 Add a loader that builds the full resident weight set once (all 43 layers) and reports total RAM
-- [ ] 4.3 Keep `dsv4_streaming_model_forward_cached` available + documented for model-exceeds-RAM
-- [ ] 4.4 Extend `dsv4_bench_cpu_vs_cuda` (or add a sibling) with a `resident` mode that loads once + decodes N steps; report prefill / steady-state tok/s
-- [ ] 4.5 Verify on RTX 4090 host: resident decode tok/s materially exceeds the streaming 0.01 tok/s; record numbers in `project_dsv4_gpu_push` memory
+- [x] 4.1 Resident forward entry point — `dsv4_resident_model_forward_cached(layers: &[(DsV4LayerWeightStorage, DsV4LayerVariant)], hp, head, token_ids, position_offset, layer_caches, backend)` in `dsv4_streaming_model_forward.rs`. Takes pre-built layers (loaded once, with resident `QuantTensor` experts), runs the same dispatch + head/norm/lm_head as the streaming forward — only the layer source differs. Validated by `resident_forward_matches_streaming_forward` (ignored real-GGUF): bit-identical logits to the streaming forward on the same f32 layers.
+- [ ] 4.2 Resident loader for the full weight set (all 43 layers, resident-quant) + total-RAM report — *next slice; composes #373 raw reader + #374 `build_layer_storage_resident` across all layers, the resident cousin of `load_dsv4_layers`*
+- [x] 4.3 Streaming forward retained + documented for model-exceeds-RAM — `dsv4_streaming_model_forward_cached` unchanged; the resident forward's doc + the spec scenario "Streaming path retained for oversized models" cover the fallback.
+- [ ] 4.4 Extend `dsv4_bench_cpu_vs_cuda` with a `resident` mode (load once + decode N steps; prefill / steady-state tok/s) — needs 4.2 (the full resident loader)
+- [ ] 4.5 Verify on RTX 4090: resident decode tok/s materially exceeds the streaming 0.01 tok/s; record in `project_dsv4_gpu_push` memory — needs 4.2 + 4.4
 
 ## 5. P4 — CPU-FFN / GPU-attention hybrid
 

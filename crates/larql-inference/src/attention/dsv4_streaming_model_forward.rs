@@ -44,6 +44,7 @@ use super::dsv4_per_layer::{
     dsv4_per_layer_forward, dsv4_per_layer_forward_cached, DsV4LayerParams, DsV4LayerWeights,
 };
 use super::dsv4_rope_tail::DsV4RopeMode;
+use super::dsv4_storage::DsV4LayerWeightStorage;
 use super::dsv4_storage_build::DsV4Hyperparams;
 
 /// Build the per-layer [`DsV4LayerParams`] (MoE + mHC scalar config)
@@ -365,6 +366,99 @@ pub fn dsv4_streaming_model_forward_cached(
     }
 
     // 5. lm_head projection via ComputeBackend.
+    let lm_head_owned = head_w.output_lm_head.to_owned();
+    let logits = dot_proj_gpu(&pooled, &lm_head_owned, backend);
+    Ok(logits)
+}
+
+/// Resident (non-streaming) DSv4 forward: runs the decode against
+/// pre-built per-layer storages held in RAM rather than reloading +
+/// re-dequantizing each layer from the GGUF per token.
+///
+/// `layers` is the full set of `(storage, variant)` pairs for the model
+/// (built once — e.g. with resident `QuantTensor` experts via
+/// `build_layer_storage_resident`). This is the `dsv4-quant-residency`
+/// payoff path: with the quantized working set resident in RAM
+/// (~161 GB Q4_K) the per-token streaming reload that dominates
+/// [`dsv4_streaming_model_forward_cached`] (~90 s/step on the 2026-05-25
+/// bench) is gone — each layer is loaded at most once for the whole
+/// decode. The streaming forward stays available for the
+/// model-exceeds-RAM case.
+///
+/// Output and semantics are identical to the streaming forward; the
+/// only difference is the layer source (a borrowed slice vs a per-layer
+/// GGUF load). `layer_caches`, when supplied, must have one entry per
+/// layer in `layers` (same order).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_resident_model_forward_cached(
+    layers: &[(DsV4LayerWeightStorage, DsV4LayerVariant)],
+    hp: &DsV4Hyperparams,
+    head: &DsV4HeadStorage,
+    token_ids: &[u32],
+    position_offset: usize,
+    mut layer_caches: Option<&mut [DsV4LayerCache]>,
+    backend: Option<&dyn ComputeBackend>,
+) -> Result<Array2<f32>, DsV4LoadError> {
+    let layer_p = build_layer_params(hp);
+    let pool = DispatchParamsPool::new(hp);
+
+    let head_w = head.as_weights();
+    let head_p = head.params(hp);
+
+    let x = embed_tokens(token_ids, head.token_embd_view());
+    let mut residual: Array3<f32> = broadcast_to_streams(x.view(), hp.n_hc);
+
+    for (i, (storage, variant)) in layers.iter().enumerate() {
+        let (cp_ref, ip_ref) = pool.pick(variant);
+        let layer_w = DsV4LayerWeights {
+            mhc_attn: storage
+                .mhc_attn
+                .as_ref()
+                .expect("mhc_attn loaded by full loader")
+                .as_weights(),
+            attn: storage.dispatcher_layer(cp_ref, ip_ref),
+            mhc_ffn: storage
+                .mhc_ffn
+                .as_ref()
+                .expect("mhc_ffn loaded by full loader")
+                .as_weights(),
+            ffn: storage
+                .ffn
+                .as_ref()
+                .expect("ffn loaded by full loader")
+                .as_weights(),
+        };
+        let cache_for_this_layer: Option<&mut DsV4LayerCache> = match &mut layer_caches {
+            Some(caches) => caches.get_mut(i),
+            None => None,
+        };
+        residual = dsv4_per_layer_forward_cached(
+            residual.view(),
+            &layer_w,
+            &layer_p,
+            Some(token_ids),
+            position_offset,
+            cache_for_this_layer,
+            backend,
+        );
+    }
+
+    let mut pooled = dsv4_hc_head(residual.view(), &head_w, &head_p, backend);
+
+    let n_tokens = token_ids.len();
+    let n_embd = hp.n_embd;
+    for t in 0..n_tokens {
+        let mut sumsq = 0.0_f32;
+        for d in 0..n_embd {
+            let v = pooled[[t, d]];
+            sumsq += v * v;
+        }
+        let inv = 1.0 / (sumsq / n_embd as f32 + head_p.norm_eps).sqrt();
+        for d in 0..n_embd {
+            pooled[[t, d]] *= inv * head_w.output_norm[d];
+        }
+    }
+
     let lm_head_owned = head_w.output_lm_head.to_owned();
     let logits = dot_proj_gpu(&pooled, &lm_head_owned, backend);
     Ok(logits)
@@ -704,5 +798,66 @@ mod tests {
                 "layer {i} cache position after decode"
             );
         }
+    }
+
+    /// dsv4-quant-residency P3: the resident forward
+    /// ([`dsv4_resident_model_forward_cached`]) produces **identical**
+    /// logits to the streaming forward on the same layers. Both build
+    /// f32 layers here (via `load_dsv4_layers` / per-call
+    /// `load_dsv4_layer`), so the only difference is the layer source —
+    /// the residual math, dispatch, and head are the same code path, so
+    /// the result is bit-identical. This pins the resident loop's
+    /// correctness; the quant-vs-f32 numeric tolerance is covered
+    /// separately by the MoE-dispatch parity test.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn resident_forward_matches_streaming_forward() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_tokens = 16;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+
+        // Resident: build all 3 layers once, forward against them.
+        let layers = crate::attention::dsv4_full_loader::load_dsv4_layers(&gguf, &hp, 3)
+            .expect("load resident layers");
+        let resident =
+            dsv4_resident_model_forward_cached(&layers, &hp, &head, &token_ids, 0, None, None)
+                .expect("resident forward");
+
+        // Streaming: reload each layer per call.
+        let streaming = dsv4_streaming_model_forward_cached(
+            &gguf,
+            &hp,
+            &head,
+            &token_ids,
+            &[0, 1, 2],
+            0,
+            None,
+            None,
+        )
+        .expect("streaming forward");
+
+        assert_eq!(resident.shape(), streaming.shape());
+        let max_diff = resident
+            .iter()
+            .zip(streaming.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(
+            max_diff, 0.0,
+            "resident vs streaming logits differ (max_diff={max_diff}) — same f32 layers \
+             should be bit-identical"
+        );
     }
 }
