@@ -13,13 +13,18 @@
 use larql_models::detect::ModelError;
 use larql_models::loading::gguf::GgufFile;
 
+use larql_models::architectures::deepseek_v4_tensors::DsV4TensorKind;
+
 use super::dsv4_gguf_reader::{
-    read_dsv4_layer_int_tensors_from_gguf, read_dsv4_layer_tensors_from_gguf,
+    read_dsv4_layer_int_tensors_from_gguf, read_dsv4_layer_raw_expert_tensors_from_gguf,
+    read_dsv4_layer_tensors_from_gguf, read_dsv4_layer_tensors_from_gguf_excluding,
 };
 use super::dsv4_hyperparams_load::DsV4MetadataError;
 use super::dsv4_layer_variants::{detect_layer_variant, DsV4LayerVariant};
 use super::dsv4_storage::DsV4LayerWeightStorage;
-use super::dsv4_storage_build::{build_layer_storage, DsV4BuildError, DsV4Hyperparams};
+use super::dsv4_storage_build::{
+    build_layer_storage, build_layer_storage_resident, DsV4BuildError, DsV4Hyperparams,
+};
 
 /// Errors that can arise during full DSv4 loading.
 #[derive(Debug)]
@@ -91,6 +96,59 @@ pub fn load_dsv4_layers(
     let mut out = Vec::with_capacity(n_layer);
     for l in 0..n_layer {
         out.push(load_dsv4_layer(gguf, hp, l)?);
+    }
+    Ok(out)
+}
+
+/// The routed-MoE expert tensor kinds that the resident loader keeps
+/// quantized (`QuantTensor`) instead of dequantizing to f32.
+const RESIDENT_EXPERT_KINDS: [DsV4TensorKind; 3] = [
+    DsV4TensorKind::FfnGateExps,
+    DsV4TensorKind::FfnUpExps,
+    DsV4TensorKind::FfnDownExps,
+];
+
+/// Load a single DSv4 layer with **resident-quantized** routed experts
+/// (`dsv4-quant-residency`).
+///
+/// Reads the small per-kind tensors as f32 (excluding the routed
+/// experts) and the routed experts as raw quantized bytes, then builds
+/// storage via [`build_layer_storage_resident`] — so the ~26 GB/layer
+/// f32 expansion of the experts is never allocated (they stay
+/// `QuantTensor`s, ~4 GB/layer Q4_K). Everything else is identical to
+/// [`load_dsv4_layer`].
+pub fn load_dsv4_resident_layer(
+    gguf: &GgufFile,
+    hp: &DsV4Hyperparams,
+    layer_index: usize,
+) -> Result<(DsV4LayerWeightStorage, DsV4LayerVariant), DsV4LoadError> {
+    let variant = detect_layer_variant(gguf, layer_index, hp.head_dim);
+    let f32_tensors =
+        read_dsv4_layer_tensors_from_gguf_excluding(gguf, layer_index, &RESIDENT_EXPERT_KINDS)?;
+    let raw_experts = read_dsv4_layer_raw_expert_tensors_from_gguf(gguf, layer_index)?;
+    let int_raw = read_dsv4_layer_int_tensors_from_gguf(gguf, layer_index)?;
+    let compress_ratio = variant.compress_ratio.unwrap_or(0);
+    let storage =
+        build_layer_storage_resident(f32_tensors, raw_experts, int_raw, hp, compress_ratio)
+            .map_err(|cause| DsV4LoadError::Build { layer_index, cause })?;
+    Ok((storage, variant))
+}
+
+/// Load every layer of a DSv4 model with resident-quantized experts.
+///
+/// The resident cousin of [`load_dsv4_layers`]: holds all layers'
+/// weights in RAM at once (~161 GB Q4_K for DSv4-Flash vs ~1.1 TB f32),
+/// suitable for the non-streaming [`super::dsv4_streaming_model_forward::
+/// dsv4_resident_model_forward_cached`]. Requires a host with enough
+/// RAM; use the streaming path otherwise.
+pub fn load_dsv4_resident_layers(
+    gguf: &GgufFile,
+    hp: &DsV4Hyperparams,
+    n_layer: usize,
+) -> Result<Vec<(DsV4LayerWeightStorage, DsV4LayerVariant)>, DsV4LoadError> {
+    let mut out = Vec::with_capacity(n_layer);
+    for l in 0..n_layer {
+        out.push(load_dsv4_resident_layer(gguf, hp, l)?);
     }
     Ok(out)
 }
@@ -237,5 +295,61 @@ mod tests {
         assert_eq!(idx.wproj.shape(), &[hp.n_index_head.unwrap(), hp.n_embd]);
 
         assert_eq!(storage.top_k, hp.top_k);
+    }
+
+    /// dsv4-quant-residency P3: `load_dsv4_resident_layer` builds a
+    /// layer with the routed experts held as `QuantTensor`s and their
+    /// f32 arrays empty — without ever dequantizing them. Confirms the
+    /// reader-exclusion + `build_layer_storage_resident` composition on
+    /// the real GGUF, and reports the resident footprint.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn real_gguf_resident_layer_holds_quant_experts() {
+        use larql_models::quant::ggml::{tensor_data_size, type_name};
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+
+        // Layer 4 is a regular routed-MoE layer (hash routing is 0-2).
+        let (storage, _variant) =
+            load_dsv4_resident_layer(&gguf, &hp, 4).expect("resident load layer 4");
+        let ffn = storage.ffn.as_ref().expect("ffn present");
+
+        // Routed experts are resident QuantTensors; f32 arrays empty.
+        let gate_q = ffn.gate_exps_quant.as_ref().expect("gate_exps_quant");
+        let up_q = ffn.up_exps_quant.as_ref().expect("up_exps_quant");
+        let down_q = ffn.down_exps_quant.as_ref().expect("down_exps_quant");
+        assert_eq!(ffn.gate_exps.len(), 0, "f32 gate_exps must be empty");
+        assert_eq!(ffn.up_exps.len(), 0, "f32 up_exps must be empty");
+        assert_eq!(ffn.down_exps.len(), 0, "f32 down_exps must be empty");
+        // Quant shapes: gate/up `[n_expert*n_ff_exp, n_embd]`, down
+        // `[n_expert*n_embd, n_ff_exp]`.
+        assert_eq!(gate_q.shape(), [hp.n_expert * hp.n_ff_exp, hp.n_embd]);
+        assert_eq!(up_q.shape(), [hp.n_expert * hp.n_ff_exp, hp.n_embd]);
+        assert_eq!(down_q.shape(), [hp.n_expert * hp.n_embd, hp.n_ff_exp]);
+
+        // Non-expert FFN parts still f32.
+        assert_eq!(ffn.gate_inp.shape(), &[hp.n_expert, hp.n_embd]);
+
+        // Report the resident expert footprint for this layer.
+        let q_bytes = |q: &larql_models::quant::lazy::QuantTensor| {
+            tensor_data_size(q.tensor_type(), q.shape()[0] * q.shape()[1]).unwrap()
+        };
+        let resident: usize = q_bytes(gate_q) + q_bytes(up_q) + q_bytes(down_q);
+        let f32_equiv = 3 * hp.n_expert * hp.n_ff_exp * hp.n_embd * 4;
+        eprintln!(
+            "layer 4 resident experts: {:.2} GB ({}) vs {:.2} GB f32 ({:.1}× smaller)",
+            resident as f64 / 1e9,
+            type_name(gate_q.tensor_type()),
+            f32_equiv as f64 / 1e9,
+            f32_equiv as f64 / resident as f64,
+        );
     }
 }

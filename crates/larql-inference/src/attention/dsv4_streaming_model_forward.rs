@@ -860,4 +860,98 @@ mod tests {
              should be bit-identical"
         );
     }
+
+    /// dsv4-quant-residency parity: the **quant-resident** forward
+    /// (Q4_K experts via `expert_slice` + lazy-quant matmul) agrees with
+    /// the **f32-streaming** forward (Q4_K dequant → f32 matmul) within
+    /// tolerance, and predicts the **same greedy next token**. The two
+    /// differ only by the Q8_K activation quantization in the lazy-quant
+    /// kernel (the weights decode from the same Q4_K blocks), so logits
+    /// are close but not bit-identical. Backs spec scenarios "Logits
+    /// within tolerance" + "Greedy tokens match".
+    ///
+    /// The relative bound below is generous and **calibration-pending**
+    /// on the first real-GGUF run; tighten it once observed.
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk"]
+    fn resident_quant_forward_within_tolerance_of_streaming_f32() {
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open DSv4 GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hyperparams");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+
+        let n_tokens = 16;
+        let token_ids: Vec<u32> = (0..n_tokens)
+            .map(|t| (t * 257 % head.n_vocab) as u32)
+            .collect();
+
+        // Quant-resident forward (Q4_K experts).
+        let resident_layers =
+            crate::attention::dsv4_full_loader::load_dsv4_resident_layers(&gguf, &hp, 3)
+                .expect("resident-quant layers");
+        let quant = dsv4_resident_model_forward_cached(
+            &resident_layers,
+            &hp,
+            &head,
+            &token_ids,
+            0,
+            None,
+            None,
+        )
+        .expect("quant resident forward");
+
+        // f32-streaming forward (Q4_K → f32 dequant).
+        let f32 = dsv4_streaming_model_forward_cached(
+            &gguf,
+            &hp,
+            &head,
+            &token_ids,
+            &[0, 1, 2],
+            0,
+            None,
+            None,
+        )
+        .expect("f32 streaming forward");
+
+        assert_eq!(quant.shape(), f32.shape());
+
+        // Relative logit agreement, scaled by the f32 logit magnitude.
+        let mut max_rel = 0.0_f32;
+        for (q, r) in quant.iter().zip(f32.iter()) {
+            let denom = r.abs().max(1.0);
+            max_rel = max_rel.max((q - r).abs() / denom);
+        }
+        eprintln!("quant vs f32 max relative logit diff: {max_rel:.4}");
+        assert!(
+            max_rel < 0.1,
+            "quant-resident logits diverge from f32 by {max_rel:.4} (>10%) — \
+             unexpected; the Q8_K activation quant should keep this small"
+        );
+
+        // Greedy next-token (argmax of the last position) must match.
+        let argmax_row = |logits: &Array2<f32>, t: usize| -> usize {
+            let row = logits.row(t);
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (j, &v) in row.iter().enumerate() {
+                if v > best_v {
+                    best_v = v;
+                    best = j;
+                }
+            }
+            best
+        };
+        let last = n_tokens - 1;
+        assert_eq!(
+            argmax_row(&quant, last),
+            argmax_row(&f32, last),
+            "greedy next-token differs between quant-resident and f32 forward"
+        );
+    }
 }
