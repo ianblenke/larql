@@ -68,10 +68,26 @@ pub fn read_dsv4_layer_tensors_from_gguf(
     gguf: &GgufFile,
     layer_index: usize,
 ) -> Result<HashMap<DsV4TensorKind, Vec<f32>>, ModelError> {
+    read_dsv4_layer_tensors_from_gguf_excluding(gguf, layer_index, &[])
+}
+
+/// Like [`read_dsv4_layer_tensors_from_gguf`] but skips the tensor
+/// kinds in `exclude` — they are neither read nor dequantized.
+///
+/// The resident-quant loader (`dsv4-quant-residency`) uses this to read
+/// the small f32 tensors while **excluding** the routed-MoE experts
+/// (`ffn_{gate,up,down}_exps`), which it reads raw via
+/// [`read_dsv4_layer_raw_expert_tensors_from_gguf`] instead — so the
+/// ~26 GB/layer f32 expansion of those tensors is never allocated.
+pub fn read_dsv4_layer_tensors_from_gguf_excluding(
+    gguf: &GgufFile,
+    layer_index: usize,
+    exclude: &[DsV4TensorKind],
+) -> Result<HashMap<DsV4TensorKind, Vec<f32>>, ModelError> {
     // Build the per-layer name → kind index up front.
     let mut want: HashMap<String, DsV4TensorKind> = HashMap::new();
     for &kind in all_kinds() {
-        if !kind.is_per_layer() {
+        if !kind.is_per_layer() || exclude.contains(&kind) {
             continue;
         }
         want.insert(tensor_name_of(kind, layer_index), kind);

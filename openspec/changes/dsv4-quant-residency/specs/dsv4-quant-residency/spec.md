@@ -115,12 +115,14 @@ two paths for non-degenerate logit gaps.
   and the f32 forward
 - **THEN** the per-position logits SHALL agree within the documented
   relative tolerance
+<!-- test: larql_inference::attention::dsv4_streaming_model_forward::resident_quant_forward_within_tolerance_of_streaming_f32 -->
 
 #### Scenario: Greedy tokens match
 
 - **WHEN** greedy decoding the same prompt through both forwards
 - **THEN** the generated token sequences SHALL be identical (argmax is
   stable across the tolerance gap for non-degenerate cases)
+<!-- test: larql_inference::attention::dsv4_streaming_model_forward::resident_quant_forward_within_tolerance_of_streaming_f32 -->
 
 ### Requirement: CPU-FFN / GPU-attention hybrid placement
 
