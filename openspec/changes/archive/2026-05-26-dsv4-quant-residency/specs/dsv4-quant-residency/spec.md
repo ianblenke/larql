@@ -139,6 +139,7 @@ FFN/MoE sites receive `None` / CPU).
 - **THEN** attention projections SHALL dispatch to the GPU backend and
   FFN/MoE expert matmuls SHALL run on CPU against resident quantized
   weights
+<!-- test: larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda -->
 
 #### Scenario: Attention weights fit device memory
 
@@ -146,3 +147,4 @@ FFN/MoE sites receive `None` / CPU).
 - **THEN** their device footprint SHALL fit within the target GPU's
   memory (DSv4-Flash attention weights are a few GB in f32), leaving
   room for the KV cache
+<!-- test: larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda -->

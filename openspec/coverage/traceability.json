@@ -3,9 +3,9 @@
     "capabilities": 55,
     "requirements": 534,
     "scenarios": 1564,
-    "scenarios_backed": 1352,
-    "scenarios_unbacked": 212,
-    "test_refs": 3489,
+    "scenarios_backed": 1354,
+    "scenarios_unbacked": 210,
+    "test_refs": 3491,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5340,7 +5340,7 @@
     },
     {
       "name": "dsv4-quant-residency",
-      "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
+      "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
       "requirements": [
         {
           "name": "Dual-representation layer storage",
@@ -5352,16 +5352,16 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 12
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 15
             },
             {
               "name": "Unsupported format falls back to f32",
               "tests_resolved": [],
               "tests_unresolved": [],
               "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 21
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 24
             }
           ]
         },
@@ -5375,8 +5375,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 37
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 40
             },
             {
               "name": "Resident footprint fits the quantized size",
@@ -5385,8 +5385,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 44
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 47
             }
           ]
         },
@@ -5398,16 +5398,16 @@
               "tests_resolved": [],
               "tests_unresolved": [],
               "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 60
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 63
             },
             {
               "name": "f32 fallback weight uses the existing path",
               "tests_resolved": [],
               "tests_unresolved": [],
               "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 67
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 70
             },
             {
               "name": "MoE experts read quantized slices without re-dequant",
@@ -5416,8 +5416,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 74
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 77
             }
           ]
         },
@@ -5431,16 +5431,16 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 91
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 94
             },
             {
               "name": "Streaming path retained for oversized models",
               "tests_resolved": [],
               "tests_unresolved": [],
               "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 98
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 101
             }
           ]
         },
@@ -5454,8 +5454,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 112
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 115
             },
             {
               "name": "Greedy tokens match",
@@ -5464,8 +5464,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 120
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 123
             }
           ]
         },
@@ -5474,19 +5474,23 @@
           "scenarios": [
             {
               "name": "Attention on GPU, FFN on CPU",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 135
+              "unbacked": false,
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 138
             },
             {
               "name": "Attention weights fit device memory",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 143
+              "unbacked": false,
+              "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
+              "line": 147
             }
           ]
         }
@@ -25219,12 +25223,6 @@
       "fqn": "larql_inference::attention::dsv4_full_loader::tests::real_gguf_resident_layer_holds_quant_experts",
       "file": "crates/larql-inference/src/attention/dsv4_full_loader.rs",
       "line": 307,
-      "crate": "larql_inference"
-    },
-    {
-      "fqn": "larql_inference::attention::dsv4_generate::dsv4_bench_cpu_vs_cuda",
-      "file": "crates/larql-inference/src/attention/dsv4_generate.rs",
-      "line": 393,
       "crate": "larql_inference"
     },
     {
