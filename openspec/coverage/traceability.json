@@ -3,9 +3,9 @@
     "capabilities": 55,
     "requirements": 534,
     "scenarios": 1564,
-    "scenarios_backed": 1348,
-    "scenarios_unbacked": 216,
-    "test_refs": 3485,
+    "scenarios_backed": 1349,
+    "scenarios_unbacked": 215,
+    "test_refs": 3486,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5411,9 +5411,11 @@
             },
             {
               "name": "MoE experts read quantized slices without re-dequant",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_moe_dispatch::quant_moe_dispatch_matches_f32_within_tolerance"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
               "line": 74
             }
@@ -5428,7 +5430,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 90
+              "line": 91
             },
             {
               "name": "Streaming path retained for oversized models",
@@ -5436,7 +5438,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 96
+              "line": 97
             }
           ]
         },
@@ -5449,7 +5451,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 110
+              "line": 111
             },
             {
               "name": "Greedy tokens match",
@@ -5457,7 +5459,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 117
+              "line": 118
             }
           ]
         },
@@ -5470,7 +5472,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 131
+              "line": 132
             },
             {
               "name": "Attention weights fit device memory",
@@ -5478,7 +5480,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 139
+              "line": 140
             }
           ]
         }
@@ -25024,7 +25026,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 357,
+      "line": 358,
       "crate": "larql_inference"
     },
     {
@@ -25048,7 +25050,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_ffn_block::tests::ffn_block_hash_routing_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_ffn_block.rs",
-      "line": 357,
+      "line": 358,
       "crate": "larql_inference"
     },
     {
@@ -26128,19 +26130,19 @@
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_2_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 581,
+      "line": 582,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_mixed_variant_3_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 695,
+      "line": 696,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::smoke_real_gguf_streaming_5_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 881,
+      "line": 882,
       "crate": "larql_inference"
     },
     {
@@ -26170,79 +26172,85 @@
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_2_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 581,
+      "line": 582,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_mixed_variant_3_layer_model_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 695,
+      "line": 696,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_model_forward::tests::smoke_real_gguf_streaming_5_layer_forward",
       "file": "crates/larql-inference/src/attention/dsv4_model_forward.rs",
-      "line": 881,
+      "line": 882,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::moe_dispatch_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 400,
+      "line": 454,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::route_then_dispatch_finite_nonzero",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 348,
+      "line": 401,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::single_expert_unit_weight_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 177,
+      "line": 227,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::moe_dispatch_cpu_backend_matches_none_backend",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 400,
+      "line": 454,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::quant_moe_dispatch_matches_f32_within_tolerance",
+      "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
+      "line": 522,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::route_then_dispatch_finite_nonzero",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 348,
+      "line": 401,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::single_expert_unit_weight_matches_direct_compute",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 177,
+      "line": 227,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::weighted_sum_linearity",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 241,
+      "line": 292,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::tests::zero_weights_produces_zero_output",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 319,
+      "line": 371,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::weighted_sum_linearity",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 241,
+      "line": 292,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_moe_dispatch::zero_weights_produces_zero_output",
       "file": "crates/larql-inference/src/attention/dsv4_moe_dispatch.rs",
-      "line": 319,
+      "line": 371,
       "crate": "larql_inference"
     },
     {
@@ -26404,13 +26412,13 @@
     {
       "fqn": "larql_inference::attention::dsv4_per_layer::cached_with_empty_cache_full_prefill_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_per_layer.rs",
-      "line": 635,
+      "line": 637,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_per_layer::cached_with_no_cache_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_per_layer.rs",
-      "line": 536,
+      "line": 537,
       "crate": "larql_inference"
     },
     {
@@ -26422,13 +26430,13 @@
     {
       "fqn": "larql_inference::attention::dsv4_per_layer::tests::cached_with_empty_cache_full_prefill_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_per_layer.rs",
-      "line": 635,
+      "line": 637,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_per_layer::tests::cached_with_no_cache_equals_uncached",
       "file": "crates/larql-inference/src/attention/dsv4_per_layer.rs",
-      "line": 536,
+      "line": 537,
       "crate": "larql_inference"
     },
     {
@@ -26836,97 +26844,97 @@
     {
       "fqn": "larql_inference::attention::dsv4_storage::dispatcher_priority_indexer_over_compress_over_nocompress",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 492,
+      "line": 512,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::ffn_storage_as_weights_roundtrip",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 548,
+      "line": 568,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::ffn_storage_without_optional_fields",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 594,
+      "line": 614,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::layer_storage_with_mhc_bookends_exposes_views",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 618,
+      "line": 638,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::mhc_storage_as_weights_roundtrip",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 522,
+      "line": 542,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::storage_no_compress_dispatches_correctly",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 424,
+      "line": 444,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::storage_with_compressor_dispatches_compress",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 439,
+      "line": 459,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::storage_with_indexer_dispatches_indexer",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 461,
+      "line": 481,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::dispatcher_priority_indexer_over_compress_over_nocompress",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 492,
+      "line": 512,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::ffn_storage_as_weights_roundtrip",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 548,
+      "line": 568,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::ffn_storage_without_optional_fields",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 594,
+      "line": 614,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::layer_storage_with_mhc_bookends_exposes_views",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 618,
+      "line": 638,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::mhc_storage_as_weights_roundtrip",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 522,
+      "line": 542,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::storage_no_compress_dispatches_correctly",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 424,
+      "line": 444,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::storage_with_compressor_dispatches_compress",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 439,
+      "line": 459,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage::tests::storage_with_indexer_dispatches_indexer",
       "file": "crates/larql-inference/src/attention/dsv4_storage.rs",
-      "line": 461,
+      "line": 481,
       "crate": "larql_inference"
     },
     {

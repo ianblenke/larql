@@ -325,6 +325,7 @@ mod tests {
                     gate_exps: gate_exps.view(),
                     up_exps: up_exps.view(),
                     down_exps: down_exps.view(),
+                    quant: None,
                 },
                 shared: SharedExpertWeights {
                     gate_shexp: gate_shexp.view(),
@@ -603,6 +604,7 @@ mod tests {
                     gate_exps: gate_exps.view(),
                     up_exps: up_exps.view(),
                     down_exps: down_exps.view(),
+                    quant: None,
                 },
                 shared: SharedExpertWeights {
                     gate_shexp: gate_shexp.view(),
@@ -702,6 +704,7 @@ mod tests {
                     gate_exps: gate_exps.view(),
                     up_exps: up_exps.view(),
                     down_exps: down_exps.view(),
+                    quant: None,
                 },
                 shared: SharedExpertWeights {
                     gate_shexp: gate_shexp.view(),

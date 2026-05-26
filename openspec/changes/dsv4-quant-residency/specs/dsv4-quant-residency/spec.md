@@ -78,6 +78,7 @@ is unchanged when no quantized weight is present.
 - **THEN** each expert's gate/up/down SHALL be obtained as a
   zero-copy quantized slice (`QuantTensor::expert_slice`) and run
   through the lazy-quant matmul, with no per-expert f32 dequant
+<!-- test: larql_inference::attention::dsv4_moe_dispatch::quant_moe_dispatch_matches_f32_within_tolerance -->
 
 ### Requirement: Resident (non-streaming) model forward
 
