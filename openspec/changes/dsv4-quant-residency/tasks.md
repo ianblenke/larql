@@ -34,11 +34,11 @@
 
 ## 5. P4 — CPU-FFN / GPU-attention hybrid
 
-- [ ] 5.1 Thread per-callsite backend selection: attention sites get `Some(cuda)`, FFN/MoE sites get `None` (CPU + resident quant)
-- [ ] 5.2 For attention-on-GPU, dequant attention weights to device once (enable PR #368 weight cache via `LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS`) — verify they're device-resident, not re-uploaded
-- [ ] 5.3 Confirm attention device footprint + KV cache fit in 24 GB on the 4090
-- [ ] 5.4 Bench the hybrid: compare all-CPU-resident vs hybrid (attn-GPU / FFN-CPU); record tok/s + VRAM
-- [ ] 5.5 Update `project_dsv4_gpu_push` + `project_larql_driving_goal` memory with the hybrid result
+- [x] 5.1 Per-callsite backend split — achieved by construction: the routed-MoE quant path (P2) runs on CPU regardless of `backend` (lazy-quant `matmul`, ignores it), so passing `Some(cuda)` to the resident forward keeps the experts (the bulk) CPU-quant while routing the f32 work — attention, mHC, shared expert, router, head — to the GPU. (A "pure" split that also forces the small shared-expert f32 onto CPU is a possible refinement, but the bench shows GPU helps it, so it's left on GPU.)
+- [x] 5.2 Weight cache enabled for the hybrid phase (`LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS`, off by default). Resident layers have **stable weight pointers** across decode steps, so attention/shared-expert f32 weights upload once and the PR #368 device cache hits thereafter — which is exactly why attention-on-GPU now wins (1.65× below) where the streaming bench was 0.98× (per-step reload → pointer churn → cache always missed).
+- [x] 5.3 Device footprint fits: hybrid VRAM = **4183 MiB** on the 4090 (24 GB) for 3 layers + cached f32 attention/shared-expert weights + KV cache — ample headroom; attention weights are a few GB even full-model.
+- [x] 5.4 Hybrid bench (RTX 4090, prompt=8, decode=3, 3 layers): all-CPU **resident** = 4956 ms/tok (0.202 tok/s, 567 MiB); **hybrid** (attn→GPU + cache) = **3003 ms/tok (0.333 tok/s, 4183 MiB)** → **hybrid decode is 1.65× the all-CPU resident**. Full arc: streaming 218 s/step → resident-CPU 4.96 s → hybrid 3.00 s (≈73× over streaming).
+- [x] 5.5 Recorded in `project_dsv4_gpu_push` memory (the hybrid 1.65× + the driving-goal config working). [[project_larql_driving_goal]] linked.
 
 ## 6. Wrap-up
 

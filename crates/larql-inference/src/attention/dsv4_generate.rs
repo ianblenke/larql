@@ -460,17 +460,22 @@ mod tests {
             backend.name(),
             backend.device_info()
         );
-        eprintln!("[cuda]  starting...");
-        let cuda = run_phase(
-            "cuda",
-            &gguf,
-            &hp,
-            &head,
-            &layers,
-            &prompt,
-            n_decode,
-            Some(backend.as_ref()),
-        );
+        let cuda = if std::env::var("LARQL_DSV4_BENCH_SKIP_CUDA").is_ok() {
+            eprintln!("[cuda]  skipped (LARQL_DSV4_BENCH_SKIP_CUDA set)");
+            None
+        } else {
+            eprintln!("[cuda]  starting...");
+            Some(run_phase(
+                "cuda",
+                &gguf,
+                &hp,
+                &head,
+                &layers,
+                &prompt,
+                n_decode,
+                Some(backend.as_ref()),
+            ))
+        };
 
         // Resident-quant phase (dsv4-quant-residency): load the layers
         // once (Q4_K experts held in RAM) and decode against them — no
@@ -484,6 +489,40 @@ mod tests {
             eprintln!("[resident] starting (CPU, Q4_K-resident experts)...");
             Some(run_phase_resident(
                 "resident", &gguf, &hp, &head, &layers, &prompt, n_decode, None,
+            ))
+        };
+
+        // P4 hybrid (dsv4-quant-residency): resident layers + CUDA
+        // backend. The routed-MoE quant path runs CPU (it ignores
+        // `backend`), so this routes only the f32 work — attention,
+        // mHC, shared expert, router — to the GPU while the experts
+        // (the bulk) stay CPU-quant. Because resident layers have
+        // stable weight pointers across decode steps, the PR #368
+        // device-resident f32 weight cache (enabled here) uploads each
+        // attention weight once and reuses it — unlike streaming, where
+        // per-step reload changes pointers and the cache always misses.
+        let hybrid = if std::env::var("LARQL_DSV4_BENCH_SKIP_HYBRID").is_ok() {
+            eprintln!("[hybrid] skipped (LARQL_DSV4_BENCH_SKIP_HYBRID set)");
+            None
+        } else {
+            // Enable the device-resident weight cache (off by default).
+            // Threshold covers attention + shared-expert f32 weights;
+            // the routed experts never reach this path (CPU-quant).
+            if std::env::var("LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS").is_err() {
+                std::env::set_var("LARQL_CUDA_WEIGHT_CACHE_MAX_ELEMS", "67108864");
+            }
+            eprintln!(
+                "[hybrid] starting (attn/mHC/shared→GPU + #368 weight cache, routed experts→CPU-quant)..."
+            );
+            Some(run_phase_resident(
+                "hybrid",
+                &gguf,
+                &hp,
+                &head,
+                &layers,
+                &prompt,
+                n_decode,
+                Some(backend.as_ref()),
             ))
         };
 
@@ -512,13 +551,18 @@ mod tests {
         if let Some(p) = &cpu {
             row("cpu", p);
         }
-        row("cuda", &cuda);
+        if let Some(p) = &cuda {
+            row("cuda", p);
+        }
         if let Some(p) = &resident {
             row("resident", p);
         }
-        if let Some(p) = &cpu {
-            let prefill_speedup = p.prefill_s / cuda.prefill_s.max(1e-9);
-            let decode_speedup = p.decode_s / cuda.decode_s.max(1e-9);
+        if let Some(p) = &hybrid {
+            row("hybrid", p);
+        }
+        if let (Some(p), Some(c)) = (&cpu, &cuda) {
+            let prefill_speedup = p.prefill_s / c.prefill_s.max(1e-9);
+            let decode_speedup = p.decode_s / c.decode_s.max(1e-9);
             eprintln!(
                 "  cpu/cuda     {:>10.2}x prefill   {:>10.2}x decode (steady-state)",
                 prefill_speedup, decode_speedup
@@ -534,12 +578,28 @@ mod tests {
                      (load-once vs per-token reload)"
                 );
             }
+            // P4: hybrid (attn→GPU) vs resident (all-CPU) steady-state.
+            if let Some(h) = &hybrid {
+                let ratio = r.decode_s.max(1e-9) / h.decode_s.max(1e-9);
+                eprintln!(
+                    "  hybrid (attn→GPU) decode is {ratio:>.2}x the all-CPU resident steady-state"
+                );
+            }
         }
         eprintln!();
 
-        // Sanity: prefill produced timings. Deeper equivalence is
-        // the milestone test's job.
-        assert!(cuda.prefill_s > 0.0);
+        // Sanity: at least one phase produced timings. Deeper
+        // equivalence is the milestone test's job.
+        let any_prefill = [
+            cpu.as_ref(),
+            cuda.as_ref(),
+            resident.as_ref(),
+            hybrid.as_ref(),
+        ]
+        .iter()
+        .flatten()
+        .any(|p| p.prefill_s > 0.0);
+        assert!(any_prefill, "no phase ran");
     }
 
     /// One backend's measurement: prefill wall + warmup decode +
