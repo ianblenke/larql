@@ -16,6 +16,7 @@ runs.
 - **THEN** storage SHALL hold it as a `Some(QuantTensor)` over the raw
   quantized bytes, and the corresponding f32 array SHALL be empty
   (0×0)
+<!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_populates_quant_and_empties_f32 -->
 
 #### Scenario: Unsupported format falls back to f32
 

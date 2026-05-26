@@ -17,6 +17,9 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2, Array3};
 
 use larql_models::architectures::deepseek_v4_tensors::DsV4TensorKind;
+use larql_models::quant::lazy::QuantTensor;
+
+use super::dsv4_gguf_reader::RawExpertTensor;
 
 use super::dsv4_attn_block::DsV4AttnBlockParams;
 use super::dsv4_compressor_prefill::CompressorParams;
@@ -108,6 +111,9 @@ pub enum DsV4BuildError {
     MissingIndexerHyperparams,
     /// `compress_ratio == 4` requires indexer support.
     IndexerRequiredForCompressRatio4,
+    /// A resident routed-expert tensor's raw bytes failed to build a
+    /// `QuantTensor` (e.g. byte length doesn't match the declared shape).
+    ResidentQuant(String),
 }
 
 impl std::fmt::Display for DsV4BuildError {
@@ -129,6 +135,9 @@ impl std::fmt::Display for DsV4BuildError {
             DsV4BuildError::IndexerRequiredForCompressRatio4 => {
                 write!(f, "compress_ratio == 4 requires indexer support")
             }
+            DsV4BuildError::ResidentQuant(msg) => {
+                write!(f, "resident quant expert build failed: {msg}")
+            }
         }
     }
 }
@@ -144,12 +153,48 @@ impl std::error::Error for DsV4BuildError {}
 ///
 /// Validates that every tensor required for the variant is present
 /// and has the expected element count. Missing tensors → error;
-/// off-by-one shapes → error.
+/// off-by-one shapes → error. The routed-MoE experts are dequantized
+/// to f32 (`FfnStorage::*_exps`); for the resident-quant path use
+/// [`build_layer_storage_resident`].
 pub fn build_layer_storage(
     tensors: HashMap<DsV4TensorKind, Vec<f32>>,
     int_tensors: HashMap<DsV4TensorKind, Vec<i32>>,
     hp: &DsV4Hyperparams,
     compress_ratio: usize,
+) -> Result<DsV4LayerWeightStorage, DsV4BuildError> {
+    build_layer_storage_inner(tensors, int_tensors, hp, compress_ratio, None)
+}
+
+/// Like [`build_layer_storage`], but the routed-MoE expert tensors are
+/// held **resident-quantized** (`dsv4-quant-residency`): `raw_experts`
+/// supplies the `ffn_{gate,up,down}_exps` raw quantized bytes (from
+/// [`super::dsv4_gguf_reader::read_dsv4_layer_raw_expert_tensors_from_gguf`]),
+/// which are wrapped in `QuantTensor`s and stored in
+/// `FfnStorage::*_exps_quant` **without** allocating their ~26 GB/layer
+/// f32 expansion — the f32 `*_exps` arrays are left empty (`0×0×0`).
+///
+/// Everything else (attention, mHC, shared expert, compressor, indexer)
+/// is built from `tensors` exactly as the f32 path does. The caller
+/// therefore reads the small f32 tensors normally but reads the experts
+/// raw, never paying the f32 dequant for them.
+pub fn build_layer_storage_resident(
+    tensors: HashMap<DsV4TensorKind, Vec<f32>>,
+    raw_experts: HashMap<DsV4TensorKind, RawExpertTensor>,
+    int_tensors: HashMap<DsV4TensorKind, Vec<i32>>,
+    hp: &DsV4Hyperparams,
+    compress_ratio: usize,
+) -> Result<DsV4LayerWeightStorage, DsV4BuildError> {
+    build_layer_storage_inner(tensors, int_tensors, hp, compress_ratio, Some(raw_experts))
+}
+
+/// Shared core. `raw_experts == None` → f32 experts (dequantized via
+/// `take_3d`); `Some(map)` → resident `QuantTensor` experts + empty f32.
+fn build_layer_storage_inner(
+    tensors: HashMap<DsV4TensorKind, Vec<f32>>,
+    int_tensors: HashMap<DsV4TensorKind, Vec<i32>>,
+    hp: &DsV4Hyperparams,
+    compress_ratio: usize,
+    mut raw_experts: Option<HashMap<DsV4TensorKind, RawExpertTensor>>,
 ) -> Result<DsV4LayerWeightStorage, DsV4BuildError> {
     // ── Main attention (always required) ──
     let attn_norm = take_vec(&tensors, DsV4TensorKind::AttnNorm, &[hp.n_embd])?;
@@ -222,6 +267,48 @@ pub fn build_layer_storage(
     let n_vocab_for_routing = int_tensors
         .get(&DsV4TensorKind::FfnGateTid2Eid)
         .map(|v| v.len() / hp.n_expert_used);
+
+    // Routed experts: f32 (dequantized) or resident QuantTensor. In the
+    // resident case the f32 arrays are left empty (`0×0×0`) per the
+    // dual-storage contract and the raw bytes are moved into
+    // `QuantTensor`s — never expanded to f32.
+    let (gate_exps, up_exps, down_exps, gate_exps_quant, up_exps_quant, down_exps_quant) =
+        match raw_experts.as_mut() {
+            None => (
+                take_3d(
+                    &tensors,
+                    DsV4TensorKind::FfnGateExps,
+                    hp.n_expert,
+                    hp.n_ff_exp,
+                    hp.n_embd,
+                )?,
+                take_3d(
+                    &tensors,
+                    DsV4TensorKind::FfnUpExps,
+                    hp.n_expert,
+                    hp.n_ff_exp,
+                    hp.n_embd,
+                )?,
+                take_3d(
+                    &tensors,
+                    DsV4TensorKind::FfnDownExps,
+                    hp.n_expert,
+                    hp.n_embd,
+                    hp.n_ff_exp,
+                )?,
+                None,
+                None,
+                None,
+            ),
+            Some(raw) => {
+                let g = resident_quant(raw, DsV4TensorKind::FfnGateExps)?;
+                let u = resident_quant(raw, DsV4TensorKind::FfnUpExps)?;
+                let d = resident_quant(raw, DsV4TensorKind::FfnDownExps)?;
+                let empty = || Array3::<f32>::zeros((0, 0, 0));
+                (empty(), empty(), empty(), Some(g), Some(u), Some(d))
+            }
+        };
+
     storage.ffn = Some(super::dsv4_storage::FfnStorage {
         ffn_norm: take_vec(&tensors, DsV4TensorKind::FfnNorm, &[hp.n_embd])?,
         gate_inp: take_2d(&tensors, DsV4TensorKind::FfnGateInp, hp.n_expert, hp.n_embd)?,
@@ -238,27 +325,9 @@ pub fn build_layer_storage(
             ),
             _ => None,
         },
-        gate_exps: take_3d(
-            &tensors,
-            DsV4TensorKind::FfnGateExps,
-            hp.n_expert,
-            hp.n_ff_exp,
-            hp.n_embd,
-        )?,
-        up_exps: take_3d(
-            &tensors,
-            DsV4TensorKind::FfnUpExps,
-            hp.n_expert,
-            hp.n_ff_exp,
-            hp.n_embd,
-        )?,
-        down_exps: take_3d(
-            &tensors,
-            DsV4TensorKind::FfnDownExps,
-            hp.n_expert,
-            hp.n_embd,
-            hp.n_ff_exp,
-        )?,
+        gate_exps,
+        up_exps,
+        down_exps,
         gate_shexp: take_2d(
             &tensors,
             DsV4TensorKind::FfnGateShexp,
@@ -277,11 +346,9 @@ pub fn build_layer_storage(
             hp.n_embd,
             hidden_shared,
         )?,
-        // f32 builder: routed experts stay f32 (quant residency is the
-        // opt-in resident loader, a follow-up). dsv4-quant-residency P1.
-        gate_exps_quant: None,
-        up_exps_quant: None,
-        down_exps_quant: None,
+        gate_exps_quant,
+        up_exps_quant,
+        down_exps_quant,
     });
 
     if compress_ratio == 0 {
@@ -388,6 +455,19 @@ pub fn build_layer_storage(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+/// Build a resident `QuantTensor` for one routed-expert tensor by
+/// **moving** its raw bytes out of `raw` (no clone, no f32 expansion).
+fn resident_quant(
+    raw: &mut HashMap<DsV4TensorKind, RawExpertTensor>,
+    kind: DsV4TensorKind,
+) -> Result<QuantTensor, DsV4BuildError> {
+    let t = raw
+        .remove(&kind)
+        .ok_or(DsV4BuildError::MissingTensor(kind))?;
+    QuantTensor::from_raw(t.bytes, t.tensor_type, t.rows, t.cols)
+        .map_err(|e| DsV4BuildError::ResidentQuant(format!("{kind}: {e}")))
+}
 
 fn take_vec(
     tensors: &HashMap<DsV4TensorKind, Vec<f32>>,
@@ -699,5 +779,90 @@ mod tests {
             DsV4BuildError::MissingIndexerHyperparams => {}
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    /// dsv4-quant-residency P1: `build_layer_storage_resident` holds the
+    /// routed experts as `QuantTensor`s and leaves the f32 `*_exps`
+    /// arrays empty — without ever needing the experts as f32 (they're
+    /// removed from the f32 map here, proving no 26 GB/layer dequant).
+    /// Uses TYPE_F32 raw bytes so the test needs no real K-quant blocks.
+    #[test]
+    fn build_layer_storage_resident_populates_quant_and_empties_f32() {
+        use larql_models::quant::ggml::TYPE_F32;
+
+        let hp = base_hp();
+        // Full f32 map, minus the routed experts — the resident builder
+        // must not require them as f32.
+        let mut tensors = no_compress_tensors(&hp);
+        tensors.remove(&DsV4TensorKind::FfnGateExps);
+        tensors.remove(&DsV4TensorKind::FfnUpExps);
+        tensors.remove(&DsV4TensorKind::FfnDownExps);
+
+        // Synthetic raw experts as TYPE_F32 (from_raw accepts F32). The
+        // flat `from_raw` shape is `[n_expert*out_dim, in_dim]`: gate/up
+        // are `[n_expert*n_ff_exp, n_embd]`, down is `[n_expert*n_embd,
+        // n_ff_exp]`.
+        let raw_f32 = |rows: usize, cols: usize| -> RawExpertTensor {
+            let bytes: Vec<u8> = (0..rows * cols)
+                .flat_map(|i| (i as f32 * 0.001).to_le_bytes())
+                .collect();
+            RawExpertTensor {
+                bytes,
+                tensor_type: TYPE_F32,
+                rows,
+                cols,
+            }
+        };
+        let mut raw = HashMap::new();
+        raw.insert(
+            DsV4TensorKind::FfnGateExps,
+            raw_f32(hp.n_expert * hp.n_ff_exp, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnUpExps,
+            raw_f32(hp.n_expert * hp.n_ff_exp, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnDownExps,
+            raw_f32(hp.n_expert * hp.n_embd, hp.n_ff_exp),
+        );
+
+        let storage = build_layer_storage_resident(tensors, raw, HashMap::new(), &hp, 0)
+            .expect("resident build");
+        let ffn = storage.ffn.as_ref().expect("ffn present");
+
+        // Quant fields populated with the from_raw shapes.
+        assert_eq!(
+            ffn.gate_exps_quant.as_ref().unwrap().shape(),
+            [hp.n_expert * hp.n_ff_exp, hp.n_embd]
+        );
+        assert_eq!(
+            ffn.up_exps_quant.as_ref().unwrap().shape(),
+            [hp.n_expert * hp.n_ff_exp, hp.n_embd]
+        );
+        assert_eq!(
+            ffn.down_exps_quant.as_ref().unwrap().shape(),
+            [hp.n_expert * hp.n_embd, hp.n_ff_exp]
+        );
+        // f32 expert arrays left empty (dual-storage contract).
+        assert_eq!(ffn.gate_exps.len(), 0);
+        assert_eq!(ffn.up_exps.len(), 0);
+        assert_eq!(ffn.down_exps.len(), 0);
+        // Non-expert FFN fields still built from f32 as usual.
+        assert_eq!(ffn.gate_inp.shape(), &[hp.n_expert, hp.n_embd]);
+        assert_eq!(
+            ffn.gate_shexp.shape(),
+            &[hp.n_ff_exp * hp.n_expert_shared, hp.n_embd]
+        );
+
+        // f32 path is unchanged: same hp, full map, no quant fields.
+        let f32_storage =
+            build_layer_storage(no_compress_tensors(&hp), HashMap::new(), &hp, 0).unwrap();
+        let f32_ffn = f32_storage.ffn.as_ref().unwrap();
+        assert!(f32_ffn.gate_exps_quant.is_none());
+        assert_eq!(
+            f32_ffn.gate_exps.shape(),
+            &[hp.n_expert, hp.n_ff_exp, hp.n_embd]
+        );
     }
 }

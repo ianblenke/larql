@@ -3,9 +3,9 @@
     "capabilities": 55,
     "requirements": 534,
     "scenarios": 1564,
-    "scenarios_backed": 1347,
-    "scenarios_unbacked": 217,
-    "test_refs": 3484,
+    "scenarios_backed": 1348,
+    "scenarios_unbacked": 216,
+    "test_refs": 3485,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5347,9 +5347,11 @@
           "scenarios": [
             {
               "name": "Quantized tensor populates the QuantTensor field",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_populates_quant_and_empties_f32"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
               "line": 12
             },
@@ -5359,7 +5361,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 20
+              "line": 21
             }
           ]
         },
@@ -5374,7 +5376,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 36
+              "line": 37
             },
             {
               "name": "Resident footprint fits the quantized size",
@@ -5384,7 +5386,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 43
+              "line": 44
             }
           ]
         },
@@ -5397,7 +5399,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 59
+              "line": 60
             },
             {
               "name": "f32 fallback weight uses the existing path",
@@ -5405,7 +5407,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 66
+              "line": 67
             },
             {
               "name": "MoE experts read quantized slices without re-dequant",
@@ -5413,7 +5415,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 73
+              "line": 74
             }
           ]
         },
@@ -5426,7 +5428,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 89
+              "line": 90
             },
             {
               "name": "Streaming path retained for oversized models",
@@ -5434,7 +5436,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 95
+              "line": 96
             }
           ]
         },
@@ -5447,7 +5449,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 109
+              "line": 110
             },
             {
               "name": "Greedy tokens match",
@@ -5455,7 +5457,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 116
+              "line": 117
             }
           ]
         },
@@ -5468,7 +5470,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 130
+              "line": 131
             },
             {
               "name": "Attention weights fit device memory",
@@ -5476,7 +5478,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-quant-residency/specs/dsv4-quant-residency/spec.md",
-              "line": 138
+              "line": 139
             }
           ]
         }
@@ -26930,73 +26932,79 @@
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::build_compress_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 554,
+      "line": 634,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::build_indexer_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 584,
+      "line": 664,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::build_no_compress_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 542,
+      "line": 622,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::compress_ratio_4_requires_indexer_hyperparams",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 675,
+      "line": 755,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::missing_tensor_errors",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 639,
+      "line": 719,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::shape_mismatch_errors",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 654,
+      "line": 734,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::build_compress_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 554,
+      "line": 634,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::build_indexer_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 584,
+      "line": 664,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_storage_build::tests::build_layer_storage_resident_populates_quant_and_empties_f32",
+      "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
+      "line": 790,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::build_no_compress_storage",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 542,
+      "line": 622,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::compress_ratio_4_requires_indexer_hyperparams",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 675,
+      "line": 755,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::missing_tensor_errors",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 639,
+      "line": 719,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_storage_build::tests::shape_mismatch_errors",
       "file": "crates/larql-inference/src/attention/dsv4_storage_build.rs",
-      "line": 654,
+      "line": 734,
       "crate": "larql_inference"
     },
     {
