@@ -472,6 +472,21 @@ mod tests {
             Some(backend.as_ref()),
         );
 
+        // Resident-quant phase (dsv4-quant-residency): load the layers
+        // once (Q4_K experts held in RAM) and decode against them — no
+        // per-token streaming reload. CPU backend (FFN-on-CPU-resident,
+        // the driving-goal config). Opt out on low-RAM hosts running
+        // many layers via LARQL_DSV4_BENCH_SKIP_RESIDENT=1.
+        let resident = if std::env::var("LARQL_DSV4_BENCH_SKIP_RESIDENT").is_ok() {
+            eprintln!("[resident] skipped (LARQL_DSV4_BENCH_SKIP_RESIDENT set)");
+            None
+        } else {
+            eprintln!("[resident] starting (CPU, Q4_K-resident experts)...");
+            Some(run_phase_resident(
+                "resident", &gguf, &hp, &head, &layers, &prompt, n_decode, None,
+            ))
+        };
+
         // Summary table. `decode_s` is the steady-state wall (decode
         // steps 2..=n_decode); `warmup_s` is step 1, reported
         // separately. tok/s_dec is computed over steady-state only.
@@ -479,12 +494,13 @@ mod tests {
         eprintln!();
         eprintln!("=== Summary ===");
         eprintln!(
-            "                {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-            "prefill_s", "warmup_s", "decode_s", "ms/tok", "tok/s_dec", "vram_MiB"
+            "                {:>9}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "load_s", "prefill_s", "warmup_s", "decode_s", "ms/tok", "tok/s_dec", "vram_MiB"
         );
-        if let Some(p) = &cpu {
+        let row = |tag: &str, p: &BenchPhase| {
             eprintln!(
-                "  cpu          {:>10.2}  {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
+                "  {tag:<11}{:>9.2}  {:>10.2}  {:>10.2}  {:>10.2}  {:>10.1}  {:>10.3}  {:>10}",
+                p.load_s,
                 p.prefill_s,
                 p.warmup_s,
                 p.decode_s,
@@ -492,16 +508,14 @@ mod tests {
                 steady_steps as f64 / p.decode_s.max(1e-9),
                 p.vram_mib
             );
+        };
+        if let Some(p) = &cpu {
+            row("cpu", p);
         }
-        eprintln!(
-            "  cuda         {:>10.2}  {:>10.2}  {:>10.2}  {:>10.1}  {:>10.2}  {:>10}",
-            cuda.prefill_s,
-            cuda.warmup_s,
-            cuda.decode_s,
-            1000.0 * cuda.decode_s / steady_steps as f64,
-            steady_steps as f64 / cuda.decode_s.max(1e-9),
-            cuda.vram_mib
-        );
+        row("cuda", &cuda);
+        if let Some(p) = &resident {
+            row("resident", p);
+        }
         if let Some(p) = &cpu {
             let prefill_speedup = p.prefill_s / cuda.prefill_s.max(1e-9);
             let decode_speedup = p.decode_s / cuda.decode_s.max(1e-9);
@@ -509,6 +523,17 @@ mod tests {
                 "  cpu/cuda     {:>10.2}x prefill   {:>10.2}x decode (steady-state)",
                 prefill_speedup, decode_speedup
             );
+        }
+        if let Some(r) = &resident {
+            // The headline: resident steady-state decode vs the
+            // streaming CPU baseline (per-token reload+dequant).
+            if let Some(p) = &cpu {
+                let decode_speedup = p.decode_s.max(1e-9) / r.decode_s.max(1e-9);
+                eprintln!(
+                    "  resident decode is {decode_speedup:>.1}x the cpu-streaming steady-state \
+                     (load-once vs per-token reload)"
+                );
+            }
         }
         eprintln!();
 
@@ -525,6 +550,9 @@ mod tests {
     /// `warmup_s` is reported separately for transparency.
     #[cfg(feature = "cuda")]
     struct BenchPhase {
+        /// One-time weight load (resident phase only; 0 for streaming,
+        /// which loads per layer per step inside the forward).
+        load_s: f64,
         prefill_s: f64,
         warmup_s: f64,
         decode_s: f64,
@@ -633,6 +661,120 @@ mod tests {
             1000.0 * decode_s / steady_steps as f64
         );
         BenchPhase {
+            load_s: 0.0,
+            prefill_s,
+            warmup_s,
+            decode_s,
+            vram_mib,
+        }
+    }
+
+    /// Resident-quant phase: load all `layers` once with routed experts
+    /// held Q4_K-resident (`load_dsv4_resident_layer`), then run prefill
+    /// + N-step decode against them via
+    /// [`super::super::dsv4_streaming_model_forward::dsv4_resident_model_forward_cached`]
+    /// — no per-token reload. This is the `dsv4-quant-residency` payoff:
+    /// compare its steady-state ms/tok against the streaming phases'.
+    /// `backend` is typically `None` (CPU resident — the driving-goal
+    /// FFN-on-CPU config).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_phase_resident(
+        tag: &str,
+        gguf: &GgufFile,
+        hp: &DsV4Hyperparams,
+        head: &DsV4HeadStorage,
+        layers: &[usize],
+        prompt: &[u32],
+        n_decode: usize,
+        backend: Option<&dyn larql_compute::ComputeBackend>,
+    ) -> BenchPhase {
+        use super::super::dsv4_full_loader::load_dsv4_resident_layer;
+        use super::super::dsv4_streaming_model_forward::dsv4_resident_model_forward_cached;
+
+        // 0. Load every layer's storage ONCE (resident-quant experts).
+        let t_load = std::time::Instant::now();
+        let resident: Vec<_> = layers
+            .iter()
+            .map(|&i| load_dsv4_resident_layer(gguf, hp, i).expect("resident layer load"))
+            .collect();
+        let load_s = t_load.elapsed().as_secs_f64();
+        eprintln!(
+            "[{tag}]   resident load done in {load_s:.2}s ({} layers held in RAM)",
+            layers.len()
+        );
+
+        let max_seq_len = prompt.len() + n_decode;
+        let mut layer_caches: Vec<DsV4LayerCache> = resident
+            .iter()
+            .map(|(_, variant)| DsV4LayerCache::for_variant(hp, variant, max_seq_len))
+            .collect();
+
+        // 1. Prefill against the resident layers.
+        let t_prefill = std::time::Instant::now();
+        let mut logits = dsv4_resident_model_forward_cached(
+            &resident,
+            hp,
+            head,
+            prompt,
+            0,
+            Some(&mut layer_caches),
+            backend,
+        )
+        .expect("resident prefill");
+        let prefill_s = t_prefill.elapsed().as_secs_f64();
+        eprintln!(
+            "[{tag}]   prefill done in {prefill_s:.2}s ({} tokens)",
+            prompt.len()
+        );
+
+        // 2. Decode loop (argmax). step 0 = warmup; 1.. = steady-state.
+        let verbose = std::env::var("LARQL_DSV4_BENCH_VERBOSE").is_ok();
+        let mut tokens = prompt.to_vec();
+        let mut warmup_s = 0.0_f64;
+        let mut decode_s = 0.0_f64;
+        for step in 0..n_decode {
+            let last = logits.shape()[0] - 1;
+            let next = logits
+                .row(last)
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .expect("non-empty logits");
+            tokens.push(next);
+            let pos = tokens.len() - 1;
+            let t_step = std::time::Instant::now();
+            logits = dsv4_resident_model_forward_cached(
+                &resident,
+                hp,
+                head,
+                &[next],
+                pos,
+                Some(&mut layer_caches),
+                backend,
+            )
+            .expect("resident decode step");
+            let dt = t_step.elapsed().as_secs_f64();
+            if step == 0 {
+                warmup_s = dt;
+            } else {
+                decode_s += dt;
+            }
+            if verbose {
+                let kind = if step == 0 { "warmup" } else { "steady" };
+                eprintln!("[{tag}]     step {step:>3} ({kind}): {:.3}s", dt);
+            }
+        }
+        let steady_steps = n_decode.saturating_sub(1).max(1);
+        let vram_mib = read_nvidia_smi_used_mib();
+        eprintln!(
+            "[{tag}]   decode done   warmup={warmup_s:.3}s  steady={decode_s:.3}s ({} steps, {:.1} ms/tok)  vram={vram_mib} MiB",
+            steady_steps,
+            1000.0 * decode_s / steady_steps as f64
+        );
+        BenchPhase {
+            load_s,
             prefill_s,
             warmup_s,
             decode_s,
