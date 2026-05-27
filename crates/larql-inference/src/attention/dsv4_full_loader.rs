@@ -102,10 +102,20 @@ pub fn load_dsv4_layers(
 
 /// The routed-MoE expert tensor kinds that the resident loader keeps
 /// quantized (`QuantTensor`) instead of dequantizing to f32.
-const RESIDENT_EXPERT_KINDS: [DsV4TensorKind; 3] = [
+/// Tensor kinds held resident as raw Q4_K [`QuantTensor`]s (never
+/// dequantized to f32) in the resident path: the routed MoE experts
+/// (P1-P3) **plus** the base attention projections (P5 — the 74% decode
+/// hot spot). Used both as the f32-dequant *exclude* list and the raw-read
+/// *want* list, so each weight is read exactly once, as Q4_K bytes.
+const RESIDENT_RAW_KINDS: [DsV4TensorKind; 8] = [
     DsV4TensorKind::FfnGateExps,
     DsV4TensorKind::FfnUpExps,
     DsV4TensorKind::FfnDownExps,
+    DsV4TensorKind::AttnQA,
+    DsV4TensorKind::AttnQB,
+    DsV4TensorKind::AttnKv,
+    DsV4TensorKind::AttnOutA,
+    DsV4TensorKind::AttnOutB,
 ];
 
 /// Load a single DSv4 layer with **resident-quantized** routed experts
@@ -124,8 +134,9 @@ pub fn load_dsv4_resident_layer(
 ) -> Result<(DsV4LayerWeightStorage, DsV4LayerVariant), DsV4LoadError> {
     let variant = detect_layer_variant(gguf, layer_index, hp.head_dim);
     let f32_tensors =
-        read_dsv4_layer_tensors_from_gguf_excluding(gguf, layer_index, &RESIDENT_EXPERT_KINDS)?;
-    let raw_experts = read_dsv4_layer_raw_expert_tensors_from_gguf(gguf, layer_index)?;
+        read_dsv4_layer_tensors_from_gguf_excluding(gguf, layer_index, &RESIDENT_RAW_KINDS)?;
+    let raw_experts =
+        read_dsv4_layer_raw_expert_tensors_from_gguf(gguf, layer_index, &RESIDENT_RAW_KINDS)?;
     let int_raw = read_dsv4_layer_int_tensors_from_gguf(gguf, layer_index)?;
     let compress_ratio = variant.compress_ratio.unwrap_or(0);
     let storage =

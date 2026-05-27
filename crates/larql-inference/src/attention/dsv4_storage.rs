@@ -21,7 +21,7 @@ use ndarray::{Array1, Array2, Array3};
 
 use larql_models::quant::lazy::QuantTensor;
 
-use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights};
+use super::dsv4_attn_block::{DsV4AttnBlockParams, DsV4AttnBlockWeights, DsV4AttnQuant};
 use super::dsv4_attn_block_compress::{DsV4AttnBlockCompressParams, DsV4AttnBlockCompressWeights};
 use super::dsv4_attn_block_indexer::{DsV4AttnBlockIndexerParams, DsV4AttnBlockIndexerWeights};
 use super::dsv4_attn_dispatch::DsV4AttnLayer;
@@ -207,6 +207,15 @@ pub struct DsV4LayerWeightStorage {
     pub attn_sinks: Option<Array1<f32>>,
     pub wo_a: Array3<f32>,
     pub wo_b: Array2<f32>,
+    // ── Resident-Q4_K attention companions (P5) ──
+    // When `Some`, the matching f32 array above is left empty (`0×0`) and
+    // the projection runs the lazy-quant matmul. All-or-nothing: resident
+    // mode populates all five; streaming leaves all `None`.
+    pub wq_a_quant: Option<QuantTensor>,
+    pub wq_b_quant: Option<QuantTensor>,
+    pub wkv_quant: Option<QuantTensor>,
+    pub wo_a_quant: Option<QuantTensor>,
+    pub wo_b_quant: Option<QuantTensor>,
     pub attn_params: DsV4AttnBlockParams,
     // ── Optional HCA pieces ──
     pub compressor: Option<CompressorStorage>,
@@ -231,7 +240,27 @@ impl DsV4LayerWeightStorage {
     /// Always valid — the main attention weights are present in every
     /// variant.
     pub fn as_attn_weights(&self) -> DsV4AttnBlockWeights<'_> {
+        // Resident-Q4_K (P5): when the companions are populated, hand the
+        // forward the `QuantTensor`s (the f32 views are empty). All five
+        // are set together by the resident builder.
+        let quant = match (
+            self.wq_a_quant.as_ref(),
+            self.wq_b_quant.as_ref(),
+            self.wkv_quant.as_ref(),
+            self.wo_a_quant.as_ref(),
+            self.wo_b_quant.as_ref(),
+        ) {
+            (Some(wq_a), Some(wq_b), Some(wkv), Some(wo_a), Some(wo_b)) => Some(DsV4AttnQuant {
+                wq_a,
+                wq_b,
+                wkv,
+                wo_a,
+                wo_b,
+            }),
+            _ => None,
+        };
         DsV4AttnBlockWeights {
+            quant,
             attn_norm: &self.attn_norm,
             wq_a: self.wq_a.view(),
             q_a_norm: &self.q_a_norm,
@@ -345,6 +374,11 @@ mod tests {
             wo_b: Array2::<f32>::from_shape_fn((n_embd, low_dim), |(i, j)| {
                 ((i + j) as f32 * 0.011).sin() * 0.1
             }),
+            wq_a_quant: None,
+            wq_b_quant: None,
+            wkv_quant: None,
+            wo_a_quant: None,
+            wo_b_quant: None,
             attn_params,
             compressor: None,
             compressor_params: None,

@@ -29,6 +29,7 @@
 use ndarray::{Array2, ArrayView1, ArrayView2, ArrayView3};
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 
 use super::dsv4_fp8_kv::fp8_kv_quantize;
 use super::dsv4_grouped_o_proj::grouped_o_proj;
@@ -36,6 +37,29 @@ use super::dsv4_kv_cache::DsV4LayerKvCache;
 use super::dsv4_rope_tail::DsV4RopeMode;
 use super::dsv4_rope_tail_yarn::rope_tail_dispatch;
 use super::dsv4_swa::dsv4_sliding_window_attn;
+
+/// Resident-Q4_K companions for the attention projection weights (P5).
+///
+/// When present on [`DsV4AttnBlockWeights::quant`], the projection matmuls
+/// run against these [`QuantTensor`]s (lazy Q4_K×Q8_K dot, no f32 dequant)
+/// instead of the f32 views — cutting the per-token cold-RAM read ~3.5× on
+/// the attention projections, the 74% decode hot spot (see `dsv4_profile`).
+/// All-or-nothing per layer: resident mode sets `Some(_)` with every field
+/// populated and leaves the f32 views empty; streaming leaves it `None`.
+#[derive(Clone, Copy)]
+pub struct DsV4AttnQuant<'a> {
+    /// `(q_lora_rank, n_embd)` Q-down.
+    pub wq_a: &'a QuantTensor,
+    /// `(n_head*head_dim, q_lora_rank)` Q-up.
+    pub wq_b: &'a QuantTensor,
+    /// `(head_dim, n_embd)` KV-down.
+    pub wkv: &'a QuantTensor,
+    /// `(n_groups*o_lora_rank, group_dim)` grouped O-a (per-group via
+    /// [`QuantTensor::expert_slice`]).
+    pub wo_a: &'a QuantTensor,
+    /// `(n_embd, o_lora_rank*n_groups)` shared O-b.
+    pub wo_b: &'a QuantTensor,
+}
 
 /// Per-layer DSv4 attention weights — references-only, so callers can
 /// hold the weight buffers however they like (mmap'd GGUF, owned Vec,
@@ -60,6 +84,33 @@ pub struct DsV4AttnBlockWeights<'a> {
     pub wo_b: ArrayView2<'a, f32>,
     /// Optional per-head attention sinks `(n_head,)`.
     pub attn_sinks: Option<ArrayView1<'a, f32>>,
+    /// Resident-Q4_K companions (P5). `None` = use the f32 views above.
+    pub quant: Option<DsV4AttnQuant<'a>>,
+}
+
+impl<'a> DsV4AttnBlockWeights<'a> {
+    /// `x @ wq_a^T`: resident-Q4_K lazy matmul when `quant` is set, else
+    /// the f32 `dot_proj_gpu` path.
+    pub fn proj_wq_a(&self, x: &Array2<f32>, backend: Option<&dyn ComputeBackend>) -> Array2<f32> {
+        match &self.quant {
+            Some(q) => q.wq_a.matmul(x).expect("wq_a quant matmul"),
+            None => dot_proj_gpu(x, &self.wq_a, backend),
+        }
+    }
+    /// `x @ wq_b^T` (resident-Q4_K when available).
+    pub fn proj_wq_b(&self, x: &Array2<f32>, backend: Option<&dyn ComputeBackend>) -> Array2<f32> {
+        match &self.quant {
+            Some(q) => q.wq_b.matmul(x).expect("wq_b quant matmul"),
+            None => dot_proj_gpu(x, &self.wq_b, backend),
+        }
+    }
+    /// `x @ wkv^T` (resident-Q4_K when available).
+    pub fn proj_wkv(&self, x: &Array2<f32>, backend: Option<&dyn ComputeBackend>) -> Array2<f32> {
+        match &self.quant {
+            Some(q) => q.wkv.matmul(x).expect("wkv quant matmul"),
+            None => dot_proj_gpu(x, &self.wkv, backend),
+        }
+    }
 }
 
 /// Per-layer DSv4 attention dimensions and scalar config.
@@ -108,10 +159,10 @@ pub fn dsv4_attn_block_no_compress(
 
     // 2. Q low-rank.
     //    qr = (cur @ Wq_a^T) — (n_tokens, q_lora_rank)
-    let qr = dot_proj_gpu(&cur, &w.wq_a, backend);
+    let qr = w.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.q_a_norm, p.norm_eps);
     //    q = qr @ Wq_b^T — (n_tokens, n_head * head_dim)
-    let q = dot_proj_gpu(&qr, &w.wq_b, backend);
+    let q = w.proj_wq_b(&qr, backend);
     //    per-head RMSNorm (no learned weight) on each (token, head)
     //    n_embd_head_k vector — apply BEFORE tail-RoPE.
     let q = rms_norm_per_head(q.view(), p.n_head, p.head_dim, p.norm_eps);
@@ -129,7 +180,7 @@ pub fn dsv4_attn_block_no_compress(
 
     // 3. KV low-rank — single shared head.
     //    kv = (cur @ Wkv^T) — (n_tokens, head_dim)
-    let kv = dot_proj_gpu(&cur, &w.wkv, backend);
+    let kv = w.proj_wkv(&cur, backend);
     let kv = rms_norm_2d(kv.view(), w.kv_a_norm, p.norm_eps);
     //    tail-RoPE — reshape view (n_tokens, head_dim) treated as 1 head.
     let kv = rope_tail_dispatch(
@@ -173,6 +224,8 @@ pub fn dsv4_attn_block_no_compress(
         p.n_groups,
         p.o_lora_rank,
         backend,
+        w.quant.map(|q| q.wo_a),
+        w.quant.map(|q| q.wo_b),
     )
 }
 
@@ -277,9 +330,9 @@ pub fn dsv4_attn_block_no_compress_cached(
 
     // 2. Q low-rank + tail-RoPE. Q matmuls route through backend when
     //    supplied — dot_proj_gpu(a, b, backend) = a @ b^T.
-    let qr = dot_proj_gpu(&cur, &w.wq_a, backend);
+    let qr = w.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.q_a_norm, p.norm_eps);
-    let q = dot_proj_gpu(&qr, &w.wq_b, backend);
+    let q = w.proj_wq_b(&qr, backend);
     let q = rms_norm_per_head(q.view(), p.n_head, p.head_dim, p.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -294,7 +347,7 @@ pub fn dsv4_attn_block_no_compress_cached(
     );
 
     // 3. KV low-rank + tail-RoPE (for the NEW tokens only). Backend-routed.
-    let kv_new = dot_proj_gpu(&cur, &w.wkv, backend);
+    let kv_new = w.proj_wkv(&cur, backend);
     let kv_new = rms_norm_2d(kv_new.view(), w.kv_a_norm, p.norm_eps);
     let kv_new = rope_tail_dispatch(
         &kv_new,
@@ -340,6 +393,8 @@ pub fn dsv4_attn_block_no_compress_cached(
         p.n_groups,
         p.o_lora_rank,
         backend,
+        w.quant.map(|q| q.wo_a),
+        w.quant.map(|q| q.wo_b),
     )
 }
 
@@ -403,6 +458,7 @@ mod tests {
         let attn_sinks = Array1::<f32>::from_elem(p.n_head, -1.0);
 
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -478,6 +534,7 @@ mod tests {
         });
 
         let w_nosink = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -490,6 +547,7 @@ mod tests {
         };
         let sinks = Array1::<f32>::from_elem(p.n_head, 5.0);
         let w_sink = DsV4AttnBlockWeights {
+            quant: None,
             attn_sinks: Some(sinks.view()),
             ..w_nosink
         };
@@ -544,6 +602,7 @@ mod tests {
         let wo_a = Array3::<f32>::from_shape_fn((p.n_groups, p.o_lora_rank, group_dim), |_| 0.01);
         let wo_b = Array2::<f32>::from_shape_fn((p.n_embd, low_dim), |_| 0.01);
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -605,6 +664,7 @@ mod tests {
         });
         let attn_sinks = Array1::<f32>::from_elem(p.n_head, -1.0);
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -705,6 +765,7 @@ mod tests {
         let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
             build_cached_test_weights();
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -751,6 +812,7 @@ mod tests {
         let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
             build_cached_test_weights();
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -811,6 +873,7 @@ mod tests {
         let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
             build_cached_test_weights();
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -834,6 +897,7 @@ mod tests {
         let (p, attn_norm, wq_a, q_a_norm, wq_b, wkv, kv_a_norm, wo_a, wo_b, attn_sinks) =
             build_cached_test_weights();
         let w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,

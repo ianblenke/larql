@@ -198,15 +198,7 @@ fn build_layer_storage_inner(
 ) -> Result<DsV4LayerWeightStorage, DsV4BuildError> {
     // ── Main attention (always required) ──
     let attn_norm = take_vec(&tensors, DsV4TensorKind::AttnNorm, &[hp.n_embd])?;
-    let wq_a = take_2d(&tensors, DsV4TensorKind::AttnQA, hp.q_lora_rank, hp.n_embd)?;
     let q_a_norm = take_vec(&tensors, DsV4TensorKind::AttnQANorm, &[hp.q_lora_rank])?;
-    let wq_b = take_2d(
-        &tensors,
-        DsV4TensorKind::AttnQB,
-        hp.n_head * hp.head_dim,
-        hp.q_lora_rank,
-    )?;
-    let wkv = take_2d(&tensors, DsV4TensorKind::AttnKv, hp.head_dim, hp.n_embd)?;
     let kv_a_norm = take_vec(&tensors, DsV4TensorKind::AttnKvANorm, &[hp.head_dim])?;
     let attn_sinks = tensors
         .get(&DsV4TensorKind::AttnSinks)
@@ -215,14 +207,62 @@ fn build_layer_storage_inner(
     let group_heads = hp.n_head / hp.n_groups;
     let group_dim = hp.head_dim * group_heads;
     let low_dim = hp.o_lora_rank * hp.n_groups;
-    let wo_a = take_3d(
-        &tensors,
-        DsV4TensorKind::AttnOutA,
-        hp.n_groups,
-        hp.o_lora_rank,
-        group_dim,
-    )?;
-    let wo_b = take_2d(&tensors, DsV4TensorKind::AttnOutB, hp.n_embd, low_dim)?;
+
+    // P5: base attention projection weights — resident Q4_K `QuantTensor`s
+    // when `raw_experts` is present (the f32 arrays stay empty `0×0`), or
+    // dequantized f32 in the streaming path. Mirrors the routed-expert
+    // dual-storage below. `AttnOutA` (wo_a) is the grouped o-proj A,
+    // packed `[n_groups*o_lora_rank, group_dim]` (per-group via
+    // `expert_slice`); the others are plain 2D `[out, in]`.
+    #[allow(clippy::type_complexity)]
+    let (wq_a, wq_b, wkv, wo_a, wo_b, wq_a_quant, wq_b_quant, wkv_quant, wo_a_quant, wo_b_quant): (
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array3<f32>,
+        Array2<f32>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+    ) = match raw_experts.as_mut() {
+        None => (
+            take_2d(&tensors, DsV4TensorKind::AttnQA, hp.q_lora_rank, hp.n_embd)?,
+            take_2d(
+                &tensors,
+                DsV4TensorKind::AttnQB,
+                hp.n_head * hp.head_dim,
+                hp.q_lora_rank,
+            )?,
+            take_2d(&tensors, DsV4TensorKind::AttnKv, hp.head_dim, hp.n_embd)?,
+            take_3d(
+                &tensors,
+                DsV4TensorKind::AttnOutA,
+                hp.n_groups,
+                hp.o_lora_rank,
+                group_dim,
+            )?,
+            take_2d(&tensors, DsV4TensorKind::AttnOutB, hp.n_embd, low_dim)?,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        Some(raw) => (
+            Array2::zeros((0, 0)),
+            Array2::zeros((0, 0)),
+            Array2::zeros((0, 0)),
+            Array3::zeros((0, 0, 0)),
+            Array2::zeros((0, 0)),
+            Some(resident_quant(raw, DsV4TensorKind::AttnQA)?),
+            Some(resident_quant(raw, DsV4TensorKind::AttnQB)?),
+            Some(resident_quant(raw, DsV4TensorKind::AttnKv)?),
+            Some(resident_quant(raw, DsV4TensorKind::AttnOutA)?),
+            Some(resident_quant(raw, DsV4TensorKind::AttnOutB)?),
+        ),
+    };
 
     let mut storage = DsV4LayerWeightStorage {
         attn_norm,
@@ -234,6 +274,11 @@ fn build_layer_storage_inner(
         attn_sinks,
         wo_a,
         wo_b,
+        wq_a_quant,
+        wq_b_quant,
+        wkv_quant,
+        wo_a_quant,
+        wo_b_quant,
         attn_params: hp.attn_params(),
         compressor: None,
         compressor_params: None,
