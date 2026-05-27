@@ -173,10 +173,12 @@ pub fn build_layer_storage(
 /// `FfnStorage::*_exps_quant` **without** allocating their ~26 GB/layer
 /// f32 expansion — the f32 `*_exps` arrays are left empty (`0×0×0`).
 ///
-/// Everything else (attention, mHC, shared expert, compressor, indexer)
-/// is built from `tensors` exactly as the f32 path does. The caller
-/// therefore reads the small f32 tensors normally but reads the experts
-/// raw, never paying the f32 dequant for them.
+/// The base attention projections (P5) and the shared-expert FFN (P6)
+/// are likewise held resident-Q4_K from `raw_experts` (their f32 arrays
+/// left empty); mHC, compressor, and indexer weights are still built
+/// from `tensors` as f32. So the caller reads the small f32 tensors
+/// normally but reads every large matmul weight raw, never paying the
+/// f32 dequant for it.
 pub fn build_layer_storage_resident(
     tensors: HashMap<DsV4TensorKind, Vec<f32>>,
     raw_experts: HashMap<DsV4TensorKind, RawExpertTensor>,
@@ -354,6 +356,34 @@ fn build_layer_storage_inner(
             }
         };
 
+    // Shared expert (P6): same dual-storage as the routed experts — a
+    // single dense FFN held resident-Q4_K when `raw_experts` is present.
+    #[allow(clippy::type_complexity)]
+    let (gate_shexp, up_shexp, down_shexp, gate_shexp_quant, up_shexp_quant, down_shexp_quant): (
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+        Option<QuantTensor>,
+    ) = match raw_experts.as_mut() {
+        None => (
+            take_2d(&tensors, DsV4TensorKind::FfnGateShexp, hidden_shared, hp.n_embd)?,
+            take_2d(&tensors, DsV4TensorKind::FfnUpShexp, hidden_shared, hp.n_embd)?,
+            take_2d(&tensors, DsV4TensorKind::FfnDownShexp, hp.n_embd, hidden_shared)?,
+            None,
+            None,
+            None,
+        ),
+        Some(raw) => {
+            let g = resident_quant(raw, DsV4TensorKind::FfnGateShexp)?;
+            let u = resident_quant(raw, DsV4TensorKind::FfnUpShexp)?;
+            let d = resident_quant(raw, DsV4TensorKind::FfnDownShexp)?;
+            let empty = || Array2::<f32>::zeros((0, 0));
+            (empty(), empty(), empty(), Some(g), Some(u), Some(d))
+        }
+    };
+
     storage.ffn = Some(super::dsv4_storage::FfnStorage {
         ffn_norm: take_vec(&tensors, DsV4TensorKind::FfnNorm, &[hp.n_embd])?,
         gate_inp: take_2d(&tensors, DsV4TensorKind::FfnGateInp, hp.n_expert, hp.n_embd)?,
@@ -373,27 +403,15 @@ fn build_layer_storage_inner(
         gate_exps,
         up_exps,
         down_exps,
-        gate_shexp: take_2d(
-            &tensors,
-            DsV4TensorKind::FfnGateShexp,
-            hidden_shared,
-            hp.n_embd,
-        )?,
-        up_shexp: take_2d(
-            &tensors,
-            DsV4TensorKind::FfnUpShexp,
-            hidden_shared,
-            hp.n_embd,
-        )?,
-        down_shexp: take_2d(
-            &tensors,
-            DsV4TensorKind::FfnDownShexp,
-            hp.n_embd,
-            hidden_shared,
-        )?,
+        gate_shexp,
+        up_shexp,
+        down_shexp,
         gate_exps_quant,
         up_exps_quant,
         down_exps_quant,
+        gate_shexp_quant,
+        up_shexp_quant,
+        down_shexp_quant,
     });
 
     if compress_ratio == 0 {
@@ -887,6 +905,20 @@ mod tests {
             raw_f32(hp.n_groups * hp.o_lora_rank, group_dim),
         );
         raw.insert(DsV4TensorKind::AttnOutB, raw_f32(hp.n_embd, low_dim));
+        // P6: shared-expert FFN (gate/up `[hidden, n_embd]`, down `[n_embd, hidden]`).
+        let hidden_shared = hp.n_ff_exp * hp.n_expert_shared;
+        raw.insert(
+            DsV4TensorKind::FfnGateShexp,
+            raw_f32(hidden_shared, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnUpShexp,
+            raw_f32(hidden_shared, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnDownShexp,
+            raw_f32(hp.n_embd, hidden_shared),
+        );
 
         let storage = build_layer_storage_resident(tensors, raw, HashMap::new(), &hp, 0)
             .expect("resident build");
@@ -909,12 +941,24 @@ mod tests {
         assert_eq!(ffn.gate_exps.len(), 0);
         assert_eq!(ffn.up_exps.len(), 0);
         assert_eq!(ffn.down_exps.len(), 0);
-        // Non-expert FFN fields still built from f32 as usual.
+        // Router gate_inp stays f32 (not quantized).
         assert_eq!(ffn.gate_inp.shape(), &[hp.n_expert, hp.n_embd]);
+        // P6: shared expert held resident-Q4_K; f32 emptied.
         assert_eq!(
-            ffn.gate_shexp.shape(),
-            &[hp.n_ff_exp * hp.n_expert_shared, hp.n_embd]
+            ffn.gate_shexp_quant.as_ref().unwrap().shape(),
+            [hidden_shared, hp.n_embd]
         );
+        assert_eq!(
+            ffn.up_shexp_quant.as_ref().unwrap().shape(),
+            [hidden_shared, hp.n_embd]
+        );
+        assert_eq!(
+            ffn.down_shexp_quant.as_ref().unwrap().shape(),
+            [hp.n_embd, hidden_shared]
+        );
+        assert_eq!(ffn.gate_shexp.len(), 0);
+        assert_eq!(ffn.up_shexp.len(), 0);
+        assert_eq!(ffn.down_shexp.len(), 0);
 
         // P5: base attention projections held resident-Q4_K; f32 emptied.
         assert_eq!(
