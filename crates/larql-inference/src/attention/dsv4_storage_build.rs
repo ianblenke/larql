@@ -871,6 +871,22 @@ mod tests {
             DsV4TensorKind::FfnDownExps,
             raw_f32(hp.n_expert * hp.n_embd, hp.n_ff_exp),
         );
+        // P5: the resident builder also holds the base attention
+        // projections as raw QuantTensors (`[out, in]` shapes; wo_a is
+        // packed `[n_groups*o_lora_rank, group_dim]`).
+        let group_dim = hp.head_dim * (hp.n_head / hp.n_groups);
+        let low_dim = hp.o_lora_rank * hp.n_groups;
+        raw.insert(DsV4TensorKind::AttnQA, raw_f32(hp.q_lora_rank, hp.n_embd));
+        raw.insert(
+            DsV4TensorKind::AttnQB,
+            raw_f32(hp.n_head * hp.head_dim, hp.q_lora_rank),
+        );
+        raw.insert(DsV4TensorKind::AttnKv, raw_f32(hp.head_dim, hp.n_embd));
+        raw.insert(
+            DsV4TensorKind::AttnOutA,
+            raw_f32(hp.n_groups * hp.o_lora_rank, group_dim),
+        );
+        raw.insert(DsV4TensorKind::AttnOutB, raw_f32(hp.n_embd, low_dim));
 
         let storage = build_layer_storage_resident(tensors, raw, HashMap::new(), &hp, 0)
             .expect("resident build");
@@ -899,6 +915,33 @@ mod tests {
             ffn.gate_shexp.shape(),
             &[hp.n_ff_exp * hp.n_expert_shared, hp.n_embd]
         );
+
+        // P5: base attention projections held resident-Q4_K; f32 emptied.
+        assert_eq!(
+            storage.wq_a_quant.as_ref().unwrap().shape(),
+            [hp.q_lora_rank, hp.n_embd]
+        );
+        assert_eq!(
+            storage.wq_b_quant.as_ref().unwrap().shape(),
+            [hp.n_head * hp.head_dim, hp.q_lora_rank]
+        );
+        assert_eq!(
+            storage.wkv_quant.as_ref().unwrap().shape(),
+            [hp.head_dim, hp.n_embd]
+        );
+        assert_eq!(
+            storage.wo_a_quant.as_ref().unwrap().shape(),
+            [hp.n_groups * hp.o_lora_rank, group_dim]
+        );
+        assert_eq!(
+            storage.wo_b_quant.as_ref().unwrap().shape(),
+            [hp.n_embd, low_dim]
+        );
+        assert_eq!(storage.wq_a.len(), 0);
+        assert_eq!(storage.wq_b.len(), 0);
+        assert_eq!(storage.wkv.len(), 0);
+        assert_eq!(storage.wo_a.len(), 0);
+        assert_eq!(storage.wo_b.len(), 0);
 
         // f32 path is unchanged: same hp, full map, no quant fields.
         let f32_storage =
