@@ -24,6 +24,7 @@
 //! ndarray BLAS on CPU.
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 use ndarray::{s, Array2, ArrayView2, ArrayView3};
 
 /// Apply the grouped low-rank output projection to the attention block's
@@ -44,6 +45,7 @@ use ndarray::{s, Array2, ArrayView2, ArrayView3};
 ///   matmuls through cuBLAS / Metal / CPU as available.
 ///
 /// Output: `(n_tokens, n_embd_out)`.
+#[allow(clippy::too_many_arguments)]
 pub fn grouped_o_proj(
     o: ArrayView2<f32>,
     wo_a: ArrayView3<f32>,
@@ -53,6 +55,13 @@ pub fn grouped_o_proj(
     n_groups: usize,
     o_lora_rank: usize,
     backend: Option<&dyn ComputeBackend>,
+    // P5 resident-Q4_K companions. When `Some`, the matmuls run the
+    // lazy-quant path and the f32 `wo_a`/`wo_b` views are ignored (they
+    // are empty in resident mode). `wo_a_q` is packed
+    // `[n_groups*o_lora_rank, group_dim]`, sliced per group via
+    // `expert_slice`.
+    wo_a_q: Option<&QuantTensor>,
+    wo_b_q: Option<&QuantTensor>,
 ) -> Array2<f32> {
     assert!(
         n_head > 0 && n_groups > 0 && n_head % n_groups == 0,
@@ -68,17 +77,20 @@ pub fn grouped_o_proj(
         &[n_tokens, n_head * n_embd_head],
         "o shape must be (n_tokens, n_head * n_embd_head)"
     );
-    assert_eq!(
-        wo_a.shape(),
-        &[n_groups, o_lora_rank, group_dim],
-        "wo_a shape must be (n_groups, o_lora_rank, group_dim)"
-    );
-    let n_embd_out = wo_b.shape()[0];
-    assert_eq!(
-        wo_b.shape()[1],
-        low_dim,
-        "wo_b second dim must be o_lora_rank * n_groups"
-    );
+    // f32-layout asserts only apply when not using the resident-Q4_K path
+    // (in which case the f32 views are empty placeholders).
+    if wo_a_q.is_none() {
+        assert_eq!(
+            wo_a.shape(),
+            &[n_groups, o_lora_rank, group_dim],
+            "wo_a shape must be (n_groups, o_lora_rank, group_dim)"
+        );
+        assert_eq!(
+            wo_b.shape()[1],
+            low_dim,
+            "wo_b second dim must be o_lora_rank * n_groups"
+        );
+    }
 
     // 1. Per-group A matmul, batched across tokens.
     //    For each group g: o_group (n_tokens, group_dim) @ wo_a[g]^T (group_dim, o_lora_rank)
@@ -88,15 +100,23 @@ pub fn grouped_o_proj(
         let group_off = g * group_dim;
         let low_off = g * o_lora_rank;
         let o_group = o.slice(s![.., group_off..group_off + group_dim]);
-        let wo_a_g = wo_a.slice(s![g, .., ..]);
-        let part = dot_proj_gpu(&o_group, &wo_a_g, backend);
+        let part = match wo_a_q {
+            Some(q) => {
+                let wg = q.expert_slice(g, n_groups).expect("wo_a expert_slice");
+                wg.matmul(&o_group.to_owned()).expect("wo_a quant matmul")
+            }
+            None => dot_proj_gpu(&o_group, &wo_a.slice(s![g, .., ..]), backend),
+        };
         low.slice_mut(s![.., low_off..low_off + o_lora_rank])
             .assign(&part);
     }
 
     // 2. Shared B matmul: low (n_tokens, low_dim) @ wo_b^T (low_dim, n_embd_out)
     //                   → out (n_tokens, n_embd_out).
-    dot_proj_gpu(&low, &wo_b, backend)
+    match wo_b_q {
+        Some(q) => q.matmul(&low).expect("wo_b quant matmul"),
+        None => dot_proj_gpu(&low, &wo_b, backend),
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +170,8 @@ mod tests {
             n_embd_head,
             n_groups,
             o_lora_rank,
+            None,
+            None,
             None,
         );
         for t in 0..n_tokens {
@@ -211,6 +233,8 @@ mod tests {
             n_groups,
             o_lora_rank,
             None,
+            None,
+            None,
         );
         assert!(approx_eq(out[[0, 0]], 10.0, 1e-5));
         assert!(approx_eq(out[[0, 1]], 26.0, 1e-5));
@@ -265,6 +289,8 @@ mod tests {
             n_groups,
             o_lora_rank,
             None,
+            None,
+            None,
         );
         assert_eq!(out.shape(), &[n_tokens, n_embd_out]);
         for v in out.iter() {
@@ -318,6 +344,8 @@ mod tests {
             n_groups,
             o_lora_rank,
             None,
+            None,
+            None,
         );
         let cpu = larql_compute::CpuBackend;
         let out_cpu = grouped_o_proj(
@@ -329,6 +357,8 @@ mod tests {
             n_groups,
             o_lora_rank,
             Some(&cpu as &dyn ComputeBackend),
+            None,
+            None,
         );
 
         assert_eq!(out_none.shape(), out_cpu.shape());

@@ -176,6 +176,7 @@ mod tests {
         let wo_a = Array3::<f32>::zeros((1, 4, 16));
         let wo_b = Array2::<f32>::zeros((16, 4));
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -253,6 +254,7 @@ mod tests {
         let attn_sinks = Array1::<f32>::from_elem(n_head, -1.0);
 
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -428,6 +430,7 @@ mod tests {
         });
         let attn_sinks = Array1::<f32>::from_elem(n_head, -1.0);
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,

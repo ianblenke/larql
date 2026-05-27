@@ -112,9 +112,9 @@ pub fn dsv4_attn_block_compress_with_indexer(
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
     // 2. Q low-rank: qr is shared with the indexer.
-    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
+    let qr = w.attn.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
+    let q = w.attn.proj_wq_b(&qr, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -129,7 +129,7 @@ pub fn dsv4_attn_block_compress_with_indexer(
     );
 
     // 3. Raw KV low-rank.
-    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
+    let kv_raw = w.attn.proj_wkv(&cur, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -225,6 +225,8 @@ pub fn dsv4_attn_block_compress_with_indexer(
         p.attn.n_groups,
         p.attn.o_lora_rank,
         backend,
+        w.attn.quant.map(|q| q.wo_a),
+        w.attn.quant.map(|q| q.wo_b),
     )
 }
 
@@ -329,9 +331,9 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
     // 2. Q low-rank: qr shared with the indexer scores; routed via backend.
-    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
+    let qr = w.attn.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
+    let q = w.attn.proj_wq_b(&qr, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -346,7 +348,7 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
     );
 
     // 3. Raw KV (new tokens only) → append to cache.raw. Backend-routed.
-    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
+    let kv_raw = w.attn.proj_wkv(&cur, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -490,6 +492,8 @@ pub fn dsv4_attn_block_compress_with_indexer_cached(
         p.attn.n_groups,
         p.attn.o_lora_rank,
         backend,
+        w.attn.quant.map(|q| q.wo_a),
+        w.attn.quant.map(|q| q.wo_b),
     )
 }
 
@@ -710,6 +714,7 @@ mod tests {
 
         let w = DsV4AttnBlockIndexerWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1001,6 +1006,7 @@ mod tests {
         ) = build_indexer_test_setup(n_tokens);
         let w = DsV4AttnBlockIndexerWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1090,6 +1096,7 @@ mod tests {
         ) = build_indexer_test_setup(n_tokens);
         let w = DsV4AttnBlockIndexerWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1170,6 +1177,7 @@ mod tests {
         ) = build_indexer_test_setup(n_total);
         let w = DsV4AttnBlockIndexerWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1272,6 +1280,7 @@ mod tests {
         ) = build_indexer_test_setup(4);
         let w = DsV4AttnBlockIndexerWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,

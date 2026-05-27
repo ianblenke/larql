@@ -818,6 +818,9 @@ mod tests {
             let dt = t_step.elapsed().as_secs_f64();
             if step == 0 {
                 warmup_s = dt;
+                // Reset the per-stage profiler so it accumulates only the
+                // steady-state steps (LARQL_DSV4_PROFILE; no-op when unset).
+                super::super::dsv4_profile::reset();
             } else {
                 decode_s += dt;
             }
@@ -833,6 +836,10 @@ mod tests {
             steady_steps,
             1000.0 * decode_s / steady_steps as f64
         );
+        let prof = super::super::dsv4_profile::report();
+        if !prof.is_empty() {
+            eprintln!("[{tag}] steady-state stage breakdown ({steady_steps} steps):\n{prof}");
+        }
         BenchPhase {
             load_s,
             prefill_s,

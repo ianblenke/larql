@@ -95,9 +95,9 @@ pub fn dsv4_attn_block_compress_no_indexer(
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
     // 2. Q low-rank (mirrors Stage 8a).
-    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
+    let qr = w.attn.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
+    let q = w.attn.proj_wq_b(&qr, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -112,7 +112,7 @@ pub fn dsv4_attn_block_compress_no_indexer(
     );
 
     // 3. Raw KV low-rank.
-    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
+    let kv_raw = w.attn.proj_wkv(&cur, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -171,6 +171,8 @@ pub fn dsv4_attn_block_compress_no_indexer(
         p.attn.n_groups,
         p.attn.o_lora_rank,
         backend,
+        w.attn.quant.map(|q| q.wo_a),
+        w.attn.quant.map(|q| q.wo_b),
     )
 }
 
@@ -278,9 +280,9 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
     let cur = rms_norm_2d(x, w.attn.attn_norm, p.attn.norm_eps);
 
     // 2. Q low-rank + tail-RoPE (routed via backend when supplied).
-    let qr = dot_proj_gpu(&cur, &w.attn.wq_a, backend);
+    let qr = w.attn.proj_wq_a(&cur, backend);
     let qr = rms_norm_2d(qr.view(), w.attn.q_a_norm, p.attn.norm_eps);
-    let q = dot_proj_gpu(&qr, &w.attn.wq_b, backend);
+    let q = w.attn.proj_wq_b(&qr, backend);
     let q = rms_norm_per_head(q.view(), p.attn.n_head, p.attn.head_dim, p.attn.norm_eps);
     let q = rope_tail_dispatch(
         &q,
@@ -295,7 +297,7 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
     );
 
     // 3. Raw KV (for new tokens only) + tail-RoPE + FP8 → append to cache.
-    let kv_raw = dot_proj_gpu(&cur, &w.attn.wkv, backend);
+    let kv_raw = w.attn.proj_wkv(&cur, backend);
     let kv_raw = rms_norm_2d(kv_raw.view(), w.attn.kv_a_norm, p.attn.norm_eps);
     let kv_raw = rope_tail_dispatch(
         &kv_raw,
@@ -390,6 +392,8 @@ pub fn dsv4_attn_block_compress_no_indexer_cached(
         p.attn.n_groups,
         p.attn.o_lora_rank,
         backend,
+        w.attn.quant.map(|q| q.wo_a),
+        w.attn.quant.map(|q| q.wo_b),
     )
 }
 
@@ -612,6 +616,7 @@ mod tests {
 
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -663,6 +668,7 @@ mod tests {
 
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -785,6 +791,7 @@ mod tests {
         // What we DO check: shape + finiteness + that the compressed
         // path contributes (output differs from the Stage 8a baseline).
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -857,6 +864,7 @@ mod tests {
         ) = make_block(8, 4);
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -904,6 +912,7 @@ mod tests {
         ) = make_block(n_tokens, cr);
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -968,6 +977,7 @@ mod tests {
         ) = make_block(n_total, cr);
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1048,6 +1058,7 @@ mod tests {
         ) = make_block(n_total, cr);
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,
@@ -1098,6 +1109,7 @@ mod tests {
         ) = make_block(4, cr);
         let w = DsV4AttnBlockCompressWeights {
             attn: DsV4AttnBlockWeights {
+                quant: None,
                 attn_norm: &attn_norm,
                 wq_a: wq_a.view(),
                 q_a_norm: &q_a_norm,

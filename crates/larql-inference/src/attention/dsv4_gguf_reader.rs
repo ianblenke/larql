@@ -162,15 +162,12 @@ pub struct RawExpertTensor {
 pub fn read_dsv4_layer_raw_expert_tensors_from_gguf(
     gguf: &GgufFile,
     layer_index: usize,
+    want_kinds: &[DsV4TensorKind],
 ) -> Result<HashMap<DsV4TensorKind, RawExpertTensor>, ModelError> {
-    let want: HashMap<String, DsV4TensorKind> = [
-        DsV4TensorKind::FfnGateExps,
-        DsV4TensorKind::FfnUpExps,
-        DsV4TensorKind::FfnDownExps,
-    ]
-    .into_iter()
-    .map(|k| (tensor_name_of(k, layer_index), k))
-    .collect();
+    let want: HashMap<String, DsV4TensorKind> = want_kinds
+        .iter()
+        .map(|&k| (tensor_name_of(k, layer_index), k))
+        .collect();
 
     let mut out: HashMap<DsV4TensorKind, RawExpertTensor> = HashMap::new();
     let mut shard_files: HashMap<usize, File> = HashMap::new();
@@ -179,19 +176,32 @@ pub fn read_dsv4_layer_raw_expert_tensors_from_gguf(
             continue;
         };
         let dims = info.dims();
-        if dims.len() != 3 {
-            return Err(ModelError::Parse(format!(
-                "DSv4 layer {layer_index}: {} expected a 3D expert tensor, got dims {dims:?}",
-                info.name(),
-            )));
-        }
-        // GGUF stores fastest-first `[in_dim, out_dim, n_expert]`; the
-        // flat 2D `from_raw` shape is `[n_expert * out_dim, in_dim]`.
-        let in_dim = dims[0] as usize;
-        let out_dim = dims[1] as usize;
-        let n_expert = dims[2] as usize;
-        let rows = n_expert * out_dim;
-        let cols = in_dim;
+        // GGUF stores weights fastest-first. The flat `from_raw` shape is
+        // `[rows, cols]` row-major:
+        // - 3D expert tensor `[in, out, n_expert]` → `[n_expert*out, in]`
+        //   (per-expert slice via `QuantTensor::expert_slice`); also used
+        //   for the grouped o-proj A `[group_dim, o_lora, n_groups]`.
+        // - 2D linear weight `[in, out]` → `[out, in]` (matches the f32
+        //   `take_2d(out, in)` layout: `x @ W^T`).
+        let (rows, cols) = match dims.len() {
+            3 => {
+                let in_dim = dims[0] as usize;
+                let out_dim = dims[1] as usize;
+                let n_expert = dims[2] as usize;
+                (n_expert * out_dim, in_dim)
+            }
+            2 => {
+                let in_dim = dims[0] as usize;
+                let out_dim = dims[1] as usize;
+                (out_dim, in_dim)
+            }
+            other => {
+                return Err(ModelError::Parse(format!(
+                    "DSv4 layer {layer_index}: {} expected a 2D/3D tensor, got {other}D dims {dims:?}",
+                    info.name(),
+                )));
+            }
+        };
 
         let abs_offset = gguf
             .shard_data_offset(info)
@@ -694,14 +704,15 @@ mod tests {
 
         // Pick a routed-MoE layer (hash routing is layers 0-2; layer 4
         // is a regular routed-expert layer).
-        let raw = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 4)
-            .expect("read raw expert tensors");
-
-        for kind in [
+        let want = [
             DsV4TensorKind::FfnGateExps,
             DsV4TensorKind::FfnUpExps,
             DsV4TensorKind::FfnDownExps,
-        ] {
+        ];
+        let raw = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 4, &want)
+            .expect("read raw expert tensors");
+
+        for kind in want {
             let t = raw
                 .get(&kind)
                 .unwrap_or_else(|| panic!("layer 4 should have {kind}"));
@@ -724,7 +735,7 @@ mod tests {
 
         // A dense / hash-routed-only layer query still succeeds (the map
         // just contains whatever expert tensors exist).
-        let _ = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 0)
+        let _ = read_dsv4_layer_raw_expert_tensors_from_gguf(&gguf, 0, &want)
             .expect("layer 0 raw expert read");
     }
 }

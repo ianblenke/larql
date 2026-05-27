@@ -149,10 +149,14 @@ pub fn dsv4_ffn_block(
     };
 
     // 3. Routed MoE dispatch.
-    let moe_out = dsv4_moe_dispatch(cur.view(), &routing, &w.moe, p.routed_swiglu_limit, backend);
+    let moe_out = super::dsv4_profile::timed("ffn.routed", || {
+        dsv4_moe_dispatch(cur.view(), &routing, &w.moe, p.routed_swiglu_limit, backend)
+    });
 
     // 4. Shared expert FFN.
-    let shared_out = dsv4_shared_expert_ffn(cur.view(), &w.shared, p.shared_swiglu_limit, backend);
+    let shared_out = super::dsv4_profile::timed("ffn.shared", || {
+        dsv4_shared_expert_ffn(cur.view(), &w.shared, p.shared_swiglu_limit, backend)
+    });
 
     // 5. Sum.
     let mut out = Array2::<f32>::zeros((n_tokens, n_embd));

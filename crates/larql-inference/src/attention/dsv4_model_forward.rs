@@ -424,6 +424,7 @@ mod tests {
 
         // Single attention weight set reused across the n_layer layers.
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,

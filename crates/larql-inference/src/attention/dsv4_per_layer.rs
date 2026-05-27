@@ -121,11 +121,15 @@ pub fn dsv4_per_layer_forward_cached(
     layer_cache: Option<&mut DsV4LayerCache>,
     backend: Option<&dyn ComputeBackend>,
 ) -> Array3<f32> {
+    use super::dsv4_profile::timed;
+
     // ── 1. Attention bookend pre ──
-    let pre_attn = dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc, backend);
+    let pre_attn = timed("mhc", || {
+        dsv4_mhc_pre(residual, &w.mhc_attn, &p.mhc, backend)
+    });
 
     // ── 2. Attention block (cached if variants align, fallback otherwise) ──
-    let attn_out = match (&w.attn, layer_cache) {
+    let attn_out = timed("attn", || match (&w.attn, layer_cache) {
         (DsV4AttnLayer::NoCompress { weights, params }, Some(DsV4LayerCache::NoCompress(c))) => {
             dsv4_attn_block_no_compress_cached(
                 pre_attn.cur.view(),
@@ -160,29 +164,37 @@ pub fn dsv4_per_layer_forward_cached(
         }
         // No-cache or mismatched variant pair → non-cached path.
         _ => dsv4_attn_layer(pre_attn.cur.view(), &w.attn, position_offset, backend),
-    };
+    });
 
     // ── 3. Attention bookend post → updated residual ──
-    let residual_mid = dsv4_mhc_post(
-        attn_out.view(),
-        residual,
-        pre_attn.post.view(),
-        pre_attn.comb.view(),
-    );
+    let residual_mid = timed("mhc", || {
+        dsv4_mhc_post(
+            attn_out.view(),
+            residual,
+            pre_attn.post.view(),
+            pre_attn.comb.view(),
+        )
+    });
 
     // ── 4. FFN bookend pre ──
-    let pre_ffn = dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc, backend);
+    let pre_ffn = timed("mhc", || {
+        dsv4_mhc_pre(residual_mid.view(), &w.mhc_ffn, &p.mhc, backend)
+    });
 
     // ── 5. FFN block ──
-    let ffn_out = dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend);
+    let ffn_out = timed("ffn", || {
+        dsv4_ffn_block(pre_ffn.cur.view(), &w.ffn, &p.ffn, token_ids, backend)
+    });
 
     // ── 6. FFN bookend post → final residual ──
-    dsv4_mhc_post(
-        ffn_out.view(),
-        residual_mid.view(),
-        pre_ffn.post.view(),
-        pre_ffn.comb.view(),
-    )
+    timed("mhc", || {
+        dsv4_mhc_post(
+            ffn_out.view(),
+            residual_mid.view(),
+            pre_ffn.post.view(),
+            pre_ffn.comb.view(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +303,7 @@ mod tests {
         });
 
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -570,6 +583,7 @@ mod tests {
         ) = build_no_compress_layer();
 
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
@@ -670,6 +684,7 @@ mod tests {
         ) = build_no_compress_layer();
 
         let attn_w = DsV4AttnBlockWeights {
+            quant: None,
             attn_norm: &attn_norm,
             wq_a: wq_a.view(),
             q_a_norm: &q_a_norm,
