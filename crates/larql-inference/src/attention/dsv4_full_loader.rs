@@ -105,9 +105,10 @@ pub fn load_dsv4_layers(
 /// Tensor kinds held resident as raw Q4_K [`QuantTensor`]s (never
 /// dequantized to f32) in the resident path: the routed MoE experts
 /// (P1-P3) **plus** the base attention projections (P5 — the 74% decode
-/// hot spot). Used both as the f32-dequant *exclude* list and the raw-read
-/// *want* list, so each weight is read exactly once, as Q4_K bytes.
-const RESIDENT_RAW_KINDS: [DsV4TensorKind; 8] = [
+/// hot spot) and the shared-expert FFN (P6). Used both as the f32-dequant
+/// *exclude* list and the raw-read *want* list, so each weight is read
+/// exactly once, as Q4_K bytes.
+const RESIDENT_RAW_KINDS: [DsV4TensorKind; 11] = [
     DsV4TensorKind::FfnGateExps,
     DsV4TensorKind::FfnUpExps,
     DsV4TensorKind::FfnDownExps,
@@ -116,6 +117,10 @@ const RESIDENT_RAW_KINDS: [DsV4TensorKind; 8] = [
     DsV4TensorKind::AttnKv,
     DsV4TensorKind::AttnOutA,
     DsV4TensorKind::AttnOutB,
+    // P6: shared-expert FFN.
+    DsV4TensorKind::FfnGateShexp,
+    DsV4TensorKind::FfnUpShexp,
+    DsV4TensorKind::FfnDownShexp,
 ];
 
 /// Load a single DSv4 layer with **resident-quantized** routed experts

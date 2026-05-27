@@ -463,6 +463,7 @@ mod tests {
                     quant: None,
                 },
                 shared: SharedExpertWeights {
+                    quant: None,
                     gate_shexp: gate_shexp.view(),
                     up_shexp: up_shexp.view(),
                     down_shexp: down_shexp.view(),

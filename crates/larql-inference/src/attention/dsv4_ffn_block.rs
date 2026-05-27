@@ -17,10 +17,27 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 
 use super::dsv4_moe_dispatch::{dsv4_moe_dispatch, MoeExpertWeights};
 use super::dsv4_moe_ops::clamped_swiglu_row;
 use super::dsv4_moe_routing::{compute_router_topk, hash_route_topk, RoutingResult};
+
+/// Resident-Q4_K companions for the shared-expert weights (P6).
+///
+/// Mirrors [`super::dsv4_attn_block::DsV4AttnQuant`] (P5): when present,
+/// the shared-expert matmuls run the lazy Q4_K×Q8_K dot instead of
+/// dequantizing to f32. The shared expert is a single dense FFN (no
+/// per-expert grouping), so these are plain 2D `QuantTensor`s.
+#[derive(Clone, Copy)]
+pub struct SharedExpertQuant<'a> {
+    /// `(hidden, n_embd)` gate.
+    pub gate: &'a QuantTensor,
+    /// `(hidden, n_embd)` up.
+    pub up: &'a QuantTensor,
+    /// `(n_embd, hidden)` down.
+    pub down: &'a QuantTensor,
+}
 
 /// Shared-expert FFN weights — a single dense gate/up/down with hidden
 /// width `n_ff_exp * n_expert_shared` (DSv4 concatenates the shared
@@ -33,6 +50,8 @@ pub struct SharedExpertWeights<'a> {
     pub up_shexp: ArrayView2<'a, f32>,
     /// `(n_embd, hidden)` — concatenated shared-expert down matrix.
     pub down_shexp: ArrayView2<'a, f32>,
+    /// Resident-Q4_K companions (P6). `None` = use the f32 views above.
+    pub quant: Option<SharedExpertQuant<'a>>,
 }
 
 /// Run the shared-expert FFN over every token. Plain SwiGLU (no
@@ -49,16 +68,34 @@ pub fn dsv4_shared_expert_ffn(
 ) -> Array2<f32> {
     let n_tokens = x.shape()[0];
     let n_embd = x.shape()[1];
-    let hidden = w.gate_shexp.shape()[0];
-    assert_eq!(w.gate_shexp.shape(), &[hidden, n_embd], "gate_shexp shape");
-    assert_eq!(w.up_shexp.shape(), &[hidden, n_embd], "up_shexp shape");
-    assert_eq!(w.down_shexp.shape(), &[n_embd, hidden], "down_shexp shape");
+    // `hidden` from the f32 view (resident mode leaves it empty) or the
+    // resident QuantTensor (`[hidden, n_embd]`).
+    let hidden = match &w.quant {
+        Some(q) => q.gate.shape()[0],
+        None => w.gate_shexp.shape()[0],
+    };
+    if w.quant.is_none() {
+        assert_eq!(w.gate_shexp.shape(), &[hidden, n_embd], "gate_shexp shape");
+        assert_eq!(w.up_shexp.shape(), &[hidden, n_embd], "up_shexp shape");
+        assert_eq!(w.down_shexp.shape(), &[n_embd, hidden], "down_shexp shape");
+    }
 
-    // 1. Gate + up matmuls, batched over tokens.
-    //    x: (n_tokens, n_embd), gate_shexp: (hidden, n_embd)
-    //    → gate_all = x @ gate_shexp^T = (n_tokens, hidden).
-    let gate_all = dot_proj_gpu(&x, &w.gate_shexp, backend);
-    let up_all = dot_proj_gpu(&x, &w.up_shexp, backend);
+    // 1. Gate + up matmuls, batched over tokens. Resident-Q4_K (P6) runs
+    //    the lazy-quant matmul; else the f32 `dot_proj_gpu` path.
+    //    x: (n_tokens, n_embd) → (n_tokens, hidden).
+    let (gate_all, up_all) = match &w.quant {
+        Some(q) => {
+            let x_owned = x.to_owned();
+            (
+                q.gate.matmul(&x_owned).expect("shexp gate quant matmul"),
+                q.up.matmul(&x_owned).expect("shexp up quant matmul"),
+            )
+        }
+        None => (
+            dot_proj_gpu(&x, &w.gate_shexp, backend),
+            dot_proj_gpu(&x, &w.up_shexp, backend),
+        ),
+    };
 
     // 2. Per-token SwiGLU activation.
     let mut activated = Array2::<f32>::zeros((n_tokens, hidden));
@@ -68,9 +105,11 @@ pub fn dsv4_shared_expert_ffn(
     }
 
     // 3. Down matmul, batched.
-    //    activated: (n_tokens, hidden), down_shexp: (n_embd, hidden)
-    //    → out = activated @ down_shexp^T = (n_tokens, n_embd).
-    dot_proj_gpu(&activated, &w.down_shexp, backend)
+    //    activated: (n_tokens, hidden) → out (n_tokens, n_embd).
+    match &w.quant {
+        Some(q) => q.down.matmul(&activated).expect("shexp down quant matmul"),
+        None => dot_proj_gpu(&activated, &w.down_shexp, backend),
+    }
 }
 
 /// All weights for the DSv4 FFN block (pre-norm + routed + shared).
@@ -208,6 +247,7 @@ mod tests {
         let down_shexp =
             Array2::<f32>::from_shape_fn((n_embd, hidden), |(d, i)| ((d + i) as f32 * 0.07).sin());
         let w = SharedExpertWeights {
+            quant: None,
             gate_shexp: gate_shexp.view(),
             up_shexp: up_shexp.view(),
             down_shexp: down_shexp.view(),
@@ -264,6 +304,7 @@ mod tests {
             ((d * 3 + i) as f32 * 0.019).cos() * 0.05
         });
         let w = SharedExpertWeights {
+            quant: None,
             gate_shexp: gate_shexp.view(),
             up_shexp: up_shexp.view(),
             down_shexp: down_shexp.view(),
@@ -335,6 +376,7 @@ mod tests {
                 quant: None,
             },
             shared: SharedExpertWeights {
+                quant: None,
                 gate_shexp: gate_shexp.view(),
                 up_shexp: up_shexp.view(),
                 down_shexp: down_shexp.view(),
@@ -409,6 +451,7 @@ mod tests {
                 quant: None,
             },
             shared: SharedExpertWeights {
+                quant: None,
                 gate_shexp: gate_shexp.view(),
                 up_shexp: up_shexp.view(),
                 down_shexp: down_shexp.view(),

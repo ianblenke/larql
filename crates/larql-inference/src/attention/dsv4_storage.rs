@@ -26,7 +26,7 @@ use super::dsv4_attn_block_compress::{DsV4AttnBlockCompressParams, DsV4AttnBlock
 use super::dsv4_attn_block_indexer::{DsV4AttnBlockIndexerParams, DsV4AttnBlockIndexerWeights};
 use super::dsv4_attn_dispatch::DsV4AttnLayer;
 use super::dsv4_compressor_prefill::{CompressorParams, CompressorWeights};
-use super::dsv4_ffn_block::{Dsv4FfnWeights, SharedExpertWeights};
+use super::dsv4_ffn_block::{Dsv4FfnWeights, SharedExpertQuant, SharedExpertWeights};
 use super::dsv4_indexer::{IndexerParams, IndexerWeights};
 use super::dsv4_mhc_bookend::MhcWeights;
 use super::dsv4_moe_dispatch::{MoeExpertWeights, ResidentMoeExperts};
@@ -141,6 +141,13 @@ pub struct FfnStorage {
     pub gate_exps_quant: Option<QuantTensor>,
     pub up_exps_quant: Option<QuantTensor>,
     pub down_exps_quant: Option<QuantTensor>,
+    // ── Dual storage: resident quantized shared expert (P6) ──
+    // Same contract as the routed experts above, for the single dense
+    // shared-expert FFN (`ffn.shared` ~5.5 ms/layer f32). When `Some`,
+    // the matching f32 array is empty.
+    pub gate_shexp_quant: Option<QuantTensor>,
+    pub up_shexp_quant: Option<QuantTensor>,
+    pub down_shexp_quant: Option<QuantTensor>,
 }
 
 impl FfnStorage {
@@ -181,6 +188,17 @@ impl FfnStorage {
                 gate_shexp: self.gate_shexp.view(),
                 up_shexp: self.up_shexp.view(),
                 down_shexp: self.down_shexp.view(),
+                // Resident-Q4_K shared expert when populated (P6).
+                quant: match (
+                    self.gate_shexp_quant.as_ref(),
+                    self.up_shexp_quant.as_ref(),
+                    self.down_shexp_quant.as_ref(),
+                ) {
+                    (Some(gate), Some(up), Some(down)) => {
+                        Some(SharedExpertQuant { gate, up, down })
+                    }
+                    _ => None,
+                },
             },
         }
     }
@@ -626,6 +644,9 @@ mod tests {
             gate_exps_quant: None,
             up_exps_quant: None,
             down_exps_quant: None,
+            gate_shexp_quant: None,
+            up_shexp_quant: None,
+            down_shexp_quant: None,
         };
         let w = ffn.as_weights();
         assert_eq!(w.ffn_norm.len(), n_embd);
@@ -660,6 +681,9 @@ mod tests {
             gate_exps_quant: None,
             up_exps_quant: None,
             down_exps_quant: None,
+            gate_shexp_quant: None,
+            up_shexp_quant: None,
+            down_shexp_quant: None,
         };
         let w = ffn.as_weights();
         assert!(w.exp_probs_b.is_none());
