@@ -6,10 +6,10 @@
 
 ## 2. P1 — Serialization wire format (no store, no reuse)
 
-- [ ] 2.1 New `dsv4_kv_persist.rs`: `serialize_hca_cache(&DsV4LayerHcaCache) -> Vec<u8>` + `deserialize_hca_cache(&[u8]) -> DsV4LayerHcaCache` for the **compressed** cache (+ indexer compressed) + `compress_ratio` + `overlap_state`; `raw`/`pending_cur` omitted (Zero-SWA). Versioned header.
-- [ ] 2.2 Round-trip test (synthetic, no GGUF): `deserialize(serialize(c))` reproduces the compressed entries bit-exactly + the same dims/compress_ratio. Backs "Compressed cache round-trips losslessly".
-- [ ] 2.3 NoCompress-layer (pure SWA) handling: such layers have no compressed entries → serialize an empty/sentinel blob; deserialize yields an empty compressed cache. Test it.
-- [ ] 2.4 Version/format-mismatch handling: a bad magic or unknown version → typed error, not panic. Test it.
+- [x] 2.1 New `dsv4_kv_persist.rs`: `serialize_layer_cache(&DsV4LayerCache) -> Vec<u8>` + `deserialize_layer_cache(&[u8]) -> Result<DsV4LayerCache, KvPersistError>`. Operates at the per-layer `DsV4LayerCache` enum (NoCompress | Hca) so it covers both variants uniformly. Serializes the **compressed** cache (+ indexer compressed) + `compress_ratio` + both overlap states; `raw`/`pending_cur` omitted (Zero-SWA). Versioned LE header (magic `D4KV`, version, tag); hand-rolled, no serde.
+- [x] 2.2 Round-trip tests (synthetic, no GGUF): `hca_compressed_round_trips_losslessly` + `hca_with_indexer_and_overlap_round_trips` — compressed/indexer-compressed rows bit-exact, compress_ratio/dims/overlap preserved, `raw`+`pending_cur` come back empty.
+- [x] 2.3 NoCompress-layer (pure SWA) handling: `no_compress_layer_round_trips_as_empty` (shape-only shell → empty cache) + `empty_compressed_round_trips` (HCA layer with no chunk yet).
+- [x] 2.4 Version/format-mismatch handling: typed `KvPersistError` (BadMagic / UnsupportedVersion / UnknownTag / Truncated), never a panic — `bad_magic_is_typed_error`, `unsupported_version_is_typed_error`, `unknown_tag_is_typed_error`, `truncated_blob_is_typed_error` (every truncation length).
 
 ## 3. P2 — Prefix-keyed on-disk store
 

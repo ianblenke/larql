@@ -16,17 +16,23 @@ SHALL NOT be serialized (Zero-SWA).
 - **THEN** the restored compressed entries SHALL equal the originals
   bit-exactly, with the same `compress_ratio`, dims, and indexer-present
   flag, and the `raw` cache SHALL be empty
+<!-- test: larql_inference::attention::dsv4_kv_persist::hca_compressed_round_trips_losslessly -->
+<!-- test: larql_inference::attention::dsv4_kv_persist::hca_with_indexer_and_overlap_round_trips -->
 
 #### Scenario: No-compress layer serializes as empty compressed cache
 
 - **WHEN** a NoCompress (pure-SWA) layer's cache is serialized
 - **THEN** the blob SHALL encode an empty compressed cache and
   deserialize to one, without error
+<!-- test: larql_inference::attention::dsv4_kv_persist::no_compress_layer_round_trips_as_empty -->
 
 #### Scenario: Unknown format version is a typed error
 
 - **WHEN** a blob with a bad magic or unknown version is deserialized
 - **THEN** deserialization SHALL return a typed error, not panic
+<!-- test: larql_inference::attention::dsv4_kv_persist::unsupported_version_is_typed_error -->
+<!-- test: larql_inference::attention::dsv4_kv_persist::bad_magic_is_typed_error -->
+<!-- test: larql_inference::attention::dsv4_kv_persist::truncated_blob_is_typed_error -->
 
 ### Requirement: Prefix-keyed on-disk store
 

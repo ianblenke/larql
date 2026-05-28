@@ -3,9 +3,9 @@
     "capabilities": 57,
     "requirements": 540,
     "scenarios": 1580,
-    "scenarios_backed": 1360,
-    "scenarios_unbacked": 220,
-    "test_refs": 3497,
+    "scenarios_backed": 1363,
+    "scenarios_unbacked": 217,
+    "test_refs": 3503,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5416,27 +5416,36 @@
           "scenarios": [
             {
               "name": "Compressed cache round-trips losslessly",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_kv_persist::hca_compressed_round_trips_losslessly",
+                "larql_inference::attention::dsv4_kv_persist::hca_with_indexer_and_overlap_round_trips"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
               "line": 12
             },
             {
               "name": "No-compress layer serializes as empty compressed cache",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_kv_persist::no_compress_layer_round_trips_as_empty"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 20
+              "line": 22
             },
             {
               "name": "Unknown format version is a typed error",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_kv_persist::unsupported_version_is_typed_error",
+                "larql_inference::attention::dsv4_kv_persist::bad_magic_is_typed_error",
+                "larql_inference::attention::dsv4_kv_persist::truncated_blob_is_typed_error"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 26
+              "line": 29
             }
           ]
         },
@@ -5449,7 +5458,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 40
+              "line": 46
             },
             {
               "name": "Miss returns no hit",
@@ -5457,7 +5466,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 47
+              "line": 53
             },
             {
               "name": "Size cap evicts least-recently-used entries",
@@ -5465,7 +5474,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 52
+              "line": 58
             }
           ]
         },
@@ -5478,7 +5487,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 68
+              "line": 74
             },
             {
               "name": "Reuse recomputes only the SWA tail",
@@ -5486,7 +5495,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 75
+              "line": 81
             },
             {
               "name": "Disabled cache leaves cold prefill unchanged",
@@ -5494,7 +5503,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 82
+              "line": 88
             }
           ]
         }
@@ -26023,6 +26032,66 @@
       "fqn": "larql_inference::attention::dsv4_kv_cache::zero_max_seq_len_panics",
       "file": "crates/larql-inference/src/attention/dsv4_kv_cache.rs",
       "line": 242,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::empty_compressed_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 415,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::bad_magic_is_typed_error",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 427,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::empty_compressed_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 415,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::hca_compressed_round_trips_losslessly",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 326,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::hca_with_indexer_and_overlap_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 354,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::no_compress_layer_round_trips_as_empty",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 401,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::truncated_blob_is_typed_error",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 465,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::unknown_tag_is_typed_error",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 453,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::tests::unsupported_version_is_typed_error",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 439,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_kv_persist::unknown_tag_is_typed_error",
+      "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
+      "line": 453,
       "crate": "larql_inference"
     },
     {
