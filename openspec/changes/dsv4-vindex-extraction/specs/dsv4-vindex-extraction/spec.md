@@ -30,6 +30,12 @@ stored quantized bytes SHALL match the GGUF (no dequantize/recompress).
   SHALL equal the GGUF-loaded weights (same shapes + quantized bytes),
   and each layer's `compress_ratio` SHALL be recorded
 
+<!-- test: larql_inference::attention::dsv4_vindex_attn::tests::attn_weights_round_trip_losslessly -->
+<!-- test: larql_inference::attention::dsv4_vindex_attn::tests::no_sinks_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_attn::tests::round_tripped_raw_builds_quant_tensor -->
+<!-- test: larql_inference::attention::dsv4_vindex_attn::tests::malformed_blobs_are_typed_errors -->
+<!-- test: larql_inference::attention::dsv4_vindex_attn::tests::real_gguf_attn_round_trips_to_storage -->
+
 ### Requirement: HCA, indexer, and mHC weights are extracted
 
 The vindex SHALL store, per layer where present, the HCA compressor
