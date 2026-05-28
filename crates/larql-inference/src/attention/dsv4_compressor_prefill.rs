@@ -441,8 +441,12 @@ pub fn dsv4_compressor_step_coff2(
         "cur_chunk must be (compress_ratio, n_embd)"
     );
     let n_kv = 2 * p.head_dim; // coff = 2
-    assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
-    assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    // Shape checks apply to the f32 view; in resident-Q4_K mode (P8) the
+    // f32 wkv/wgate are empty and the shape lives in the QuantTensor.
+    if w.quant.is_none() {
+        assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
+        assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    }
     assert_eq!(
         w.ape.shape(),
         &[p.compress_ratio, n_kv],
@@ -451,8 +455,9 @@ pub fn dsv4_compressor_step_coff2(
     assert_eq!(w.norm.len(), p.head_dim, "norm length");
 
     // 1. Project chunk to kv and score: each (compress_ratio, 2*head_dim).
-    let kv_chunk = dot_proj_gpu(&cur_chunk, &w.wkv, backend);
-    let mut score_chunk = dot_proj_gpu(&cur_chunk, &w.wgate, backend);
+    //    Resident-Q4_K lazy matmul when present, else f32 dot_proj_gpu.
+    let kv_chunk = w.proj_wkv(cur_chunk, backend);
+    let mut score_chunk = w.proj_wgate(cur_chunk, backend);
 
     // 2. Add APE row-wise.
     for r in 0..p.compress_ratio {
