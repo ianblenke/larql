@@ -1,10 +1,10 @@
 {
   "summary": {
-    "capabilities": 56,
-    "requirements": 537,
-    "scenarios": 1571,
+    "capabilities": 57,
+    "requirements": 540,
+    "scenarios": 1580,
     "scenarios_backed": 1360,
-    "scenarios_unbacked": 211,
+    "scenarios_unbacked": 220,
     "test_refs": 3497,
     "test_refs_unresolved": 98
   },
@@ -5402,6 +5402,99 @@
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md",
               "line": 60
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsv4-ondisk-prefix-cache",
+      "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+      "requirements": [
+        {
+          "name": "Compressed-cache serialization",
+          "scenarios": [
+            {
+              "name": "Compressed cache round-trips losslessly",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 12
+            },
+            {
+              "name": "No-compress layer serializes as empty compressed cache",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 20
+            },
+            {
+              "name": "Unknown format version is a typed error",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 26
+            }
+          ]
+        },
+        {
+          "name": "Prefix-keyed on-disk store",
+          "scenarios": [
+            {
+              "name": "Put then longest-prefix get returns the same caches",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 40
+            },
+            {
+              "name": "Miss returns no hit",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 47
+            },
+            {
+              "name": "Size cap evicts least-recently-used entries",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 52
+            }
+          ]
+        },
+        {
+          "name": "Zero-SWA prefill reuse is transparent",
+          "scenarios": [
+            {
+              "name": "Cache hit is transparent to output",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 68
+            },
+            {
+              "name": "Reuse recomputes only the SWA tail",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 75
+            },
+            {
+              "name": "Disabled cache leaves cold prefill unchanged",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 82
             }
           ]
         }
