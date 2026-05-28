@@ -49,17 +49,23 @@ store SHALL enforce a size cap.
   are written, then a superset token sequence is looked up
 - **THEN** the store SHALL return that prefix's hit length and the same
   compressed caches it stored
+<!-- test: larql_inference::attention::dsv4_prefix_cache::put_then_get_longest_prefix_round_trips -->
+<!-- test: larql_inference::attention::dsv4_prefix_cache::longest_prefix_wins -->
+<!-- test: larql_inference::attention::dsv4_prefix_cache::reopen_rebuilds_index -->
+<!-- test: larql_inference::attention::dsv4_prefix_cache::model_id_isolates -->
 
 #### Scenario: Miss returns no hit
 
 - **WHEN** a token sequence shares no cached block-prefix
 - **THEN** the lookup SHALL return no hit, and prefill SHALL proceed cold
+<!-- test: larql_inference::attention::dsv4_prefix_cache::no_shared_prefix_misses -->
 
 #### Scenario: Size cap evicts least-recently-used entries
 
 - **WHEN** writes would exceed the configured size cap
 - **THEN** the store SHALL evict least-recently-used prefixes to stay
   under the cap, and surviving entries SHALL still load correctly
+<!-- test: larql_inference::attention::dsv4_prefix_cache::size_cap_evicts_lru -->
 
 ### Requirement: Zero-SWA prefill reuse is transparent
 
