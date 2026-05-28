@@ -1,10 +1,10 @@
 {
   "summary": {
-    "capabilities": 58,
-    "requirements": 544,
-    "scenarios": 1586,
+    "capabilities": 59,
+    "requirements": 549,
+    "scenarios": 1591,
     "scenarios_backed": 1368,
-    "scenarios_unbacked": 218,
+    "scenarios_unbacked": 223,
     "test_refs": 3512,
     "test_refs_unresolved": 98
   },
@@ -5770,6 +5770,77 @@
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
               "line": 64
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsv4-vindex-extraction",
+      "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+      "requirements": [
+        {
+          "name": "DSv4 architecture is extractable to vindex",
+          "scenarios": [
+            {
+              "name": "V4 accepted, V2/V3 still rejected",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+              "line": 10
+            }
+          ]
+        },
+        {
+          "name": "DSv4 attention + structural weights are represented",
+          "scenarios": [
+            {
+              "name": "Attention weights round-trip from the vindex",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+              "line": 25
+            }
+          ]
+        },
+        {
+          "name": "HCA, indexer, and mHC weights are extracted",
+          "scenarios": [
+            {
+              "name": "Variant-gated structural weights round-trip",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+              "line": 41
+            }
+          ]
+        },
+        {
+          "name": "Routed and shared MoE reuse generic extraction",
+          "scenarios": [
+            {
+              "name": "MoE weights and hash routing round-trip",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+              "line": 56
+            }
+          ]
+        },
+        {
+          "name": "Full-model extraction round-trips",
+          "scenarios": [
+            {
+              "name": "Whole-model round-trip",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
+              "line": 70
             }
           ]
         }
