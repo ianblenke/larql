@@ -763,6 +763,15 @@ pub trait ModelArchitecture: Send + Sync {
         false
     }
 
+    /// Whether this model uses DeepSeek-V4-style compressed/latent
+    /// attention — low-rank Q + latent KV + grouped low-rank output
+    /// projection, plus HCA compression, the lightning indexer, and mHC
+    /// residual streams. The standard Q/K/V/O vindex writers cannot
+    /// represent these; a dedicated DSv4 extraction path is required.
+    fn uses_dsv4_attention(&self) -> bool {
+        false
+    }
+
     /// MLA compressed KV dimension.
     fn kv_lora_rank(&self) -> usize {
         0

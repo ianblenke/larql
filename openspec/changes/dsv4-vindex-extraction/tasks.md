@@ -1,8 +1,8 @@
 ## 1. V0 — Groundwork & decision gate
 
-- [ ] 1.1 Confirm DSv4-Flash GGUF tensor inventory vs `DsV4TensorKind` (already audited for inference) — the extraction source set, with shapes + quant types per kind.
-- [ ] 1.2 Decide FP8-KV handling (store FP8 bytes vs dequant to f16) — record in design D3/D5.
-- [ ] 1.3 Capabilities: add a `deepseek_v4` branch to `capabilities.rs` (allow extraction; distinct from V2/V3 MLA reject) + a unit test that V4 is accepted and V2/V3 still rejected.
+- [x] 1.1 GGUF tensor inventory (from the inference audit / gguf-dump): attn `q_a`[1024,4096]·`q_b`[1024,32768]·`kv_latent`[4096,512]·`output_a`[4096,8192]·`output_b`[8192,4096] (all Q4_K), HCA `attn_compress_kv/gate`[4096,512] Q4_K + `compress_ape`/`norm` F32, indexer `attn_q_b`[1024,8192] Q4_K + `compress_*` Q4_K + `proj`[4096,64] Q4_K, mHC `hc_*_fn`[16384,24] F32, MoE exps Q4_K + `ffn_down_shexp` Q6_K, norms/sinks/`gate_inp` F32, `gate_tid2eid` I32 (first 3 layers).
+- [x] 1.2 FP8-KV decision: FP8 is a **runtime KV-cache** quant (`dsv4_fp8_kv`), not a stored weight — extraction has no FP8 tensor to store; it stores the Q4_K/Q6_K/F32 weights as-is and FP8-KV stays a runtime concern of the (existing) inference path. So no FP8 format support is needed in the vindex.
+- [x] 1.3 Capabilities: added `ModelArchitecture::uses_dsv4_attention()` (default false; `true` for `DeepSeekV4Arch`) and a DSv4 branch in `capabilities.rs` that gates DSv4 out of the standard Q/K/V/O writers with a **distinct** feature message (DSv4 was previously not MLA-flagged, so it silently fell into the broken standard writer). 5 new tests; V2/V3 still MLA-rejected, llama still passes. The gate **flips to accept** when the DSv4 writer lands (V1+) — until then this is a clean reject, not the spec's end-state "accept".
 
 ## 2. V1 — Config + attention storage (the decisive unknown)
 
