@@ -632,6 +632,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
         let out = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
@@ -684,6 +685,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
 
@@ -823,6 +825,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
         let compressed = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
@@ -880,6 +883,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
         let _ = dsv4_attn_block_compress_no_indexer(x.view(), &w, &p, 0, None);
@@ -928,6 +932,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
 
@@ -993,6 +998,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
 
@@ -1074,6 +1080,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
         let mut cache = DsV4LayerHcaCache::with_capacity(32, p.attn.head_dim, cr);
@@ -1125,6 +1132,7 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
         };
         // Empty cache but caller claims offset=5 → panic.

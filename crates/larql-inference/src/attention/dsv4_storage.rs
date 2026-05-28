@@ -38,15 +38,28 @@ pub struct CompressorStorage {
     pub wgate: Array2<f32>,
     pub ape: Array2<f32>,
     pub norm: Vec<f32>,
+    /// Resident-Q4_K companions for `wkv`/`wgate` (P8). When `Some`, the
+    /// matching f32 array above is empty (`0×0`) and the compressor runs
+    /// the lazy-quant matmul. All-or-nothing: the resident builder sets
+    /// both together; streaming leaves both `None`.
+    pub wkv_quant: Option<QuantTensor>,
+    pub wgate_quant: Option<QuantTensor>,
 }
 
 impl CompressorStorage {
     pub fn as_weights(&self) -> CompressorWeights<'_> {
+        let quant = match (self.wkv_quant.as_ref(), self.wgate_quant.as_ref()) {
+            (Some(wkv), Some(wgate)) => {
+                Some(super::dsv4_compressor_prefill::CompressorQuant { wkv, wgate })
+            }
+            _ => None,
+        };
         CompressorWeights {
             wkv: self.wkv.view(),
             wgate: self.wgate.view(),
             ape: self.ape.view(),
             norm: &self.norm,
+            quant,
         }
     }
 }
@@ -59,6 +72,11 @@ pub struct IndexerStorage {
     pub compressor: CompressorStorage,
     pub wq_b: Array2<f32>,
     pub wproj: Array2<f32>,
+    /// Resident-Q4_K companion for `wq_b` (P7). When `Some`, the f32
+    /// `wq_b` above is left empty (`0×0`) and the indexer scoring runs
+    /// the lazy-quant matmul. Set by the resident builder; `None` in the
+    /// streaming path.
+    pub wq_b_quant: Option<QuantTensor>,
 }
 
 impl IndexerStorage {
@@ -69,6 +87,10 @@ impl IndexerStorage {
         IndexerWeights {
             wq_b: self.wq_b.view(),
             wproj: self.wproj.view(),
+            quant: self
+                .wq_b_quant
+                .as_ref()
+                .map(|wq_b| super::dsv4_indexer::IndexerQuant { wq_b }),
         }
     }
 }
@@ -425,6 +447,8 @@ mod tests {
                 ((r + k) as f32 * 0.03).sin() * 0.05
             }),
             norm: vec![1.0; head_dim],
+            wkv_quant: None,
+            wgate_quant: None,
         });
         storage.compressor_params = Some(CompressorParams {
             head_dim,
@@ -458,6 +482,8 @@ mod tests {
                 ((r + k) as f32 * 0.025).sin() * 0.05
             }),
             norm: vec![1.0; indexer_head_size],
+            wkv_quant: None,
+            wgate_quant: None,
         };
         storage.indexer = Some(IndexerStorage {
             compressor: idx_comp,
@@ -468,6 +494,7 @@ mod tests {
             wproj: Array2::<f32>::from_shape_fn((n_index_head, n_embd), |(i, j)| {
                 ((i + j) as f32 * 0.012).cos() * 0.1
             }),
+            wq_b_quant: None,
         });
         storage.indexer_compressor_params = Some(CompressorParams {
             head_dim: indexer_head_size,

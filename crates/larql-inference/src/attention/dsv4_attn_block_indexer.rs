@@ -730,16 +730,19 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
             indexer_compressor: CompressorWeights {
                 wkv: idx_comp_wkv.view(),
                 wgate: idx_comp_wgate.view(),
                 ape: idx_comp_ape.view(),
                 norm: &idx_comp_norm,
+                quant: None,
             },
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1022,16 +1025,19 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
             indexer_compressor: CompressorWeights {
                 wkv: idx_comp_wkv.view(),
                 wgate: idx_comp_wgate.view(),
                 ape: idx_comp_ape.view(),
                 norm: &idx_comp_norm,
+                quant: None,
             },
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1112,16 +1118,19 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
             indexer_compressor: CompressorWeights {
                 wkv: idx_comp_wkv.view(),
                 wgate: idx_comp_wgate.view(),
                 ape: idx_comp_ape.view(),
                 norm: &idx_comp_norm,
+                quant: None,
             },
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1193,16 +1202,19 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
             indexer_compressor: CompressorWeights {
                 wkv: idx_comp_wkv.view(),
                 wgate: idx_comp_wgate.view(),
                 ape: idx_comp_ape.view(),
                 norm: &idx_comp_norm,
+                quant: None,
             },
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1296,16 +1308,19 @@ mod tests {
                 wgate: comp_wgate.view(),
                 ape: comp_ape.view(),
                 norm: &comp_norm,
+                quant: None,
             },
             indexer_compressor: CompressorWeights {
                 wkv: idx_comp_wkv.view(),
                 wgate: idx_comp_wgate.view(),
                 ape: idx_comp_ape.view(),
                 norm: &idx_comp_norm,
+                quant: None,
             },
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
         // Cache without enable_indexer → index_compressed is None → panic.

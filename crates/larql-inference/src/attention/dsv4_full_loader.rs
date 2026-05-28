@@ -108,7 +108,7 @@ pub fn load_dsv4_layers(
 /// hot spot) and the shared-expert FFN (P6). Used both as the f32-dequant
 /// *exclude* list and the raw-read *want* list, so each weight is read
 /// exactly once, as Q4_K bytes.
-const RESIDENT_RAW_KINDS: [DsV4TensorKind; 11] = [
+const RESIDENT_RAW_KINDS: [DsV4TensorKind; 16] = [
     DsV4TensorKind::FfnGateExps,
     DsV4TensorKind::FfnUpExps,
     DsV4TensorKind::FfnDownExps,
@@ -121,6 +121,17 @@ const RESIDENT_RAW_KINDS: [DsV4TensorKind; 11] = [
     DsV4TensorKind::FfnGateShexp,
     DsV4TensorKind::FfnUpShexp,
     DsV4TensorKind::FfnDownShexp,
+    // P7: indexer Q-up (only present on Indexer-variant layers; absent
+    // kinds are simply skipped by the raw reader, so this is a no-op for
+    // NoCompress/Compress layers).
+    DsV4TensorKind::IndexerAttnQB,
+    // P8: HCA compressor wkv/wgate — the main compressor (Compress +
+    // Indexer layers) and the indexer's sub-compressor (Indexer layers).
+    // Absent on NoCompress layers (no-op there).
+    DsV4TensorKind::AttnCompressorKv,
+    DsV4TensorKind::AttnCompressorGate,
+    DsV4TensorKind::IndexerCompressorKv,
+    DsV4TensorKind::IndexerCompressorGate,
 ];
 
 /// Load a single DSv4 layer with **resident-quantized** routed experts
