@@ -1,10 +1,10 @@
 {
   "summary": {
-    "capabilities": 57,
-    "requirements": 540,
-    "scenarios": 1580,
+    "capabilities": 58,
+    "requirements": 544,
+    "scenarios": 1586,
     "scenarios_backed": 1368,
-    "scenarios_unbacked": 212,
+    "scenarios_unbacked": 218,
     "test_refs": 3512,
     "test_refs_unresolved": 98
   },
@@ -5696,6 +5696,80 @@
               "unbacked": false,
               "spec_file": "openspec/specs/dsv4-quant-residency/spec.md",
               "line": 169
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "dsv4-server-serving",
+      "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+      "requirements": [
+        {
+          "name": "GGUF-backed DSv4 model residency",
+          "scenarios": [
+            {
+              "name": "Resident layers loaded once",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 12
+            },
+            {
+              "name": "Load failure is a typed error",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 19
+            }
+          ]
+        },
+        {
+          "name": "DSv4 chat completions",
+          "scenarios": [
+            {
+              "name": "DSv4 chat request returns a completion",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 32
+            },
+            {
+              "name": "DSv4 is no longer rejected",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 39
+            }
+          ]
+        },
+        {
+          "name": "DSv4 token streaming",
+          "scenarios": [
+            {
+              "name": "Streamed tokens match buffered",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 51
+            }
+          ]
+        },
+        {
+          "name": "DSv4 prefix-cache reuse in serving",
+          "scenarios": [
+            {
+              "name": "Shared prefix is reused across requests",
+              "tests_resolved": [],
+              "tests_unresolved": [],
+              "unbacked": true,
+              "spec_file": "openspec/changes/dsv4-server-serving/specs/dsv4-server-serving/spec.md",
+              "line": 64
             }
           ]
         }
