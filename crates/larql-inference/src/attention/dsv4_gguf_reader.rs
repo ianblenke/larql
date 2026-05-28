@@ -142,6 +142,7 @@ pub fn read_dsv4_layer_tensors_from_gguf_excluding(
 /// n_expert]`). This is exactly the packing `QuantTensor::expert_slice`
 /// expects, verified against the real GGUF by
 /// [`tests::real_gguf_audit_expert_slice_packing`].
+#[derive(Clone)]
 pub struct RawExpertTensor {
     pub bytes: Vec<u8>,
     pub tensor_type: u32,
