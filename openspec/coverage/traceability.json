@@ -27744,31 +27744,31 @@
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::attn_weights_round_trip_losslessly",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 260,
+      "line": 268,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::malformed_blobs_are_typed_errors",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 298,
+      "line": 311,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::no_sinks_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 277,
+      "line": 285,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::real_gguf_attn_round_trips_to_storage",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 337,
+      "line": 350,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::round_tripped_raw_builds_quant_tensor",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 287,
+      "line": 295,
       "crate": "larql_inference"
     },
     {
