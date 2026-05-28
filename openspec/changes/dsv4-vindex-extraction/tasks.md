@@ -6,7 +6,7 @@
 
 ## 2. V1 — Config + attention storage (the decisive unknown)
 
-- [ ] 2.1 `DsV4VindexMeta` on `VindexModelConfig` (n_hc, indexer dims, fp8_kv, yarn) + `compress_ratio: u8` on `VindexLayerInfo`; serialize into `index.json`. Round-trip test.
+- [x] 2.1 `DsV4VindexMeta` on `VindexModelConfig` (full DsV4Hyperparams scalar set + `DsV4YarnMeta`), `Option`/`#[serde(default)]` so non-DSv4 configs omit it. Per-layer `compress_ratios: Vec<u8>` kept **inside** `DsV4VindexMeta` (not on the generic `VindexLayerInfo`) so all DSv4 metadata is isolated — zero blast radius on the 9 generic construction sites. Round-trip + backward-compat serde tests (`dsv4_meta_serde_round_trip`, `dsv4_field_is_backward_compatible`). FP8 carried as runtime-only (per V0 1.2) → no field. The reader→`DsV4Hyperparams` conversion lands with the reader (2.3).
 - [ ] 2.2 `dsv4_attn.bin` + manifest: write low-rank Q (`attn_q_a/q_b`), latent KV (`attn_kv_latent`), grouped O (`attn_output_a/b`) as Q4_K/Q6_K passthrough + inline f32 norms/sinks.
 - [ ] 2.3 Thin **test reader** for `dsv4_attn.bin` → reconstruct the attention half of `DsV4LayerWeightStorage`; assert weights equal the GGUF-loaded ones (byte/shape round-trip). **This is the V1 gate + the re-evaluation point.**
 

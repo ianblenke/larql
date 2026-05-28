@@ -47416,99 +47416,123 @@
       "crate": "larql_vindex"
     },
     {
+      "fqn": "larql_vindex::config::model::dsv4_field_is_backward_compatible",
+      "file": "crates/larql-vindex/src/config/model.rs",
+      "line": 400,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::config::model::dsv4_meta_serde_round_trip",
+      "file": "crates/larql-vindex/src/config/model.rs",
+      "line": 383,
+      "crate": "larql_vindex"
+    },
+    {
       "fqn": "larql_vindex::config::model::model_config_serde_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 252,
+      "line": 331,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::model_config_with_moe",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 286,
+      "line": 434,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::model_config_with_softcap_round_trips",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 277,
+      "line": 425,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::moe_config_default_router_type_via_serde",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 304,
+      "line": 452,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::moe_shared_expert_default_false",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 312,
+      "line": 460,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::optional_fields_absent_in_json_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 263,
+      "line": 411,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::qwen35_deltanet_fields_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 320,
+      "line": 468,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::qwen35_fields_omitted_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 343,
+      "line": 491,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::config::model::tests::dsv4_field_is_backward_compatible",
+      "file": "crates/larql-vindex/src/config/model.rs",
+      "line": 400,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::config::model::tests::dsv4_meta_serde_round_trip",
+      "file": "crates/larql-vindex/src/config/model.rs",
+      "line": 383,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::model_config_serde_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 252,
+      "line": 331,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::model_config_with_moe",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 286,
+      "line": 434,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::model_config_with_softcap_round_trips",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 277,
+      "line": 425,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::moe_config_default_router_type_via_serde",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 304,
+      "line": 452,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::moe_shared_expert_default_false",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 312,
+      "line": 460,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::optional_fields_absent_in_json_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 263,
+      "line": 411,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::qwen35_deltanet_fields_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 320,
+      "line": 468,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::qwen35_fields_omitted_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 343,
+      "line": 491,
       "crate": "larql_vindex"
     },
     {
