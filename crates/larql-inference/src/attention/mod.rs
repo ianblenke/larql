@@ -40,6 +40,7 @@ pub mod dsv4_moe_ops;
 pub mod dsv4_moe_routing;
 pub mod dsv4_per_layer;
 pub mod dsv4_prefix_cache;
+pub mod dsv4_prefix_reuse;
 pub mod dsv4_profile;
 pub mod dsv4_rope_tail;
 pub mod dsv4_rope_tail_yarn;

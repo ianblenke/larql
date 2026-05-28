@@ -1,32 +1,32 @@
-//! DeepSeek V4 KV-cache serialization wire format (Zero-SWA).
+//! DeepSeek V4 KV-cache serialization wire format (Full-SWA).
 //!
-//! `dsv4-ondisk-prefix-cache` P1. Serializes a per-layer
+//! `dsv4-ondisk-prefix-cache` P1/P3. Serializes a per-layer
 //! [`DsV4LayerCache`] to a versioned little-endian binary blob for the
-//! on-disk prefix cache. Following the DeepSeek-V4 paper §3.5.2
-//! **Zero-SWA** strategy, only the *compressed* CSA/HCA KV (and the
-//! indexer's compressed KV) plus the `compress_ratio` and the
-//! compressor `overlap_state`(s) are persisted. The uncompressed
-//! sliding-window (`raw`) cache and the partial-chunk `pending_cur`
-//! buffer are **not** stored — they are reconstructed on a prefix hit
-//! by recomputing the last `n_win·L` tokens (a later phase).
-//!
-//! A NoCompress (pure-SWA) layer has no compressed entries, so it
-//! serializes to a shape-only shell (its capacity + head_dim) that
-//! deserializes back to an empty cache.
+//! on-disk prefix cache. The format is a **lossless, complete**
+//! round-trip of the cache state (the "Full-SWA" strategy): the `raw`
+//! sliding-window KV, the `compressed` CSA/HCA KV (+ the indexer's
+//! compressed KV), the partial-chunk `pending_cur` buffer, the
+//! `compress_ratio`, and both compressor overlap states. Because the
+//! deserialized cache equals the post-prefill cache bit-for-bit, a
+//! prefix hit can simply **continue prefilling** at position `H` via the
+//! existing cached forward — no recompute (the storage-leaner Zero-SWA
+//! strategy, which drops `raw`/`pending_cur` and recomputes the SWA
+//! tail, is a later optimization).
 //!
 //! Hand-rolled LE encoding (no serde/bincode), matching the codebase's
 //! existing GGUF / kv-snapshot readers. All reads are bounds-checked:
 //! malformed input yields a [`KvPersistError`], never a panic.
 
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2};
 
 use super::dsv4_compressor_prefill::CompressorOverlapState;
 use super::dsv4_kv_cache::{DsV4LayerCache, DsV4LayerHcaCache, DsV4LayerKvCache};
 
 /// 4-byte magic identifying a DSv4 KV-cache blob ("D4KV").
 const MAGIC: [u8; 4] = *b"D4KV";
-/// Wire format version. Bump on any layout change.
-const VERSION: u16 = 1;
+/// Wire format version. v2 = Full-SWA (complete cache, incl. `raw` +
+/// `pending_cur`). v1 (Zero-SWA, compressed-only) is not read back.
+const VERSION: u16 = 2;
 
 /// Layer-cache variant tag in the blob header.
 const TAG_NO_COMPRESS: u8 = 0;
@@ -59,10 +59,7 @@ impl std::fmt::Display for KvPersistError {
             KvPersistError::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
             KvPersistError::UnknownTag(t) => write!(f, "unknown layer-cache tag {t}"),
             KvPersistError::Truncated { what, need, have } => {
-                write!(
-                    f,
-                    "truncated reading {what}: need {need} bytes, have {have}"
-                )
+                write!(f, "truncated reading {what}: need {need} bytes, have {have}")
             }
         }
     }
@@ -70,10 +67,11 @@ impl std::fmt::Display for KvPersistError {
 
 impl std::error::Error for KvPersistError {}
 
-/// Serialize a per-layer cache to a Zero-SWA blob.
+/// Serialize a per-layer cache to a complete (Full-SWA) blob.
 ///
-/// Drops the `raw` SWA cache and `pending_cur`; keeps the compressed
-/// CSA/HCA KV (+ indexer compressed) + `compress_ratio` + overlap states.
+/// Round-trips every field — `raw`, `compressed`, `pending_cur`,
+/// `compress_ratio`, both overlap states, and the indexer compressed
+/// cache — so `deserialize_layer_cache` reproduces the cache exactly.
 pub fn serialize_layer_cache(cache: &DsV4LayerCache) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
@@ -81,17 +79,14 @@ pub fn serialize_layer_cache(cache: &DsV4LayerCache) -> Vec<u8> {
     match cache {
         DsV4LayerCache::NoCompress(kv) => {
             out.push(TAG_NO_COMPRESS);
-            // Shape only — Zero-SWA drops the SWA rows.
-            put_u32(&mut out, kv.max_seq_len() as u32);
-            put_u32(&mut out, kv.head_dim() as u32);
+            put_kv_section(&mut out, kv);
         }
         DsV4LayerCache::Hca(hca) => {
             out.push(TAG_HCA);
             put_u32(&mut out, hca.compress_ratio as u32);
-            // Raw cache shape (rebuilt empty on load); rows dropped.
-            put_u32(&mut out, hca.raw.max_seq_len() as u32);
-            put_u32(&mut out, hca.raw.head_dim() as u32);
+            put_kv_section(&mut out, &hca.raw);
             put_kv_section(&mut out, &hca.compressed);
+            put_pending(&mut out, &hca.pending_cur);
             match &hca.index_compressed {
                 Some(idx) => {
                     out.push(1);
@@ -106,11 +101,8 @@ pub fn serialize_layer_cache(cache: &DsV4LayerCache) -> Vec<u8> {
     out
 }
 
-/// Deserialize a per-layer cache from a Zero-SWA blob.
-///
-/// The `raw` cache and `pending_cur` come back **empty** (Zero-SWA);
-/// the compressed caches + compress_ratio + overlap states round-trip
-/// bit-exactly.
+/// Deserialize a per-layer cache from a Full-SWA blob — a complete
+/// reconstruction equal to the serialized cache.
 pub fn deserialize_layer_cache(bytes: &[u8]) -> Result<DsV4LayerCache, KvPersistError> {
     let mut c = Cursor::new(bytes);
     let magic = c.take_array4("magic")?;
@@ -123,16 +115,12 @@ pub fn deserialize_layer_cache(bytes: &[u8]) -> Result<DsV4LayerCache, KvPersist
     }
     let tag = c.read_u8("tag")?;
     match tag {
-        TAG_NO_COMPRESS => {
-            let max_seq_len = c.read_u32("nc.max_seq_len")? as usize;
-            let head_dim = c.read_u32("nc.head_dim")? as usize;
-            Ok(DsV4LayerCache::NoCompress(empty_kv(max_seq_len, head_dim)))
-        }
+        TAG_NO_COMPRESS => Ok(DsV4LayerCache::NoCompress(c.read_kv_section("nc.kv")?)),
         TAG_HCA => {
             let compress_ratio = c.read_u32("hca.compress_ratio")? as usize;
-            let raw_max = c.read_u32("hca.raw_max_seq_len")? as usize;
-            let raw_head = c.read_u32("hca.raw_head_dim")? as usize;
+            let raw = c.read_kv_section("hca.raw")?;
             let compressed = c.read_kv_section("hca.compressed")?;
+            let pending_cur = c.read_pending("hca.pending")?;
             let index_compressed = if c.read_u8("hca.has_indexer")? != 0 {
                 Some(c.read_kv_section("hca.index_compressed")?)
             } else {
@@ -141,10 +129,10 @@ pub fn deserialize_layer_cache(bytes: &[u8]) -> Result<DsV4LayerCache, KvPersist
             let overlap_state = c.read_overlap("hca.overlap")?;
             let indexer_overlap_state = c.read_overlap("hca.indexer_overlap")?;
             Ok(DsV4LayerCache::Hca(DsV4LayerHcaCache {
-                raw: empty_kv(raw_max, raw_head),
+                raw,
                 compressed,
                 compress_ratio,
-                pending_cur: Vec::new(),
+                pending_cur,
                 overlap_state,
                 index_compressed,
                 indexer_overlap_state,
@@ -161,8 +149,6 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 }
 
 fn put_f32_rows(out: &mut Vec<u8>, rows: ArrayView2<f32>) {
-    // Row-major LE f32. `rows` is contiguous from a fresh slice in our
-    // call sites, but iterate to be layout-agnostic.
     for v in rows.iter() {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -174,6 +160,19 @@ fn put_kv_section(out: &mut Vec<u8>, kv: &DsV4LayerKvCache) {
     put_u32(out, kv.head_dim() as u32);
     put_u32(out, kv.current_len() as u32);
     put_f32_rows(out, kv.view_current());
+}
+
+/// `count | width | count*width f32`. `pending_cur` rows are all `n_embd`
+/// wide; `width = 0` when empty.
+fn put_pending(out: &mut Vec<u8>, pending: &[Array1<f32>]) {
+    let width = pending.first().map(|r| r.len()).unwrap_or(0);
+    put_u32(out, pending.len() as u32);
+    put_u32(out, width as u32);
+    for row in pending {
+        for &v in row.iter() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
 }
 
 /// `optArray2(kv_prev_last) | optArray2(score_prev_last)`.
@@ -195,7 +194,7 @@ fn put_opt_array2(out: &mut Vec<u8>, a: Option<&Array2<f32>>) {
     }
 }
 
-fn empty_kv(max_seq_len: usize, head_dim: usize) -> DsV4LayerKvCache {
+fn kv_with_capacity(max_seq_len: usize, head_dim: usize) -> DsV4LayerKvCache {
     DsV4LayerKvCache::with_capacity(max_seq_len.max(1), head_dim.max(1))
 }
 
@@ -215,11 +214,7 @@ impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], KvPersistError> {
         let have = self.buf.len() - self.pos.min(self.buf.len());
         if self.pos + n > self.buf.len() {
-            return Err(KvPersistError::Truncated {
-                what,
-                need: n,
-                have,
-            });
+            return Err(KvPersistError::Truncated { what, need: n, have });
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -257,7 +252,6 @@ impl<'a> Cursor<'a> {
         for chunk in s.chunks_exact(4) {
             data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
-        // Shape is exact by construction (n = rows*cols bytes read).
         Ok(Array2::from_shape_vec((rows, cols), data).expect("rows*cols matches read length"))
     }
 
@@ -265,12 +259,27 @@ impl<'a> Cursor<'a> {
         let max_seq_len = self.read_u32(what)? as usize;
         let head_dim = self.read_u32(what)? as usize;
         let current_len = self.read_u32(what)? as usize;
-        let mut kv = empty_kv(max_seq_len, head_dim);
+        let mut kv = kv_with_capacity(max_seq_len, head_dim);
         if current_len > 0 {
             let rows = self.read_f32_rows(current_len, head_dim, what)?;
             kv.append(rows.view());
         }
         Ok(kv)
+    }
+
+    fn read_pending(&mut self, what: &'static str) -> Result<Vec<Array1<f32>>, KvPersistError> {
+        let count = self.read_u32(what)? as usize;
+        let width = self.read_u32(what)? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let s = self.take(width * 4, what)?;
+            let mut row = Vec::with_capacity(width);
+            for chunk in s.chunks_exact(4) {
+                row.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            out.push(Array1::from(row));
+        }
+        Ok(out)
     }
 
     fn read_overlap(
@@ -301,7 +310,6 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array1;
 
     fn kv_with_rows(max_seq_len: usize, head_dim: usize, n: usize) -> DsV4LayerKvCache {
         let mut kv = DsV4LayerKvCache::with_capacity(max_seq_len, head_dim);
@@ -317,20 +325,20 @@ mod tests {
         assert_eq!(a.max_seq_len(), b.max_seq_len());
         assert_eq!(a.head_dim(), b.head_dim());
         assert_eq!(a.current_len(), b.current_len());
-        assert_eq!(a.view_current(), b.view_current(), "compressed rows differ");
+        assert_eq!(a.view_current(), b.view_current(), "kv rows differ");
     }
 
-    /// Compressed (HCA, no indexer) cache round-trips: compressed rows
-    /// bit-exact, compress_ratio + dims preserved, raw comes back empty.
+    /// Full HCA cache (raw + compressed + pending + overlap) round-trips
+    /// bit-exactly — the Full-SWA lossless contract.
     #[test]
-    fn hca_compressed_round_trips_losslessly() {
+    fn hca_full_cache_round_trips_losslessly() {
         let mut hca = DsV4LayerHcaCache::with_capacity(64, 8, 4);
-        // Populate raw (will be dropped) + compressed (must survive).
-        hca.raw.append(Array2::<f32>::ones((10, 8)).view());
+        hca.raw
+            .append(Array2::<f32>::from_shape_fn((10, 8), |(r, d)| (r * 3 + d) as f32 * 0.7).view());
         hca.compressed
             .append(Array2::<f32>::from_shape_fn((3, 8), |(r, d)| (r + d) as f32 * 0.5).view());
-        // A pending row (must be dropped).
-        hca.pending_cur.push(Array1::<f32>::zeros(8));
+        hca.pending_cur.push(Array1::<f32>::from_shape_fn(16, |i| i as f32 * 0.25));
+        hca.pending_cur.push(Array1::<f32>::from_elem(16, -2.0));
 
         let blob = serialize_layer_cache(&DsV4LayerCache::Hca(hca.clone()));
         let DsV4LayerCache::Hca(got) = deserialize_layer_cache(&blob).unwrap() else {
@@ -338,21 +346,21 @@ mod tests {
         };
 
         assert_eq!(got.compress_ratio, 4);
+        assert_kv_eq(&got.raw, &hca.raw); // raw now PRESERVED (Full-SWA)
         assert_kv_eq(&got.compressed, &hca.compressed);
-        assert!(got.index_compressed.is_none(), "no indexer → None");
-        // Zero-SWA: raw + pending dropped.
-        assert_eq!(got.raw.current_len(), 0, "raw must be empty (Zero-SWA)");
-        assert!(got.pending_cur.is_empty(), "pending_cur must be dropped");
-        // Raw shape preserved so the cache is usable.
-        assert_eq!(got.raw.max_seq_len(), hca.raw.max_seq_len());
-        assert_eq!(got.raw.head_dim(), hca.raw.head_dim());
+        assert_eq!(got.pending_cur.len(), 2);
+        assert_eq!(got.pending_cur[0], hca.pending_cur[0]);
+        assert_eq!(got.pending_cur[1], hca.pending_cur[1]);
+        assert!(got.index_compressed.is_none());
     }
 
-    /// Indexer-variant cache: the indexer compressed KV + both overlap
-    /// states round-trip.
+    /// Indexer-variant cache: indexer compressed + both overlap states +
+    /// raw all round-trip.
     #[test]
     fn hca_with_indexer_and_overlap_round_trips() {
         let mut hca = DsV4LayerHcaCache::with_capacity_and_indexer(64, 8, 4, 5);
+        hca.raw
+            .append(Array2::<f32>::from_shape_fn((6, 8), |(r, d)| (r + d) as f32).view());
         hca.compressed
             .append(Array2::<f32>::from_shape_fn((2, 8), |(r, d)| (r * 7 + d) as f32).view());
         hca.index_compressed
@@ -360,9 +368,7 @@ mod tests {
             .unwrap()
             .append(Array2::<f32>::from_shape_fn((2, 5), |(r, d)| (r + d * 2) as f32).view());
         hca.overlap_state = CompressorOverlapState {
-            kv_prev_last: Some(Array2::<f32>::from_shape_fn((4, 8), |(r, d)| {
-                (r + d) as f32 * 0.3
-            })),
+            kv_prev_last: Some(Array2::<f32>::from_shape_fn((4, 8), |(r, d)| (r + d) as f32 * 0.3)),
             score_prev_last: Some(Array2::<f32>::from_elem((4, 8), -1.0)),
         };
         hca.indexer_overlap_state = CompressorOverlapState {
@@ -375,15 +381,13 @@ mod tests {
             panic!("expected Hca");
         };
 
+        assert_kv_eq(&got.raw, &hca.raw);
         assert_kv_eq(&got.compressed, &hca.compressed);
         assert_kv_eq(
             got.index_compressed.as_ref().unwrap(),
             hca.index_compressed.as_ref().unwrap(),
         );
-        assert_eq!(
-            got.overlap_state.kv_prev_last,
-            hca.overlap_state.kv_prev_last
-        );
+        assert_eq!(got.overlap_state.kv_prev_last, hca.overlap_state.kv_prev_last);
         assert_eq!(
             got.overlap_state.score_prev_last,
             hca.overlap_state.score_prev_last
@@ -395,30 +399,29 @@ mod tests {
         assert_eq!(got.indexer_overlap_state.score_prev_last, None);
     }
 
-    /// NoCompress (pure-SWA) layer serializes to a shape-only shell and
-    /// deserializes to an empty cache of the same shape.
+    /// NoCompress (pure-SWA) layer: its `raw` rows round-trip in full
+    /// (Full-SWA — those rows ARE the layer's cache).
     #[test]
-    fn no_compress_layer_round_trips_as_empty() {
-        let kv = kv_with_rows(128, 512, 17); // rows will be dropped
+    fn no_compress_layer_round_trips_full() {
+        let kv = kv_with_rows(128, 512, 17);
         let blob = serialize_layer_cache(&DsV4LayerCache::NoCompress(kv.clone()));
         let DsV4LayerCache::NoCompress(got) = deserialize_layer_cache(&blob).unwrap() else {
             panic!("expected NoCompress");
         };
-        assert_eq!(got.current_len(), 0, "Zero-SWA drops the SWA rows");
-        assert_eq!(got.max_seq_len(), kv.max_seq_len());
-        assert_eq!(got.head_dim(), kv.head_dim());
+        assert_kv_eq(&got, &kv);
     }
 
-    /// Empty compressed cache (HCA layer that hasn't produced a chunk yet)
-    /// round-trips to an empty compressed cache.
+    /// Empty HCA cache (no chunk yet) round-trips.
     #[test]
-    fn empty_compressed_round_trips() {
-        let hca = DsV4LayerHcaCache::with_capacity(64, 8, 4); // nothing appended
+    fn empty_cache_round_trips() {
+        let hca = DsV4LayerHcaCache::with_capacity(64, 8, 4);
         let blob = serialize_layer_cache(&DsV4LayerCache::Hca(hca));
         let DsV4LayerCache::Hca(got) = deserialize_layer_cache(&blob).unwrap() else {
             panic!("expected Hca");
         };
+        assert_eq!(got.raw.current_len(), 0);
         assert_eq!(got.compressed.current_len(), 0);
+        assert!(got.pending_cur.is_empty());
         assert!(got.index_compressed.is_none());
     }
 
@@ -438,7 +441,6 @@ mod tests {
     #[test]
     fn unsupported_version_is_typed_error() {
         let mut blob = serialize_layer_cache(&DsV4LayerCache::NoCompress(kv_with_rows(8, 4, 0)));
-        // version is bytes [4..6] LE; set to 0xFFFF.
         blob[4] = 0xFF;
         blob[5] = 0xFF;
         match deserialize_layer_cache(&blob) {
@@ -463,7 +465,9 @@ mod tests {
     /// Truncated blob → typed error, never a panic.
     #[test]
     fn truncated_blob_is_typed_error() {
-        let hca = DsV4LayerHcaCache::with_capacity(64, 8, 4);
+        let mut hca = DsV4LayerHcaCache::with_capacity(64, 8, 4);
+        hca.raw.append(Array2::<f32>::ones((4, 8)).view());
+        hca.compressed.append(Array2::<f32>::ones((1, 8)).view());
         let blob = serialize_layer_cache(&DsV4LayerCache::Hca(hca));
         for cut in 0..blob.len() {
             match deserialize_layer_cache(&blob[..cut]) {

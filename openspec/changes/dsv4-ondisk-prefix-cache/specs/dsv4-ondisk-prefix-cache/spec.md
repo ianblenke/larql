@@ -1,30 +1,33 @@
 ## ADDED Requirements
 
-### Requirement: Compressed-cache serialization
+### Requirement: Layer-cache serialization
 
 DSv4 SHALL provide a versioned binary wire format that serializes a
-layer's **compressed** CSA/HCA KV cache (and, on Indexer layers, the
-indexer's compressed KV), together with the `compress_ratio` and the
-compressor `overlap_state`, and deserializes it back losslessly. The
-uncompressed sliding-window (`raw`) cache and the `pending_cur` tail
-SHALL NOT be serialized (Zero-SWA).
+per-layer cache (`DsV4LayerCache`) completely — the `raw` sliding-window
+KV, the `compressed` CSA/HCA KV (and, on Indexer layers, the indexer's
+compressed KV), the `pending_cur` buffer, the `compress_ratio`, and both
+compressor overlap states — and deserializes it back **losslessly**
+(the Full-SWA strategy). Because the round-trip is exact, a deserialized
+cache equals the post-prefill cache and prefill can simply continue from
+it. (Dropping `raw`/`pending_cur` to recompute the SWA tail — Zero-SWA —
+is a later storage optimization.)
 
-#### Scenario: Compressed cache round-trips losslessly
+#### Scenario: Layer cache round-trips losslessly
 
-- **WHEN** a layer's `DsV4LayerHcaCache` is serialized and then
-  deserialized
-- **THEN** the restored compressed entries SHALL equal the originals
-  bit-exactly, with the same `compress_ratio`, dims, and indexer-present
-  flag, and the `raw` cache SHALL be empty
-<!-- test: larql_inference::attention::dsv4_kv_persist::hca_compressed_round_trips_losslessly -->
+- **WHEN** a layer's `DsV4LayerCache` (raw + compressed + pending +
+  overlap, and the indexer compressed cache on Indexer layers) is
+  serialized and then deserialized
+- **THEN** every field SHALL equal the original bit-exactly, with the
+  same `compress_ratio`, dims, and indexer-present flag
+<!-- test: larql_inference::attention::dsv4_kv_persist::hca_full_cache_round_trips_losslessly -->
 <!-- test: larql_inference::attention::dsv4_kv_persist::hca_with_indexer_and_overlap_round_trips -->
 
-#### Scenario: No-compress layer serializes as empty compressed cache
+#### Scenario: No-compress layer round-trips its SWA cache
 
 - **WHEN** a NoCompress (pure-SWA) layer's cache is serialized
-- **THEN** the blob SHALL encode an empty compressed cache and
-  deserialize to one, without error
-<!-- test: larql_inference::attention::dsv4_kv_persist::no_compress_layer_round_trips_as_empty -->
+- **THEN** its `raw` rows SHALL round-trip in full and deserialize back
+  to an equal cache, without error
+<!-- test: larql_inference::attention::dsv4_kv_persist::no_compress_layer_round_trips_full -->
 
 #### Scenario: Unknown format version is a typed error
 
@@ -67,29 +70,34 @@ store SHALL enforce a size cap.
   under the cap, and surviving entries SHALL still load correctly
 <!-- test: larql_inference::attention::dsv4_prefix_cache::size_cap_evicts_lru -->
 
-### Requirement: Zero-SWA prefill reuse is transparent
+### Requirement: Full-SWA prefix reuse is transparent
 
-On a prefix hit, DSv4 SHALL reconstruct each layer's cache by loading the
-compressed entries and recomputing only the last `n_win·L` tokens of the
-prefix to restore the sliding-window tail and compressor state, then
-prefill the uncached suffix. The reconstructed state SHALL produce the
-same model output as a cold full prefill of the identical prompt, within
-the documented numerical tolerance. The feature SHALL be opt-in; with no
-cache supplied the cold prefill path SHALL be unchanged.
+On a prefix hit, DSv4 SHALL load the complete per-layer caches and
+**continue prefilling** the uncached suffix at position `H` — the first
+`H` tokens are not recomputed. The result SHALL match a cold full
+prefill of the identical prompt at the generation level: the greedy next
+token SHALL be identical at every continued position (the load-bearing
+signal). Raw logits MAY differ within the documented HCA reduction-order
+/ FP8 tolerance (the same sensitivity the resident-quant parity
+tolerates). The feature SHALL be opt-in; with no cache supplied the cold
+prefill path SHALL be unchanged.
 
-#### Scenario: Cache hit is transparent to output
+#### Scenario: Cache hit matches cold prefill (greedy-transparent)
 
-- **WHEN** the same prompt is prefilled cold and via a prefix-cache hit
-- **THEN** the per-position logits SHALL agree within the documented
-  tolerance and the greedy next token SHALL be identical, including for
-  a prompt whose suffix is not block-aligned
+- **WHEN** a prompt is prefilled cold, and the same prompt is prefilled
+  via a prefix-cache hit that continues from a stored prefix
+- **THEN** the greedy argmax of every continued-position logit SHALL be
+  identical to the cold prefill, across NoCompress, Indexer, and Compress
+  layers
+<!-- test: larql_inference::attention::dsv4_prefix_reuse::prefix_cache_hit_matches_cold_prefill -->
 
-#### Scenario: Reuse recomputes only the SWA tail
+#### Scenario: Cache hit skips re-prefilling the shared prefix
 
-- **WHEN** a prefix hit of length `H` (a multiple of the block size) is
-  reused
-- **THEN** the number of recomputed tokens SHALL be `min(H, n_win·L)` —
-  bounded independent of `H` — not the full `H`
+- **WHEN** a prefix hit of length `H` (a block multiple, `H < N`) is
+  reused for an `N`-token prompt
+- **THEN** only the `N - H` suffix tokens SHALL be forwarded; the first
+  `H` tokens SHALL NOT be re-run
+<!-- test: larql_inference::attention::dsv4_prefix_reuse::prefix_cache_hit_matches_cold_prefill -->
 
 #### Scenario: Disabled cache leaves cold prefill unchanged
 

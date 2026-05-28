@@ -19,12 +19,21 @@
 - [x] 3.4 Size-capped LRU eviction by `last_used` (`size_cap_evicts_lru`: A touched → B evicted, C survives, survivors still load). Atomicity via tmp-dir rename.
 - [x] 3.5 Store round-trip (`put_then_get_longest_prefix_round_trips`) + miss/short-prefix (`no_shared_prefix_misses`). All 7 tests on tempdirs.
 
-## 4. P3 — Zero-SWA prefill reuse (the payoff)
+## 4. P3 — Full-SWA prefill reuse (the payoff)
 
-- [ ] 4.1 `dsv4_prefill_with_prefix_cache(gguf/resident layers, hp, head, token_ids, &mut DsV4PrefixCache)`: longest-prefix `get`, seed each layer's `compressed`, recompute the last `min(hit_len, n_win·L)` tokens to restore `raw`/`pending`/`overlap`, then prefill the suffix; `put` new block boundaries through.
-- [ ] 4.2 **Transparency test (load-bearing, real-GGUF, ignored):** logits after a cache-hit prefill equal a cold full prefill within the documented tolerance, at several prefix lengths incl. a non-block-aligned suffix. Greedy next-token identical. Backs "Cache hit is transparent to output".
-- [ ] 4.3 Reuse-cost assertion: the recompute window is `O(n_win·L)`, independent of hit length (count forward-token invocations on a short vs long hit). Backs "Reuse recomputes only the SWA tail".
-- [ ] 4.4 Opt-in gate: feature is off by default (`DsV4PrefixCache` constructed explicitly); the existing cold prefill path is byte-for-byte unchanged when no cache is passed. Test the disabled path is untouched.
+**Pivot (2026-05-28):** investigating the cached forward showed Zero-SWA
+reuse needs a dedicated "recompute-mode" attention (decouple raw/compressed
+position + custom causal mask + suppress re-compress) — large and
+correctness-critical. Switched to **Full-SWA first**: serialize the
+complete cache (incl. `raw`/`pending`) so a hit just *continues prefill*
+at `H` via the existing cached forward — transparent by construction
+(lossless serialize + the proven split-prefill==one-shot). Zero-SWA stays
+a future storage optimization.
+
+- [x] 4.1 `dsv4_resident_prefill_with_prefix_cache(layers, hp, head, token_ids, &mut DsV4PrefixCache, max_seq_len, backend)` in `dsv4_prefix_reuse.rs`: longest-prefix `get`; on a hit load the complete caches and continue prefill of the suffix at `H` (no recompute); on a miss prefill cold. Write-through `put` of the block-aligned prompt. Opt-in (`PrefixPrefillResult{start_pos, logits, cache_hit}`).
+- [x] 4.2 **Transparency test (load-bearing, real-GGUF, ignored):** `prefix_cache_hit_matches_cold_prefill` — cache-hit suffix vs cold one-shot over 4 layers (NoCompress 0,1 · Indexer 2 · Compress 3). **Greedy argmax 16/16** at every continued position (the gate). SWA-only max rel diff ~5e-3; HCA layers add split-batch reduction-order/FP8 drift (max_rel 0.47 < 1.5 documented bound), greedy-transparent throughout — same convention as the resident-quant parity.
+- [x] 4.3 **Fixed a latent P8 bug** surfaced by 4.2: `dsv4_compressor_step_coff2` (cr=4 cached step, Indexer layers) was never wired through `proj_wkv`/`proj_wgate` — it would panic on any resident cached decode through an Indexer layer once a chunk completes. P8's parity test ran `layer_caches=None` (prefill path) so missed it. Now guarded + dispatched like `coff1`.
+- [x] 4.4 Opt-in gate: the helper is a separate entry point; callers not passing a cache use the unchanged cold `dsv4_resident_model_forward_cached`. Write-through only on a block-aligned prompt.
 
 ## 5. P4 — Wire-up & docs
 

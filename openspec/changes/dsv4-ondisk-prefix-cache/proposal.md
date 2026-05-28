@@ -1,3 +1,15 @@
+> **Update (2026-05-28, during P3):** investigating the cached forward
+> showed the Zero-SWA reuse path needs a dedicated "recompute-mode"
+> attention (decouple raw/compressed position + custom causal mask +
+> suppress re-compress) — large and correctness-critical. We pivoted to
+> **Full-SWA first**: the wire format serializes the *complete* cache
+> (incl. `raw`/`pending_cur`), so a prefix hit simply *continues
+> prefilling* at `H` via the existing cached forward — transparent by
+> construction. Zero-SWA (drop `raw`, recompute the `n_win·L` tail)
+> remains a future storage optimization. P1 (serialize) and P2 (store)
+> are unchanged in shape; the wire format just gained the `raw`/`pending`
+> fields. See `tasks.md` §4.
+
 ## Why
 
 DSv4-Flash decode is now at the resident-Q4_K weight-bandwidth floor
