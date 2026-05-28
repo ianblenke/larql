@@ -12,10 +12,14 @@
 //! test below) reconstruct the attention half of `DsV4LayerWeightStorage`
 //! from this.
 //!
-//! Hand-rolled little-endian, no serde — same style as
-//! [`super::dsv4_kv_persist`]. All reads are bounds-checked.
+//! Hand-rolled little-endian, no serde — built on the shared
+//! [`super::dsv4_vindex_wire`] primitives. All reads are bounds-checked.
 
 use super::dsv4_gguf_reader::RawExpertTensor;
+use super::dsv4_vindex_wire::{put_f32_vec, put_header, put_opt_f32_vec, put_raw, Cursor};
+
+/// Error decoding a `dsv4_attn.bin` blob (the shared vindex wire error).
+pub type DsV4AttnPersistError = super::dsv4_vindex_wire::DsV4VindexWireError;
 
 /// 4-byte magic: "D4VA" (DSv4 Vindex Attention).
 const MAGIC: [u8; 4] = *b"D4VA";
@@ -45,36 +49,10 @@ pub struct DsV4AttnWeights {
     pub attn_sinks: Option<Vec<f32>>,
 }
 
-/// Error decoding a `dsv4_attn.bin` blob.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DsV4AttnPersistError {
-    BadMagic([u8; 4]),
-    UnsupportedVersion(u16),
-    Truncated {
-        what: &'static str,
-        need: usize,
-        have: usize,
-    },
-}
-
-impl std::fmt::Display for DsV4AttnPersistError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DsV4AttnPersistError::BadMagic(m) => write!(f, "bad magic {m:?} (expected {MAGIC:?})"),
-            DsV4AttnPersistError::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
-            DsV4AttnPersistError::Truncated { what, need, have } => {
-                write!(f, "truncated reading {what}: need {need}, have {have}")
-            }
-        }
-    }
-}
-impl std::error::Error for DsV4AttnPersistError {}
-
 /// Serialize one layer's attention weights to a `dsv4_attn.bin` blob.
 pub fn serialize_dsv4_attn(w: &DsV4AttnWeights) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    put_header(&mut out, MAGIC, VERSION);
     // Five raw tensors, fixed order (no tags needed).
     for t in [&w.q_a, &w.q_b, &w.kv_latent, &w.output_a, &w.output_b] {
         put_raw(&mut out, t);
@@ -82,147 +60,25 @@ pub fn serialize_dsv4_attn(w: &DsV4AttnWeights) -> Vec<u8> {
     put_f32_vec(&mut out, &w.attn_norm);
     put_f32_vec(&mut out, &w.q_a_norm);
     put_f32_vec(&mut out, &w.kv_a_norm);
-    match &w.attn_sinks {
-        Some(s) => {
-            out.push(1);
-            put_f32_vec(&mut out, s);
-        }
-        None => out.push(0),
-    }
+    put_opt_f32_vec(&mut out, &w.attn_sinks);
     out
 }
 
 /// Deserialize one layer's attention weights from a `dsv4_attn.bin` blob.
 pub fn deserialize_dsv4_attn(bytes: &[u8]) -> Result<DsV4AttnWeights, DsV4AttnPersistError> {
     let mut c = Cursor::new(bytes);
-    let magic = c.take_array4("magic")?;
-    if magic != MAGIC {
-        return Err(DsV4AttnPersistError::BadMagic(magic));
-    }
-    let version = c.read_u16("version")?;
-    if version != VERSION {
-        return Err(DsV4AttnPersistError::UnsupportedVersion(version));
-    }
-    let q_a = c.read_raw("q_a")?;
-    let q_b = c.read_raw("q_b")?;
-    let kv_latent = c.read_raw("kv_latent")?;
-    let output_a = c.read_raw("output_a")?;
-    let output_b = c.read_raw("output_b")?;
-    let attn_norm = c.read_f32_vec("attn_norm")?;
-    let q_a_norm = c.read_f32_vec("q_a_norm")?;
-    let kv_a_norm = c.read_f32_vec("kv_a_norm")?;
-    let attn_sinks = if c.read_u8("has_sinks")? != 0 {
-        Some(c.read_f32_vec("attn_sinks")?)
-    } else {
-        None
-    };
+    c.read_header(MAGIC, VERSION)?;
     Ok(DsV4AttnWeights {
-        q_a,
-        q_b,
-        kv_latent,
-        output_a,
-        output_b,
-        attn_norm,
-        q_a_norm,
-        kv_a_norm,
-        attn_sinks,
+        q_a: c.read_raw("q_a")?,
+        q_b: c.read_raw("q_b")?,
+        kv_latent: c.read_raw("kv_latent")?,
+        output_a: c.read_raw("output_a")?,
+        output_b: c.read_raw("output_b")?,
+        attn_norm: c.read_f32_vec("attn_norm")?,
+        q_a_norm: c.read_f32_vec("q_a_norm")?,
+        kv_a_norm: c.read_f32_vec("kv_a_norm")?,
+        attn_sinks: c.read_opt_f32_vec("attn_sinks")?,
     })
-}
-
-// ── encode helpers ──────────────────────────────────────────────────────
-
-fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-/// `tensor_type:u32 | rows:u32 | cols:u32 | byte_len:u64 | bytes`.
-fn put_raw(out: &mut Vec<u8>, t: &RawExpertTensor) {
-    put_u32(out, t.tensor_type);
-    put_u32(out, t.rows as u32);
-    put_u32(out, t.cols as u32);
-    out.extend_from_slice(&(t.bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(&t.bytes);
-}
-
-/// `len:u32 | len*f32`.
-fn put_f32_vec(out: &mut Vec<u8>, v: &[f32]) {
-    put_u32(out, v.len() as u32);
-    for &x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
-// ── decode helpers ──────────────────────────────────────────────────────
-
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], DsV4AttnPersistError> {
-        let have = self.buf.len().saturating_sub(self.pos);
-        if n > have {
-            return Err(DsV4AttnPersistError::Truncated {
-                what,
-                need: n,
-                have,
-            });
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-
-    fn take_array4(&mut self, what: &'static str) -> Result<[u8; 4], DsV4AttnPersistError> {
-        let s = self.take(4, what)?;
-        Ok([s[0], s[1], s[2], s[3]])
-    }
-    fn read_u8(&mut self, what: &'static str) -> Result<u8, DsV4AttnPersistError> {
-        Ok(self.take(1, what)?[0])
-    }
-    fn read_u16(&mut self, what: &'static str) -> Result<u16, DsV4AttnPersistError> {
-        let s = self.take(2, what)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn read_u32(&mut self, what: &'static str) -> Result<u32, DsV4AttnPersistError> {
-        let s = self.take(4, what)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn read_u64(&mut self, what: &'static str) -> Result<u64, DsV4AttnPersistError> {
-        let s = self.take(8, what)?;
-        let mut b = [0u8; 8];
-        b.copy_from_slice(s);
-        Ok(u64::from_le_bytes(b))
-    }
-
-    fn read_raw(&mut self, what: &'static str) -> Result<RawExpertTensor, DsV4AttnPersistError> {
-        let tensor_type = self.read_u32(what)?;
-        let rows = self.read_u32(what)? as usize;
-        let cols = self.read_u32(what)? as usize;
-        let byte_len = self.read_u64(what)? as usize;
-        let bytes = self.take(byte_len, what)?.to_vec();
-        Ok(RawExpertTensor {
-            bytes,
-            tensor_type,
-            rows,
-            cols,
-        })
-    }
-
-    fn read_f32_vec(&mut self, what: &'static str) -> Result<Vec<f32>, DsV4AttnPersistError> {
-        let n = self.read_u32(what)? as usize;
-        let s = self.take(n * 4, what)?;
-        let mut v = Vec::with_capacity(n);
-        for chunk in s.chunks_exact(4) {
-            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        Ok(v)
-    }
 }
 
 #[cfg(test)]

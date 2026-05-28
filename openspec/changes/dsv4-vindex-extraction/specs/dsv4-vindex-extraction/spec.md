@@ -52,6 +52,12 @@ only the indexer weights are stored (selection stays runtime-dynamic).
   bookends SHALL be present for every layer — all round-tripping to the
   GGUF-loaded values
 
+<!-- test: larql_inference::attention::dsv4_vindex_hca::tests::compressor_only_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_hca::tests::indexer_layer_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_hca::tests::nocompress_layer_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_hca::tests::malformed_blobs_are_typed_errors -->
+<!-- test: larql_inference::attention::dsv4_vindex_hca::tests::real_gguf_hca_round_trips_to_storage -->
+
 ### Requirement: Routed and shared MoE reuse generic extraction
 
 The extraction pipeline SHALL extract DSv4's routed experts, shared
