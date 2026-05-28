@@ -12,8 +12,8 @@
 
 ## 3. V2 — HCA compressor + indexer
 
-- [ ] 3.1 `dsv4_hca.bin` + manifest: per-layer compressor (`attn_compress_kv/gate/ape/norm`) gated by `compress_ratio>0`; indexer (`indexer.compress_*`, `indexer.attn_q_b`, `indexer.proj`) gated by `compress_ratio==4`.
-- [ ] 3.2 Test-reader round-trip for the HCA/indexer tensors (variant-aware: NoCompress/Compress/Indexer layers).
+- [x] 3.1 `dsv4_hca.bin` wire format (`crates/larql-inference/src/attention/dsv4_vindex_hca.rs`, magic `D4HC` v1): `DsV4HcaWeights { compressor: Option, indexer: Option }`. Compressor (gated `compress_ratio>0`) = `attn_compress_kv`/`gate` raw-Q4_K passthrough + `ape`/`norm` f32. Indexer (gated `compress_ratio==4`) = its sub-compressor (`indexer.compress_*`) + `indexer.attn_q_b` raw-Q4_K + `indexer.proj` (Q4_K, stored **raw** to stay byte-faithful even though the resident loader currently dequantizes it). Top-k masks NOT stored (selection stays runtime-dynamic). Wire primitives extracted to shared `dsv4_vindex_wire.rs` (Cursor/put_raw/read_raw/f32-vec/header + `DsV4VindexWireError`); V1 `dsv4_vindex_attn.rs` refactored onto it (its 4 tests still green → refactor verified safe). V3 mHC reuses the same wire.
+- [x] 3.2 Variant-aware round-trip: synthetic CI tests (`compressor_only_round_trips` = Compress, `indexer_layer_round_trips` = Indexer, `nocompress_layer_round_trips` = NoCompress→7-byte blob, `malformed_blobs_are_typed_errors`). Real-GGUF `#[ignore]` gate `real_gguf_hca_round_trips_to_storage`: scans for a Compress + an Indexer layer, reads their HCA/indexer weights via the *same* readers the resident loader feeds, round-trips, asserts byte/type/shape equality on every raw tensor + f32 equality on ape/norm — compressor only for the Compress layer, compressor+indexer for the Indexer layer.
 
 ## 4. V3 — mHC + MoE + head
 

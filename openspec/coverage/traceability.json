@@ -3,9 +3,9 @@
     "capabilities": 59,
     "requirements": 549,
     "scenarios": 1591,
-    "scenarios_backed": 1369,
-    "scenarios_unbacked": 222,
-    "test_refs": 3517,
+    "scenarios_backed": 1370,
+    "scenarios_unbacked": 221,
+    "test_refs": 3522,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5816,9 +5816,15 @@
           "scenarios": [
             {
               "name": "Variant-gated structural weights round-trip",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_vindex_hca::tests::compressor_only_round_trips",
+                "larql_inference::attention::dsv4_vindex_hca::tests::indexer_layer_round_trips",
+                "larql_inference::attention::dsv4_vindex_hca::tests::nocompress_layer_round_trips",
+                "larql_inference::attention::dsv4_vindex_hca::tests::malformed_blobs_are_typed_errors",
+                "larql_inference::attention::dsv4_vindex_hca::tests::real_gguf_hca_round_trips_to_storage"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
               "line": 47
             }
@@ -5833,7 +5839,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 62
+              "line": 68
             }
           ]
         },
@@ -5846,7 +5852,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 76
+              "line": 82
             }
           ]
         }
@@ -27744,31 +27750,61 @@
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::attn_weights_round_trip_losslessly",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 268,
+      "line": 124,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::malformed_blobs_are_typed_errors",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 311,
+      "line": 167,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::no_sinks_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 285,
+      "line": 141,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::real_gguf_attn_round_trips_to_storage",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 350,
+      "line": 206,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_attn::round_tripped_raw_builds_quant_tensor",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_attn.rs",
-      "line": 295,
+      "line": 151,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_hca::compressor_only_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
+      "line": 172,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_hca::indexer_layer_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
+      "line": 187,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_hca::malformed_blobs_are_typed_errors",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
+      "line": 222,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_hca::nocompress_layer_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
+      "line": 211,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_hca::real_gguf_hca_round_trips_to_storage",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
+      "line": 266,
       "crate": "larql_inference"
     },
     {
