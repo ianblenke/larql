@@ -96,8 +96,10 @@ prefill path SHALL be unchanged.
 - **WHEN** a prefix hit of length `H` (a block multiple, `H < N`) is
   reused for an `N`-token prompt
 - **THEN** only the `N - H` suffix tokens SHALL be forwarded; the first
-  `H` tokens SHALL NOT be re-run
+  `H` tokens SHALL NOT be re-run, yielding a wall-time speedup that grows
+  with the shared-prefix length
 <!-- test: larql_inference::attention::dsv4_prefix_reuse::prefix_cache_hit_matches_cold_prefill -->
+<!-- test: larql_inference::attention::dsv4_prefix_reuse::bench_cold_vs_warm_prefill -->
 
 #### Scenario: Disabled cache leaves cold prefill unchanged
 

@@ -5,7 +5,7 @@
     "scenarios": 1580,
     "scenarios_backed": 1368,
     "scenarios_unbacked": 212,
-    "test_refs": 3511,
+    "test_refs": 3512,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5503,7 +5503,8 @@
             {
               "name": "Cache hit skips re-prefilling the shared prefix",
               "tests_resolved": [
-                "larql_inference::attention::dsv4_prefix_reuse::prefix_cache_hit_matches_cold_prefill"
+                "larql_inference::attention::dsv4_prefix_reuse::prefix_cache_hit_matches_cold_prefill",
+                "larql_inference::attention::dsv4_prefix_reuse::bench_cold_vs_warm_prefill"
               ],
               "tests_unresolved": [],
               "unbacked": false,
@@ -5516,7 +5517,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 102
+              "line": 104
             }
           ]
         }
@@ -26774,9 +26775,15 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::attention::dsv4_prefix_reuse::tests::bench_cold_vs_warm_prefill",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_reuse.rs",
+      "line": 355,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::attention::dsv4_prefix_reuse::tests::prefix_cache_hit_matches_cold_prefill",
       "file": "crates/larql-inference/src/attention/dsv4_prefix_reuse.rs",
-      "line": 166,
+      "line": 235,
       "crate": "larql_inference"
     },
     {

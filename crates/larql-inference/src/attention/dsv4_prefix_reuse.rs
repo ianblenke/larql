@@ -67,6 +67,9 @@ pub struct PrefixPrefillResult {
     pub logits: Array2<f32>,
     /// Whether a cached prefix was reused.
     pub cache_hit: bool,
+    /// The per-layer caches at position `token_ids.len()`, ready to feed
+    /// a decode loop (one entry per model layer, same order as `layers`).
+    pub caches: Vec<DsV4LayerCache>,
 }
 
 /// Prefill `token_ids` against the resident model, reusing a cached
@@ -141,7 +144,73 @@ pub fn dsv4_resident_prefill_with_prefix_cache(
         start_pos,
         logits,
         cache_hit,
+        caches,
     })
+}
+
+/// Generate from `prompt` against the resident model, reusing a cached
+/// shared prefix for the prefill phase.
+///
+/// Prefill goes through [`dsv4_resident_prefill_with_prefix_cache`] (so a
+/// shared prefix is not recomputed); the decode loop then samples and
+/// forwards one token at a time against the returned caches — identical
+/// to a cold resident decode. Returns the full token sequence (prompt +
+/// up to `max_new_tokens`) and whether the prefill hit the cache.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_resident_generate_with_prefix_cache<R: rand::Rng + ?Sized>(
+    layers: &[(DsV4LayerWeightStorage, DsV4LayerVariant)],
+    hp: &DsV4Hyperparams,
+    head: &DsV4HeadStorage,
+    prompt: &[u32],
+    decode_config: super::dsv4_decode_loop::DecodeConfig,
+    rng: &mut R,
+    prefix_cache: &mut DsV4PrefixCache,
+    backend: Option<&dyn ComputeBackend>,
+) -> Result<(Vec<u32>, bool), DsV4PrefixReuseError> {
+    assert!(!prompt.is_empty(), "prompt must be non-empty");
+    let max_seq_len = prompt.len() + decode_config.max_new_tokens;
+
+    let pre = dsv4_resident_prefill_with_prefix_cache(
+        layers,
+        hp,
+        head,
+        prompt,
+        prefix_cache,
+        max_seq_len,
+        backend,
+    )?;
+    let cache_hit = pre.cache_hit;
+    let mut caches = pre.caches;
+    let mut logits = pre.logits; // last row = logits at the final prompt position
+    let mut tokens = prompt.to_vec();
+
+    for i in 0..decode_config.max_new_tokens {
+        let last = logits.shape()[0] - 1;
+        let next = super::dsv4_sampling::dsv4_sample_next_token(
+            logits.row(last),
+            decode_config.sampling,
+            rng,
+        );
+        tokens.push(next);
+        if decode_config.eos_token == Some(next) {
+            break;
+        }
+        if i + 1 >= decode_config.max_new_tokens {
+            break;
+        }
+        let pos = tokens.len() - 1;
+        logits = dsv4_resident_model_forward_cached(
+            layers,
+            hp,
+            head,
+            &[next],
+            pos,
+            Some(&mut caches),
+            backend,
+        )?;
+    }
+
+    Ok((tokens, cache_hit))
 }
 
 #[cfg(test)]
@@ -274,6 +343,80 @@ mod tests {
         assert!(
             max_rel < 1.5,
             "suffix logits diverge beyond documented HCA tolerance: max_rel={max_rel}"
+        );
+    }
+
+    /// Cold-vs-warm prefill wall time (real GGUF, ignored). Quantifies the
+    /// prefix-reuse speedup: a warm prefill forwards only the uncached
+    /// suffix, a cold prefill forwards the whole prompt. Reports the ratio
+    /// (not asserted — wall time varies by host).
+    #[test]
+    #[ignore = "Requires the real ~172 GB DSv4-Flash GGUF on disk; perf bench"]
+    fn bench_cold_vs_warm_prefill() {
+        use std::time::Instant;
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open GGUF");
+        let hp: Hp = Hp::from_gguf(&gguf).expect("hp");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+        let n_layer: usize = std::env::var("DSV4_PREFIX_TEST_LAYERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let layers = load_dsv4_resident_layers(&gguf, &hp, n_layer).expect("resident layers");
+
+        let h = 4 * PREFIX_BLOCK_TOKENS; // 512-token shared prefix
+        let s = 16;
+        let toks: Vec<u32> = (0..h + s).map(|i| (i * 257 % head.n_vocab) as u32).collect();
+        let max_seq_len = h + s + 8;
+
+        // Cold: full prefill of the whole prompt, no cache.
+        let mut cold_caches: Vec<DsV4LayerCache> = layers
+            .iter()
+            .map(|(_, v)| DsV4LayerCache::for_variant(&hp, v, max_seq_len))
+            .collect();
+        let t0 = Instant::now();
+        let _ = dsv4_resident_model_forward_cached(
+            &layers,
+            &hp,
+            &head,
+            &toks,
+            0,
+            Some(&mut cold_caches),
+            None,
+        )
+        .expect("cold");
+        let cold = t0.elapsed();
+
+        // Warm: populate the store with the H-token prefix, then prefill
+        // the full prompt — hits at H, forwards only the S-token suffix.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = DsV4PrefixCache::open(tmp.path(), "dsv4-flash", 1 << 34).unwrap();
+        dsv4_resident_prefill_with_prefix_cache(
+            &layers, &hp, &head, &toks[..h], &mut store, max_seq_len, None,
+        )
+        .expect("seed");
+        let t1 = Instant::now();
+        let r = dsv4_resident_prefill_with_prefix_cache(
+            &layers, &hp, &head, &toks, &mut store, max_seq_len, None,
+        )
+        .expect("warm");
+        let warm = t1.elapsed();
+
+        assert!(r.cache_hit && r.start_pos == h);
+        eprintln!(
+            "[prefix-bench] {n_layer} layers, prefix={h} suffix={s}: \
+             cold {:.2}s (forwards {} tok) vs warm {:.2}s (forwards {} tok) → {:.1}× faster",
+            cold.as_secs_f64(),
+            h + s,
+            warm.as_secs_f64(),
+            s,
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9),
         );
     }
 }
