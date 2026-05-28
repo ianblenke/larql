@@ -740,6 +740,7 @@ mod tests {
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1032,6 +1033,7 @@ mod tests {
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1122,6 +1124,7 @@ mod tests {
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1203,6 +1206,7 @@ mod tests {
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
 
@@ -1306,6 +1310,7 @@ mod tests {
             indexer: IndexerWeights {
                 wq_b: idx_wq_b.view(),
                 wproj: idx_wproj.view(),
+                quant: None,
             },
         };
         // Cache without enable_indexer → index_compressed is None → panic.

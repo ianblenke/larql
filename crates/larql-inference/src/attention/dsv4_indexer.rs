@@ -20,8 +20,25 @@
 use ndarray::{Array2, ArrayView2, ArrayView3};
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 
 use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
+
+/// Resident-Q4_K companion for the indexer's `wq_b` up-projection (P7).
+///
+/// `indexer.attn_q_b` is `(n_index_head*n_index_head_size, q_lora_rank)`
+/// = `[8192, 1024]` ≈ 8.4M params for DSv4-Flash — the single largest
+/// weight that the P1–P6 residency arc left dequantized to f32 (~33.5 MB
+/// f32 read per indexer layer, ~700 MB/decode-step across the ~21
+/// Indexer-variant layers). Holding it as a `QuantTensor` over the raw
+/// Q4_K bytes (mirrors P5's [`super::dsv4_attn_block::DsV4AttnQuant`]) and
+/// running the lazy Q4_K×Q8_K matmul cuts that read ~3.5×. This is the
+/// larql-native analog of the DeepSeek-V4 paper's FP4 indexer-QK path.
+#[derive(Clone, Copy)]
+pub struct IndexerQuant<'a> {
+    /// `(n_index_head*n_index_head_size, q_lora_rank)` indexer Q-up.
+    pub wq_b: &'a QuantTensor,
+}
 
 /// Per-layer indexer weight refs.
 #[derive(Clone, Copy)]
@@ -33,6 +50,30 @@ pub struct IndexerWeights<'a> {
     /// `(n_index_head, n_embd)` — per-head score weights projected from
     /// the residual.
     pub wproj: ArrayView2<'a, f32>,
+    /// Resident-Q4_K companion for `wq_b` (P7). `None` = use the f32
+    /// `wq_b` view above (streaming path).
+    pub quant: Option<IndexerQuant<'a>>,
+}
+
+impl<'a> IndexerWeights<'a> {
+    /// `qr @ wq_b^T`: resident-Q4_K lazy matmul when `quant` is set, else
+    /// the f32 `dot_proj_gpu` path. Same semantics either way (`wq_b` is
+    /// stored `[out, in]`).
+    pub fn proj_wq_b(
+        &self,
+        qr: ArrayView2<f32>,
+        backend: Option<&dyn ComputeBackend>,
+    ) -> Array2<f32> {
+        match &self.quant {
+            // `matmul` wants an owned `Array2`; at decode `qr` is
+            // `[1, q_lora_rank]` so the copy is negligible.
+            Some(q) => q
+                .wq_b
+                .matmul(&qr.to_owned())
+                .expect("indexer wq_b quant matmul"),
+            None => dot_proj_gpu(&qr, &self.wq_b, backend),
+        }
+    }
 }
 
 /// Indexer scalar config.
@@ -86,15 +127,21 @@ pub fn build_indexer_scores_prefill(
         &[n_tokens, n_comp],
         "causal mask shape"
     );
-    assert_eq!(
-        w.wq_b.shape(),
-        &[p.n_index_head * p.n_index_head_size, p.q_lora_rank],
-        "wq_b shape"
-    );
+    // wq_b shape check only applies to the f32 view; in resident-Q4_K
+    // mode (P7) the f32 view is empty and the shape lives in the
+    // `QuantTensor` (validated at build time).
+    if w.quant.is_none() {
+        assert_eq!(
+            w.wq_b.shape(),
+            &[p.n_index_head * p.n_index_head_size, p.q_lora_rank],
+            "wq_b shape"
+        );
+    }
     assert_eq!(w.wproj.shape(), &[p.n_index_head, p.n_embd], "wproj shape");
 
     // 1. q = qr @ wq_b^T  →  (n_tokens, n_index_head * n_index_head_size)
-    let q = dot_proj_gpu(&qr, &w.wq_b, backend);
+    //    Resident-Q4_K lazy matmul when present, else f32 dot_proj_gpu.
+    let q = w.proj_wq_b(qr, backend);
     //    Tail-RoPE at positions 0..n_tokens-1.
     let q = dsv4_rope_tail(
         &q,
@@ -285,6 +332,7 @@ mod tests {
         let w = IndexerWeights {
             wq_b: wq_b.view(),
             wproj: wproj.view(),
+            quant: None,
         };
         let out = build_indexer_scores_prefill(
             x.view(),
@@ -329,6 +377,7 @@ mod tests {
         let w = IndexerWeights {
             wq_b: wq_b.view(),
             wproj: wproj.view(),
+            quant: None,
         };
         let out = build_indexer_scores_prefill(
             x.view(),
@@ -392,6 +441,7 @@ mod tests {
         let w = IndexerWeights {
             wq_b: wq_b.view(),
             wproj: wproj.view(),
+            quant: None,
         };
 
         let out_none = build_indexer_scores_prefill(

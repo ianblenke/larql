@@ -21,6 +21,16 @@ runs.
   (0×0)
 <!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_populates_quant_and_empties_f32 -->
 
+#### Scenario: Indexer Q-up held resident on indexer layers
+
+- **WHEN** an Indexer-variant layer (`compress_ratio == 4`) is loaded
+  resident and its `indexer.attn_q_b` is a supported quantized format
+- **THEN** the indexer `wq_b` SHALL be held as a `Some(QuantTensor)`
+  with its f32 array empty (0×0), while the indexer's own compressor
+  and `wproj` remain f32, and the indexer scoring SHALL dispatch the
+  `wq_b` matmul through the lazy-quant path
+<!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_indexer_wq_b_is_quantized -->
+
 #### Scenario: Unsupported format falls back to f32
 
 - **WHEN** a layer weight's GGUF tensor type is not supported by the

@@ -488,6 +488,7 @@ mod tests {
         let idx_w = IndexerWeights {
             wq_b: idx_wq_b.view(),
             wproj: idx_wproj.view(),
+            quant: None,
         };
 
         let block_indexer_w = DsV4AttnBlockIndexerWeights {

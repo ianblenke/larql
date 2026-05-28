@@ -482,17 +482,33 @@ fn build_layer_storage_inner(
         )?,
         norm: take_vec(&tensors, DsV4TensorKind::IndexerCompressorNorm, &[ihead])?,
     };
-    let idx_wq_b = take_2d(
-        &tensors,
-        DsV4TensorKind::IndexerAttnQB,
-        inh * ihead,
-        hp.q_lora_rank,
-    )?;
+    // Indexer `wq_b` (P7): the largest indexer weight (`[inh*ihead,
+    // q_lora_rank]` = `[8192, 1024]` ≈ 8.4M for DSv4-Flash). Dual-storage
+    // like the P5 attention projections — resident-Q4_K `QuantTensor` when
+    // `raw_experts` is present (f32 left empty `0×0`), else dequantized
+    // f32. The indexer's own compressor + `wproj` stay f32 (small).
+    let (idx_wq_b, idx_wq_b_quant): (Array2<f32>, Option<QuantTensor>) = match raw_experts.as_mut()
+    {
+        None => (
+            take_2d(
+                &tensors,
+                DsV4TensorKind::IndexerAttnQB,
+                inh * ihead,
+                hp.q_lora_rank,
+            )?,
+            None,
+        ),
+        Some(raw) => (
+            Array2::zeros((0, 0)),
+            Some(resident_quant(raw, DsV4TensorKind::IndexerAttnQB)?),
+        ),
+    };
     let idx_wproj = take_2d(&tensors, DsV4TensorKind::IndexerProj, inh, hp.n_embd)?;
     storage.indexer = Some(IndexerStorage {
         compressor: idx_comp,
         wq_b: idx_wq_b,
         wproj: idx_wproj,
+        wq_b_quant: idx_wq_b_quant,
     });
     storage.indexer_compressor_params = Some(CompressorParams {
         head_dim: ihead,
@@ -996,5 +1012,173 @@ mod tests {
             f32_ffn.gate_exps.shape(),
             &[hp.n_expert, hp.n_ff_exp, hp.n_embd]
         );
+    }
+
+    /// dsv4-quant-residency P7: on an Indexer-variant layer (compress_ratio
+    /// == 4), `build_layer_storage_resident` holds the indexer `wq_b`
+    /// (`indexer.attn_q_b`) as a `QuantTensor` and leaves its f32 array
+    /// empty — without ever needing it as f32 (removed from the f32 map
+    /// here). The indexer's own compressor + `wproj` stay f32.
+    #[test]
+    fn build_layer_storage_resident_indexer_wq_b_is_quantized() {
+        use larql_models::quant::ggml::TYPE_F32;
+
+        let mut hp = base_hp();
+        hp.indexer_head_size = Some(16);
+        hp.n_index_head = Some(2);
+        hp.top_k = Some(2);
+        let ihead = 16usize;
+        let inh = 2usize;
+        let compress_ratio = 4usize;
+
+        // Full f32 map for an indexer layer, then strip every resident-raw
+        // kind (experts, attn proj, shexp, indexer wq_b) — the resident
+        // builder must not require any of them as f32.
+        let mut tensors = no_compress_tensors(&hp);
+        let main_n_kv = 2 * hp.head_dim;
+        tensors.insert(
+            DsV4TensorKind::AttnCompressorKv,
+            vec![0.01; main_n_kv * hp.n_embd],
+        );
+        tensors.insert(
+            DsV4TensorKind::AttnCompressorGate,
+            vec![0.01; main_n_kv * hp.n_embd],
+        );
+        tensors.insert(
+            DsV4TensorKind::AttnCompressorApe,
+            vec![0.01; compress_ratio * main_n_kv],
+        );
+        tensors.insert(DsV4TensorKind::AttnCompressorNorm, vec![1.0; hp.head_dim]);
+        let idx_n_kv = 2 * ihead;
+        tensors.insert(
+            DsV4TensorKind::IndexerCompressorKv,
+            vec![0.01; idx_n_kv * hp.n_embd],
+        );
+        tensors.insert(
+            DsV4TensorKind::IndexerCompressorGate,
+            vec![0.01; idx_n_kv * hp.n_embd],
+        );
+        tensors.insert(
+            DsV4TensorKind::IndexerCompressorApe,
+            vec![0.01; compress_ratio * idx_n_kv],
+        );
+        tensors.insert(DsV4TensorKind::IndexerCompressorNorm, vec![1.0; ihead]);
+        tensors.insert(DsV4TensorKind::IndexerProj, vec![0.01; inh * hp.n_embd]);
+        // The resident-raw kinds are NOT in the f32 map.
+        for k in [
+            DsV4TensorKind::FfnGateExps,
+            DsV4TensorKind::FfnUpExps,
+            DsV4TensorKind::FfnDownExps,
+            DsV4TensorKind::IndexerAttnQB,
+        ] {
+            tensors.remove(&k);
+        }
+
+        // Raw (TYPE_F32) bytes for every resident-raw kind.
+        let raw_f32 = |rows: usize, cols: usize| -> RawExpertTensor {
+            RawExpertTensor {
+                bytes: (0..rows * cols)
+                    .flat_map(|i| (i as f32 * 0.001).to_le_bytes())
+                    .collect(),
+                tensor_type: TYPE_F32,
+                rows,
+                cols,
+            }
+        };
+        let group_dim = hp.head_dim * (hp.n_head / hp.n_groups);
+        let low_dim = hp.o_lora_rank * hp.n_groups;
+        let hidden_shared = hp.n_ff_exp * hp.n_expert_shared;
+        let mut raw = HashMap::new();
+        raw.insert(
+            DsV4TensorKind::FfnGateExps,
+            raw_f32(hp.n_expert * hp.n_ff_exp, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnUpExps,
+            raw_f32(hp.n_expert * hp.n_ff_exp, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnDownExps,
+            raw_f32(hp.n_expert * hp.n_embd, hp.n_ff_exp),
+        );
+        raw.insert(DsV4TensorKind::AttnQA, raw_f32(hp.q_lora_rank, hp.n_embd));
+        raw.insert(
+            DsV4TensorKind::AttnQB,
+            raw_f32(hp.n_head * hp.head_dim, hp.q_lora_rank),
+        );
+        raw.insert(DsV4TensorKind::AttnKv, raw_f32(hp.head_dim, hp.n_embd));
+        raw.insert(
+            DsV4TensorKind::AttnOutA,
+            raw_f32(hp.n_groups * hp.o_lora_rank, group_dim),
+        );
+        raw.insert(DsV4TensorKind::AttnOutB, raw_f32(hp.n_embd, low_dim));
+        raw.insert(
+            DsV4TensorKind::FfnGateShexp,
+            raw_f32(hidden_shared, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnUpShexp,
+            raw_f32(hidden_shared, hp.n_embd),
+        );
+        raw.insert(
+            DsV4TensorKind::FfnDownShexp,
+            raw_f32(hp.n_embd, hidden_shared),
+        );
+        // P7: the indexer Q-up, held resident.
+        raw.insert(
+            DsV4TensorKind::IndexerAttnQB,
+            raw_f32(inh * ihead, hp.q_lora_rank),
+        );
+
+        let storage =
+            build_layer_storage_resident(tensors, raw, HashMap::new(), &hp, compress_ratio)
+                .expect("resident indexer build");
+        let idx = storage.indexer.as_ref().expect("indexer present");
+
+        // wq_b held resident-Q4_K (here TYPE_F32 raw); f32 array emptied.
+        assert_eq!(
+            idx.wq_b_quant.as_ref().unwrap().shape(),
+            [inh * ihead, hp.q_lora_rank]
+        );
+        assert_eq!(idx.wq_b.len(), 0, "f32 wq_b emptied in resident mode");
+        // Indexer compressor + wproj stay f32 (not quantized).
+        assert_eq!(idx.wproj.shape(), &[inh, hp.n_embd]);
+        assert_eq!(idx.compressor.wkv.shape(), &[idx_n_kv, hp.n_embd]);
+
+        // The view hands the forward an IndexerWeights with quant set.
+        assert!(
+            idx.as_indexer_weights().quant.is_some(),
+            "as_indexer_weights must expose the resident wq_b"
+        );
+
+        // f32 path: same indexer layer built without raw → wq_b f32 present,
+        // quant absent.
+        let mut f32_tensors = no_compress_tensors(&hp);
+        for (k, v) in [
+            (DsV4TensorKind::AttnCompressorKv, main_n_kv * hp.n_embd),
+            (DsV4TensorKind::AttnCompressorGate, main_n_kv * hp.n_embd),
+            (
+                DsV4TensorKind::AttnCompressorApe,
+                compress_ratio * main_n_kv,
+            ),
+            (DsV4TensorKind::IndexerCompressorKv, idx_n_kv * hp.n_embd),
+            (DsV4TensorKind::IndexerCompressorGate, idx_n_kv * hp.n_embd),
+            (
+                DsV4TensorKind::IndexerCompressorApe,
+                compress_ratio * idx_n_kv,
+            ),
+            (DsV4TensorKind::IndexerAttnQB, inh * ihead * hp.q_lora_rank),
+            (DsV4TensorKind::IndexerProj, inh * hp.n_embd),
+        ] {
+            f32_tensors.insert(k, vec![0.01; v]);
+        }
+        f32_tensors.insert(DsV4TensorKind::AttnCompressorNorm, vec![1.0; hp.head_dim]);
+        f32_tensors.insert(DsV4TensorKind::IndexerCompressorNorm, vec![1.0; ihead]);
+        let f32_storage =
+            build_layer_storage(f32_tensors, HashMap::new(), &hp, compress_ratio).unwrap();
+        let f32_idx = f32_storage.indexer.as_ref().unwrap();
+        assert!(f32_idx.wq_b_quant.is_none());
+        assert_eq!(f32_idx.wq_b.shape(), &[inh * ihead, hp.q_lora_rank]);
+        assert!(f32_idx.as_indexer_weights().quant.is_none());
     }
 }

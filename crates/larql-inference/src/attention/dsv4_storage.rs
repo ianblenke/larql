@@ -59,6 +59,11 @@ pub struct IndexerStorage {
     pub compressor: CompressorStorage,
     pub wq_b: Array2<f32>,
     pub wproj: Array2<f32>,
+    /// Resident-Q4_K companion for `wq_b` (P7). When `Some`, the f32
+    /// `wq_b` above is left empty (`0×0`) and the indexer scoring runs
+    /// the lazy-quant matmul. Set by the resident builder; `None` in the
+    /// streaming path.
+    pub wq_b_quant: Option<QuantTensor>,
 }
 
 impl IndexerStorage {
@@ -69,6 +74,10 @@ impl IndexerStorage {
         IndexerWeights {
             wq_b: self.wq_b.view(),
             wproj: self.wproj.view(),
+            quant: self
+                .wq_b_quant
+                .as_ref()
+                .map(|wq_b| super::dsv4_indexer::IndexerQuant { wq_b }),
         }
     }
 }
@@ -468,6 +477,7 @@ mod tests {
             wproj: Array2::<f32>::from_shape_fn((n_index_head, n_embd), |(i, j)| {
                 ((i + j) as f32 * 0.012).cos() * 0.1
             }),
+            wq_b_quant: None,
         });
         storage.indexer_compressor_params = Some(CompressorParams {
             head_dim: indexer_head_size,
