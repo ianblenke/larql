@@ -29,9 +29,27 @@
 use ndarray::{s, Array2, Array3, ArrayView2};
 
 use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_models::quant::lazy::QuantTensor;
 
 use super::dsv4_compressor::{shift_overlap_state, softmax_pool_ratio};
 use super::dsv4_rope_tail::{dsv4_rope_tail, DsV4RopeMode};
+
+/// Resident-Q4_K companions for the compressor projection weights (P8).
+///
+/// `wkv`/`wgate` (`attn_compress_kv/gate`, and the indexer's
+/// `indexer.compress_kv/gate`) are Q4_K in the GGUF. After P1–P7 they were
+/// the last large weights still dequantized to f32 on the HCA decode path
+/// (~16.8 MB f32/layer for the main compressor × the ~41 Compress+Indexer
+/// layers ≈ ~688 MB/decode-step, plus the indexer sub-compressor). Holding
+/// them resident (mirrors P5's `DsV4AttnQuant` / P7's `IndexerQuant`) and
+/// running the lazy Q4_K×Q8_K matmul cuts that read ~3.5×.
+#[derive(Clone, Copy)]
+pub struct CompressorQuant<'a> {
+    /// `(coff*head_dim, n_embd)` KV projection.
+    pub wkv: &'a QuantTensor,
+    /// `(coff*head_dim, n_embd)` gate/score projection.
+    pub wgate: &'a QuantTensor,
+}
 
 /// Per-layer compressor weight refs.
 #[derive(Clone, Copy)]
@@ -45,6 +63,41 @@ pub struct CompressorWeights<'a> {
     pub ape: ArrayView2<'a, f32>,
     /// `(head_dim,)` — RMSNorm gain applied to the pooled output.
     pub norm: &'a [f32],
+    /// Resident-Q4_K companions for `wkv`/`wgate` (P8). `None` = use the
+    /// f32 views above (streaming path).
+    pub quant: Option<CompressorQuant<'a>>,
+}
+
+impl<'a> CompressorWeights<'a> {
+    /// `x @ wkv^T`: resident-Q4_K lazy matmul when `quant` is set, else
+    /// the f32 `dot_proj_gpu` path.
+    pub fn proj_wkv(
+        &self,
+        x: ArrayView2<f32>,
+        backend: Option<&dyn ComputeBackend>,
+    ) -> Array2<f32> {
+        match &self.quant {
+            Some(q) => q
+                .wkv
+                .matmul(&x.to_owned())
+                .expect("compressor wkv quant matmul"),
+            None => dot_proj_gpu(&x, &self.wkv, backend),
+        }
+    }
+    /// `x @ wgate^T` (resident-Q4_K when available).
+    pub fn proj_wgate(
+        &self,
+        x: ArrayView2<f32>,
+        backend: Option<&dyn ComputeBackend>,
+    ) -> Array2<f32> {
+        match &self.quant {
+            Some(q) => q
+                .wgate
+                .matmul(&x.to_owned())
+                .expect("compressor wgate quant matmul"),
+            None => dot_proj_gpu(&x, &self.wgate, backend),
+        }
+    }
 }
 
 /// Compressor scalar config.
@@ -81,8 +134,10 @@ pub fn build_compressor_prefill(
 
     let coff: usize = if p.compress_ratio == 4 { 2 } else { 1 };
     let n_kv = coff * p.head_dim;
-    assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
-    assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    if w.quant.is_none() {
+        assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
+        assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    }
     assert_eq!(
         w.ape.shape(),
         &[p.compress_ratio, n_kv],
@@ -91,8 +146,8 @@ pub fn build_compressor_prefill(
     assert_eq!(w.norm.len(), p.head_dim, "norm length must equal head_dim");
 
     // 1. Project to kv and score, each (n_tokens, n_kv).
-    let kv_full = dot_proj_gpu(&x, &w.wkv, backend);
-    let score_full = dot_proj_gpu(&x, &w.wgate, backend);
+    let kv_full = w.proj_wkv(x, backend);
+    let score_full = w.proj_wgate(x, backend);
 
     // 2. Reshape the first cutoff = n_comp * compress_ratio tokens to
     //    (n_comp, ratio, n_kv).
@@ -251,8 +306,10 @@ pub fn dsv4_compressor_step_coff1(
         "cur_chunk must be (compress_ratio, n_embd)"
     );
     let n_kv = p.head_dim; // coff = 1 → n_kv == head_dim
-    assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
-    assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    if w.quant.is_none() {
+        assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
+        assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");
+    }
     assert_eq!(
         w.ape.shape(),
         &[p.compress_ratio, n_kv],
@@ -261,8 +318,8 @@ pub fn dsv4_compressor_step_coff1(
     assert_eq!(w.norm.len(), p.head_dim, "norm length");
 
     // 1. Project chunk to kv and score: each (compress_ratio, head_dim).
-    let kv_chunk = dot_proj_gpu(&cur_chunk, &w.wkv, backend);
-    let mut score_chunk = dot_proj_gpu(&cur_chunk, &w.wgate, backend);
+    let kv_chunk = w.proj_wkv(cur_chunk, backend);
+    let mut score_chunk = w.proj_wgate(cur_chunk, backend);
 
     // 2. Add APE row-wise.
     for r in 0..p.compress_ratio {
@@ -517,6 +574,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let x = make_input(n_tokens, p.n_embd);
         let out = build_compressor_prefill(x.view(), &w, &p, None);
@@ -563,6 +621,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let x = make_input(n_tokens, p.n_embd);
 
@@ -615,6 +674,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let x = make_input(n_tokens, p.n_embd);
         let out = build_compressor_prefill(x.view(), &w, &p, None);
@@ -657,6 +717,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let x = make_input(n_tokens, p.n_embd);
         let out = build_compressor_prefill(x.view(), &w, &p, None);
@@ -696,6 +757,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let out = build_compressor_prefill(x.view(), &w, &p, None);
         // Consecutive rows differ purely due to per-row tail-RoPE
@@ -759,6 +821,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
         let step = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0, None);
@@ -785,6 +848,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         assert_eq!(prefill.shape(), &[2, p.head_dim]);
@@ -813,6 +877,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         let chunk0 = full.slice(s![..p.compress_ratio, ..]);
@@ -854,6 +919,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
         let _ = dsv4_compressor_step_coff1(chunk.view(), &w, &p, 0, None);
@@ -869,6 +935,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         // Half-size chunk.
         let chunk = Array2::<f32>::zeros((1, p.n_embd));
@@ -923,6 +990,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(chunk.view(), &w, &p, None);
         let mut state = CompressorOverlapState::empty();
@@ -950,6 +1018,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         assert_eq!(prefill.shape(), &[2, p.head_dim]);
@@ -979,6 +1048,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let prefill = build_compressor_prefill(full.view(), &w, &p, None);
         let mut state = CompressorOverlapState::empty();
@@ -1015,6 +1085,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
 
         // Run once with empty state.
@@ -1057,6 +1128,7 @@ mod tests {
             wgate: wgate.view(),
             ape: ape.view(),
             norm: &norm,
+            quant: None,
         };
         let chunk = Array2::<f32>::zeros((p.compress_ratio, p.n_embd));
         let mut state = CompressorOverlapState::empty();

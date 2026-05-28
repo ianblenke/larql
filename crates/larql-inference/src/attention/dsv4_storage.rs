@@ -38,15 +38,28 @@ pub struct CompressorStorage {
     pub wgate: Array2<f32>,
     pub ape: Array2<f32>,
     pub norm: Vec<f32>,
+    /// Resident-Q4_K companions for `wkv`/`wgate` (P8). When `Some`, the
+    /// matching f32 array above is empty (`0×0`) and the compressor runs
+    /// the lazy-quant matmul. All-or-nothing: the resident builder sets
+    /// both together; streaming leaves both `None`.
+    pub wkv_quant: Option<QuantTensor>,
+    pub wgate_quant: Option<QuantTensor>,
 }
 
 impl CompressorStorage {
     pub fn as_weights(&self) -> CompressorWeights<'_> {
+        let quant = match (self.wkv_quant.as_ref(), self.wgate_quant.as_ref()) {
+            (Some(wkv), Some(wgate)) => {
+                Some(super::dsv4_compressor_prefill::CompressorQuant { wkv, wgate })
+            }
+            _ => None,
+        };
         CompressorWeights {
             wkv: self.wkv.view(),
             wgate: self.wgate.view(),
             ape: self.ape.view(),
             norm: &self.norm,
+            quant,
         }
     }
 }
@@ -434,6 +447,8 @@ mod tests {
                 ((r + k) as f32 * 0.03).sin() * 0.05
             }),
             norm: vec![1.0; head_dim],
+            wkv_quant: None,
+            wgate_quant: None,
         });
         storage.compressor_params = Some(CompressorParams {
             head_dim,
@@ -467,6 +482,8 @@ mod tests {
                 ((r + k) as f32 * 0.025).sin() * 0.05
             }),
             norm: vec![1.0; indexer_head_size],
+            wkv_quant: None,
+            wgate_quant: None,
         };
         storage.indexer = Some(IndexerStorage {
             compressor: idx_comp,

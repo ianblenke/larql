@@ -26,10 +26,22 @@ runs.
 - **WHEN** an Indexer-variant layer (`compress_ratio == 4`) is loaded
   resident and its `indexer.attn_q_b` is a supported quantized format
 - **THEN** the indexer `wq_b` SHALL be held as a `Some(QuantTensor)`
-  with its f32 array empty (0×0), while the indexer's own compressor
-  and `wproj` remain f32, and the indexer scoring SHALL dispatch the
-  `wq_b` matmul through the lazy-quant path
-<!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_indexer_wq_b_is_quantized -->
+  with its f32 array empty (0×0), while the indexer's `wproj` remains
+  f32, and the indexer scoring SHALL dispatch the `wq_b` matmul through
+  the lazy-quant path
+<!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_hca_weights_quantized -->
+
+#### Scenario: HCA compressor wkv/wgate held resident
+
+- **WHEN** an HCA layer (Compress or Indexer variant) is loaded resident
+  and its compressor `wkv`/`wgate` (`attn_compress_kv/gate` and, for
+  Indexer layers, `indexer.compress_kv/gate`) are a supported quantized
+  format
+- **THEN** both projections SHALL be held as `Some(QuantTensor)` with
+  their f32 arrays empty (0×0), the compressor `ape`/`norm` SHALL remain
+  f32, and the compressor SHALL dispatch the `wkv`/`wgate` matmuls
+  through the lazy-quant path
+<!-- test: larql_inference::attention::dsv4_storage_build::build_layer_storage_resident_hca_weights_quantized -->
 
 #### Scenario: Unsupported format falls back to f32
 

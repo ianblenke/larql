@@ -304,6 +304,7 @@ mod tests {
             wgate: comp_wgate.view(),
             ape: comp_ape.view(),
             norm: &comp_norm,
+            quant: None,
         };
         let block_compress_w = DsV4AttnBlockCompressWeights {
             attn: attn_w,
@@ -458,6 +459,7 @@ mod tests {
             wgate: comp_wgate.view(),
             ape: comp_ape.view(),
             norm: &comp_norm,
+            quant: None,
         };
 
         let idx_n_kv = 2 * indexer_head_size;
@@ -476,6 +478,7 @@ mod tests {
             wgate: idx_comp_wgate.view(),
             ape: idx_comp_ape.view(),
             norm: &idx_comp_norm,
+            quant: None,
         };
 
         let idx_wq_b = Array2::<f32>::from_shape_fn(
