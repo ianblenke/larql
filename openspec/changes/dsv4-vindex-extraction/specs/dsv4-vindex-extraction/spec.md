@@ -57,6 +57,11 @@ only the indexer weights are stored (selection stays runtime-dynamic).
 <!-- test: larql_inference::attention::dsv4_vindex_hca::tests::nocompress_layer_round_trips -->
 <!-- test: larql_inference::attention::dsv4_vindex_hca::tests::malformed_blobs_are_typed_errors -->
 <!-- test: larql_inference::attention::dsv4_vindex_hca::tests::real_gguf_hca_round_trips_to_storage -->
+<!-- test: larql_inference::attention::dsv4_vindex_mhc::tests::layer_mhc_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_mhc::tests::head_mhc_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_mhc::tests::empty_mhc_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_mhc::tests::malformed_blobs_are_typed_errors -->
+<!-- test: larql_inference::attention::dsv4_vindex_mhc::tests::real_gguf_mhc_round_trips_to_storage -->
 
 ### Requirement: Routed and shared MoE reuse generic extraction
 

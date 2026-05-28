@@ -5,7 +5,7 @@
     "scenarios": 1591,
     "scenarios_backed": 1370,
     "scenarios_unbacked": 221,
-    "test_refs": 3522,
+    "test_refs": 3527,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5821,7 +5821,12 @@
                 "larql_inference::attention::dsv4_vindex_hca::tests::indexer_layer_round_trips",
                 "larql_inference::attention::dsv4_vindex_hca::tests::nocompress_layer_round_trips",
                 "larql_inference::attention::dsv4_vindex_hca::tests::malformed_blobs_are_typed_errors",
-                "larql_inference::attention::dsv4_vindex_hca::tests::real_gguf_hca_round_trips_to_storage"
+                "larql_inference::attention::dsv4_vindex_hca::tests::real_gguf_hca_round_trips_to_storage",
+                "larql_inference::attention::dsv4_vindex_mhc::tests::layer_mhc_round_trips",
+                "larql_inference::attention::dsv4_vindex_mhc::tests::head_mhc_round_trips",
+                "larql_inference::attention::dsv4_vindex_mhc::tests::empty_mhc_round_trips",
+                "larql_inference::attention::dsv4_vindex_mhc::tests::malformed_blobs_are_typed_errors",
+                "larql_inference::attention::dsv4_vindex_mhc::tests::real_gguf_mhc_round_trips_to_storage"
               ],
               "tests_unresolved": [],
               "unbacked": false,
@@ -5839,7 +5844,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 68
+              "line": 73
             }
           ]
         },
@@ -5852,7 +5857,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 82
+              "line": 87
             }
           ]
         }
@@ -27805,6 +27810,36 @@
       "fqn": "larql_inference::attention::dsv4_vindex_hca::real_gguf_hca_round_trips_to_storage",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
       "line": 266,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_mhc::empty_mhc_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
+      "line": 139,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_mhc::head_mhc_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
+      "line": 125,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_mhc::layer_mhc_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
+      "line": 111,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_mhc::malformed_blobs_are_typed_errors",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
+      "line": 148,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_mhc::real_gguf_mhc_round_trips_to_storage",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
+      "line": 187,
       "crate": "larql_inference"
     },
     {
