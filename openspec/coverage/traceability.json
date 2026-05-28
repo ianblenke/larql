@@ -5409,7 +5409,7 @@
     },
     {
       "name": "dsv4-ondisk-prefix-cache",
-      "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
+      "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
       "requirements": [
         {
           "name": "Layer-cache serialization",
@@ -5422,8 +5422,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 15
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 18
             },
             {
               "name": "No-compress layer round-trips its SWA cache",
@@ -5432,8 +5432,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 25
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 28
             },
             {
               "name": "Unknown format version is a typed error",
@@ -5444,8 +5444,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 32
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 35
             }
           ]
         },
@@ -5462,8 +5462,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 49
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 52
             },
             {
               "name": "Miss returns no hit",
@@ -5472,8 +5472,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 60
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 63
             },
             {
               "name": "Size cap evicts least-recently-used entries",
@@ -5482,8 +5482,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 66
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 69
             }
           ]
         },
@@ -5497,8 +5497,8 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 85
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 88
             },
             {
               "name": "Cache hit skips re-prefilling the shared prefix",
@@ -5508,16 +5508,16 @@
               ],
               "tests_unresolved": [],
               "unbacked": false,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 94
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 97
             },
             {
               "name": "Disabled cache leaves cold prefill unchanged",
               "tests_resolved": [],
               "tests_unresolved": [],
               "unbacked": true,
-              "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 104
+              "spec_file": "openspec/specs/dsv4-ondisk-prefix-cache/spec.md",
+              "line": 107
             }
           ]
         }

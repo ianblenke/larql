@@ -540,7 +540,7 @@ _Source: `openspec/changes/dsv4-hf-parity/specs/dsv4-hf-parity/spec.md`_
 
 ## dsv4-ondisk-prefix-cache
 
-_Source: `openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md`_
+_Source: `openspec/specs/dsv4-ondisk-prefix-cache/spec.md`_
 
 | Requirement | Scenario | Backed by |
 |---|---|---|
