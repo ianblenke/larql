@@ -36343,6 +36343,30 @@
       "crate": "larql_inference"
     },
     {
+      "fqn": "larql_inference::test_gemma3_smoke::first_token_matches_expected_surface",
+      "file": "crates/larql-inference/tests/test_gemma3_smoke.rs",
+      "line": 42,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_kv_cache_real_gemma3::cache_decode_step_matches_uncached_full_replay",
+      "file": "crates/larql-inference/tests/test_kv_cache_real_gemma3.rs",
+      "line": 109,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_kv_cache_real_gemma3::cache_prefill_matches_uncached_prefill",
+      "file": "crates/larql-inference/tests/test_kv_cache_real_gemma3.rs",
+      "line": 24,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::test_kv_cache_real_gemma3::cache_prefill_predict_matches_uncached_predict",
+      "file": "crates/larql-inference/tests/test_kv_cache_real_gemma3.rs",
+      "line": 61,
+      "crate": "larql_inference"
+    },
+    {
       "fqn": "larql_inference::test_model_loader::capture_decoy_residuals_empty_input",
       "file": "crates/larql-inference/tests/test_model_loader.rs",
       "line": 111,
