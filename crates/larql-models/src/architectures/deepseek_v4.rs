@@ -40,4 +40,12 @@ impl ModelArchitecture for DeepSeekV4Arch {
     fn config(&self) -> &ModelConfig {
         &self.config
     }
+
+    /// DSv4 attention is low-rank Q + latent KV + grouped O with HCA /
+    /// indexer / mHC — not standard Q/K/V/O. Routes the vindex extractor
+    /// to the dedicated DSv4 path (and gates it out of the standard
+    /// writers until that path exists).
+    fn uses_dsv4_attention(&self) -> bool {
+        true
+    }
 }

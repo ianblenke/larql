@@ -50026,75 +50026,123 @@
       "crate": "larql_vindex"
     },
     {
+      "fqn": "larql_vindex::format::weights::capabilities::dsv4_is_recognized_as_its_own_attention",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 205,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::dsv4_rejected_with_distinct_feature",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 216,
+      "crate": "larql_vindex"
+    },
+    {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_all_passes_for_llama",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 163,
+      "line": 176,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_all_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 155,
+      "line": 168,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::extract_level_attention_rejects_dsv4",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 230,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_attention_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 138,
+      "line": 151,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::extract_level_browse_passes_for_dsv4",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 237,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_browse_passes_for_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 128,
+      "line": 141,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_inference_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 147,
+      "line": 160,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::mla_architecture_is_rejected",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 83,
+      "line": 96,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::standard_attention_accepts_llama",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 71,
+      "line": 84,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::tests::dsv4_is_recognized_as_its_own_attention",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 205,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::tests::dsv4_rejected_with_distinct_feature",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 216,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_all_passes_for_llama",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 163,
+      "line": 176,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_all_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 155,
+      "line": 168,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_attention_rejects_dsv4",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 230,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_attention_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 138,
+      "line": 151,
+      "crate": "larql_vindex"
+    },
+    {
+      "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_browse_passes_for_dsv4",
+      "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
+      "line": 237,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_browse_passes_for_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 128,
+      "line": 141,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_inference_rejects_mla",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 147,
+      "line": 160,
       "crate": "larql_vindex"
     },
     {
