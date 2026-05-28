@@ -3,9 +3,9 @@
     "capabilities": 57,
     "requirements": 540,
     "scenarios": 1580,
-    "scenarios_backed": 1363,
-    "scenarios_unbacked": 217,
-    "test_refs": 3503,
+    "scenarios_backed": 1366,
+    "scenarios_unbacked": 214,
+    "test_refs": 3509,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5454,27 +5454,36 @@
           "scenarios": [
             {
               "name": "Put then longest-prefix get returns the same caches",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_prefix_cache::put_then_get_longest_prefix_round_trips",
+                "larql_inference::attention::dsv4_prefix_cache::longest_prefix_wins",
+                "larql_inference::attention::dsv4_prefix_cache::reopen_rebuilds_index",
+                "larql_inference::attention::dsv4_prefix_cache::model_id_isolates"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
               "line": 46
             },
             {
               "name": "Miss returns no hit",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_prefix_cache::no_shared_prefix_misses"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 53
+              "line": 57
             },
             {
               "name": "Size cap evicts least-recently-used entries",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_prefix_cache::size_cap_evicts_lru"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 58
+              "line": 63
             }
           ]
         },
@@ -5487,7 +5496,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 74
+              "line": 80
             },
             {
               "name": "Reuse recomputes only the SWA tail",
@@ -5495,7 +5504,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 81
+              "line": 87
             },
             {
               "name": "Disabled cache leaves cold prefill unchanged",
@@ -5503,7 +5512,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-ondisk-prefix-cache/specs/dsv4-ondisk-prefix-cache/spec.md",
-              "line": 88
+              "line": 94
             }
           ]
         }
@@ -26710,6 +26719,54 @@
       "fqn": "larql_inference::attention::dsv4_per_layer::tests::per_layer_forward_smoke",
       "file": "crates/larql-inference/src/attention/dsv4_per_layer.rs",
       "line": 212,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::put_rejects_unaligned",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 518,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::longest_prefix_wins",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 491,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::model_id_isolates",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 589,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::no_shared_prefix_misses",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 506,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::put_rejects_unaligned",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 518,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::put_then_get_longest_prefix_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 471,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::reopen_rebuilds_index",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 572,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_prefix_cache::tests::size_cap_evicts_lru",
+      "file": "crates/larql-inference/src/attention/dsv4_prefix_cache.rs",
+      "line": 530,
       "crate": "larql_inference"
     },
     {

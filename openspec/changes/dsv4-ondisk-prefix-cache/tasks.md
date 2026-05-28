@@ -13,11 +13,11 @@
 
 ## 3. P2 — Prefix-keyed on-disk store
 
-- [ ] 3.1 `DsV4PrefixCache::open(root, model_id)` — content-addressed dir tree `<root>/<model_id>/<prefix_hash>/layer_{i}.kvz`; in-memory index rebuilt by scanning on open.
-- [ ] 3.2 `put(token_ids_prefix, &[DsV4LayerHcaCache])` at a 128-block boundary — atomic write (`.tmp` + rename), one blob per layer. `get_longest_prefix(token_ids) -> Option<(hit_len, Vec<DsV4LayerHcaCache>)>`.
-- [ ] 3.3 Prefix hashing at 128-token block boundaries, salted by `model_id`; longest-prefix match over present blocks.
-- [ ] 3.4 Size-capped LRU eviction (by mtime); atomicity + eviction tests on a tempdir.
-- [ ] 3.5 Store round-trip test: put then get-longest-prefix returns the same compressed caches; partial-prefix and miss cases.
+- [x] 3.1 `DsV4PrefixCache::open(root, model_id, max_bytes)` — content-addressed dir tree `<root>/<model_id>/<prefix_hash>/{tokens.bin, layer_{i}.kvz}`; in-memory index rebuilt by scanning on open (`reopen_rebuilds_index`). Sweeps leftover `.tmp.*` dirs.
+- [x] 3.2 `put(token_ids, &[DsV4LayerCache])` (the per-layer enum, matching P1's serializer) at a 128-block boundary — atomic write (populate `.tmp.<key>.<nonce>` dir, then `rename`), one `layer_{i}.kvz` per layer + `tokens.bin`. `get_longest_prefix(token_ids) -> Option<(hit_len, Vec<DsV4LayerCache>)>`. Non-aligned `put` → `NotBlockAligned` (`put_rejects_unaligned`).
+- [x] 3.3 Prefix hashing at 128-token block boundaries via stable FNV-1a salted by `model_id` (`block_prefix_hashes`, one O(n) pass); longest-prefix match, **verified against `tokens.bin`** so a hash collision can never return the wrong cache (`longest_prefix_wins`, `model_id_isolates`).
+- [x] 3.4 Size-capped LRU eviction by `last_used` (`size_cap_evicts_lru`: A touched → B evicted, C survives, survivors still load). Atomicity via tmp-dir rename.
+- [x] 3.5 Store round-trip (`put_then_get_longest_prefix_round_trips`) + miss/short-prefix (`no_shared_prefix_misses`). All 7 tests on tempdirs.
 
 ## 4. P3 — Zero-SWA prefill reuse (the payoff)
 
