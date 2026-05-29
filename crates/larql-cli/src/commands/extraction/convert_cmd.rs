@@ -42,6 +42,29 @@ enum ConvertCommand {
         quant: String,
     },
 
+    /// Convert a DeepSeek-V4-Flash GGUF to a (server-conforming) DSv4
+    /// vindex via the dedicated extraction path (`build_dsv4_vindex`).
+    /// Distinct from `gguf-to-vindex` — DSv4's low-rank/latent/grouped
+    /// attention can't go through the generic Q/K/V/O writer. Emits the
+    /// per-blob weight files + `index.json` (VindexConfig) + `embeddings.bin`,
+    /// and copies `--tokenizer` to `tokenizer.json` so larql-server can
+    /// load + serve it.
+    GgufToDsv4Vindex {
+        /// Path to the DeepSeek-V4-Flash `.gguf` file.
+        input: PathBuf,
+
+        /// Output vindex directory.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Source HuggingFace `tokenizer.json` to copy into the vindex
+        /// (the GGUF stores tokenizer data as metadata KVs, not an HF
+        /// file, and there's no in-repo converter). Without it the vindex
+        /// has no `tokenizer.json` and the server can't tokenise.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+    },
+
     /// Convert a safetensors model to a vindex (alias for extract-index).
     SafetensorsToVindex {
         /// Path to the model directory.
@@ -196,6 +219,11 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             f16,
             quant,
         } => run_gguf_to_vindex(&input, &output, &level, f16, &quant),
+        ConvertCommand::GgufToDsv4Vindex {
+            input,
+            output,
+            tokenizer,
+        } => run_gguf_to_dsv4_vindex(&input, &output, tokenizer.as_deref()),
         ConvertCommand::SafetensorsToVindex {
             input,
             output,
@@ -208,6 +236,74 @@ pub fn run(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
             run_add_feature_major_down(&input, quiet)
         }
     }
+}
+
+fn run_gguf_to_dsv4_vindex(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    tokenizer: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use larql_inference::attention::dsv4_storage_build::DsV4Hyperparams;
+    use larql_inference::attention::dsv4_vindex_build::build_dsv4_vindex;
+
+    eprintln!("Loading GGUF: {}", input.display());
+    let gguf = larql_models::loading::gguf::GgufFile::open(input)?;
+
+    if let Some(arch) = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+    {
+        eprintln!("  Architecture: {arch}");
+        if arch != "deepseek4" && arch != "deepseek_v4" {
+            return Err(format!(
+                "expected a DeepSeek-V4 GGUF (general.architecture deepseek4), got {arch:?}"
+            )
+            .into());
+        }
+    }
+    let model_id = gguf
+        .metadata
+        .get("general.name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("deepseek-v4-flash")
+        .to_string();
+
+    let hp = DsV4Hyperparams::from_gguf(&gguf)
+        .map_err(|e| format!("DsV4Hyperparams::from_gguf: {e}"))?;
+
+    // Derive the layer count from the tensor names (`blk.<N>.*`) — robust
+    // against metadata-key drift.
+    let n_layer = gguf
+        .tensor_infos
+        .iter()
+        .filter_map(|i| {
+            i.name()
+                .strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|d| d.parse::<usize>().ok())
+        })
+        .max()
+        .map(|m| m + 1)
+        .ok_or("no blk.N.* tensors found — not a per-layer GGUF")?;
+
+    if tokenizer.is_none() {
+        eprintln!(
+            "  WARNING: no --tokenizer given; the vindex will have no \
+             tokenizer.json and larql-server won't be able to serve it."
+        );
+    }
+    eprintln!(
+        "  Building DSv4 vindex: {n_layer} layers → {}",
+        output.display()
+    );
+    let manifest = build_dsv4_vindex(&gguf, &hp, n_layer, &model_id, output, tokenizer)
+        .map_err(|e| format!("build_dsv4_vindex: {e}"))?;
+    eprintln!(
+        "  Done: {} layers, model_id={:?}, compress_ratios={:?}",
+        manifest.n_layer, manifest.model_id, manifest.compress_ratios
+    );
+    Ok(())
 }
 
 fn run_add_feature_major_down(
