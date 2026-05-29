@@ -52,6 +52,7 @@ pub mod dsv4_swa;
 pub mod dsv4_topk_logits;
 pub mod dsv4_vindex_attn;
 pub mod dsv4_vindex_hca;
+pub mod dsv4_vindex_mhc;
 pub mod dsv4_vindex_wire;
 pub mod dsv4_yarn_config;
 pub mod fine_profile;

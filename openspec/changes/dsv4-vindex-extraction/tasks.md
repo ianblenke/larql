@@ -17,7 +17,7 @@
 
 ## 4. V3 — mHC + MoE + head
 
-- [ ] 4.1 `dsv4_mhc.bin`: `hc_{attn,ffn,head}_{base,fn,scale}` bookends, all layers + head.
+- [x] 4.1 `dsv4_mhc.bin` wire format (`crates/larql-inference/src/attention/dsv4_vindex_mhc.rs`, magic `D4MH` v1): `DsV4MhcWeights { attn, ffn, head: Option<MhcBookend> }` — per-layer blobs set `attn` + `ffn` (`hc_attn/ffn_{fn,scale,base}`), the model-level head blob sets `head` (`hc_head_{fn,scale,base}`). All bookends are f32 (no quantized passthrough); `hc_fn`'s 2D shape and `hc_base` length are recovered from `hp` on read, so only flat values are stored (scale is `[3]` per-layer, `[1]` for the head). Built on shared `dsv4_vindex_wire`. Synthetic CI tests (layer / head / empty / malformed) + real-GGUF `#[ignore]` gate `real_gguf_mhc_round_trips_to_storage` (layer 0 attn/ffn via the per-layer f32 reader + head via `load_dsv4_head`, round-trip, assert bit-exact + hp-derived shapes).
 - [ ] 4.2 Routed MoE experts + shared expert + router (`ffn_gate_inp`, hash `ffn_gate_tid2eid` for the first 3 layers, `exp_probs_b`) via the existing generic MoE extraction path; verify the hash table + bias survive.
 - [ ] 4.3 lm_head + token-embed + final norm via existing generic writers.
 
