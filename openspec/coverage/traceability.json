@@ -5,7 +5,7 @@
     "scenarios": 1591,
     "scenarios_backed": 1373,
     "scenarios_unbacked": 218,
-    "test_refs": 3540,
+    "test_refs": 3542,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5868,7 +5868,9 @@
                 "larql_inference::attention::dsv4_vindex_head::tests::malformed_blobs_are_typed_errors",
                 "larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage",
                 "larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips",
-                "larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips"
+                "larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips",
+                "larql_inference::attention::dsv4_vindex_load::tests::map_routing_places_kinds_correctly",
+                "larql_inference::attention::dsv4_vindex_load::tests::real_gguf_vindex_storage_equals_gguf_resident_load"
               ],
               "tests_unresolved": [],
               "unbacked": false,
@@ -26229,61 +26231,61 @@
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::empty_cache_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 416,
+      "line": 430,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::bad_magic_is_typed_error",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 430,
+      "line": 444,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::empty_cache_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 416,
+      "line": 430,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::hca_full_cache_round_trips_losslessly",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 334,
+      "line": 341,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::hca_with_indexer_and_overlap_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 360,
+      "line": 369,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::no_compress_layer_round_trips_full",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 405,
+      "line": 419,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::truncated_blob_is_typed_error",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 467,
+      "line": 481,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::unknown_tag_is_typed_error",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 455,
+      "line": 469,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::tests::unsupported_version_is_typed_error",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 442,
+      "line": 456,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_kv_persist::unknown_tag_is_typed_error",
       "file": "crates/larql-inference/src/attention/dsv4_kv_persist.rs",
-      "line": 455,
+      "line": 469,
       "crate": "larql_inference"
     },
     {
@@ -26955,7 +26957,7 @@
     {
       "fqn": "larql_inference::attention::dsv4_prefix_reuse::tests::bench_cold_vs_warm_prefill",
       "file": "crates/larql-inference/src/attention/dsv4_prefix_reuse.rs",
-      "line": 355,
+      "line": 360,
       "crate": "larql_inference"
     },
     {
@@ -27862,6 +27864,18 @@
       "fqn": "larql_inference::attention::dsv4_vindex_head::untied_head_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
       "line": 98,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_load::map_routing_places_kinds_correctly",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_load.rs",
+      "line": 246,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_load::real_gguf_vindex_storage_equals_gguf_resident_load",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_load.rs",
+      "line": 338,
       "crate": "larql_inference"
     },
     {
@@ -47619,43 +47633,43 @@
     {
       "fqn": "larql_vindex::config::model::model_config_with_moe",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 434,
+      "line": 437,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::model_config_with_softcap_round_trips",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 425,
+      "line": 428,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::moe_config_default_router_type_via_serde",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 452,
+      "line": 455,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::moe_shared_expert_default_false",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 460,
+      "line": 463,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::optional_fields_absent_in_json_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 411,
+      "line": 414,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::qwen35_deltanet_fields_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 468,
+      "line": 471,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::qwen35_fields_omitted_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 491,
+      "line": 494,
       "crate": "larql_vindex"
     },
     {
@@ -47679,43 +47693,43 @@
     {
       "fqn": "larql_vindex::config::model::tests::model_config_with_moe",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 434,
+      "line": 437,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::model_config_with_softcap_round_trips",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 425,
+      "line": 428,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::moe_config_default_router_type_via_serde",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 452,
+      "line": 455,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::moe_shared_expert_default_false",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 460,
+      "line": 463,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::optional_fields_absent_in_json_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 411,
+      "line": 414,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::qwen35_deltanet_fields_round_trip",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 468,
+      "line": 471,
       "crate": "larql_vindex"
     },
     {
       "fqn": "larql_vindex::config::model::tests::qwen35_fields_omitted_when_none",
       "file": "crates/larql-vindex/src/config/model.rs",
-      "line": 491,
+      "line": 494,
       "crate": "larql_vindex"
     },
     {
@@ -50259,7 +50273,7 @@
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_attention_rejects_dsv4",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 230,
+      "line": 233,
       "crate": "larql_vindex"
     },
     {
@@ -50271,7 +50285,7 @@
     {
       "fqn": "larql_vindex::format::weights::capabilities::extract_level_browse_passes_for_dsv4",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 237,
+      "line": 240,
       "crate": "larql_vindex"
     },
     {
@@ -50319,7 +50333,7 @@
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_attention_rejects_dsv4",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 230,
+      "line": 233,
       "crate": "larql_vindex"
     },
     {
@@ -50331,7 +50345,7 @@
     {
       "fqn": "larql_vindex::format::weights::capabilities::tests::extract_level_browse_passes_for_dsv4",
       "file": "crates/larql-vindex/src/format/weights/capabilities.rs",
-      "line": 237,
+      "line": 240,
       "crate": "larql_vindex"
     },
     {

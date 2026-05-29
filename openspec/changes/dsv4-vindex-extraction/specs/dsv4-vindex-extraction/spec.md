@@ -113,3 +113,5 @@ direct GGUF resident load of the same model.
 <!-- test: larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage -->
 <!-- test: larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips -->
 <!-- test: larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_load::tests::map_routing_places_kinds_correctly -->
+<!-- test: larql_inference::attention::dsv4_vindex_load::tests::real_gguf_vindex_storage_equals_gguf_resident_load -->
