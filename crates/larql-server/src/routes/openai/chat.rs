@@ -1123,6 +1123,15 @@ fn pick_template(model: &LoadedModel) -> larql_inference::prompt::ChatTemplate {
             return ChatTemplate::for_family(weights.arch.family());
         }
     }
+    // Weights not loaded yet. For most arches that's a cold-start window,
+    // but for DSv4 the generic `ModelWeights` is *never* loaded (it uses
+    // dedicated resident storage), so this is the only signal — and
+    // `model.id` is often the GGUF's opaque hash name, which the id
+    // heuristic can't classify (→ Plain, an unformatted prompt). The
+    // vindex config's `family` (from index.json) is authoritative.
+    if !model.config.family.is_empty() {
+        return ChatTemplate::for_family(&model.config.family);
+    }
     ChatTemplate::for_model_id(&model.id)
 }
 
