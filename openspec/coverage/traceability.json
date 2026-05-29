@@ -3,9 +3,9 @@
     "capabilities": 59,
     "requirements": 549,
     "scenarios": 1591,
-    "scenarios_backed": 1371,
-    "scenarios_unbacked": 220,
-    "test_refs": 3531,
+    "scenarios_backed": 1372,
+    "scenarios_unbacked": 219,
+    "test_refs": 3535,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5858,9 +5858,14 @@
           "scenarios": [
             {
               "name": "Whole-model round-trip",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_vindex_head::tests::untied_head_round_trips",
+                "larql_inference::attention::dsv4_vindex_head::tests::tied_head_round_trips",
+                "larql_inference::attention::dsv4_vindex_head::tests::malformed_blobs_are_typed_errors",
+                "larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
               "line": 92
             }
@@ -25642,115 +25647,115 @@
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_audit_expert_slice_packing",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 516,
+      "line": 561,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_audit_tensor_types",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 426,
+      "line": 471,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_loads_ffn_gate_tid2eid",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 379,
+      "line": 424,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::real_gguf_raw_expert_reader_round_trips_to_quant_tensor",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 693,
+      "line": 738,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_empty_input_yields_empty_output",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 369,
+      "line": 414,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_handles_indexer_dotted_names",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 335,
+      "line": 380,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_handles_no_suffix_exp_probs_b",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 348,
+      "line": 393,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_layer_mismatch_drops_everything",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 360,
+      "line": 405,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::rekey_picks_only_requested_layer",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 317,
+      "line": 362,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_audit_expert_slice_packing",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 516,
+      "line": 561,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_audit_tensor_types",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 426,
+      "line": 471,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_loads_ffn_gate_tid2eid",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 379,
+      "line": 424,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_raw_expert_reader_round_trips_to_quant_tensor",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 693,
+      "line": 738,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::real_gguf_resident_expert_footprint",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 609,
+      "line": 654,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::rekey_empty_input_yields_empty_output",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 369,
+      "line": 414,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::rekey_handles_indexer_dotted_names",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 335,
+      "line": 380,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::rekey_handles_no_suffix_exp_probs_b",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 348,
+      "line": 393,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::rekey_layer_mismatch_drops_everything",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 360,
+      "line": 405,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_gguf_reader::tests::rekey_picks_only_requested_layer",
       "file": "crates/larql-inference/src/attention/dsv4_gguf_reader.rs",
-      "line": 317,
+      "line": 362,
       "crate": "larql_inference"
     },
     {
@@ -27815,6 +27820,30 @@
       "fqn": "larql_inference::attention::dsv4_vindex_hca::real_gguf_hca_round_trips_to_storage",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_hca.rs",
       "line": 266,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_head::malformed_blobs_are_typed_errors",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
+      "line": 126,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_head::real_gguf_head_round_trips_to_storage",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
+      "line": 166,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_head::tied_head_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
+      "line": 112,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_head::untied_head_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
+      "line": 98,
       "crate": "larql_inference"
     },
     {

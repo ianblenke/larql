@@ -94,3 +94,8 @@ direct GGUF resident load of the same model.
 - **WHEN** every layer is loaded from a produced DSv4-Flash vindex
 - **THEN** the reconstructed per-layer storage SHALL equal the GGUF
   resident load for all layers and the global head/embeddings
+
+<!-- test: larql_inference::attention::dsv4_vindex_head::tests::untied_head_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_head::tests::tied_head_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_head::tests::malformed_blobs_are_typed_errors -->
+<!-- test: larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage -->

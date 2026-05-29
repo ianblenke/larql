@@ -238,6 +238,51 @@ pub fn read_dsv4_layer_raw_expert_tensors_from_gguf(
     Ok(out)
 }
 
+/// Read a single **global** (non-layer) tensor by exact GGUF name as raw
+/// quantized bytes (e.g. `token_embd.weight`, `output.weight`), returning
+/// `None` if the model doesn't carry it (e.g. tied embeddings omit
+/// `output.weight`).
+///
+/// Like [`read_dsv4_layer_raw_expert_tensors_from_gguf`] but for the
+/// global head tensors the per-layer (`blk.N.*`) name schema doesn't
+/// cover. 2D `[in, out]` → flat `[out, in]` (matches the f32 head
+/// loader's `(n_vocab, n_embd)` reshape).
+pub fn read_dsv4_named_raw_tensor(
+    gguf: &GgufFile,
+    name: &str,
+) -> Result<Option<RawExpertTensor>, ModelError> {
+    let Some(info) = gguf.tensor_infos.iter().find(|i| i.name() == name) else {
+        return Ok(None);
+    };
+    let dims = info.dims();
+    let (rows, cols) = match dims.len() {
+        2 => (dims[1] as usize, dims[0] as usize),
+        1 => (dims[0] as usize, 1usize),
+        other => {
+            return Err(ModelError::Parse(format!(
+                "DSv4 global {name}: expected 1D/2D tensor, got {other}D dims {dims:?}"
+            )));
+        }
+    };
+    let abs_offset = gguf
+        .shard_data_offset(info)
+        .checked_add(info.offset())
+        .ok_or_else(|| ModelError::Parse(format!("DSv4 global {name}: offset overflow")))?;
+    let n_elements: u64 = dims.iter().product();
+    let data_size = tensor_data_size(info.tensor_type(), n_elements as usize)?;
+    let path = gguf.shard_path(info).to_path_buf();
+    let mut f = File::open(&path)?;
+    f.seek(SeekFrom::Start(abs_offset))?;
+    let mut bytes = vec![0u8; data_size];
+    f.read_exact(&mut bytes)?;
+    Ok(Some(RawExpertTensor {
+        bytes,
+        tensor_type: info.tensor_type(),
+        rows,
+        cols,
+    }))
+}
+
 /// Read per-layer DSv4 **integer** tensors (e.g. `ffn_gate_tid2eid`),
 /// keyed by [`DsV4TensorKind`]. Returns `Vec<i32>` per kind so the
 /// downstream loader can shape it into the right routing table.
