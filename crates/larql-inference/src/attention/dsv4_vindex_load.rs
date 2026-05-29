@@ -354,8 +354,15 @@ mod tests {
 
         let out = std::path::Path::new("/tank/ai/tmp/dsv4-vindex-serving");
         let _ = std::fs::remove_dir_all(out);
-        build_dsv4_vindex(&gguf, &hp, N_LAYER, "deepseek-ai/DeepSeek-V4-Flash", out)
-            .expect("build vindex");
+        build_dsv4_vindex(
+            &gguf,
+            &hp,
+            N_LAYER,
+            "deepseek-ai/DeepSeek-V4-Flash",
+            out,
+            None,
+        )
+        .expect("build vindex");
 
         let (layers, head, manifest) = load_dsv4_vindex_resident(out, &hp).expect("serving load");
         assert_eq!(manifest.n_layer, N_LAYER);

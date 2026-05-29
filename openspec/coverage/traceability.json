@@ -27804,19 +27804,31 @@
     {
       "fqn": "larql_inference::attention::dsv4_vindex_build::real_gguf_full_vindex_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
-      "line": 686,
+      "line": 705,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_build::server_config_and_embeddings_parse_via_vindex_loaders",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
-      "line": 772,
+      "line": 798,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_build::tests::tokenizer_is_copied_byte_faithfully",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
+      "line": 839,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_build::tokenizer_is_copied_byte_faithfully",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
+      "line": 839,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_build::vindex_dir_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
-      "line": 638,
+      "line": 657,
       "crate": "larql_inference"
     },
     {
