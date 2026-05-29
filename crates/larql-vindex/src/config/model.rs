@@ -404,7 +404,10 @@ mod tests {
         assert!(cfg.dsv4.is_none());
         // Non-DSv4 config omits the key entirely (skip_serializing_if).
         let j = serde_json::to_string(&minimal_model_config()).unwrap();
-        assert!(!j.contains("dsv4"), "dsv4 key must be omitted when None: {j}");
+        assert!(
+            !j.contains("dsv4"),
+            "dsv4 key must be omitted when None: {j}"
+        );
     }
 
     #[test]

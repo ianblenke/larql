@@ -19,13 +19,13 @@ use ndarray::Array2;
 use larql_compute::ComputeBackend;
 
 use super::dsv4_full_loader::DsV4LoadError;
+use super::dsv4_head_storage::DsV4HeadStorage;
 use super::dsv4_kv_cache::DsV4LayerCache;
 use super::dsv4_layer_variants::DsV4LayerVariant;
 use super::dsv4_prefix_cache::{DsV4PrefixCache, PrefixCacheError, PREFIX_BLOCK_TOKENS};
 use super::dsv4_storage::DsV4LayerWeightStorage;
 use super::dsv4_storage_build::DsV4Hyperparams;
 use super::dsv4_streaming_model_forward::dsv4_resident_model_forward_cached;
-use super::dsv4_head_storage::DsV4HeadStorage;
 
 /// Error from a prefix-cache-backed prefill.
 #[derive(Debug)]
@@ -251,7 +251,9 @@ mod tests {
 
         let h = 2 * PREFIX_BLOCK_TOKENS; // 256, block-aligned
         let s = 16;
-        let toks: Vec<u32> = (0..h + s).map(|i| (i * 257 % head.n_vocab) as u32).collect();
+        let toks: Vec<u32> = (0..h + s)
+            .map(|i| (i * 257 % head.n_vocab) as u32)
+            .collect();
         let max_seq_len = h + s + 8;
 
         // Cold one-shot reference over the full prompt.
@@ -339,7 +341,10 @@ mod tests {
         // resident-quant parity tolerates (≤1.5). The indexer top-k is
         // split-invariant (identical query + compressed KV ⇒ identical
         // scores), so this is numeric, not a behavioral divergence.
-        assert_eq!(tok_matches, s, "every suffix token's greedy argmax must match");
+        assert_eq!(
+            tok_matches, s,
+            "every suffix token's greedy argmax must match"
+        );
         assert!(
             max_rel < 1.5,
             "suffix logits diverge beyond documented HCA tolerance: max_rel={max_rel}"
@@ -372,7 +377,9 @@ mod tests {
 
         let h = 4 * PREFIX_BLOCK_TOKENS; // 512-token shared prefix
         let s = 16;
-        let toks: Vec<u32> = (0..h + s).map(|i| (i * 257 % head.n_vocab) as u32).collect();
+        let toks: Vec<u32> = (0..h + s)
+            .map(|i| (i * 257 % head.n_vocab) as u32)
+            .collect();
         let max_seq_len = h + s + 8;
 
         // Cold: full prefill of the whole prompt, no cache.
@@ -398,12 +405,24 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut store = DsV4PrefixCache::open(tmp.path(), "dsv4-flash", 1 << 34).unwrap();
         dsv4_resident_prefill_with_prefix_cache(
-            &layers, &hp, &head, &toks[..h], &mut store, max_seq_len, None,
+            &layers,
+            &hp,
+            &head,
+            &toks[..h],
+            &mut store,
+            max_seq_len,
+            None,
         )
         .expect("seed");
         let t1 = Instant::now();
         let r = dsv4_resident_prefill_with_prefix_cache(
-            &layers, &hp, &head, &toks, &mut store, max_seq_len, None,
+            &layers,
+            &hp,
+            &head,
+            &toks,
+            &mut store,
+            max_seq_len,
+            None,
         )
         .expect("warm");
         let warm = t1.elapsed();

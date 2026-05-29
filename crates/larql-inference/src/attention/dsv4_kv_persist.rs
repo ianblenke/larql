@@ -59,7 +59,10 @@ impl std::fmt::Display for KvPersistError {
             KvPersistError::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
             KvPersistError::UnknownTag(t) => write!(f, "unknown layer-cache tag {t}"),
             KvPersistError::Truncated { what, need, have } => {
-                write!(f, "truncated reading {what}: need {need} bytes, have {have}")
+                write!(
+                    f,
+                    "truncated reading {what}: need {need} bytes, have {have}"
+                )
             }
         }
     }
@@ -214,7 +217,11 @@ impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], KvPersistError> {
         let have = self.buf.len() - self.pos.min(self.buf.len());
         if self.pos + n > self.buf.len() {
-            return Err(KvPersistError::Truncated { what, need: n, have });
+            return Err(KvPersistError::Truncated {
+                what,
+                need: n,
+                have,
+            });
         }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
@@ -333,11 +340,13 @@ mod tests {
     #[test]
     fn hca_full_cache_round_trips_losslessly() {
         let mut hca = DsV4LayerHcaCache::with_capacity(64, 8, 4);
-        hca.raw
-            .append(Array2::<f32>::from_shape_fn((10, 8), |(r, d)| (r * 3 + d) as f32 * 0.7).view());
+        hca.raw.append(
+            Array2::<f32>::from_shape_fn((10, 8), |(r, d)| (r * 3 + d) as f32 * 0.7).view(),
+        );
         hca.compressed
             .append(Array2::<f32>::from_shape_fn((3, 8), |(r, d)| (r + d) as f32 * 0.5).view());
-        hca.pending_cur.push(Array1::<f32>::from_shape_fn(16, |i| i as f32 * 0.25));
+        hca.pending_cur
+            .push(Array1::<f32>::from_shape_fn(16, |i| i as f32 * 0.25));
         hca.pending_cur.push(Array1::<f32>::from_elem(16, -2.0));
 
         let blob = serialize_layer_cache(&DsV4LayerCache::Hca(hca.clone()));
@@ -368,7 +377,9 @@ mod tests {
             .unwrap()
             .append(Array2::<f32>::from_shape_fn((2, 5), |(r, d)| (r + d * 2) as f32).view());
         hca.overlap_state = CompressorOverlapState {
-            kv_prev_last: Some(Array2::<f32>::from_shape_fn((4, 8), |(r, d)| (r + d) as f32 * 0.3)),
+            kv_prev_last: Some(Array2::<f32>::from_shape_fn((4, 8), |(r, d)| {
+                (r + d) as f32 * 0.3
+            })),
             score_prev_last: Some(Array2::<f32>::from_elem((4, 8), -1.0)),
         };
         hca.indexer_overlap_state = CompressorOverlapState {
@@ -387,7 +398,10 @@ mod tests {
             got.index_compressed.as_ref().unwrap(),
             hca.index_compressed.as_ref().unwrap(),
         );
-        assert_eq!(got.overlap_state.kv_prev_last, hca.overlap_state.kv_prev_last);
+        assert_eq!(
+            got.overlap_state.kv_prev_last,
+            hca.overlap_state.kv_prev_last
+        );
         assert_eq!(
             got.overlap_state.score_prev_last,
             hca.overlap_state.score_prev_last
