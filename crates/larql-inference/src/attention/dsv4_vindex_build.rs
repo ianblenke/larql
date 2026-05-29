@@ -432,7 +432,7 @@ pub fn build_dsv4_vindex(
 /// Map the inference-side `DsV4Hyperparams` (+ per-layer `compress_ratios`)
 /// to the `DsV4VindexMeta` carried in `index.json`, so a DSv4 vindex
 /// reader can rebuild `DsV4Hyperparams` without the source GGUF.
-fn dsv4_meta_from_hp(hp: &DsV4Hyperparams, compress_ratios: &[u8]) -> DsV4VindexMeta {
+pub fn dsv4_meta_from_hp(hp: &DsV4Hyperparams, compress_ratios: &[u8]) -> DsV4VindexMeta {
     use super::dsv4_rope_tail::DsV4RopeMode;
     let rope_mode = match hp.rope_mode {
         DsV4RopeMode::Neox => "neox",
@@ -850,5 +850,38 @@ mod tests {
             payload,
             "tokenizer.json must be a faithful copy"
         );
+    }
+
+    /// `hp → DsV4VindexMeta → hp` round-trips losslessly (the converter
+    /// pair the vindex-only server uses to rebuild `hp` from `index.json`
+    /// without the GGUF). `DsV4Hyperparams` isn't `PartialEq`, but
+    /// `DsV4VindexMeta` is — so re-deriving the meta from the reconstructed
+    /// hp and comparing proves every field (incl. `rope_mode` + `yarn`)
+    /// survived.
+    #[test]
+    fn hp_meta_round_trips() {
+        use super::super::dsv4_vindex_load::dsv4_hyperparams_from_meta;
+        let hp = tiny_hp();
+        let crs = vec![0u8, 1, 4];
+
+        // yarn = None path (tiny_hp).
+        let meta = dsv4_meta_from_hp(&hp, &crs);
+        let hp2 = dsv4_hyperparams_from_meta(&meta).unwrap();
+        assert_eq!(dsv4_meta_from_hp(&hp2, &crs), meta);
+
+        // yarn = Some path.
+        let mut meta_y = meta.clone();
+        meta_y.yarn = Some(DsV4YarnMeta {
+            scaling_type: "yarn".to_string(),
+            freq_base: 10000.0,
+            freq_scale: 0.0625,
+            ext_factor: 1.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            n_ctx_orig: 4096,
+        });
+        let hp_y = dsv4_hyperparams_from_meta(&meta_y).unwrap();
+        assert_eq!(dsv4_meta_from_hp(&hp_y, &crs), meta_y);
     }
 }

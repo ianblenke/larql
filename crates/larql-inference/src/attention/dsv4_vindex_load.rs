@@ -22,11 +22,13 @@ use std::path::Path;
 
 use larql_models::architectures::deepseek_v4_tensors::DsV4TensorKind;
 use larql_models::quant::ggml::dequantize;
+use larql_vindex::config::model::DsV4VindexMeta;
 use ndarray::Array2;
 
 use super::dsv4_gguf_reader::RawExpertTensor;
 use super::dsv4_head_storage::DsV4HeadStorage;
 use super::dsv4_layer_variants::DsV4LayerVariant;
+use super::dsv4_rope_tail::DsV4RopeMode;
 use super::dsv4_storage::DsV4LayerWeightStorage;
 use super::dsv4_storage_build::{build_layer_storage_resident, DsV4Hyperparams};
 use super::dsv4_vindex_build::{
@@ -35,6 +37,7 @@ use super::dsv4_vindex_build::{
 };
 use super::dsv4_vindex_head::DsV4HeadVindex;
 use super::dsv4_vindex_mhc::{DsV4MhcWeights, MhcBookend};
+use super::dsv4_yarn_config::{DsV4RopeYarnConfig, RopeScalingType};
 
 type F32Map = HashMap<DsV4TensorKind, Vec<f32>>;
 type RawMap = HashMap<DsV4TensorKind, RawExpertTensor>;
@@ -191,6 +194,63 @@ pub fn reconstruct_dsv4_head_storage(
         output_hc_scale,
         output_hc_base: hb.base.clone(),
         n_vocab,
+    })
+}
+
+/// Reconstruct `DsV4Hyperparams` from the `DsV4VindexMeta` carried in
+/// `index.json` — the inverse of `build`'s `dsv4_meta_from_hp`. Lets a
+/// vindex-only server rebuild `hp` without the source GGUF. (Per-layer
+/// `compress_ratios` is variant-dispatch data carried on the manifest, not
+/// part of `hp`.)
+pub fn dsv4_hyperparams_from_meta(
+    meta: &DsV4VindexMeta,
+) -> Result<DsV4Hyperparams, DsV4VindexError> {
+    let rope_mode = match meta.rope_mode.as_str() {
+        "neox" => DsV4RopeMode::Neox,
+        "normal" => DsV4RopeMode::Normal,
+        other => {
+            return Err(DsV4VindexError::Manifest(format!(
+                "unknown rope_mode {other:?}"
+            )))
+        }
+    };
+    let yarn = meta.yarn.as_ref().map(|y| DsV4RopeYarnConfig {
+        scaling_type: match y.scaling_type.as_str() {
+            "yarn" => RopeScalingType::Yarn,
+            _ => RopeScalingType::None,
+        },
+        freq_base: y.freq_base,
+        freq_scale: y.freq_scale,
+        ext_factor: y.ext_factor,
+        attn_factor: y.attn_factor,
+        beta_fast: y.beta_fast,
+        beta_slow: y.beta_slow,
+        n_ctx_orig: y.n_ctx_orig,
+    });
+    Ok(DsV4Hyperparams {
+        n_embd: meta.n_embd,
+        n_head: meta.n_head,
+        head_dim: meta.head_dim,
+        q_lora_rank: meta.q_lora_rank,
+        n_groups: meta.n_groups,
+        o_lora_rank: meta.o_lora_rank,
+        n_rot: meta.n_rot,
+        rope_base: meta.rope_base,
+        rope_mode,
+        window_size: meta.window_size,
+        norm_eps: meta.norm_eps,
+        indexer_head_size: meta.indexer_head_size,
+        n_index_head: meta.n_index_head,
+        top_k: meta.top_k,
+        n_hc: meta.n_hc,
+        n_expert: meta.n_expert,
+        n_expert_used: meta.n_expert_used,
+        n_ff_exp: meta.n_ff_exp,
+        n_expert_shared: meta.n_expert_shared,
+        expert_weights_norm: meta.expert_weights_norm,
+        expert_weights_scale: meta.expert_weights_scale,
+        yarn,
+        rope_base_swa: meta.rope_base_swa,
     })
 }
 
