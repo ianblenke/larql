@@ -441,8 +441,8 @@ pub fn dsv4_compressor_step_coff2(
         "cur_chunk must be (compress_ratio, n_embd)"
     );
     let n_kv = 2 * p.head_dim; // coff = 2
-    // Shape checks apply to the f32 view; in resident-Q4_K mode (P8) the
-    // f32 wkv/wgate are empty and the shape lives in the QuantTensor.
+                               // Shape checks apply to the f32 view; in resident-Q4_K mode (P8) the
+                               // f32 wkv/wgate are empty and the shape lives in the QuantTensor.
     if w.quant.is_none() {
         assert_eq!(w.wkv.shape(), &[n_kv, p.n_embd], "wkv shape");
         assert_eq!(w.wgate.shape(), &[n_kv, p.n_embd], "wgate shape");

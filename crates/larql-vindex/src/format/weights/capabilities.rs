@@ -219,7 +219,10 @@ mod tests {
             .expect_err("DSv4 must not be accepted by the standard Q/K/V/O writers");
         let msg = err.to_string();
         assert!(msg.contains("deepseek_v4"), "{msg}");
-        assert!(msg.contains("DeepSeek-V4"), "DSv4 feature message expected: {msg}");
+        assert!(
+            msg.contains("DeepSeek-V4"),
+            "DSv4 feature message expected: {msg}"
+        );
         assert!(
             !msg.contains(FEATURE_MLA),
             "DSv4 reject must be distinct from the MLA reject: {msg}"
