@@ -51,6 +51,7 @@ pub mod dsv4_streaming_model_forward;
 pub mod dsv4_swa;
 pub mod dsv4_topk_logits;
 pub mod dsv4_vindex_attn;
+pub mod dsv4_vindex_build;
 pub mod dsv4_vindex_hca;
 pub mod dsv4_vindex_head;
 pub mod dsv4_vindex_mhc;
