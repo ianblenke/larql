@@ -23,6 +23,7 @@ generic builder calling the DSv4 writers.
 
 <!-- test: larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips -->
 <!-- test: larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_build::tests::server_config_and_embeddings_parse_via_vindex_loaders -->
 <!-- test: larql_vindex::format::weights::capabilities::tests::dsv4_rejected_with_distinct_feature -->
 
 ### Requirement: DSv4 attention + structural weights are represented

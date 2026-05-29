@@ -15,7 +15,9 @@
 //!
 //! On-disk layout (a flat dir):
 //! ```text
-//! <out>/index.json            DsV4VindexManifest
+//! <out>/index.json            VindexConfig (server-parseable; DSv4 meta in model_config.dsv4)
+//! <out>/embeddings.bin        token_embd dequantized to raw f32 [vocab, n_embd]
+//! <out>/dsv4_manifest.json    DsV4VindexManifest (DSv4-internal variant dispatch)
 //! <out>/head.bin              D4HD (token_embd + lm_head + output_norm)
 //! <out>/mhc_head.bin          D4MH (head bookend only)
 //! <out>/blk.<i>/attn.bin      D4VA
@@ -23,6 +25,10 @@
 //! <out>/blk.<i>/mhc.bin       D4MH (attn + ffn bookends)
 //! <out>/blk.<i>/moe.bin       D4MO
 //! ```
+//! The `index.json` + `embeddings.bin` make the dir parseable by
+//! larql-server's bootstrap config/embeddings stages — `#155` step 1
+//! toward serving DSv4. (`tokenizer.json` + the bootstrap's semantic
+//! `VectorIndex` tolerance are the next steps.)
 //!
 //! V4 produces this and round-trips the *blobs* back to the GGUF tensors.
 //! Reconstructing a full `DsV4LayerWeightStorage` from the blobs (the
@@ -36,6 +42,9 @@ use std::path::{Path, PathBuf};
 use larql_models::architectures::deepseek_v4_tensors::DsV4TensorKind;
 use larql_models::detect::ModelError;
 use larql_models::loading::gguf::GgufFile;
+use larql_models::quant::ggml::dequantize;
+use larql_vindex::config::model::{DsV4VindexMeta, DsV4YarnMeta};
+use larql_vindex::{ExtractLevel, VindexConfig, VindexLayerInfo, VindexModelConfig};
 use serde::{Deserialize, Serialize};
 
 use super::dsv4_gguf_reader::{
@@ -55,7 +64,16 @@ use super::dsv4_vindex_mhc::{
 };
 use super::dsv4_vindex_moe::{deserialize_dsv4_moe, serialize_dsv4_moe, DsV4MoeWeights};
 
-const MANIFEST_JSON: &str = "index.json";
+/// Server-parseable `VindexConfig` (consumed by larql-vindex's
+/// `load_vindex_config` + the larql-server bootstrap).
+const INDEX_JSON: &str = "index.json";
+/// Dequantized token embeddings (raw f32 `[vocab, n_embd]`), read by
+/// `load_vindex_embeddings`.
+const EMBEDDINGS_BIN: &str = "embeddings.bin";
+/// DSv4-internal per-layer manifest (variant dispatch for the serving
+/// reader). Distinct from `index.json` so the server's `VindexConfig`
+/// owns the canonical filename.
+const MANIFEST_JSON: &str = "dsv4_manifest.json";
 const HEAD_BIN: &str = "head.bin";
 const MHC_HEAD_BIN: &str = "mhc_head.bin";
 const ATTN_BIN: &str = "attn.bin";
@@ -383,6 +401,14 @@ pub fn build_dsv4_vindex(
     let (head, head_mhc) = read_dsv4_head_vindex_from_gguf(gguf, hp)?;
     write_dsv4_vindex_head(out_dir, &head, &head_mhc)?;
 
+    // Server-conforming metadata: VindexConfig index.json + raw-f32
+    // embeddings.bin (the two things larql-server's bootstrap parses
+    // before per-layer weight load).
+    let n_vocab = head.token_embd.rows;
+    let config = dsv4_vindex_config(hp, n_vocab, n_layer, model_id, &compress_ratios);
+    write_dsv4_vindex_config(out_dir, &config)?;
+    write_dsv4_embeddings(out_dir, &head)?;
+
     let manifest = DsV4VindexManifest {
         format: "dsv4-vindex".to_string(),
         version: 1,
@@ -392,6 +418,130 @@ pub fn build_dsv4_vindex(
     };
     write_dsv4_vindex_manifest(out_dir, &manifest)?;
     Ok(manifest)
+}
+
+/// Map the inference-side `DsV4Hyperparams` (+ per-layer `compress_ratios`)
+/// to the `DsV4VindexMeta` carried in `index.json`, so a DSv4 vindex
+/// reader can rebuild `DsV4Hyperparams` without the source GGUF.
+fn dsv4_meta_from_hp(hp: &DsV4Hyperparams, compress_ratios: &[u8]) -> DsV4VindexMeta {
+    use super::dsv4_rope_tail::DsV4RopeMode;
+    let rope_mode = match hp.rope_mode {
+        DsV4RopeMode::Neox => "neox",
+        DsV4RopeMode::Normal => "normal",
+    }
+    .to_string();
+    let yarn = hp.yarn.as_ref().map(|y| {
+        use super::dsv4_yarn_config::RopeScalingType;
+        DsV4YarnMeta {
+            scaling_type: match y.scaling_type {
+                RopeScalingType::Yarn => "yarn",
+                RopeScalingType::None => "none",
+            }
+            .to_string(),
+            freq_base: y.freq_base,
+            freq_scale: y.freq_scale,
+            ext_factor: y.ext_factor,
+            attn_factor: y.attn_factor,
+            beta_fast: y.beta_fast,
+            beta_slow: y.beta_slow,
+            n_ctx_orig: y.n_ctx_orig,
+        }
+    });
+    DsV4VindexMeta {
+        n_embd: hp.n_embd,
+        n_head: hp.n_head,
+        head_dim: hp.head_dim,
+        compress_ratios: compress_ratios.to_vec(),
+        q_lora_rank: hp.q_lora_rank,
+        n_groups: hp.n_groups,
+        o_lora_rank: hp.o_lora_rank,
+        n_rot: hp.n_rot,
+        rope_base: hp.rope_base,
+        rope_mode,
+        window_size: hp.window_size,
+        norm_eps: hp.norm_eps,
+        n_hc: hp.n_hc,
+        n_expert: hp.n_expert,
+        n_expert_used: hp.n_expert_used,
+        n_ff_exp: hp.n_ff_exp,
+        n_expert_shared: hp.n_expert_shared,
+        expert_weights_norm: hp.expert_weights_norm,
+        expert_weights_scale: hp.expert_weights_scale,
+        indexer_head_size: hp.indexer_head_size,
+        n_index_head: hp.n_index_head,
+        top_k: hp.top_k,
+        rope_base_swa: hp.rope_base_swa,
+        yarn,
+    }
+}
+
+/// Build the server-parseable `VindexConfig` for a DSv4 vindex. Generic
+/// gate/feature fields are zeroed (DSv4 stores no semantic vector index);
+/// all DSv4 specifics live in `model_config.dsv4`.
+pub fn dsv4_vindex_config(
+    hp: &DsV4Hyperparams,
+    n_vocab: usize,
+    n_layer: usize,
+    model_id: &str,
+    compress_ratios: &[u8],
+) -> VindexConfig {
+    let layers = (0..n_layer)
+        .map(|layer| VindexLayerInfo {
+            layer,
+            num_features: 0,
+            offset: 0,
+            length: 0,
+            num_experts: None,
+            num_features_per_expert: None,
+        })
+        .collect();
+    let model_config = VindexModelConfig {
+        model_type: "deepseek_v4".to_string(),
+        head_dim: hp.head_dim,
+        num_q_heads: hp.n_head,
+        num_kv_heads: hp.n_head,
+        rope_base: hp.rope_base,
+        dsv4: Some(dsv4_meta_from_hp(hp, compress_ratios)),
+        ..Default::default()
+    };
+    VindexConfig {
+        version: 1,
+        model: model_id.to_string(),
+        family: "deepseek_v4".to_string(),
+        num_layers: n_layer,
+        hidden_size: hp.n_embd,
+        intermediate_size: hp.n_ff_exp,
+        vocab_size: n_vocab,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::Inference,
+        has_model_weights: true,
+        layers,
+        down_top_k: 0,
+        model_config: Some(model_config),
+        ..Default::default()
+    }
+}
+
+/// Write `index.json` as a `VindexConfig`.
+pub fn write_dsv4_vindex_config(root: &Path, config: &VindexConfig) -> Result<(), DsV4VindexError> {
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| DsV4VindexError::Manifest(e.to_string()))?;
+    fs::write(root.join(INDEX_JSON), json)?;
+    Ok(())
+}
+
+/// Write `embeddings.bin` — `token_embd` dequantized to raw little-endian
+/// f32 `[vocab, n_embd]` (the layout `load_vindex_embeddings` size-detects).
+pub fn write_dsv4_embeddings(root: &Path, head: &DsV4HeadVindex) -> Result<(), DsV4VindexError> {
+    let t = &head.token_embd;
+    let floats =
+        dequantize(&t.bytes, t.tensor_type, t.rows * t.cols).map_err(DsV4VindexError::Model)?;
+    let mut bytes = Vec::with_capacity(floats.len() * 4);
+    for f in floats {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    fs::write(root.join(EMBEDDINGS_BIN), bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -582,5 +732,77 @@ mod tests {
         assert_eq!(head.token_embd.bytes, head_gguf.token_embd.bytes);
         let _ = fs::remove_dir_all(out);
         eprintln!("full vindex round-trip OK for {N_LAYER} layers + head");
+    }
+
+    fn tiny_hp() -> DsV4Hyperparams {
+        use super::super::dsv4_rope_tail::DsV4RopeMode;
+        DsV4Hyperparams {
+            n_embd: 32,
+            n_head: 4,
+            head_dim: 8,
+            q_lora_rank: 16,
+            n_groups: 2,
+            o_lora_rank: 8,
+            n_rot: 4,
+            rope_base: 10000.0,
+            rope_mode: DsV4RopeMode::Neox,
+            window_size: 128,
+            norm_eps: 1e-6,
+            indexer_head_size: Some(8),
+            n_index_head: Some(4),
+            top_k: Some(64),
+            n_hc: 2,
+            n_expert: 8,
+            n_expert_used: 2,
+            n_ff_exp: 64,
+            n_expert_shared: 1,
+            expert_weights_norm: true,
+            expert_weights_scale: 1.5,
+            yarn: None,
+            rope_base_swa: Some(160000.0),
+        }
+    }
+
+    /// **#155 step 1 gate:** the server-conforming metadata
+    /// (`index.json` + `embeddings.bin`) `build_dsv4_vindex` emits is
+    /// parsed by larql-vindex's *actual* server loaders — proving a DSv4
+    /// vindex dir is loadable by the bootstrap's config/embeddings stages
+    /// (no GGUF, no real weights needed).
+    #[test]
+    fn server_config_and_embeddings_parse_via_vindex_loaders() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let hp = tiny_hp();
+        let n_vocab = 128;
+        let compress_ratios = vec![0u8, 1, 4];
+        let n_layer = compress_ratios.len();
+
+        let config = dsv4_vindex_config(&hp, n_vocab, n_layer, "test/dsv4-flash", &compress_ratios);
+        write_dsv4_vindex_config(root, &config).unwrap();
+        // token_embd: [n_vocab, n_embd] TYPE_F32 → dequant is identity.
+        let head = DsV4HeadVindex {
+            token_embd: raw(n_vocab, hp.n_embd, 7),
+            lm_head: None,
+            output_norm: vec![1.0; hp.n_embd],
+        };
+        write_dsv4_embeddings(root, &head).unwrap();
+
+        // Parse via the real server loaders.
+        let loaded = larql_vindex::load_vindex_config(root).expect("load_vindex_config");
+        assert_eq!(loaded.family, "deepseek_v4");
+        assert_eq!(loaded.vocab_size, n_vocab);
+        assert_eq!(loaded.hidden_size, hp.n_embd);
+        assert_eq!(loaded.num_layers, n_layer);
+        let dsv4 = loaded
+            .model_config
+            .as_ref()
+            .and_then(|m| m.dsv4.as_ref())
+            .expect("model_config.dsv4 present");
+        assert_eq!(dsv4.compress_ratios, compress_ratios);
+        assert_eq!(dsv4.n_expert, hp.n_expert);
+        assert_eq!(dsv4.rope_base_swa, Some(160000.0));
+
+        let (embed, _scale) = larql_vindex::load_vindex_embeddings(root).expect("load embeddings");
+        assert_eq!(embed.shape(), [n_vocab, hp.n_embd]);
     }
 }

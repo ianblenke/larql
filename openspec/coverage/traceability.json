@@ -5,7 +5,7 @@
     "scenarios": 1591,
     "scenarios_backed": 1373,
     "scenarios_unbacked": 218,
-    "test_refs": 3542,
+    "test_refs": 3543,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5787,6 +5787,7 @@
               "tests_resolved": [
                 "larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips",
                 "larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips",
+                "larql_inference::attention::dsv4_vindex_build::tests::server_config_and_embeddings_parse_via_vindex_loaders",
                 "larql_vindex::format::weights::capabilities::tests::dsv4_rejected_with_distinct_feature"
               ],
               "tests_unresolved": [],
@@ -5811,7 +5812,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 37
+              "line": 38
             }
           ]
         },
@@ -5835,7 +5836,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 59
+              "line": 60
             }
           ]
         },
@@ -5853,7 +5854,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 85
+              "line": 86
             }
           ]
         },
@@ -5875,7 +5876,7 @@
               "tests_unresolved": [],
               "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 104
+              "line": 105
             }
           ]
         }
@@ -27803,13 +27804,19 @@
     {
       "fqn": "larql_inference::attention::dsv4_vindex_build::real_gguf_full_vindex_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
-      "line": 536,
+      "line": 686,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_build::server_config_and_embeddings_parse_via_vindex_loaders",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
+      "line": 772,
       "crate": "larql_inference"
     },
     {
       "fqn": "larql_inference::attention::dsv4_vindex_build::vindex_dir_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_build.rs",
-      "line": 488,
+      "line": 638,
       "crate": "larql_inference"
     },
     {
