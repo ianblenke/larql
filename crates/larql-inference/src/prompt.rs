@@ -91,7 +91,15 @@ impl ChatTemplate {
             "gemma2" | "gemma3" | "gemma4" => Self::Gemma,
             "mistral" | "mixtral" => Self::Mistral,
             "llama" => Self::Llama,
-            "qwen" | "qwen2" | "qwen3" | "deepseek" | "gpt_oss" => Self::ChatML,
+            "qwen" | "qwen2" | "qwen3" | "gpt_oss" => Self::ChatML,
+            // DeepSeek family — incl. the GGUF arch strings `deepseek`,
+            // `deepseek_v4`/`deepseek4`, and the V2/V3 lineage. DeepSeek
+            // uses its own `<｜User｜>/<｜Assistant｜>` format; ChatML is the
+            // existing approximation (a native DeepSeek template is a
+            // follow-up). Previously only the bare `"deepseek"` matched, so
+            // `deepseek_v4` fell through to `Plain` — feeding DSv4 an
+            // unformatted prompt.
+            f if f.starts_with("deepseek") => Self::ChatML,
             _ => Self::Plain,
         }
     }
@@ -376,6 +384,19 @@ mod tests {
         assert_eq!(ChatTemplate::for_family("qwen3"), ChatTemplate::ChatML);
         assert_eq!(ChatTemplate::for_family("deepseek"), ChatTemplate::ChatML);
         assert_eq!(ChatTemplate::for_family("gpt_oss"), ChatTemplate::ChatML);
+    }
+
+    /// The DeepSeek-V4 GGUF arch strings (`deepseek_v4` / `deepseek4`) and
+    /// the V2/V3 lineage all resolve to ChatML, not the `Plain` fallback.
+    /// Regression guard for the DSv4 serve path, which fed an unformatted
+    /// prompt when `deepseek_v4` fell through to `Plain`.
+    #[test]
+    fn for_family_handles_deepseek_v4_variants() {
+        for f in ["deepseek_v4", "deepseek4", "deepseek_v3", "deepseek_v2"] {
+            assert_eq!(ChatTemplate::for_family(f), ChatTemplate::ChatML, "{f}");
+        }
+        // Non-deepseek unknowns still fall back to Plain.
+        assert_eq!(ChatTemplate::for_family("starcoder2"), ChatTemplate::Plain);
     }
 
     #[test]

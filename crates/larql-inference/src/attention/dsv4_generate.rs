@@ -248,6 +248,82 @@ mod tests {
         }
     }
 
+    /// **Coherence diagnostic (2b)** — the one thing the rest of the DSv4
+    /// suite never checks: does the forward produce *readable text*?
+    ///
+    /// GGUF-direct, resident path, real tokenizer, real ChatML-wrapped
+    /// prompt, greedy decode, then **decodes + prints** the output. This
+    /// is the EXACT generate the server uses
+    /// (`dsv4_resident_generate_with_prefix_cache`) over storage loaded
+    /// straight from the GGUF (`load_dsv4_resident_layers`) — so it
+    /// isolates the forward from the vindex serving reader: if this is
+    /// also garbage, the bug is in the forward, not the vindex
+    /// reconstruction. Run with `--ignored --nocapture` and read stdout.
+    #[test]
+    #[ignore = "Requires the real ~161 GB DSv4-Flash GGUF + ~165 GB RAM"]
+    fn coherence_gguf_direct_resident_greedy() {
+        use super::super::dsv4_full_loader::load_dsv4_resident_layers;
+        use super::super::dsv4_prefix_cache::DsV4PrefixCache;
+        use super::super::dsv4_prefix_reuse::dsv4_resident_generate_with_prefix_cache;
+        use crate::prompt::ChatTemplate;
+
+        let path = std::path::Path::new(
+            "/tank/ai/deepseek-ai/DeepSeek-V4-Flash-GGUF/DeepSeek-V4-Flash-Q4_K_M.gguf",
+        );
+        let tok_path =
+            std::path::Path::new("/tank/ai/deepseek-ai/DeepSeek-V4-Flash/tokenizer.json");
+        if !path.exists() || !tok_path.exists() {
+            eprintln!("skipping: GGUF or tokenizer not present");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open GGUF");
+        let hp = DsV4Hyperparams::from_gguf(&gguf).expect("hp");
+        let head = load_dsv4_head(&gguf, &hp).expect("head");
+        let tokenizer = tokenizers::Tokenizer::from_file(tok_path).expect("load HF tokenizer");
+
+        const N_LAYER: usize = 43;
+        eprintln!("loading {N_LAYER} resident layers (~165 GB)…");
+        let layers = load_dsv4_resident_layers(&gguf, &hp, N_LAYER).expect("resident layers");
+
+        let prompt_text = ChatTemplate::ChatML.wrap("In one sentence, what is a transformer?");
+        let prompt_ids: Vec<u32> = tokenizer
+            .encode(prompt_text.as_str(), true)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        eprintln!("prompt: {} tokens", prompt_ids.len());
+
+        let decode = DecodeConfig {
+            max_new_tokens: 24,
+            eos_token: None,
+            sampling: SamplingConfig::greedy(),
+        };
+        let mut rng = StdRng::seed_from_u64(0);
+        let root = std::env::temp_dir().join("dsv4-coherence");
+        let mut pc = DsV4PrefixCache::open(&root, "dsv4-coherence", 1 << 30).expect("prefix cache");
+        let backend = larql_compute::default_backend();
+
+        let (tokens, _hit) = dsv4_resident_generate_with_prefix_cache(
+            &layers,
+            &hp,
+            &head,
+            &prompt_ids,
+            decode,
+            &mut rng,
+            &mut pc,
+            Some(&*backend),
+        )
+        .expect("resident generate");
+
+        let gen = &tokens[prompt_ids.len()..];
+        let text = tokenizer.decode(gen, false).expect("decode");
+        eprintln!("=== GGUF-DIRECT GENERATED TEXT ===\n{text}\n=== END ===");
+        eprintln!("generated token ids: {gen:?}");
+        assert_eq!(gen.len(), 24, "should generate 24 tokens");
+        // No coherence assertion (manual read) — but it must not be empty.
+        assert!(!text.is_empty());
+    }
+
     /// **GPU milestone test**: real-GGUF `dsv4_generate` with the
     /// default ComputeBackend (CUDA when the `cuda` feature is on +
     /// a CUDA device is present, CPU otherwise).
