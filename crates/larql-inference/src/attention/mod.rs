@@ -54,6 +54,7 @@ pub mod dsv4_vindex_attn;
 pub mod dsv4_vindex_build;
 pub mod dsv4_vindex_hca;
 pub mod dsv4_vindex_head;
+pub mod dsv4_vindex_load;
 pub mod dsv4_vindex_mhc;
 pub mod dsv4_vindex_moe;
 pub mod dsv4_vindex_wire;

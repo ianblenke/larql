@@ -5,7 +5,7 @@
     "scenarios": 1591,
     "scenarios_backed": 1373,
     "scenarios_unbacked": 218,
-    "test_refs": 3540,
+    "test_refs": 3542,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5868,7 +5868,9 @@
                 "larql_inference::attention::dsv4_vindex_head::tests::malformed_blobs_are_typed_errors",
                 "larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage",
                 "larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips",
-                "larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips"
+                "larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips",
+                "larql_inference::attention::dsv4_vindex_load::tests::map_routing_places_kinds_correctly",
+                "larql_inference::attention::dsv4_vindex_load::tests::real_gguf_vindex_storage_equals_gguf_resident_load"
               ],
               "tests_unresolved": [],
               "unbacked": false,
@@ -27862,6 +27864,18 @@
       "fqn": "larql_inference::attention::dsv4_vindex_head::untied_head_round_trips",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_head.rs",
       "line": 98,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_load::map_routing_places_kinds_correctly",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_load.rs",
+      "line": 246,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_load::real_gguf_vindex_storage_equals_gguf_resident_load",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_load.rs",
+      "line": 338,
       "crate": "larql_inference"
     },
     {
