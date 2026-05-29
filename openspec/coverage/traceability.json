@@ -3,9 +3,9 @@
     "capabilities": 59,
     "requirements": 549,
     "scenarios": 1591,
-    "scenarios_backed": 1370,
-    "scenarios_unbacked": 221,
-    "test_refs": 3527,
+    "scenarios_backed": 1371,
+    "scenarios_unbacked": 220,
+    "test_refs": 3531,
     "test_refs_unresolved": 98
   },
   "capabilities": [
@@ -5840,9 +5840,14 @@
           "scenarios": [
             {
               "name": "MoE weights and hash routing round-trip",
-              "tests_resolved": [],
+              "tests_resolved": [
+                "larql_inference::attention::dsv4_vindex_moe::tests::gated_layer_round_trips",
+                "larql_inference::attention::dsv4_vindex_moe::tests::hash_layer_round_trips",
+                "larql_inference::attention::dsv4_vindex_moe::tests::malformed_blobs_are_typed_errors",
+                "larql_inference::attention::dsv4_vindex_moe::tests::real_gguf_moe_round_trips_to_storage"
+              ],
               "tests_unresolved": [],
-              "unbacked": true,
+              "unbacked": false,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
               "line": 73
             }
@@ -5857,7 +5862,7 @@
               "tests_unresolved": [],
               "unbacked": true,
               "spec_file": "openspec/changes/dsv4-vindex-extraction/specs/dsv4-vindex-extraction/spec.md",
-              "line": 87
+              "line": 92
             }
           ]
         }
@@ -27840,6 +27845,30 @@
       "fqn": "larql_inference::attention::dsv4_vindex_mhc::real_gguf_mhc_round_trips_to_storage",
       "file": "crates/larql-inference/src/attention/dsv4_vindex_mhc.rs",
       "line": 187,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_moe::gated_layer_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_moe.rs",
+      "line": 150,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_moe::hash_layer_round_trips",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_moe.rs",
+      "line": 161,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_moe::malformed_blobs_are_typed_errors",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_moe.rs",
+      "line": 171,
+      "crate": "larql_inference"
+    },
+    {
+      "fqn": "larql_inference::attention::dsv4_vindex_moe::real_gguf_moe_round_trips_to_storage",
+      "file": "crates/larql-inference/src/attention/dsv4_vindex_moe.rs",
+      "line": 207,
       "crate": "larql_inference"
     },
     {
