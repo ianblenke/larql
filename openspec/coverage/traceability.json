@@ -44352,91 +44352,91 @@
     {
       "fqn": "larql_server::bootstrap::discover_vindexes_returns_sorted_dirs_with_index_json",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1259,
+      "line": 1260,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::load_options_are_copyable",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1276,
+      "line": 1277,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::normalize_serve_alias_leaves_non_alias_args_unchanged",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1253,
+      "line": 1254,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::normalize_serve_alias_removes_subcommand",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1243,
+      "line": 1244,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_layer_range_accepts_inclusive_cli_range",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1229,
+      "line": 1230,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_layer_range_rejects_bad_shapes",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1235,
+      "line": 1236,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_ram_bytes_gb",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1119,
+      "line": 1120,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_ram_bytes_invalid",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1135,
+      "line": 1136,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_ram_bytes_mb",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1125,
+      "line": 1126,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_ram_bytes_raw",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1130,
+      "line": 1131,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_unit_manifest_accepts_empty_object",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1219,
+      "line": 1220,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_unit_manifest_missing_file_reports_path",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1204,
+      "line": 1205,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_unit_manifest_rejects_non_numeric_layer_key",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1186,
+      "line": 1187,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_unit_manifest_rejects_reversed_range",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1195,
+      "line": 1196,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::bootstrap::parse_unit_manifest_round_trips_per_layer_ranges",
       "file": "crates/larql-server/src/bootstrap.rs",
-      "line": 1169,
+      "line": 1170,
       "crate": "larql_server"
     },
     {
@@ -45360,193 +45360,193 @@
     {
       "fqn": "larql_server::routes::openai::chat::build_chat_logprobs_emits_one_entry_per_token",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1326,
+      "line": 1494,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_chat_tool_calls_chunk_shapes_delta_correctly",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1295,
+      "line": 1463,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_handles_nested_braces_in_arguments",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1387,
+      "line": 1555,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_happy_path",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1369,
+      "line": 1537,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_empty_input",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1419,
+      "line": 1587,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_invalid_json",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1452,
+      "line": 1620,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_missing_arguments",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1446,
+      "line": 1614,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_missing_name",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1440,
+      "line": 1608,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_non_object_top_level",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1427,
+      "line": 1595,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_rejects_trailing_junk_with_clean_error",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1403,
+      "line": 1571,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::build_tool_call_tolerates_surrounding_whitespace",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1380,
+      "line": 1548,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::deserialize_chat_message_with_tool_call_replay",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1339,
+      "line": 1507,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::deserialize_chat_request_full",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1255,
+      "line": 1423,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::deserialize_chat_request_min",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1245,
+      "line": 1413,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::format_tool_calls_summarises_function_calls",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1284,
+      "line": 1452,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::format_tool_result_includes_call_id_and_body",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1277,
+      "line": 1445,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_chat_logprobs_emits_one_entry_per_token",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1326,
+      "line": 1494,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_chat_tool_calls_chunk_shapes_delta_correctly",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1295,
+      "line": 1463,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_handles_nested_braces_in_arguments",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1387,
+      "line": 1555,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_happy_path",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1369,
+      "line": 1537,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_empty_input",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1419,
+      "line": 1587,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_invalid_json",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1452,
+      "line": 1620,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_missing_arguments",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1446,
+      "line": 1614,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_missing_name",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1440,
+      "line": 1608,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_non_object_top_level",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1427,
+      "line": 1595,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_rejects_trailing_junk_with_clean_error",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1403,
+      "line": 1571,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::build_tool_call_tolerates_surrounding_whitespace",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1380,
+      "line": 1548,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::deserialize_chat_message_with_tool_call_replay",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1339,
+      "line": 1507,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::deserialize_chat_request_full",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1255,
+      "line": 1423,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::deserialize_chat_request_min",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1245,
+      "line": 1413,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::format_tool_calls_summarises_function_calls",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1284,
+      "line": 1452,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::openai::chat::tests::format_tool_result_includes_call_id_and_body",
       "file": "crates/larql-server/src/routes/openai/chat.rs",
-      "line": 1277,
+      "line": 1445,
       "crate": "larql_server"
     },
     {
@@ -46296,37 +46296,37 @@
     {
       "fqn": "larql_server::routes::stream::stream_describe_messages_builds_layer_and_done_messages",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 750,
+      "line": 751,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::stream::stream_describe_messages_reports_missing_entity",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 731,
+      "line": 732,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::stream::stream_describe_messages_reports_no_model",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 740,
+      "line": 741,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::stream::tests::stream_describe_messages_builds_layer_and_done_messages",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 750,
+      "line": 751,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::stream::tests::stream_describe_messages_reports_missing_entity",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 731,
+      "line": 732,
       "crate": "larql_server"
     },
     {
       "fqn": "larql_server::routes::stream::tests::stream_describe_messages_reports_no_model",
       "file": "crates/larql-server/src/routes/stream.rs",
-      "line": 740,
+      "line": 741,
       "crate": "larql_server"
     },
     {

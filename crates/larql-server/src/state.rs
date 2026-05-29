@@ -17,6 +17,26 @@ use crate::cache::DescribeCache;
 use crate::ffn_l2_cache::FfnL2Cache;
 use crate::session::SessionManager;
 
+/// A DeepSeek-V4-Flash model reconstructed into resident storage from a
+/// vindex (the serving-reader output), cached on [`LoadedModel`] for
+/// reuse across chat requests. Reconstructing `DsV4LayerWeightStorage[]`
+/// from a ~161 GB vindex is far too slow to do per request.
+///
+/// `prefix_cache` is `Mutex`-wrapped because
+/// `dsv4_resident_generate_with_prefix_cache` mutates it and one chat
+/// completion runs at a time per model (mirroring the generic path's
+/// weights write-lock).
+pub struct DsV4ResidentModel {
+    pub layers: Vec<(
+        larql_inference::attention::dsv4_storage::DsV4LayerWeightStorage,
+        larql_inference::attention::dsv4_layer_variants::DsV4LayerVariant,
+    )>,
+    pub head: larql_inference::attention::dsv4_head_storage::DsV4HeadStorage,
+    pub hp: larql_inference::attention::dsv4_storage_build::DsV4Hyperparams,
+    pub prefix_cache:
+        std::sync::Mutex<larql_inference::attention::dsv4_prefix_cache::DsV4PrefixCache>,
+}
+
 /// A single loaded model.
 pub struct LoadedModel {
     /// Model ID derived from config (e.g., "gemma-3-4b-it").
@@ -73,6 +93,11 @@ pub struct LoadedModel {
     pub qwen35_weights: std::sync::OnceLock<
         std::sync::Arc<larql_inference::attention::qwen35_forward::Qwen35Weights>,
     >,
+    /// Lazy-cached DSv4-Flash resident model (reconstructed from the
+    /// vindex blobs via the serving reader) for `deepseek_v4` arches.
+    /// Built once on the first `/v1/chat/completions` for a DSv4 model and
+    /// reused for the server's lifetime. `None` for all other arches.
+    pub dsv4_resident: std::sync::OnceLock<std::sync::Arc<DsV4ResidentModel>>,
     /// Probe-confirmed feature labels: (layer, feature) → relation name.
     /// Loaded from feature_labels.json if present.
     pub probe_labels: HashMap<(usize, usize), String>,
@@ -458,6 +483,7 @@ mod loaded_model_tests {
             release_mmap_after_request: release_mmap,
             weights: std::sync::OnceLock::new(),
             qwen35_weights: std::sync::OnceLock::new(),
+            dsv4_resident: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
@@ -568,6 +594,7 @@ mod loaded_model_tests {
             release_mmap_after_request: false,
             weights: std::sync::OnceLock::new(),
             qwen35_weights: std::sync::OnceLock::new(),
+            dsv4_resident: std::sync::OnceLock::new(),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
