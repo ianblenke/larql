@@ -70,6 +70,11 @@ const INDEX_JSON: &str = "index.json";
 /// Dequantized token embeddings (raw f32 `[vocab, n_embd]`), read by
 /// `load_vindex_embeddings`.
 const EMBEDDINGS_BIN: &str = "embeddings.bin";
+/// HuggingFace `tokenizers` JSON, read by `load_vindex_tokenizer`. The
+/// GGUF stores tokenizer data as metadata KVs (not an HF `tokenizer.json`)
+/// and the repo has no GGUF→HF converter, so this is sourced by copy from
+/// the model's HF directory.
+const TOKENIZER_JSON: &str = "tokenizer.json";
 /// DSv4-internal per-layer manifest (variant dispatch for the serving
 /// reader). Distinct from `index.json` so the server's `VindexConfig`
 /// owns the canonical filename.
@@ -390,6 +395,7 @@ pub fn build_dsv4_vindex(
     n_layer: usize,
     model_id: &str,
     out_dir: &Path,
+    tokenizer_src: Option<&Path>,
 ) -> Result<DsV4VindexManifest, DsV4VindexError> {
     fs::create_dir_all(out_dir)?;
     let mut compress_ratios = Vec::with_capacity(n_layer);
@@ -408,6 +414,9 @@ pub fn build_dsv4_vindex(
     let config = dsv4_vindex_config(hp, n_vocab, n_layer, model_id, &compress_ratios);
     write_dsv4_vindex_config(out_dir, &config)?;
     write_dsv4_embeddings(out_dir, &head)?;
+    if let Some(src) = tokenizer_src {
+        write_dsv4_tokenizer(out_dir, src)?;
+    }
 
     let manifest = DsV4VindexManifest {
         format: "dsv4-vindex".to_string(),
@@ -541,6 +550,16 @@ pub fn write_dsv4_embeddings(root: &Path, head: &DsV4HeadVindex) -> Result<(), D
         bytes.extend_from_slice(&f.to_le_bytes());
     }
     fs::write(root.join(EMBEDDINGS_BIN), bytes)?;
+    Ok(())
+}
+
+/// Copy the model's HuggingFace `tokenizer.json` into the vindex so
+/// `load_vindex_tokenizer` (called unconditionally by the server
+/// bootstrap) succeeds. `src` is the source `tokenizer.json` (e.g.
+/// alongside the GGUF in the model's HF directory). No GGUF→HF converter
+/// exists, so this is a faithful copy.
+pub fn write_dsv4_tokenizer(root: &Path, src: &Path) -> Result<(), DsV4VindexError> {
+    fs::copy(src, root.join(TOKENIZER_JSON))?;
     Ok(())
 }
 
@@ -698,8 +717,15 @@ mod tests {
         // Write to a scratch dir on the big volume (output ~161 GB).
         let out = std::path::Path::new("/tank/ai/tmp/dsv4-vindex-roundtrip");
         let _ = fs::remove_dir_all(out);
-        let manifest = build_dsv4_vindex(&gguf, &hp, N_LAYER, "deepseek-ai/DeepSeek-V4-Flash", out)
-            .expect("build vindex");
+        let manifest = build_dsv4_vindex(
+            &gguf,
+            &hp,
+            N_LAYER,
+            "deepseek-ai/DeepSeek-V4-Flash",
+            out,
+            None,
+        )
+        .expect("build vindex");
         assert_eq!(manifest.n_layer, N_LAYER);
         assert_eq!(manifest.compress_ratios.len(), N_LAYER);
 
@@ -804,5 +830,25 @@ mod tests {
 
         let (embed, _scale) = larql_vindex::load_vindex_embeddings(root).expect("load embeddings");
         assert_eq!(embed.shape(), [n_vocab, hp.n_embd]);
+    }
+
+    /// `write_dsv4_tokenizer` copies the source `tokenizer.json` byte-for-
+    /// byte to the vindex (no GGUF→HF conversion — the server's
+    /// `load_vindex_tokenizer` then reads the standard HF file).
+    #[test]
+    fn tokenizer_is_copied_byte_faithfully() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src_tokenizer.json");
+        let payload =
+            br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{},"unk_token":"<unk>"}}"#;
+        std::fs::write(&src, payload).unwrap();
+        let out = tmp.path().join("vindex");
+        std::fs::create_dir_all(&out).unwrap();
+        write_dsv4_tokenizer(&out, &src).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("tokenizer.json")).unwrap(),
+            payload,
+            "tokenizer.json must be a faithful copy"
+        );
     }
 }
