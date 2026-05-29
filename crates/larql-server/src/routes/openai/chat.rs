@@ -709,6 +709,23 @@ fn run_chat_completion(
     let template = pick_template(model);
     let prompt = render(template, messages);
 
+    // DeepSeek V4 Flash has its own resident-storage forward
+    // (`DsV4LayerWeightStorage[]` + `DsV4HeadStorage`), not the generic
+    // `ModelWeights`. It must branch BEFORE `lock_weights_for_gen` —
+    // that lazy-loads generic Q/K/V/O + FFN weight files a DSv4 vindex
+    // doesn't contain. The family comes from `config` (index.json), so
+    // no weights load is needed to route here.
+    if model.config.family == "deepseek_v4" {
+        return run_dsv4_chat_completion(
+            model,
+            &prompt,
+            max_tokens,
+            sampling_params,
+            stop_strings,
+            constrained_schema,
+        );
+    }
+
     // Take an exclusive write guard on the weights for the duration
     // of generation. `larql_inference::layer_graph::generate` mutates
     // `weights.tensors` (the per-layer Q4_K dequant cache), so other
@@ -754,19 +771,9 @@ fn run_chat_completion(
     // Gated-DeltaNet + full-attention MoE family as Qwen 3.6; routes
     // through the same generate driver.
     let is_qwen35 = matches!(arch_family, "qwen35" | "qwen35moe" | "qwen3next");
-    // DeepSeek V4 Flash — Stage 1 arch detection landed; forward path
-    // arrives in stages 2-8. Return a clear error instead of
-    // silently routing to the generic fallback (which would produce
-    // garbled output, the failure mode PR #186 originally reverted
-    // to avoid).
-    if arch_family == "deepseek_v4" {
-        return Err(ServerError::Internal(format!(
-            "DeepSeek V4 Flash architecture (arch `{arch_family}`) detected. \
-             larql's V4 forward path is in progress (stages 2-8 of the \
-             rebuild reconsidering PR #186's revert). Inference is not \
-             yet available; use llama.cpp PR #23122 in the meantime."
-        )));
-    }
+    // DeepSeek V4 Flash is handled by the dedicated `deepseek_v4` branch
+    // at the top of this function (before the generic weights load) — it
+    // can't reach here.
     if is_qwen35 && constrained_schema.is_some() {
         return Err(ServerError::Internal(format!(
             "/v1/chat/completions with response_format/tools is not yet wired \
@@ -900,6 +907,167 @@ fn run_chat_completion(
         // align with the truncated text. We can't perfectly reverse the
         // textual trim, but discarding tokens past the byte boundary is
         // a good approximation.
+        completion_tokens = trim_tokens_to_text(&completion_tokens, &completion_text);
+    }
+
+    let completion_token_count = completion_tokens.len();
+    Ok(ChatGenerationOutput {
+        text: completion_text,
+        tokens: completion_tokens,
+        finish_reason,
+        prompt_tokens: prompt_token_count,
+        completion_tokens: completion_token_count,
+    })
+}
+
+/// DeepSeek V4 Flash chat completion — runs the resident-storage forward
+/// (`dsv4_resident_generate_with_prefix_cache`) reconstructed from the
+/// vindex blobs, instead of the generic `ModelWeights` path. Lazy-builds
+/// and caches the resident model on `LoadedModel.dsv4_resident` on first
+/// use (reconstructing `DsV4LayerWeightStorage[]` from a ~161 GB vindex is
+/// far too slow per request).
+fn run_dsv4_chat_completion(
+    model: &LoadedModel,
+    prompt: &str,
+    max_tokens: usize,
+    sampling_params: super::util::SamplingParams,
+    stop_strings: &[String],
+    constrained_schema: Option<Schema>,
+) -> Result<ChatGenerationOutput, ServerError> {
+    use larql_inference::attention::dsv4_decode_loop::DecodeConfig;
+    use larql_inference::attention::dsv4_prefix_cache::DsV4PrefixCache;
+    use larql_inference::attention::dsv4_prefix_reuse::dsv4_resident_generate_with_prefix_cache;
+    use larql_inference::attention::dsv4_vindex_load::{
+        dsv4_hyperparams_from_meta, load_dsv4_vindex_resident,
+    };
+    use rand::SeedableRng;
+
+    // Constrained masking isn't wired through the DSv4 driver yet.
+    if constrained_schema.is_some() {
+        return Err(ServerError::Internal(
+            "/v1/chat/completions with response_format/tools is not yet wired \
+             through the DeepSeek-V4 generate driver. Drop response_format/tools."
+                .into(),
+        ));
+    }
+
+    let encoding = model
+        .tokenizer
+        .encode(prompt, true)
+        .map_err(|e| ServerError::Internal(format!("tokenize: {e}")))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if prompt_ids.is_empty() {
+        return Err(ServerError::BadRequest(
+            "rendered prompt tokenises to empty".into(),
+        ));
+    }
+    let prompt_token_count = prompt_ids.len();
+
+    // Lazy-load + cache the resident model (reconstruct hp from
+    // index.json's model_config.dsv4, then load every layer's storage
+    // from the vindex blobs via the serving reader).
+    let resident = match model.dsv4_resident.get() {
+        Some(r) => std::sync::Arc::clone(r),
+        None => {
+            let meta = model
+                .config
+                .model_config
+                .as_ref()
+                .and_then(|m| m.dsv4.as_ref())
+                .ok_or_else(|| {
+                    ServerError::Internal(
+                        "DSv4 vindex missing model_config.dsv4 in index.json".into(),
+                    )
+                })?;
+            let hp = dsv4_hyperparams_from_meta(meta)
+                .map_err(|e| ServerError::Internal(format!("dsv4 hp reconstruct: {e}")))?;
+            let (layers, head, _manifest) = load_dsv4_vindex_resident(&model.path, &hp)
+                .map_err(|e| ServerError::Internal(format!("dsv4 resident load: {e}")))?;
+            let prefix_root = std::env::temp_dir().join("larql-dsv4-prefix-cache");
+            let prefix_cache = DsV4PrefixCache::open(&prefix_root, &model.id, 8 << 30)
+                .map_err(|e| ServerError::Internal(format!("dsv4 prefix cache: {e}")))?;
+            let arc = std::sync::Arc::new(crate::state::DsV4ResidentModel {
+                layers,
+                head,
+                hp,
+                prefix_cache: std::sync::Mutex::new(prefix_cache),
+            });
+            // OnceLock: first writer wins; reuse the winner if we raced.
+            let _ = model.dsv4_resident.set(std::sync::Arc::clone(&arc));
+            model.dsv4_resident.get().cloned().unwrap_or(arc)
+        }
+    };
+
+    // The DSv4 decode loop uses its own `dsv4_sampling::SamplingConfig`
+    // (distinct from the generic layer-graph one), so map directly from
+    // the request params. `build_sampling_eos` is reused only for the EOS
+    // id set + stop strings.
+    use larql_inference::attention::dsv4_sampling::SamplingConfig as DsV4Sampling;
+    let temp = sampling_params.temperature.unwrap_or(0.0).max(0.0);
+    let top_p = sampling_params.top_p.unwrap_or(0.95);
+    // `build_sampling_eos` consumes `sampling_params`; reused only for the
+    // EOS id set + stop strings (its generic SamplingConfig is discarded).
+    let (_generic_sampling, eos) = super::util::build_sampling_eos(sampling_params, stop_strings);
+    let sampling = if temp > 0.0 {
+        DsV4Sampling {
+            greedy: false,
+            temperature: temp,
+            top_k: 40,
+            top_p,
+        }
+    } else {
+        DsV4Sampling::greedy()
+    };
+    let decode = DecodeConfig {
+        max_new_tokens: max_tokens,
+        // The DSv4 decode loop stops on a single eos id; pick any from
+        // the eos set (DSv4-Flash has one canonical end-of-turn token).
+        eos_token: eos.eos_token_ids.iter().next().copied(),
+        sampling,
+    };
+    let backend = larql_compute::default_backend();
+    let mut rng = rand::rngs::StdRng::from_entropy();
+
+    // One generation at a time per model (the prefix cache is mutated);
+    // mirrors the generic path's weights write-lock.
+    let mut prefix_cache = resident
+        .prefix_cache
+        .lock()
+        .map_err(|e| ServerError::Internal(format!("dsv4 prefix cache poisoned: {e}")))?;
+    let (all_tokens, _cache_hit) = dsv4_resident_generate_with_prefix_cache(
+        &resident.layers,
+        &resident.hp,
+        &resident.head,
+        &prompt_ids,
+        decode,
+        &mut rng,
+        &mut prefix_cache,
+        Some(&*backend),
+    )
+    .map_err(|e| ServerError::Internal(format!("dsv4 generate: {e}")))?;
+    drop(prefix_cache);
+
+    // The returned vector is `prompt ++ generated`; slice off the prompt.
+    let gen_start = prompt_ids.len().min(all_tokens.len());
+    let mut completion_text = String::new();
+    let mut completion_tokens: Vec<(String, f64)> = Vec::new();
+    let mut finish_reason: &'static str = "length";
+    for &tid in &all_tokens[gen_start..] {
+        let piece = model
+            .tokenizer
+            .decode(&[tid], false)
+            .map_err(|e| ServerError::Internal(format!("detok: {e}")))?;
+        completion_text.push_str(&piece);
+        // Per-token logprobs aren't exposed by this entry point yet → 0.0.
+        completion_tokens.push((piece.clone(), 0.0));
+        if larql_inference::vindex::is_end_of_turn(&piece) {
+            finish_reason = "stop";
+            break;
+        }
+    }
+    if !stop_strings.is_empty() && contains_any(&completion_text, stop_strings) {
+        completion_text = trim_at_stop(&completion_text, stop_strings);
+        finish_reason = "stop";
         completion_tokens = trim_tokens_to_text(&completion_tokens, &completion_text);
     }
 

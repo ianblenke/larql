@@ -2436,6 +2436,7 @@ dependencies = [
  "num_cpus",
  "prost",
  "protobuf-src",
+ "rand 0.8.6",
  "rayon",
  "reqwest",
  "serde",
