@@ -2,16 +2,28 @@
 
 ### Requirement: DSv4 architecture is extractable to vindex
 
-The vindex extraction pipeline SHALL recognize the `deepseek_v4`
-architecture as extractable (distinct from the classic-MLA `deepseek_v2`/
-`deepseek_v3`, which remain rejected) and SHALL produce a vindex from a
-DeepSeek-V4-Flash GGUF.
+The `deepseek_v4` architecture SHALL be extractable to a vindex via a
+**dedicated** extraction path (`build_dsv4_vindex`, in `larql-inference`
+where the DSv4 GGUF readers + storage live), producing a vindex from a
+DeepSeek-V4-Flash GGUF. This path is distinct from larql-vindex's generic
+Q/K/V/O `build_vindex`, whose capabilities gate SHALL continue to reject
+`deepseek_v4` (with a DSv4-specific message) alongside the classic-MLA
+`deepseek_v2`/`deepseek_v3` — the generic writers genuinely cannot
+represent DSv4's low-rank/latent/grouped attention, and the crate
+dependency direction (`larql-inference` → `larql-vindex`) precludes the
+generic builder calling the DSv4 writers.
 
-#### Scenario: V4 accepted, V2/V3 still rejected
+#### Scenario: V4 extractable via dedicated path; generic gate still rejects
 
-- **WHEN** the extraction capabilities gate evaluates an architecture
-- **THEN** `deepseek_v4` SHALL be accepted for extraction, while
-  `deepseek_v2`/`deepseek_v3` SHALL still be rejected as unsupported MLA
+- **WHEN** the dedicated `build_dsv4_vindex` path runs on a `deepseek_v4`
+  GGUF, and separately the generic capabilities gate evaluates `deepseek_v4`
+- **THEN** the dedicated path SHALL produce a faithful vindex, while the
+  generic gate SHALL still reject `deepseek_v4` (distinct message) and
+  `deepseek_v2`/`deepseek_v3` as unrepresentable
+
+<!-- test: larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips -->
+<!-- test: larql_vindex::format::weights::capabilities::tests::dsv4_rejected_with_distinct_feature -->
 
 ### Requirement: DSv4 attention + structural weights are represented
 
@@ -99,3 +111,5 @@ direct GGUF resident load of the same model.
 <!-- test: larql_inference::attention::dsv4_vindex_head::tests::tied_head_round_trips -->
 <!-- test: larql_inference::attention::dsv4_vindex_head::tests::malformed_blobs_are_typed_errors -->
 <!-- test: larql_inference::attention::dsv4_vindex_head::tests::real_gguf_head_round_trips_to_storage -->
+<!-- test: larql_inference::attention::dsv4_vindex_build::tests::vindex_dir_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_build::tests::real_gguf_full_vindex_round_trips -->
