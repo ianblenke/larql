@@ -78,6 +78,25 @@ pub(crate) fn put_opt_f32_vec(out: &mut Vec<u8>, v: &Option<Vec<f32>>) {
     }
 }
 
+/// `len:u32 | len*i32`.
+pub(crate) fn put_i32_vec(out: &mut Vec<u8>, v: &[i32]) {
+    put_u32(out, v.len() as u32);
+    for &x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+/// `present:u8 | [i32_vec]`.
+pub(crate) fn put_opt_i32_vec(out: &mut Vec<u8>, v: &Option<Vec<i32>>) {
+    match v {
+        Some(s) => {
+            out.push(1);
+            put_i32_vec(out, s);
+        }
+        None => out.push(0),
+    }
+}
+
 // ── decode ──────────────────────────────────────────────────────────────
 
 pub(crate) struct Cursor<'a> {
@@ -176,6 +195,30 @@ impl<'a> Cursor<'a> {
     ) -> Result<Option<Vec<f32>>, DsV4VindexWireError> {
         if self.read_u8(what)? != 0 {
             Ok(Some(self.read_f32_vec(what)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn read_i32_vec(
+        &mut self,
+        what: &'static str,
+    ) -> Result<Vec<i32>, DsV4VindexWireError> {
+        let n = self.read_u32(what)? as usize;
+        let s = self.take(n * 4, what)?;
+        let mut v = Vec::with_capacity(n);
+        for chunk in s.chunks_exact(4) {
+            v.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(v)
+    }
+
+    pub(crate) fn read_opt_i32_vec(
+        &mut self,
+        what: &'static str,
+    ) -> Result<Option<Vec<i32>>, DsV4VindexWireError> {
+        if self.read_u8(what)? != 0 {
+            Ok(Some(self.read_i32_vec(what)?))
         } else {
             Ok(None)
         }

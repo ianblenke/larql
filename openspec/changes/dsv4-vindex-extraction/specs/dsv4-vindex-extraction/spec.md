@@ -78,6 +78,11 @@ round-trip intact.
   token→expert table, and the routing bias SHALL all reload equal to the
   GGUF-loaded values
 
+<!-- test: larql_inference::attention::dsv4_vindex_moe::tests::gated_layer_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_moe::tests::hash_layer_round_trips -->
+<!-- test: larql_inference::attention::dsv4_vindex_moe::tests::malformed_blobs_are_typed_errors -->
+<!-- test: larql_inference::attention::dsv4_vindex_moe::tests::real_gguf_moe_round_trips_to_storage -->
+
 ### Requirement: Full-model extraction round-trips
 
 A complete DSv4-Flash vindex produced from the GGUF SHALL reconstruct,
